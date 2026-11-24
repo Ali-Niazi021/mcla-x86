@@ -910,4 +910,11 @@ The orchestrator runs in the main session (Opus 5.5, medium) and needs no file.
 
 ## Amendments (orchestrator only; newest first)
 
-_None yet._
+- **2026-11-24, W0.1.** PresentMon 2.6.0 `--help` prints usage (UTF-16LE) and exits **1**. Acceptance becomes "`--help`
+  output contains `PresentMon 2.6.0`". Capture without admin works (user is in Performance Log Users).
+- **2026-11-24, W0.6.** `mcla_t_sim_math.h` includes `frame_clock_policy.h` (`$IOS/ios/src/`), and the cadence test needs
+  `present_cadence.h` (`$IOS/ios/src/`); neither is in §4.1. W1.3 copies `frame_clock_policy.h` into `mcla/hooks/`;
+  `present_cadence.h` lives in `mcla/tests/`. W1.3 must also supply `nfsmw_pch.h`, `game_profile.h`, `nfsc_progress.h`
+  equivalents the hooks include.
+- **2026-11-24, W0.0.** Role files go in `.omp/agents/` (omp loads project agents from there and rediscovers per spawn;
+  it skips `.claude/agents`). No session restart needed.
