@@ -1,0 +1,84 @@
+# MCLA bench flow, driving (tools/bench.py): free roam in a crowd, then a long drive.
+# Ported from the owner's iOS port (tools/mcla/bench_flow.txt: dev008's flow_f60p extended). Run it with the after_intro
+# fixture (run_game.py copies it into a fresh user dir).
+# Format: <second>:<button>[+<button>...][/<hold ms>], '#' comments; seconds count from process start.
+#
+# expect: free-roam
+# seconds: 360
+# fixture: after_intro
+#
+# 'expect' is the state run_game.py needs to see for exit 0: free-roam = the log shows `[mcla-mode] ... -> free-roam`.
+# 'seconds' is the default --seconds (the M4 bench runs 360); the pattern below continues to 450 s. bench.py measures from
+# `-> free-roam` + 20 s to the end.
+# T+8..24 Start presses reach free roam (parked in a crowd); T+30..42 B taps close a pause menu a late Start opened (E6: the
+# robust sequence of E5; B is a harmless handbrake tap in free roam). T+50 the car drives: throttle held in 14 s slices, a
+# gentle steer inside every slice (busiest street, then a quiet one); the pattern repeats to T+450 so a long bench keeps
+# driving. No pause.
+# Known trap: the title polls the pad every 2-4 updates, so Start is held 300 ms, and repeated because a press before the
+# title exists is lost. An earlier Start at 12..36 toggled the pause menu inside the first segments on the Mac.
+8:start/300
+12:start/300
+16:start/300
+20:start/300
+24:start/300
+30:b/300
+34:b/300
+38:b/300
+42:b/300
+50:rt=1/14000
+58:ls_right/500
+64:rt=1/14000
+72:ls_left/500
+78:rt=1/14000
+86:ls_right/500
+92:rt=1/14000
+100:ls_left/500
+106:rt=1/14000
+114:ls_right/500
+120:rt=1/14000
+128:ls_left/500
+134:rt=1/14000
+142:ls_right/500
+148:rt=1/14000
+156:ls_left/500
+162:rt=1/14000
+170:ls_right/500
+176:rt=1/14000
+184:ls_left/500
+190:rt=1/14000
+198:ls_right/500
+204:rt=1/14000
+212:ls_left/500
+218:rt=1/14000
+226:ls_right/500
+232:rt=1/14000
+240:ls_left/500
+246:rt=1/14000
+254:ls_right/500
+260:rt=1/14000
+268:ls_left/500
+274:rt=1/14000
+282:ls_right/500
+288:rt=1/14000
+296:ls_left/500
+302:rt=1/14000
+310:ls_right/500
+316:rt=1/14000
+324:ls_left/500
+330:rt=1/14000
+338:ls_right/500
+344:rt=1/14000
+352:ls_left/500
+358:rt=1/14000
+366:ls_right/500
+372:rt=1/14000
+380:ls_left/500
+386:rt=1/14000
+394:ls_right/500
+400:rt=1/14000
+408:ls_left/500
+414:rt=1/14000
+422:ls_right/500
+428:rt=1/14000
+436:ls_left/500
+442:rt=1/14000

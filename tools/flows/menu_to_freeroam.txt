@@ -1,0 +1,119 @@
+# MCLA scripted pad flow: SAVED profile -> title -> free roam -> drive -> PAUSE menu -> drive. 150 s is enough for the
+# smoke run; a longer --seconds (the M3 soak uses 600) keeps driving to 590 s (x86 addition below).
+# Ported from the owner's iOS port (mac/flows/mcla_menu_to_freeroam.txt).
+# Syntax: <second>:<button>[+<button>...][/<hold ms>], '#' comments; seconds count from process start.
+#
+# expect: free-roam
+# seconds: 150
+# fixture: after_intro
+#
+# 'expect' is the state run_game.py needs to see for exit 0: free-roam = the log shows `[mcla-mode] ... -> free-roam`.
+# 'seconds' is the default --seconds. 'fixture' is the user-data copy this flow is made for (run_game.py warns when
+# --fixture is missing): $WORK/fixtures/after_intro, a copy of a run's user/ folder holding mc4.sav with the intro, the
+# vehicle select and the first cutscene done; the game then loads straight into free roam: no alert, no cutscene.
+# run_game.py copies the fixture into a fresh per-run user dir, so the fixture itself is never written.
+# On a FRESH user dir this flow stops at the save-game ALERT (use new_profile_to_freeroam.txt for that).
+# Timeline on the Mac (Start at 44 s only): save opened ~53 s, free roam + HUD ~68 s (the Scirocco stands on the street).
+# The Starts from 12 s skip the legal / logo screens, so free roam should come at ~50 s; the throttle below (>= 72 s) lands in
+# free roam. Known trap: the title polls the pad every 2-4 updates, so Start is held 300 ms, and repeated because a press
+# before the title exists is lost. Do not press Start after the title unless the PAUSE menu is wanted: once the car is in
+# roam Start opens PAUSE.
+# Start at the title, repeated (early ones are ignored before the title exists):
+12:start/300
+16:start/300
+20:start/300
+24:start/300
+28:start/300
+32:start/300
+36:start/300
+40:start/300
+44:start/300
+# free roam: throttle (rt=1 is full throttle) with steering (ls_* = left stick, full deflection)
+72:rt=1/15000
+78:ls_right/700
+84:ls_left/700
+# Start opens the PAUSE menu (first row CONTINUE); B closes it
+100:start/300
+108:b/200
+114:rt=1/14000
+120:ls_left/900
+128:rb/200
+# x86 addition for the long soak (--seconds 600): the bench drive pattern (14 s throttle slices, a steer 8 s into each
+# one) from 136 s to 590 s, with the PAUSE menu opened and closed again at 249/253, 361/365 and 473/477 s.
+136:rt=1/14000
+144:ls_right/500
+150:rt=1/14000
+158:ls_left/500
+164:rt=1/14000
+172:ls_right/500
+178:rt=1/14000
+186:ls_left/500
+192:rt=1/14000
+200:ls_right/500
+206:rt=1/14000
+214:ls_left/500
+220:rt=1/14000
+228:ls_right/500
+234:rt=1/14000
+242:ls_left/500
+248:rt=1/14000
+# PAUSE opens (first row CONTINUE) ...
+249:start/300
+# ... and closes again
+253:b/200
+256:ls_right/500
+262:rt=1/14000
+270:ls_left/500
+276:rt=1/14000
+284:ls_right/500
+290:rt=1/14000
+298:ls_left/500
+304:rt=1/14000
+312:ls_right/500
+318:rt=1/14000
+326:ls_left/500
+332:rt=1/14000
+340:ls_right/500
+346:rt=1/14000
+354:ls_left/500
+360:rt=1/14000
+# PAUSE opens (first row CONTINUE) ...
+361:start/300
+# ... and closes again
+365:b/200
+368:ls_right/500
+374:rt=1/14000
+382:ls_left/500
+388:rt=1/14000
+396:ls_right/500
+402:rt=1/14000
+410:ls_left/500
+416:rt=1/14000
+424:ls_right/500
+430:rt=1/14000
+438:ls_left/500
+444:rt=1/14000
+452:ls_right/500
+458:rt=1/14000
+466:ls_left/500
+472:rt=1/14000
+# PAUSE opens (first row CONTINUE) ...
+473:start/300
+# ... and closes again
+477:b/200
+480:ls_right/500
+486:rt=1/14000
+494:ls_left/500
+500:rt=1/14000
+508:ls_right/500
+514:rt=1/14000
+522:ls_left/500
+528:rt=1/14000
+536:ls_right/500
+542:rt=1/14000
+550:ls_left/500
+556:rt=1/14000
+564:ls_right/500
+570:rt=1/14000
+578:ls_left/500
+584:rt=1/14000
