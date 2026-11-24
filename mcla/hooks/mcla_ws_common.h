@@ -61,14 +61,12 @@
 #ifndef MCLA_HOOK_WS_TEXCLEAR
 #define MCLA_HOOK_WS_TEXCLEAR 0
 #endif
-// New in W5.1 and not yet in mcla/sources.cmake: these two default to 1 here (still switchable with -D...=0 or the
-// cvar), so a missing sources.cmake entry cannot leave the 1080p limit hook (or the opt-in single-tile lever, whose
-// cvar is off by default) silently compiled out.
+// Like every hook flag (mcla_hooks.h): 0 here, =1 from mcla/sources.cmake's MCLA_HOOK_DEFINITIONS.
 #ifndef MCLA_HOOK_WS_EDRAM_LIMIT
-#define MCLA_HOOK_WS_EDRAM_LIMIT 1
+#define MCLA_HOOK_WS_EDRAM_LIMIT 0
 #endif
 #ifndef MCLA_HOOK_WS_SINGLE_TILE
-#define MCLA_HOOK_WS_SINGLE_TILE 1
+#define MCLA_HOOK_WS_SINGLE_TILE 0
 #endif
 
 REXCVAR_DECLARE(int32_t, mcla_widescreen_width);

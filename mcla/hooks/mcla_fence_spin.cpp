@@ -15,10 +15,12 @@
 //     EVENT_WRITE_SHD / MEM_WRITE / COND_WRITE it performs: the fence write itself), for at most 1 ms.
 //     The export lives in the GPU plugin (rexgpu-xenos.dll, where the command processor is; SDK patch
 //     W3.2, the 0207 idea): the hook looks there first and in rexruntime.dll second, once, at its
-//     first wait. If neither exports it (an SDK without the patch) a 1 ms bounded wait stands in,
+//     first poll. If neither exports it (an SDK without the patch) a 1 ms bounded wait stands in,
 //     and that is logged once.
-// The streak resets when more than 1 ms passes without a poll on that thread. The guest loop
-// re-reads the fence after every poll, so a missed wake costs at most the 1 ms bound.
+// The wait is on the sequence as it was at the end of the thread's previous poll, i.e. before the guest's own
+// fence compare (check-then-wait, see mcla_hook_fence_spin), so a fence written between that compare and the
+// wait is not slept through. The streak resets when more than 1 ms passes without a poll on that thread. The
+// guest loop re-reads the fence after every poll, so a missed wake costs at most the 1 ms bound.
 //
 // What the iOS device numbers said (docs/mcla/LEARNINGS.md, "CPU levers"): about one fence streak a
 // frame, ~18 ms of a 34 ms frame at the shipped interval-2 presentation, polled ~2,700 times a second
@@ -85,6 +87,8 @@ struct Streak {
   uint32_t polls = 0;
   int64_t start_ns = 0;
   int64_t last_ns = 0;
+  uint32_t seq = 0;        // nfsmw_cp_event_seq as of the end of this thread's previous poll (before the guest's fence read)
+  bool seq_valid = false;  // false at the start of a streak and before the word is known
 };
 thread_local Streak t_streak;
 
@@ -216,6 +220,14 @@ void Report(int64_t now_ns) {
 
 }  // namespace
 
+// The wait is check-then-wait, with the guest's own fence compare as the check. The hook cannot re-read the fence
+// itself: the poll (sub_82412F98) has six call sites (BlockOnFence and five other waits), each comparing a different
+// target after the poll returns, and the hook's TOML entry passes no registers. What it can do is take the sequence
+// BEFORE that compare: every call ends by snapshotting the sequence, before the poll body and the caller's compare
+// run, and the next call of the streak waits on that snapshot instead of on a fresh load. A fence the CP writes after
+// the snapshot has already moved the word, so the wait returns at once and the caller re-checks; one written before
+// it was seen by the compare. A fresh load at the wait (the old order) could land after such a write and sleep a
+// whole bound. A stale snapshot only ever ends a wait early (one more poll), never late.
 bool mcla_hook_fence_spin() {
   MCLA_HOOK_ENTER();
   if (!REXCVAR_GET(mcla_fence_spin)) {
@@ -227,21 +239,25 @@ bool mcla_hook_fence_spin() {
     EndStreak(streak);
     streak.polls = 0;
     streak.start_ns = now;
+    streak.seq_valid = false;
   }
   g_polls.fetch_add(1, std::memory_order_relaxed);
+  std::atomic<uint32_t>* const word = EventWord();
   if (streak.polls < kRelaxPolls) {
     ++streak.polls;
     YieldProcessor();
     streak.last_ns = now;
+    if (word) {
+      streak.seq = word->load(std::memory_order_acquire);  // before the guest reads the fence
+      streak.seq_valid = true;
+    }
     return true;
   }
   ++streak.polls;
-  std::atomic<uint32_t>* const word = EventWord();
   if (word) {
-    // The sequence first, then the wait: if the CP publishes in between, the word has already
-    // changed and the wait returns at once.
-    uint32_t before = word->load(std::memory_order_acquire);
-    const bool woke = WaitOnAddress(word, &before, sizeof(before), WaitBoundMs()) != FALSE;
+    // Wait on the sequence as it was before the guest's last fence read (a fresh load only when this thread has none).
+    uint32_t seen = streak.seq_valid ? streak.seq : word->load(std::memory_order_acquire);
+    const bool woke = WaitOnAddress(word, &seen, sizeof(seen), WaitBoundMs()) != FALSE;
     g_waits.fetch_add(1, std::memory_order_relaxed);
     if (!woke && GetLastError() == ERROR_TIMEOUT) {
       g_timeouts.fetch_add(1, std::memory_order_relaxed);
@@ -251,6 +267,10 @@ bool mcla_hook_fence_spin() {
   }
   const int64_t after = NowNs();
   streak.last_ns = after;
+  if (word) {
+    streak.seq = word->load(std::memory_order_acquire);  // the snapshot the next call waits on
+    streak.seq_valid = true;
+  }
   Report(after);
   return true;
 }

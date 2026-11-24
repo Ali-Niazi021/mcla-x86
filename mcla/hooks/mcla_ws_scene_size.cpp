@@ -143,6 +143,15 @@ void LogSizing(uint32_t width, uint32_t height) {
                   2 * device);
     }
   }
+  // The SDK's render_target_max_height (0 = no cap) makes every host render target at most that many rows tall (rounded
+  // up to the 16-row tile): a back buffer taller than that loses its bottom rows. The PC profile's 720p value is 1024.
+  const uint32_t need = sizing::RenderTargetMaxHeight(height);
+  const uint32_t max_rows = REXCVAR_QUERY(uint32_t, render_target_max_height);
+  if (max_rows != 0 && sizing::AlignUp(max_rows, 16) < need) {
+    REXLOG_ERROR("[mcla-wide] error: render_target_max_height={} cuts a {}-row buffer; set it to {} (mcla_profile=1080p "
+                 "does)",
+                 max_rows, height, need);
+  }
 }
 
 }  // namespace
