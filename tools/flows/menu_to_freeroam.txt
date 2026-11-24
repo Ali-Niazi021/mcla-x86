@@ -1,23 +1,25 @@
 # MCLA scripted pad flow: SAVED profile -> title -> free roam -> drive -> PAUSE menu -> drive. 150 s is enough for the
 # smoke run; a longer --seconds (the M3 soak uses 600) keeps driving to 590 s (x86 addition below).
-# Ported from the owner's iOS port (mac/flows/mcla_menu_to_freeroam.txt).
+# Ported from the owner's iOS port (mac/flows/mcla_menu_to_freeroam.txt), re-timed on x86 by the W2.1 bring-up
+# (the 600 s soak ran clean as run w2.1-m3c).
 # Syntax: <second>:<button>[+<button>...][/<hold ms>], '#' comments; seconds count from process start.
 #
 # expect: free-roam
 # seconds: 150
 # fixture: after_intro
 #
-# 'expect' is the state run_game.py needs to see for exit 0: free-roam = the log shows `[mcla-mode] ... -> free-roam`.
+# 'expect' is the state run_game.py needs to see for exit 0: free-roam = the log shows `[mcla-mode] <any state> -> free-roam`.
 # 'seconds' is the default --seconds. 'fixture' is the user-data copy this flow is made for (run_game.py warns when
 # --fixture is missing): $WORK/fixtures/after_intro, a copy of a run's user/ folder holding mc4.sav with the intro, the
 # vehicle select and the first cutscene done; the game then loads straight into free roam: no alert, no cutscene.
 # run_game.py copies the fixture into a fresh per-run user dir, so the fixture itself is never written.
 # On a FRESH user dir this flow stops at the save-game ALERT (use new_profile_to_freeroam.txt for that).
-# Timeline on the Mac (Start at 44 s only): save opened ~53 s, free roam + HUD ~68 s (the Scirocco stands on the street).
-# The Starts from 12 s skip the legal / logo screens, so free roam should come at ~50 s; the throttle below (>= 72 s) lands in
-# free roam. Known trap: the title polls the pad every 2-4 updates, so Start is held 300 ms, and repeated because a press
-# before the title exists is lost. Do not press Start after the title unless the PAUSE menu is wanted: once the car is in
-# roam Start opens PAUSE.
+# Timeline on x86 (runs w2.1-m3b/m3c, D3D12 720p): first engine frame ~4 s, the title takes the Start at 28 s, save opened
+# ~31 s (`front-end -> loading`), free roam + HUD at ~36.5 s (`loading -> free-roam`, the car stands on the street).
+# So there is no Start after 36 s: a later one would open the PAUSE menu (the iOS file had Starts to 44 s for a slower boot).
+# Known trap: the title polls the pad every 2-4 updates, so Start is held 300 ms, and repeated because a press before the
+# title exists is lost. Do not press Start after the title unless the PAUSE menu is wanted: once the car is in roam Start
+# opens PAUSE.
 # Start at the title, repeated (early ones are ignored before the title exists):
 12:start/300
 16:start/300
@@ -26,8 +28,6 @@
 28:start/300
 32:start/300
 36:start/300
-40:start/300
-44:start/300
 # free roam: throttle (rt=1 is full throttle) with steering (ls_* = left stick, full deflection)
 72:rt=1/15000
 78:ls_right/700
@@ -40,21 +40,31 @@
 128:rb/200
 # x86 addition for the long soak (--seconds 600): the bench drive pattern (14 s throttle slices, a steer 8 s into each
 # one) from 136 s to 590 s, with the PAUSE menu opened and closed again at 249/253, 361/365 and 473/477 s.
+# The car is driven blind, so it crashes: an A tap 4 s into every throttle slice (none inside the pause windows) clears the
+# "DAMAGED OUT / QUICK FIX" dialog that follows (run w2.1-m3c).
 136:rt=1/14000
+140:a/300
 144:ls_right/500
 150:rt=1/14000
+154:a/300
 158:ls_left/500
 164:rt=1/14000
+168:a/300
 172:ls_right/500
 178:rt=1/14000
+182:a/300
 186:ls_left/500
 192:rt=1/14000
+196:a/300
 200:ls_right/500
 206:rt=1/14000
+210:a/300
 214:ls_left/500
 220:rt=1/14000
+224:a/300
 228:ls_right/500
 234:rt=1/14000
+238:a/300
 242:ls_left/500
 248:rt=1/14000
 # PAUSE opens (first row CONTINUE) ...
@@ -63,18 +73,25 @@
 253:b/200
 256:ls_right/500
 262:rt=1/14000
+266:a/300
 270:ls_left/500
 276:rt=1/14000
+280:a/300
 284:ls_right/500
 290:rt=1/14000
+294:a/300
 298:ls_left/500
 304:rt=1/14000
+308:a/300
 312:ls_right/500
 318:rt=1/14000
+322:a/300
 326:ls_left/500
 332:rt=1/14000
+336:a/300
 340:ls_right/500
 346:rt=1/14000
+350:a/300
 354:ls_left/500
 360:rt=1/14000
 # PAUSE opens (first row CONTINUE) ...
@@ -83,18 +100,25 @@
 365:b/200
 368:ls_right/500
 374:rt=1/14000
+378:a/300
 382:ls_left/500
 388:rt=1/14000
+392:a/300
 396:ls_right/500
 402:rt=1/14000
+406:a/300
 410:ls_left/500
 416:rt=1/14000
+420:a/300
 424:ls_right/500
 430:rt=1/14000
+434:a/300
 438:ls_left/500
 444:rt=1/14000
+448:a/300
 452:ls_right/500
 458:rt=1/14000
+462:a/300
 466:ls_left/500
 472:rt=1/14000
 # PAUSE opens (first row CONTINUE) ...
@@ -103,17 +127,25 @@
 477:b/200
 480:ls_right/500
 486:rt=1/14000
+490:a/300
 494:ls_left/500
 500:rt=1/14000
+504:a/300
 508:ls_right/500
 514:rt=1/14000
+518:a/300
 522:ls_left/500
 528:rt=1/14000
+532:a/300
 536:ls_right/500
 542:rt=1/14000
+546:a/300
 550:ls_left/500
 556:rt=1/14000
+560:a/300
 564:ls_right/500
 570:rt=1/14000
+574:a/300
 578:ls_left/500
 584:rt=1/14000
+588:a/300

@@ -1,5 +1,5 @@
-# MCLA scripted pad flow: FRESH profile, title -> save ALERT -> auto-save WARNING -> intro cinematic.
-# Ported from the owner's iOS port (mac/flows/mcla_title_to_menu.txt), with the x86 changes listed below.
+# MCLA scripted pad flow: FRESH profile, title -> save ALERT -> auto-save WARNING, then it stops pressing.
+# Ported from the owner's iOS port (mac/flows/mcla_title_to_menu.txt), re-timed on x86 by the W2.1 bring-up.
 # Syntax: <second>:<button>[+<button>...][/<hold ms>], '#' comments; seconds count from process start.
 # Read by tools/run_game.py (the three headers right here) and by the host's --input-file parser (comments are dropped).
 #
@@ -10,36 +10,30 @@
 # and then `[mcla-state] Startup/Startup_Checks` (the title took Start and the save check began). 'seconds' is the
 # default --seconds. Run with no fixture: a fresh user dir (empty profile) is what shows the ALERT.
 #
-# What the screens do (measured on the Mac port at 10 fps while loading; re-measure on x86 at M2 and fix this file):
-#   legal text, Rockstar logo, MCLA logo + spinner, then the TITLE: live 3D city, 'PRESS (start)' bottom right
-#   Start held 200-300 ms: camera fly-over, a map of Los Angeles with a spinner (LOADING)
-#   ALERT 'A Midnight Club: Los Angeles save game could not be found ...':
-#       CREATE A NEW SAVE GAME (default row) / RETRY / CONTINUE WITHOUT SAVING       A = CREATE A NEW SAVE GAME
-#   WARNING 'This game uses an auto save feature ...'                                A = CONTINUE
-#   'SAVING...' (mc4.sav is created), LOADING, black, then the intro movie (~40 s) ending on a still of the Carneys sign.
+# Timeline on x86 (W2.1 runs w2.1-m2a/m2b/m3a, D3D12 720p, warm shader cache; t = process start):
+#   ~4 s    first engine frame (legal text, Rockstar logo, MCLA logo + spinner run without the engine timer)
+#   ~27 s   TITLE: live 3D city, 'PRESS (start)' bottom right. Start before this is lost. The first Start that takes is the one
+#           at 28 s (held 300 ms); Startup_Checks is logged at ~30.5 s, then fly-over and a map with a spinner (LOADING)
+#   <= 50 s ALERT 'A Midnight Club: Los Angeles save game could not be found ...':
+#           CREATE A NEW SAVE GAME (default row) / RETRY / CONTINUE WITHOUT SAVING                 A = CREATE A NEW SAVE GAME
+#   +3 s    WARNING 'This game uses an auto save feature ...'                                      A = CONTINUE
+#           -> `front-end -> loading` (Loading_Fresh) within 1 s of that second A, 'SAVING...' (mc4.sav is created, ~13 s later)
+#   +14-17 s the intro movie starts (`loading -> cutscene`, GameState_Intro). An A from here on skips it, accepts VEHICLE SELECT
+#           and the Carneys cutscene, and the run reaches free roam (`cutscene -> free-roam`) at ~137 s.
 # The full chain on to free roam is new_profile_to_freeroam.txt; a saved profile is menu_to_freeroam.txt.
 #
-# Known trap: the title polls the pad every 2-4 updates, so Start is held 200-300 ms, and it is repeated because a press
-# made before the title exists is lost. Extra Starts after the title are harmless. The dialogs are modal and wait for a
-# button, so a late A costs only time, an early one (before the dialog exists) is ignored: A is repeated every 6 s.
-# x86 change: the iOS file pressed Start once (44 s) and A twice (70, 80 s), timed for a 10 fps boot. This one repeats both.
-# Extra A presses after the WARNING skip the intro movie and accept VEHICLE SELECT; that is harmless for this flow.
-12:start/300
-16:start/300
-20:start/300
-24:start/300
+# This flow answers the two dialogs and then stops pressing, so it ends at the intro movie / the Carneys still and never
+# reaches free roam (reached=menu is what the milestone M2 asks). The A presses are 5 s apart because the dialogs are modal
+# and wait for a button: a late A costs only time, an early one (before the dialog exists) is ignored. The last A is at 55 s:
+# the earliest the intro movie can start is ~60 s (both dialogs answered by the A at 40 and 45 s), so no press reaches it.
+# Known trap: the title polls the pad every 2-4 updates, so Start is held 200-300 ms, and it is repeated because a press that
+# comes before the title exists is lost. Extra Starts after the title are harmless.
 28:start/300
+30:start/300
 32:start/300
 36:start/300
-40:start/300
-44:start/300
-# A: ALERT -> CREATE A NEW SAVE GAME, WARNING -> CONTINUE
-52:a/300
-58:a/300
-64:a/300
-70:a/300
-76:a/300
-82:a/300
-88:a/300
-94:a/300
-100:a/300
+# A: ALERT -> CREATE A NEW SAVE GAME, WARNING -> CONTINUE (five seconds apart, none after 55 s)
+40:a/300
+45:a/300
+50:a/300
+55:a/300

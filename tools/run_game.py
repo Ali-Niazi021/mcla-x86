@@ -22,8 +22,11 @@
   --cvar k=v       extra `--k=v` on the command line, repeatable. A key that run_game itself sets (e.g. fullscreen)
                    is replaced, not duplicated.
   --screenshot-every S   every S seconds (>= 1) capture the game window's client area to shots/t<sec>.png (plus
-                   shots/t<sec>_end.png just before the kill). Needs the window to be visible and not covered
-                   (--topmost raises it above other windows without taking focus).
+                   shots/t<sec>_end.png just before the kill). PrintWindow(PW_CLIENTONLY|PW_RENDERFULLCONTENT) is the
+                   primary capture (works for a covered window, and while the screen saver or the lock screen owns the
+                   desktop); a screen BitBlt is the fallback (then the window must be visible and not covered:
+                   --topmost raises it above other windows without taking focus). summary.json shot_methods counts both.
+                   The run keeps the display and the system awake (SetThreadExecutionState), restored at the end.
   --stop-on-reach  stop (after 5 s for the log to flush) as soon as the expected state is reached.
   --expect STATE   override the flow's `# expect:` header (none|title|menu|free-roam).
   --config C       build config of $WORK/build/bin/<C>/mcla.exe (default RelWithDebInfo). --exe PATH overrides.
@@ -81,7 +84,7 @@ summary.json keys: run_id, state (running|done), flow, flow_file, fixture, fixtu
   fatal_lines, fatal_process, unregistered, hang_alarms, heartbeat_last, heartbeat_last_s, heartbeat_gap_s,
   heartbeat_lines, heartbeat_frames_last, t_title, t_menu, t_free_roam (seconds since process start), mode_changes
   [[t, from, to]...], error_lines, save_rewrite_start, save_closed, save_restored, user_saves [{path, bytes}], shots,
-  shot_notes, log, log_files, log_missing, log_lines, log_last_s, t0_epoch (process start, epoch s), fatal_samples,
+  shot_notes, shot_methods, log, log_files, log_missing, log_lines, log_last_s, t0_epoch (process start, epoch s), fatal_samples,
   unregistered_samples, error_samples.
 
 From Python (tools/bench.py later):
@@ -559,6 +562,7 @@ def _winapi():
     sig(k32.TerminateJobObject, wintypes.BOOL, HANDLE, wintypes.UINT)
     sig(k32.OpenProcess, HANDLE, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
     sig(k32.CloseHandle, wintypes.BOOL, HANDLE)
+    sig(k32.SetThreadExecutionState, wintypes.DWORD, wintypes.DWORD)
     sig(u32.EnumWindows, wintypes.BOOL, ns.WNDENUMPROC, wintypes.LPARAM)
     sig(u32.GetWindowThreadProcessId, wintypes.DWORD, wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
     sig(u32.IsWindowVisible, wintypes.BOOL, wintypes.HWND)
@@ -572,6 +576,7 @@ def _winapi():
     sig(u32.ReleaseDC, ctypes.c_int, wintypes.HWND, wintypes.HDC)
     sig(u32.SetWindowPos, wintypes.BOOL, wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ctypes.c_int, wintypes.UINT)
+    sig(u32.PrintWindow, wintypes.BOOL, wintypes.HWND, wintypes.HDC, wintypes.UINT)
     sig(g32.CreateCompatibleDC, wintypes.HDC, wintypes.HDC)
     sig(g32.CreateDIBSection, HANDLE, wintypes.HDC, ctypes.POINTER(BITMAPINFOHEADER), wintypes.UINT,
         ctypes.POINTER(ctypes.c_void_p), HANDLE, wintypes.DWORD)
@@ -647,6 +652,14 @@ def kill_tree(proc: "subprocess.Popen", job: Optional[Job]) -> None:
         proc.kill()
 
 
+def keep_awake(on: bool) -> None:
+    """No screen saver, display-off or sleep while a run is in progress (a locked or dimmed desktop breaks the
+    screenshots and a sleeping machine stops the game): ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED for the
+    calling thread, and ES_CONTINUOUS alone (back to normal) when `on` is false."""
+    if os.name == "nt":
+        _winapi().k32.SetThreadExecutionState(0x80000000 | 0x00000002 | 0x00000001 if on else 0x80000000)
+
+
 def write_png(path: Path, width: int, height: int, rgb: bytes) -> None:
     """A truecolour PNG from RGB bytes (zlib only; written to a temp name and renamed)."""
     stride = width * 3
@@ -669,9 +682,9 @@ def write_png(path: Path, width: int, height: int, rgb: bytes) -> None:
 
 
 class Shooter:
-    """Screenshots of the game window's client area: found by process (any process of the job), copied from the
-    screen with BitBlt (the same as .NET's CopyFromScreen), written as PNG. The window must be visible and not
-    covered; a covered window is noted once, and the shot shows whatever is on top."""
+    """Screenshots of the game window's client area: found by process (any process of the job), captured with
+    PrintWindow(PW_CLIENTONLY | PW_RENDERFULLCONTENT) and, when that fails, copied from the screen with BitBlt (the same as
+    .NET's CopyFromScreen; then a covered window is noted once and the shot shows whatever is on top), written as PNG."""
 
     def __init__(self, pids: Callable[[], List[int]], shots_dir: Path, topmost: bool = False) -> None:
         self.pids = pids
@@ -682,6 +695,8 @@ class Shooter:
         self.misses: Dict[str, int] = {}        # problems that come and go (no window yet): message -> count
         self.attempts = 0
         self._raised = set()
+        self.use_printwindow = True             # False: the screen BitBlt only (tests)
+        self.methods: Dict[str, int] = {}       # how the shots were taken: printwindow | bitblt -> count
         shots_dir.mkdir(parents=True, exist_ok=True)
         w = _winapi()
         # Physical pixels for GetClientRect/ClientToScreen/BitBlt on a scaled (200 %) panel.
@@ -733,12 +748,54 @@ class Shooter:
         return buf.value
 
     def capture(self, hwnd) -> Optional[Tuple[int, int, bytes]]:
+        """The window's client area as (width, height, RGB bytes). PrintWindow reads the window's own composed surface, so
+        it works while the window is covered and while the screen saver or the lock screen owns the desktop (where a
+        BitBlt from the screen fails); the screen BitBlt is the fallback."""
         w = _winapi()
         ct = w.ctypes
         rc = w.RECT()
         if not w.u32.GetClientRect(hwnd, ct.byref(rc)) or rc.right < 2 or rc.bottom < 2:
             return None
         width, height = rc.right, rc.bottom
+        screen = w.u32.GetDC(None)
+        mem = w.g32.CreateCompatibleDC(screen)
+        bmi = w.BITMAPINFOHEADER()
+        bmi.biSize, bmi.biWidth, bmi.biHeight = ct.sizeof(w.BITMAPINFOHEADER), width, -height  # top-down
+        bmi.biPlanes, bmi.biBitCount, bmi.biCompression = 1, 32, 0
+        bits = ct.c_void_p()
+        bitmap = w.g32.CreateDIBSection(screen, ct.byref(bmi), 0, ct.byref(bits), None, 0)
+        method = None
+        try:
+            if not bitmap or not bits.value:
+                return None
+            old = w.g32.SelectObject(mem, bitmap)
+            try:
+                if self.use_printwindow:
+                    if w.u32.PrintWindow(hwnd, mem, 0x3):  # PW_CLIENTONLY | PW_RENDERFULLCONTENT
+                        method = "printwindow"
+                    else:
+                        self._note("PrintWindow failed: fell back to the screen BitBlt", True)
+                if method is None and self._blit(hwnd, mem, screen, width, height):
+                    method = "bitblt"
+            finally:
+                w.g32.SelectObject(mem, old)
+            if method is None:
+                return None
+            bgra = ct.string_at(bits.value, width * height * 4)
+        finally:
+            if bitmap:
+                w.g32.DeleteObject(bitmap)
+            w.g32.DeleteDC(mem)
+            w.u32.ReleaseDC(None, screen)
+        self.methods[method] = self.methods.get(method, 0) + 1
+        rgb = bytearray(width * height * 3)
+        rgb[0::3], rgb[1::3], rgb[2::3] = bgra[2::4], bgra[1::4], bgra[0::4]
+        return width, height, bytes(rgb)
+
+    def _blit(self, hwnd, mem, screen, width: int, height: int) -> bool:
+        """The fallback: copy the client area from the screen into `mem`. The window has to be on top."""
+        w = _winapi()
+        ct = w.ctypes
         origin = w.POINT(0, 0)
         w.u32.ClientToScreen(hwnd, ct.byref(origin))
         if self.topmost and hwnd not in self._raised:
@@ -754,31 +811,8 @@ class Shooter:
                 if top_root != root:
                     self._note("window covered or off screen (by '%s'): shots show what is on top of the game "
                                "(use --topmost)" % (self.title_of(top_root) if top_root else "nothing"))
-        screen = w.u32.GetDC(None)
-        mem = w.g32.CreateCompatibleDC(screen)
-        bmi = w.BITMAPINFOHEADER()
-        bmi.biSize, bmi.biWidth, bmi.biHeight = ct.sizeof(w.BITMAPINFOHEADER), width, -height  # top-down
-        bmi.biPlanes, bmi.biBitCount, bmi.biCompression = 1, 32, 0
-        bits = ct.c_void_p()
-        bitmap = w.g32.CreateDIBSection(screen, ct.byref(bmi), 0, ct.byref(bits), None, 0)
-        try:
-            if not bitmap or not bits.value:
-                return None
-            old = w.g32.SelectObject(mem, bitmap)
-            # SRCCOPY | CAPTUREBLT (layered windows too)
-            ok = w.g32.BitBlt(mem, 0, 0, width, height, screen, origin.x, origin.y, 0x00CC0020 | 0x40000000)
-            w.g32.SelectObject(mem, old)
-            if not ok:
-                return None
-            bgra = ct.string_at(bits.value, width * height * 4)
-        finally:
-            if bitmap:
-                w.g32.DeleteObject(bitmap)
-            w.g32.DeleteDC(mem)
-            w.u32.ReleaseDC(None, screen)
-        rgb = bytearray(width * height * 3)
-        rgb[0::3], rgb[1::3], rgb[2::3] = bgra[2::4], bgra[1::4], bgra[0::4]
-        return width, height, bytes(rgb)
+        # SRCCOPY | CAPTUREBLT (layered windows too)
+        return bool(w.g32.BitBlt(mem, 0, 0, width, height, screen, origin.x, origin.y, 0x00CC0020 | 0x40000000))
 
     def shoot(self, name: str) -> Optional[Path]:
         self.attempts += 1
@@ -1090,6 +1124,7 @@ def _run_locked(opts: RunOptions, work: Path, game_root: Path, exe: Path, flow_f
     exit_code: Optional[int] = None
 
     try:
+        keep_awake(True)
         if on_start is not None:
             on_start(proc.pid, run_dir)
         while True:
@@ -1122,6 +1157,7 @@ def _run_locked(opts: RunOptions, work: Path, game_root: Path, exe: Path, flow_f
                 shooter.shoot("t%d_end.png" % int(round(elapsed)))
             kill_tree(proc, job)
         job.close()
+        keep_awake(False)
 
     # One last read of what the kill left on disk, then the authoritative parse of the whole log.
     for kind, line in tail.pump():
@@ -1136,6 +1172,7 @@ def _run_locked(opts: RunOptions, work: Path, game_root: Path, exe: Path, flow_f
         "state": "done", "started": iso(started_wall), "ended": iso(time.time()), "elapsed_s": round(elapsed, 1),
         "ended_by": ended_by, "exit_code": exit_code, "user_saves": user_saves(user_dir),
         "shots": shooter.taken if shooter else [], "shot_notes": shooter.final_notes() if shooter else [],
+        "shot_methods": shooter.methods if shooter else {},
     })
     if not log_path.is_file():
         summary["log_missing"] = True

@@ -1,40 +1,38 @@
 # MCLA scripted pad flow: FRESH profile all the way to driving in free roam, then PAUSE and drive.
-# Ported from the owner's iOS port (mac/flows/mcla_new_profile_to_freeroam.txt): verified there (Mac, Vulkan/MoltenVK,
-# ~10 fps while loading): free roam with the car at t~150 s, driving + the pause menu to 240 s.
+# Ported from the owner's iOS port (mac/flows/mcla_new_profile_to_freeroam.txt), re-timed on x86 by the W2.1 bring-up
+# (run w2.1-m3a: free roam at 136.9 s via `cutscene -> free-roam`, driving + the pause menu to 240 s).
 # Syntax: <second>:<button>[+<button>...][/<hold ms>], '#' comments; seconds count from process start.
 #
 # expect: free-roam
 # seconds: 240
 #
-# 'expect' is the state run_game.py needs to see for exit 0: free-roam = the log shows `[mcla-mode] ... -> free-roam`
-# (the game's own state machine, with `[mcla-state] Cruising/Cruising_Offline`). 'seconds' is the default --seconds.
-# Run with no fixture (a fresh user dir). It also works on any fixture.
+# 'expect' is the state run_game.py needs to see for exit 0: free-roam = the log shows `[mcla-mode] <any state> -> free-roam`
+# (a new profile logs `cutscene -> free-roam`, a saved one `loading -> free-roam`; `[mcla-state] Cruising/Cruising_Offline`).
+# 'seconds' is the default --seconds. Run with no fixture (a fresh user dir). It also works on any fixture.
 #
 # Every dialog on the way is modal and waits for a button, so a press that comes late costs only time, and a press that
 # comes early (before the screen exists) is ignored; that is why this file repeats presses instead of one per screen.
-# Screens (t in s on the Mac; the early Starts also skip the legal / Rockstar-logo screens, so the title is up at ~24
-# instead of ~40; re-measure on x86 at M3 and adjust this file):
-#   legal 3-9, Rockstar logo 12-18, MCLA logo + spinner 21, title 'PRESS (start)' 24-27   Start held 300 ms (hold >= 200 ms)
-#   fly-over + map ~30, save ALERT ~33              A = CREATE A NEW SAVE GAME (row 1 is the default; mc4.sav is created)
-#   auto-save WARNING +3 s                          A = CONTINUE -> 'SAVING...' -> 'LOADING'; the intro movie is cut short by the next A
-#   VEHICLE SELECT ('1998 SCIROCCO') ~65            A = accept (autosave) -> LOADING -> Carneys cutscene (~60 s, A skips lines)
-#   'SAVING...' (autosave) + free roam + HUD ~148   rt = throttle, ls_* = steer, Start = PAUSE menu (CONTINUE), B = close
+# Screens (t in s on x86, D3D12 720p, warm shader cache; t = process start):
+#   ~4 first engine frame; legal, Rockstar logo, MCLA logo + spinner; the TITLE 'PRESS (start)' is up at ~27 s
+#   ~28 the first Start that takes (held 300 ms; an earlier one is lost); Startup_Checks ~30.5, fly-over + map, then
+#   <= 50 save ALERT                                 A = CREATE A NEW SAVE GAME (row 1 is the default; mc4.sav is created)
+#   +3 s auto-save WARNING                           A = CONTINUE -> `front-end -> loading` -> 'SAVING...' -> 'LOADING'
+#   +14-17 s after that A: the intro movie (`loading -> cutscene`), cut short by the next A
+#   VEHICLE SELECT ('1998 SCIROCCO')                 A = accept (autosave) -> LOADING -> Carneys cutscene (~64 s, A skips lines)
+#   ~137 'SAVING...' (autosave) + free roam + HUD    rt = throttle, ls_* = steer, Start = PAUSE menu (CONTINUE), B = close
 # Without the A on the intro movie the movie plays (~40 s) and ends on a still of the Carneys sign: Start there -> VEHICLE SELECT.
-# Known traps: the title polls the pad every 2-4 updates (Start is held 200-300 ms); the first save shows an ALERT
+# Known traps: the title polls the pad every 2-4 updates (Start is held 300 ms); the first save shows an ALERT
 # (answer CREATE A NEW SAVE GAME, which is the default row, so A).
-# Caution: if free roam comes earlier than ~148 s on x86 the A presses that follow land on the street (the iOS run had
-# none there); check the screenshots at M3 and end the A chain earlier if they do something.
-# Title Start, repeated:
-12:start/300
-16:start/300
-20:start/300
-24:start/300
+# The A chain runs to 155 s, past the arrival in free roam (~137 s): the iOS run had A presses there too and a cold shader cache
+# can make the boot slower, so the margin stays. Do not add A presses after the throttle starts at 165 s.
+# Title Start (the first at 28 s is the one that takes; the others cover a slower boot):
 28:start/300
+30:start/300
 32:start/300
 36:start/300
-40:start/300
-44:start/300
 # A every 5 s: alert -> CREATE A NEW SAVE GAME, warning -> CONTINUE, intro movie -> skipped, vehicle select -> accept, cutscene lines
+40:a
+45:a
 50:a
 55:a
 60:a
@@ -57,7 +55,7 @@
 145:a
 150:a
 155:a
-# free roam (arrives ~148 s on the Mac): throttle with a little steering, then the PAUSE menu and back, then throttle again
+# free roam (arrives ~137 s on x86): throttle with a little steering, then the PAUSE menu and back, then throttle again
 165:rt=1/16000
 171:ls_right/700
 177:ls_left/700
