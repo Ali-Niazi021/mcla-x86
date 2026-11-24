@@ -1,0 +1,17 @@
+#!/bin/sh
+# MCLA legal guard (docs/PLAN.md 3.9): refuse staged game data, derived files and generated code.
+# Enabled once per clone with:  git config core.hooksPath .githooks
+# Git for Windows runs hooks with its own sh; this file must keep LF line endings (see .gitattributes).
+
+root=$(git rev-parse --show-toplevel) || exit 1
+cd "$root" || exit 1
+
+# Probe each interpreter: on Windows, "python" can be the Microsoft Store stub that exists but cannot run.
+for py in python3 python py; do
+    if command -v "$py" >/dev/null 2>&1 && "$py" -c "import sys" >/dev/null 2>&1; then
+        exec "$py" tools/guard_no_game_data.py --staged
+    fi
+done
+
+echo "pre-commit: no working Python found (tried python3, python, py); the legal guard cannot run." >&2
+exit 1
