@@ -910,11 +910,18 @@ The orchestrator runs in the main session (Opus 5.5, medium) and needs no file.
 
 ## Amendments (orchestrator only; newest first)
 
+- **2026-11-24, W0.3/W0.4 errata.** The decisions list in `docs/PORT_STATE.md` ("Decisions changed since PLAN")
+  supersedes: §8 Known traps ("GPU cvars in `OnPostSetup`" → `OnPreSetup` after an explicit plugin load), §3.3 item 3
+  (`nfsmw_cp_event_seq` exported from `rexgpu-xenos.dll`), §3.6 (`d3d12_allow_variable_refresh_rate_and_tearing`; no
+  `gpu.driver` cvar on this SDK, host cvar `mcla_gpu_backend`), §3.8 (`0x82410E34` is not an owner hook; W5.1 adds it),
+  Appendix C `run_game.py` (also passes `--user_data_root`, `--cache_root`, `--log_file`, `--mcla_gpu_backend`).
+- **2026-11-24, G0-REV.** ReXGlue v0.10.0 never emits `PPC_FUNC`; generated code is marked by `DEFINE_REX_FUNC(`,
+  `REX_FUNC_PROLOGUE`, `registrar->SetFunction(0x`, `kRexRegisterTable`. §3.9's guard markers change accordingly.
 - **2026-11-24, W0.1.** PresentMon 2.6.0 `--help` prints usage (UTF-16LE) and exits **1**. Acceptance becomes "`--help`
   output contains `PresentMon 2.6.0`". Capture without admin works (user is in Performance Log Users).
 - **2026-11-24, W0.6.** `mcla_t_sim_math.h` includes `frame_clock_policy.h` (`$IOS/ios/src/`), and the cadence test needs
-  `present_cadence.h` (`$IOS/ios/src/`); neither is in §4.1. W1.3 copies `frame_clock_policy.h` into `mcla/hooks/`;
-  `present_cadence.h` lives in `mcla/tests/`. W1.3 must also supply `nfsmw_pch.h`, `game_profile.h`, `nfsc_progress.h`
-  equivalents the hooks include.
+  `present_cadence.h` (`$IOS/ios/src/`); neither is in §4.1. W1.3 copies `frame_clock_policy.h` and `nfsc_progress.h`
+  into `mcla/hooks/` and a minimal `game_profile.h` equivalent; `present_cadence.h` lives in `mcla/tests/`.
+  `nfsmw_pch.h` comes only from `MCLA_GENERATED_DIR` (generated code; never copied into the repo).
 - **2026-11-24, W0.0.** Role files go in `.omp/agents/` (omp loads project agents from there and rediscovers per spawn;
   it skips `.claude/agents`). No session restart needed.
