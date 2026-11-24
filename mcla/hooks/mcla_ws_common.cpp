@@ -7,6 +7,8 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/runtime.h>
+#include <rex/system/interfaces/graphics.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
@@ -16,20 +18,28 @@
 
 REXCVAR_DEFINE_INT32(mcla_widescreen_width, 0, "MCLA",
                      "MCLA widescreen master switch (docs/mcla/WIDESCREEN.md). 0 = off, the game's own "
-                     "1280x720 (default). 1288..1600 = a real W x 720 back buffer with a Hor+ camera "
-                     "(also pass --resolution=Wx720 so the presenter does not stretch it). -1 = auto: "
-                     "W is the video mode's width when --resolution gave a mode wider than 1280 and "
-                     "720 high. Read once, at device init");
+                     "1280x720 (default). 1288..1920 = a real W x H back buffer with a Hor+ camera (H is "
+                     "mcla_scene_height; also pass --resolution=WxH so the presenter does not stretch it). "
+                     "-1 = auto: W x H is the video mode's size when --resolution gave a mode larger than "
+                     "1280x720. A value that cannot be honoured keeps widescreen off and logs "
+                     "'[mcla-wide] error:'. Read once, at device init");
+REXCVAR_DEFINE_INT32(mcla_scene_height, 0, "MCLA",
+                     "MCLA widescreen: the back buffer's height with mcla_widescreen_width. 0 = derived: the "
+                     "video mode's height when the width is auto or equals the mode's width, else 720 (the "
+                     "original W x 720). Otherwise 720..1080, rounded down to a multiple of 4. Ignored while "
+                     "mcla_widescreen_width is 0. mcla_profile=1080p sets 1920x1080. Read once, at device "
+                     "init");
 REXCVAR_DEFINE_INT32(mcla_ws_aspect_mask, 31, "MCLA",
                      "MCLA widescreen: which 16:9 loads become W/H: 1 scene camera, 2 rear-view mirror, "
-                     "4 sub_82214AC0, 8 sub_8223E230, 16 pause-map box. 31 = all (A/B: 1, 3, 15)");
+                     "4 sub_82214AC0, 8 sub_8223E230, 16 pause-map box. 31 = all (A/B: 1, 3, 15). Idle "
+                     "whatever the mask when the back buffer is exactly 16:9 (the game's constants are right)");
 REXCVAR_DEFINE_BOOL(mcla_ws_cutscene_fov, true, "MCLA",
                     "MCLA widescreen: cutscene cameras keep their 16:9 vertical angle (Hor+) instead of "
-                    "zooming in; only with widescreen on");
+                    "zooming in; only with widescreen on and a back buffer that is not exactly 16:9");
 REXCVAR_DEFINE_BOOL(mcla_ws_rt_pool_scale, true, "MCLA",
                     "MCLA widescreen: grow the renderer's shared render-target pool with the back "
                     "buffer (it is a fixed 10.3 MB sized for 1280x720; factor = the largest growth of a "
-                    "32-texel-aligned target, 1.4 at 1560); only with widescreen on");
+                    "32-texel-aligned target, 1.4 at 1560x720, 2.667 at 1920x1080); only with widescreen on");
 
 REXCVAR_DEFINE_BOOL(mcla_ws_rt_pool_guard, true, "MCLA",
                     "MCLA widescreen: a render-target texture that does not fit in what is left of the "
@@ -37,11 +47,13 @@ REXCVAR_DEFINE_BOOL(mcla_ws_rt_pool_guard, true, "MCLA",
                     "of being placed past the pool's end (the pool's allocator has no bounds check); "
                     "only with widescreen on");
 REXCVAR_DEFINE_INT32(mcla_ws_edram_reuse, 1, "MCLA",
-                     "MCLA widescreen: the D3D EDRAM tile allocator (2048 tiles, no overlap) has no room "
-                     "for the game's small targets beside the two wide device surfaces. 1 (default) = "
-                     "give the tiles of the device depth surface back to the allocator, 2 = the tiles of "
-                     "the device colour surface instead (A/B), 0 = off (RAGE fatal 'Unable to create ... "
-                     "render target' above about 1500 px). Only with widescreen on; read at device init");
+                     "MCLA widescreen: the D3D EDRAM tile allocator has no room for the game's small targets "
+                     "beside the two wide device surfaces when fewer than 608 tiles (the shipped game's "
+                     "1280x720 margin) are left of the limit in force (2048, or edram_tiles with the limit "
+                     "hook). 1 (default) = then give the tiles of the device depth surface back to the "
+                     "allocator, 2 = the tiles of the device colour surface instead (A/B), 0 = off (RAGE fatal "
+                     "'Unable to create ... render target' above about 1500 px at 2048 tiles). Only with "
+                     "widescreen on; read at device init");
 REXCVAR_DEFINE_BOOL(mcla_ws_edram_log, true, "MCLA",
                     "MCLA widescreen: log every D3D surface the game creates (size, format, MSAA, EDRAM "
                     "tiles, who placed it) for the first 160; only with widescreen on");
@@ -50,7 +62,9 @@ namespace mcla::ws {
 namespace {
 
 std::atomic<uint32_t> g_width{0};
+std::atomic<uint32_t> g_height{0};
 std::atomic<bool> g_resolved{false};
+std::atomic<uint32_t> g_edram_limit{sizing::kConsoleEdramTiles};
 
 }  // namespace
 
@@ -61,62 +75,62 @@ uint32_t Width() {
   return g_width.load(std::memory_order_relaxed);
 }
 
+uint32_t Height() {
+  if (!g_resolved.load(std::memory_order_acquire)) {
+    return 0;
+  }
+  return g_height.load(std::memory_order_relaxed);
+}
+
 bool Armed() { return REXCVAR_GET(mcla_widescreen_width) != 0; }
 
 double Aspect() {
   const uint32_t w = Width();
-  if (w == 0) {
+  const uint32_t h = Height();
+  if (w == 0 || h == 0) {
     return 0.0;
   }
   // The game's constants are single-precision floats: round the same way.
-  return double(float(w) / float(kSceneHeight));
+  return sizing::AspectOf(w, h);
 }
+
+bool SixteenNine() { return sizing::IsSixteenNine(Width(), Height()); }
 
 bool AspectFor(int32_t bit, double* aspect) {
   const double a = Aspect();
-  if (a == 0.0 || (REXCVAR_GET(mcla_ws_aspect_mask) & bit) == 0) {
+  if (a == 0.0 || SixteenNine() || (REXCVAR_GET(mcla_ws_aspect_mask) & bit) == 0) {
     return false;
   }
   *aspect = a;
   return true;
 }
 
-uint32_t ResolveAtDeviceInit(uint32_t mode_width, uint32_t mode_height, const char** why) {
-  const char* reason = nullptr;
-  uint32_t w = 0;
-  const int32_t request = REXCVAR_GET(mcla_widescreen_width);
-  if (request == 0) {
-    reason = "mcla_widescreen_width=0";
-  } else if (request == -1) {
-    if (mode_width > kBaseWidth && mode_height == kSceneHeight) {
-      w = mode_width;
-    } else {
-      reason = "auto: the video mode is not wider than 1280 and 720 high (pass --resolution=Wx720)";
-    }
-  } else if (request > 0) {
-    w = uint32_t(request);
-  } else {
-    reason = "negative value other than -1";
-  }
-  if (w != 0) {
-    const uint32_t rounded = w & ~7u;
-    if (rounded < kMinWidth || rounded > kMaxWidth) {
-      reason = "width outside 1288..1600";
-      w = 0;
-    } else {
-      if (rounded != w) {
-        reason = "width rounded down to a multiple of 8";
-      }
-      w = rounded;
-    }
-  }
-  g_width.store(w, std::memory_order_relaxed);
-  g_resolved.store(true, std::memory_order_release);
-  if (why) {
-    *why = reason;
-  }
-  return w;
+double UiBlockWidth() {
+  const uint32_t h = Height();
+  return h == 0 ? 0.0 : sizing::UiBlockWidth(h);
 }
+
+sizing::Resolution ResolveRequest(uint32_t mode_width, uint32_t mode_height) {
+  return sizing::Resolve({REXCVAR_GET(mcla_widescreen_width), REXCVAR_GET(mcla_scene_height)},
+                         {mode_width, mode_height});
+}
+
+void Publish(uint32_t width, uint32_t height) {
+  const bool on = width != 0 && height != 0;
+  g_width.store(on ? width : 0, std::memory_order_relaxed);
+  g_height.store(on ? height : 0, std::memory_order_relaxed);
+  g_resolved.store(true, std::memory_order_release);
+}
+
+uint32_t HostEdramTiles() {
+  rex::Runtime* runtime = rex::Runtime::instance();
+  rex::system::IGraphicsSystem* graphics = runtime ? runtime->graphics_system() : nullptr;
+  return graphics ? graphics->edram_tile_count() : 0;
+}
+
+uint32_t EdramLimitInForce() { return g_edram_limit.load(std::memory_order_relaxed); }
+
+void NoteEdramLimit(uint32_t tiles) { g_edram_limit.store(tiles, std::memory_order_relaxed); }
 
 bool GuestScreenSize(uint32_t* width, uint32_t* height) {
   uint32_t w = 0, h = 0;

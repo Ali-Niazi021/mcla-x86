@@ -5,7 +5,7 @@
 // Hor+ is the aspect alone: Perspective (sub_8217D460) keeps the vertical FOV and sub_8217CB68 sets
 // tanH = tanV x GetAspect(), so the culling planes widen with it. The constant 0x8201E7EC (16/9,
 // `3FE38E39`) has exactly four `lfs` consumers, each right after `bl IsWidescreen` (0x82178848) on
-// the widescreen branch; the 4:3 branch loads 0x8201E7E8 and is never hooked. With a real W x 720
+// the widescreen branch; the 4:3 branch loads 0x8201E7E8 and is never hooked. With a real W x H
 // back buffer the screen IS W/H for all four, unlike prior art (its buffer stays 1280x720, so it
 // keeps three of them at 16:9). The .rdata constant is not written.
 //
@@ -19,7 +19,11 @@
 // mirror looks wrong (mask 3, then 1). The first call of each site logs the constant it replaced.
 // The pause-map site (bit 16) is mcla_ws_map_aspect.cpp.
 //
-// Off: widescreen off (mcla_widescreen_width), the mask bit cleared, or MCLA_HOOK_WS_ASPECT=0.
+// At exactly 16:9 (1920x1080, 1600x900) W/H is the game's own constant: ws::AspectFor() says no for every
+// bit and the whole file stays idle (nothing is replaced, nothing is logged).
+//
+// Off: widescreen off (mcla_widescreen_width), the mask bit cleared, a back buffer that is exactly 16:9, or
+// MCLA_HOOK_WS_ASPECT=0.
 #include <atomic>
 #include <cstdint>
 

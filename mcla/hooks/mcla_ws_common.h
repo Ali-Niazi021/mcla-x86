@@ -1,19 +1,29 @@
-// Midnight Club: Los Angeles: true widescreen (docs/mcla/WIDESCREEN.md): the state every mcla_ws_*
-// hook shares. Not a hook itself: mcla_ws_common.cpp is always compiled.
+// Midnight Club: Los Angeles: true widescreen (docs/mcla/WIDESCREEN.md, extended to W x H by W5.1): the state every
+// mcla_ws_* hook shares. Not a hook itself: mcla_ws_common.cpp is always compiled.
 //
-// One master cvar, `mcla_widescreen_width` (int):
+// Two master cvars:
+//
+//   mcla_widescreen_width (int)
 //     0    off: the game runs exactly as shipped (1280x720, 16:9). Default.
-//     W    (1288..1600, rounded down to a multiple of 8) a real W x 720 back buffer, Hor+ camera,
-//          rt pool scaled by area. Needs the SDK's video mode to be W x 720 too (--resolution=Wx720)
-//          or the presenter stretches the picture; the log line of the scene-size hook says so.
-//     -1   auto: W = the video mode's width when the game was given a mode wider than 1280 and
-//          exactly 720 high (what the launcher's "Fit this screen" passes as --resolution=1560x720);
-//          otherwise off. Lets the profile turn widescreen on with no extra launcher plumbing.
+//     W    (1288..1920, rounded down to a multiple of 8) a real W x H back buffer, Hor+ camera, rt pool scaled by
+//          area. Needs the SDK's video mode to be W x H too (--resolution=WxH, or video_mode_width/height) or the
+//          presenter stretches the picture; the log line of the scene-size hook says so.
+//     -1   auto: W x H = the video mode's size when it is larger than 1280x720 (what the launcher's "Fit this
+//          screen" passes as --resolution=1560x720, and --resolution=1920x1080); otherwise off.
 //
-// The scene-size hook (W1, mcla_ws_scene_size.cpp) runs once at device init, decides the final W
-// from the cvar and the video mode, writes it into the game's two `width` / `height` option words
-// and publishes it here. Every other hook asks ws::Width(): 0 until W1 has run (so a hook can never
-// act before the buffer exists, and a build with W1 compiled out leaves the whole feature off).
+//   mcla_scene_height (int): the back buffer's height.
+//     0    derived: the video mode's height when the width is auto or equals the mode's width, else 720
+//          (the original W x 720 behaviour).
+//     H    (720..1080, rounded down to a multiple of 4) explicit.
+//
+// A value that cannot be honoured (outside the ranges, narrower than 4:3) is not clamped: widescreen stays off and
+// the log gets `[mcla-wide] error: ...`. The ranges and the maths are in mcla_ws_sizing.h (kLimitsM6; 2560 x 1200 is
+// reserved for M7). The profile presets `mcla_profile=1080p` / `900p` (profile/pc_profile.cpp) set both.
+//
+// The scene-size hook (W1, mcla_ws_scene_size.cpp) runs once at device init, decides the final W x H from the cvars
+// and the video mode, writes it into the game's two `width` / `height` option words and publishes it here. Every
+// other hook asks ws::Width() / ws::Height(): 0 until W1 has run (so a hook can never act before the buffer exists,
+// and a build with W1 compiled out leaves the whole feature off).
 #pragma once
 
 #include <atomic>
@@ -22,6 +32,7 @@
 #include <rex/cvar.h>
 
 #include "mcla_hooks.h"
+#include "mcla_ws_sizing.h"
 
 #ifndef MCLA_HOOK_WS_SCENE_SIZE
 #define MCLA_HOOK_WS_SCENE_SIZE 0
@@ -50,8 +61,18 @@
 #ifndef MCLA_HOOK_WS_TEXCLEAR
 #define MCLA_HOOK_WS_TEXCLEAR 0
 #endif
+// New in W5.1 and not yet in mcla/sources.cmake: these two default to 1 here (still switchable with -D...=0 or the
+// cvar), so a missing sources.cmake entry cannot leave the 1080p limit hook (or the opt-in single-tile lever, whose
+// cvar is off by default) silently compiled out.
+#ifndef MCLA_HOOK_WS_EDRAM_LIMIT
+#define MCLA_HOOK_WS_EDRAM_LIMIT 1
+#endif
+#ifndef MCLA_HOOK_WS_SINGLE_TILE
+#define MCLA_HOOK_WS_SINGLE_TILE 1
+#endif
 
 REXCVAR_DECLARE(int32_t, mcla_widescreen_width);
+REXCVAR_DECLARE(int32_t, mcla_scene_height);
 REXCVAR_DECLARE(int32_t, mcla_ws_aspect_mask);
 REXCVAR_DECLARE(bool, mcla_ws_cutscene_fov);
 REXCVAR_DECLARE(bool, mcla_ws_rt_pool_scale);
@@ -60,11 +81,6 @@ REXCVAR_DECLARE(int32_t, mcla_ws_edram_reuse);
 REXCVAR_DECLARE(bool, mcla_ws_edram_log);
 
 namespace mcla::ws {
-
-constexpr uint32_t kSceneHeight = 720;  // the game's HD height; the scene is always 720 lines
-constexpr uint32_t kBaseWidth = 1280;   // the shipped HD width
-constexpr uint32_t kMinWidth = 1288;    // first multiple of 8 above 1280
-constexpr uint32_t kMaxWidth = 1600;    // EDRAM: 1 tile at 1x up to here (WIDESCREEN.md section 3)
 
 // The 16:9 loads that become W/H (cvar mcla_ws_aspect_mask, one bit per consumer).
 enum AspectBit : int32_t {
@@ -76,25 +92,46 @@ enum AspectBit : int32_t {
 };
 constexpr int32_t kAspectMaskAll = 31;
 
-// The back-buffer width the hooks work with: 0 = widescreen off (or the scene-size hook has not
-// run yet). Cheap: one atomic load.
+// The back-buffer size the hooks work with: 0 = widescreen off (or the scene-size hook has not run yet). Cheap:
+// one atomic load each.
 uint32_t Width();
+uint32_t Height();
 
 // The master cvar is non-zero (armed: it may still resolve to off at device init). For the
 // "[mcla-<tag>] active" registry lines.
 bool Armed();
 
-// W / 720 as the game's single-precision float (2.1666667 for 1560), or 0 when widescreen is off.
+// W / H as the game's single-precision float (2.1666667 for 1560x720, 1.7777778 for 1920x1080), or 0 when
+// widescreen is off.
 double Aspect();
 
-// For a hook that replaces a 16:9 constant: true (and the aspect in *aspect) when widescreen is on
-// and the mask cvar has `bit` set.
+// The resolved back buffer is exactly 16:9 (1920x1080, 1600x900): the game's own constants are already right and
+// every aspect hook stays idle.
+bool SixteenNine();
+
+// For a hook that replaces a 16:9 constant: true (and the aspect in *aspect) when widescreen is on, the buffer is
+// not exactly 16:9 and the mask cvar has `bit` set.
 bool AspectFor(int32_t bit, double* aspect);
 
-// Called by the scene-size hook only. Resolves the master cvar against the video mode the game was
-// given (the guest's XGetVideoMode result) and publishes the answer; returns it (0 = off). `why`
-// (optional) receives a short reason when the answer is 0 or the request was adjusted.
-uint32_t ResolveAtDeviceInit(uint32_t mode_width, uint32_t mode_height, const char** why);
+// The width in screen pixels of a 16:9 block of the back buffer's full height (1280 at 720 lines, 1920 at 1080);
+// 0 when widescreen is off. The UI squeeze's middle block.
+double UiBlockWidth();
+
+// Called by the scene-size hook only. Reads the cvars and resolves them against the video mode the game was given
+// (the guest's XGetVideoMode result); pure with respect to the published state.
+sizing::Resolution ResolveRequest(uint32_t mode_width, uint32_t mode_height);
+
+// Called by the scene-size hook only, after the game's option words hold the size. 0 x 0 = off.
+void Publish(uint32_t width, uint32_t height);
+
+// The EDRAM the GPU emulates, in tiles (rex::system::IGraphicsSystem::edram_tile_count: the SDK's edram_tiles
+// cvar, 2048 or 4096 where the host allows it); 0 until the GPU has started.
+uint32_t HostEdramTiles();
+
+// The tile limit the game's surface-create check is really under: 2048, or HostEdramTiles() once the limit hook
+// (mcla_ws_edram_limit.cpp, 0x82410E34) has run with the GPU emulating more. The hook records it on every call.
+uint32_t EdramLimitInForce();
+void NoteEdramLimit(uint32_t tiles);
 
 // The game's current screen size words (0x827D4274 / 0x827D4278: what GetWidth / GetHeight return
 // off the device thread). False when guest memory cannot be read.

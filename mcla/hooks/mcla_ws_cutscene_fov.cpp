@@ -15,7 +15,11 @@
 // cutscene viewport is the whole screen; anything else means a letterboxed viewport, which this
 // hook does not rescale: look at it in the first cutscene).
 //
-// Off: widescreen off, --mcla_ws_cutscene_fov=false, or MCLA_HOOK_WS_CUTSCENE_FOV=0.
+// At exactly 16:9 (1920x1080, 1600x900) GetAspect() already returns the game's own 16:9 value, so the
+// hook stays idle (nothing is replaced, nothing is logged).
+//
+// Off: widescreen off, a back buffer that is exactly 16:9, --mcla_ws_cutscene_fov=false, or
+// MCLA_HOOK_WS_CUTSCENE_FOV=0.
 #include <atomic>
 #include <cstdint>
 
@@ -40,7 +44,7 @@ mcla::hooks::Registration g_registration("ws-cutscene-fov", "mcla_ws_cutscene_fo
 
 void mcla_hook_ws_cutscene_fov(PPCRegister& f1) {
   MCLA_HOOK_ENTER();
-  if (mcla::ws::Width() == 0 || !REXCVAR_GET(mcla_ws_cutscene_fov)) {
+  if (mcla::ws::Width() == 0 || mcla::ws::SixteenNine() || !REXCVAR_GET(mcla_ws_cutscene_fov)) {
     return;
   }
   const double sixteen_nine = double(16.0f / 9.0f);  // 0x8201E7EC, the constant the game uses

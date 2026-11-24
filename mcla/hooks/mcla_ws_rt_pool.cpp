@@ -24,14 +24,16 @@
 // and the null read with the scale off. Scaling by area is too little because every texture is
 // rounded up to 32 texels a side: at 1280 the full, half, quarter and eighth widths (1280, 640,
 // 320, 160) are multiples of 32 and waste nothing, at 1560 they are 1568, 800, 416 and 224. So:
-//     factor = max over k = 1, 2, 4, 8, 16 of  align32(ceil(W / k)) / align32(ceil(1280 / k))
-// (times the same for the height if it is not 720), which bounds the growth of every target whose
-// width is the screen's divided by a power of two; fixed-size targets do not grow. Every slot
-// cursor is a sum of such sizes, so no cursor grows by more than the factor. 1560: 224 / 160 = 1.4
-// -> 14,483,456 bytes (13.8 MiB) after rounding up to 64 KiB; 1360: 1.2. The screen size is read
-// from the game's own words 0x827D4274 / 0x827D4278 (not the cvar), so a back buffer that did not
-// come out as asked is scaled by what it really is and is reported. Only the HD constant is
-// touched; any other size (SD formula) is left alone.
+//     factor = max over k = 1, 2, 4, 8, 16 of
+//              align32(ceil(W / k)) x align32(ceil(H / k)) / (align32(ceil(1280 / k)) x align32(ceil(720 / k)))
+// (mcla_ws_sizing.h PoolGrowth), which bounds the growth of every target whose sides are the
+// screen's divided by a power of two; fixed-size targets do not grow. Every slot cursor is a sum
+// of such sizes, so no cursor grows by more than the factor. 1560x720: 224 / 160 = 1.4 ->
+// 14,483,456 bytes (13.8 MiB) after rounding up to 64 KiB; 1360: 1.2; 1600x900: 1.867 ->
+// 19,267,584; 1920x1080: 2.667 (k = 8: 256 x 160 against 160 x 96) -> 27,525,120 (26.2 MiB).
+// The screen size is read from the game's own words 0x827D4274 / 0x827D4278 (not the cvar), so a
+// back buffer that did not come out as asked is scaled by what it really is and is reported. Only
+// the HD constant is touched; any other size (SD formula) is left alone.
 //
 // mcla_ws_rt_pool_guard (W8), the safety net for the same allocator. sub_82177EB0 (RAGE's render
 // target texture create) chooses where the texture's memory comes from:
@@ -84,66 +86,48 @@ mcla::hooks::Registration g_guard_registration("ws-rt-guard", "mcla_ws_rt_pool_g
 
 #if MCLA_HOOK_WS_RT_POOL
 
-namespace {
-
-constexpr uint32_t Align32(uint32_t texels) { return (texels + 31) & ~31u; }
-
-}  // namespace
-
 void mcla_hook_ws_rt_pool(PPCRegister& r29) {
   MCLA_HOOK_ENTER();
+  namespace sizing = mcla::ws::sizing;
   const uint32_t wanted_width = mcla::ws::Width();
-  if (wanted_width == 0) {
+  const uint32_t wanted_height = mcla::ws::Height();
+  if (wanted_width == 0 || wanted_height == 0) {
     return;
   }
-  constexpr uint32_t kHdPool = 0x9D8000;  // the shipped HD pool, 10,321,920 bytes
-  constexpr uint64_t kPage = 0x10000;     // 64 KiB
 
   uint32_t width = 0, height = 0;
   if (!mcla::ws::GuestScreenSize(&width, &height) || width == 0 || height == 0) {
     width = wanted_width;
-    height = mcla::ws::kSceneHeight;
+    height = wanted_height;
   }
 
   static std::atomic<bool> logged{false};
   const bool first = !logged.exchange(true);
-  if (first && (width != wanted_width || height != mcla::ws::kSceneHeight)) {
-    REXLOG_WARN("[mcla-wide] the back buffer is {}x{}, not {}x{}: the scene-size hook did not take "
-                "effect (the pool is scaled by the real size)",
-                width, height, wanted_width, mcla::ws::kSceneHeight);
+  if (first && (width != wanted_width || height != wanted_height)) {
+    REXLOG_ERROR("[mcla-wide] error: the back buffer is {}x{}, not {}x{}: the scene-size hook did not take "
+                 "effect (the pool is scaled by the real size)",
+                 width, height, wanted_width, wanted_height);
   }
 
   const uint32_t before = r29.u32;
-  const bool wider = width > mcla::ws::kBaseWidth || height > mcla::ws::kSceneHeight;
-  if (!REXCVAR_GET(mcla_ws_rt_pool_scale) || before != kHdPool || !wider) {
+  const bool wider = width > sizing::kBaseWidth || height > sizing::kBaseHeight;
+  if (!REXCVAR_GET(mcla_ws_rt_pool_scale) || before != sizing::kHdPoolBytes || !wider) {
     if (first) {
       REXLOG_INFO("[mcla-ws-rt-pool] pool left at {} bytes (back buffer {}x{}: {})", before, width, height,
-                  !REXCVAR_GET(mcla_ws_rt_pool_scale) ? "mcla_ws_rt_pool_scale is off"
-                  : before != kHdPool                 ? "not the HD size"
-                                                      : "not larger than 1280x720");
+                  !REXCVAR_GET(mcla_ws_rt_pool_scale)     ? "mcla_ws_rt_pool_scale is off"
+                  : before != sizing::kHdPoolBytes ? "not the HD size"
+                                                   : "not larger than 1280x720");
     }
     return;
   }
-  // The largest growth of a 32-texel-aligned target whose side is the screen's divided by 1..16.
-  uint64_t best_num = 1, best_den = 1;
-  for (uint32_t k = 1; k <= 16; k *= 2) {
-    const uint64_t num = uint64_t(Align32((width + k - 1) / k)) *
-                         Align32((height + k - 1) / k);
-    const uint64_t den = uint64_t(Align32((mcla::ws::kBaseWidth + k - 1) / k)) *
-                         Align32((mcla::ws::kSceneHeight + k - 1) / k);
-    if (num * best_den > best_num * den) {
-      best_num = num;
-      best_den = den;
-    }
-  }
-  const uint64_t scaled = (uint64_t(before) * best_num + best_den - 1) / best_den;
-  const uint64_t rounded = (scaled + kPage - 1) / kPage * kPage;
+  // The largest growth of a 32-texel-aligned target whose sides are the screen's divided by 1..16.
+  const sizing::Ratio growth = sizing::PoolGrowth(width, height);
+  const uint64_t rounded = sizing::ScaledPoolBytes(before, growth);
   r29.u64 = rounded;
   if (first) {
     REXLOG_INFO("[mcla-ws-rt-pool] shared target pool {} -> {} bytes ({:.1f} -> {:.1f} MB, x{:.3f} = the "
                 "largest growth of a 32-texel-aligned target) for a {}x{} back buffer",
-                before, rounded, before / 1.0e6, double(rounded) / 1.0e6,
-                double(best_num) / double(best_den), width, height);
+                before, rounded, before / 1.0e6, double(rounded) / 1.0e6, growth.value(), width, height);
   }
 }
 

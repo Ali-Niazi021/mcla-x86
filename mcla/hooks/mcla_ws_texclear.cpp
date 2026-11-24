@@ -8,9 +8,9 @@
 // the first): k x size, k from the table 0x827D1554 = 1, 3, 2, 0 (block pointer 0x827D1424, counter
 // 0x82830B08). They are, in order: front buffer A (0x821784EC), front buffer B (0x82178520), the
 // texture of the device colour surface (sub_821840A8 -> sub_82177EB0) and the texture of the device
-// depth surface (sub_82183FE0 -> sub_82177EB0), each S = align32(W) x 736 x 4 bytes, so they sit
-// at block + S, + 3 S, + 2 S and + 0. RAGE's texture create (sub_82177EB0) zero-fills a texture it
-// got from D3D with
+// depth surface (sub_82183FE0 -> sub_82177EB0), each S = align32(W) x align32(H) x 4 bytes (736 lines
+// at 720; mcla_ws_sizing.h TextureBlockUnit), so they sit at block + S, + 3 S, + 2 S and + 0. RAGE's
+// texture create (sub_82177EB0) zero-fills a texture it got from D3D with
 //     0x82178290  rlwinm r29,r11,12,0,19      r29 = the texture's base address
 //     0x82178294  mr r3,r29
 //     0x82178298  bl 0x82132600               MmQueryAllocationSize(base)
@@ -24,10 +24,13 @@
 // the end of the block. Physical memory is handed out top-down, so what lies after the block is
 // what was allocated just before it: D3D's secondary ring buffer (0x800000, 64 KiB pages), its
 // primary ring buffer (0x8000) and, 0x810000 bytes after the block's end, the heap of a
-// sysMemSimpleAllocator whose first node is at 0xA8F20010. At 1280 2 S = 0x730000: the memset stays
-// inside the (still empty) secondary ring buffer and nothing is seen. 2 S passes 0x810000 when
-// align32(W) > 1408: 1400 boots, 1432 / 1440 / 1560 / 1568 zero the node's guard word, and the next
-// Allocate that walks that free list reports it. The pool sizes play no part.
+// sysMemSimpleAllocator whose first node is at 0xA8F20010. At 1280x720 2 S = 0x730000: the memset stays
+// inside the (still empty) secondary ring buffer and nothing is seen. 2 S passes 0x810010 when
+// align32(W) x align32(H) exceeds 1.057 million texels (1408 x 736 = 1.036 M boots, 1440 x 736 = 1.060 M
+// does not): 1400 boots, 1432 / 1440 / 1560 / 1568 zero the node's guard word, and the next Allocate that
+// walks that free list reports it. At 1920x1080 S = 0x7F8000 (8.3 MB), the block is 33 MB and the
+// overshoot 2 S = 16.6 MB: twice the reach, always fatal without this clamp (TextureClearReachesHeap).
+// The pool sizes play no part. The clamp reads the real allocation, so it needs no knowledge of W and H.
 //
 // The fix: the size the memset gets is cut to what is left of the allocation from the base (the
 // SDK's own region table: allocation base + size - base). That is the answer of a kernel that
@@ -173,6 +176,20 @@ void LogLayout(uint32_t base, uint32_t asked, uint32_t left, uint32_t allocation
   REXLOG_INFO("[mcla-ws-heap] the uncut memset would have zeroed physical 0x{:08X}..0x{:08X} after the "
               "allocation ({} bytes)",
               uint32_t(from), uint32_t(to), to - from);
+  // The area model (mcla_ws_sizing.h): the block of the first four is 4 S, S = align32(W) x align32(H) x 4, and the
+  // device colour texture at block + 2 S is cleared 2 S past the block's end. A mismatch means another texture or a
+  // block that is not laid out as modelled.
+  const uint32_t wide = mcla::ws::Width();
+  const uint32_t high = mcla::ws::Height();
+  if (wide != 0 && high != 0) {
+    const uint64_t unit = mcla::ws::sizing::TextureBlockUnit(wide, high);
+    const uint64_t observed = uint64_t(asked) - left;
+    REXLOG_INFO("[mcla-ws-heap] sizing model for {}x{}: S = {} bytes, block 4 S = {}, uncut overshoot 2 S = {}; "
+                "observed {}: {}",
+                wide, high, unit, 4 * unit, 2 * unit, observed,
+                observed == 2 * unit ? "matches the model"
+                                     : "differs from the model (another texture, or the block is not 4 x S)");
+  }
   REXLOG_INFO("[mcla-ws-heap] D3D ring buffers: secondary 0x{:08X} (physical 0x{:08X}, 0x800000 bytes), "
               "primary 0x{:08X} (physical 0x{:08X}, 0x8000 bytes)",
               secondary, Physical(secondary), primary, Physical(primary));

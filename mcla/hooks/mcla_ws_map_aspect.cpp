@@ -12,7 +12,8 @@
 // 0x826277E8) and sub_8221BE98 stay 16:9: with a true wide buffer they must be judged from a
 // screenshot (icons against roads). The hook runs only on the widescreen branch.
 //
-// Off: widescreen off, mask bit 16 cleared (--mcla_ws_aspect_mask=15), or MCLA_HOOK_WS_MAP_ASPECT=0.
+// Off: widescreen off, mask bit 16 cleared (--mcla_ws_aspect_mask=15), a back buffer that is exactly 16:9 (the
+// constant above is then kept: 1.7778 against W/H = 1.77778), or MCLA_HOOK_WS_MAP_ASPECT=0.
 #include <atomic>
 #include <cstdint>
 

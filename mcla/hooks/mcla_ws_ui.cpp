@@ -5,6 +5,11 @@
 // the screen edges. This file keeps the stage at 16:9 proportions in the middle 1280 px, and puts
 // the HUD pieces that belong to a screen edge back at that edge.
 //
+// W5.1 (back buffers of any height): "the middle 1280 px" below is the middle 16:9 block of the buffer, which is
+// H x 16/9 px wide (ws::UiBlockWidth(): 1280 at 720 lines, 1920 at 1080); the stage itself stays 1280 stage px wide
+// (stage px per screen px = 1280 / W). A buffer that is not wider than 16:9 (1920x1080, 1600x900, 1440x1080) has
+// no side area: nothing is squeezed or moved, whatever the mask says.
+//
 // Three mechanisms (section 15 has the evidence and the reasoning):
 //
 //  1. VIEWPORT SQUEEZE. D3D SetViewport is sub_824162D8(r3 device, f1 x, f2 y, f3 width, f4 height,
@@ -801,7 +806,8 @@ void mcla_hook_ws_ui_viewport(PPCRegister& f1, PPCRegister& f2, PPCRegister& f3,
       why = " (outside a movie draw, bit 0x100 off)";
     }
   }
-  const bool squeeze = mode == 'C' || mode == 'L' || mode == 'R';
+  // A buffer that is not wider than its own 16:9 block (1920x1080, 1600x900) has no side area to squeeze into.
+  const bool squeeze = (mode == 'C' || mode == 'L' || mode == 'R') && wide > mcla::ws::UiBlockWidth() + 0.5;
 
   // Log the first few rectangles: per kind in a movie draw, and outside one in the UI phase.
   bool log_it = t_trace && ui;
@@ -834,7 +840,7 @@ void mcla_hook_ws_ui_viewport(PPCRegister& f1, PPCRegister& f2, PPCRegister& f3,
   if (!squeeze) {
     return;
   }
-  const double base = double(mcla::ws::kBaseWidth);
+  const double base = mcla::ws::UiBlockWidth();  // the middle 16:9 block: 1280 px at 720 lines
   const double inset = std::clamp(double(REXCVAR_GET(mcla_ws_hud_edge_inset)), 0.0, std::max(0.0, (wide - base) * 0.5));
   double new_x = (wide - base) * 0.5;
   if (mode == 'L') {
@@ -842,7 +848,7 @@ void mcla_hook_ws_ui_viewport(PPCRegister& f1, PPCRegister& f2, PPCRegister& f3,
   } else if (mode == 'R') {
     new_x = std::max(0.0, wide - base - inset);
   }
-  f3.f64 = double(float(base));  // width' = W x k with k = 1280 / W
+  f3.f64 = double(float(base));  // width' = W x k with k = base / W
   f1.f64 = double(float(new_x));
   if (in_movie) {
     g_viewport_squeezed[kind].fetch_add(1, std::memory_order_relaxed);
@@ -956,7 +962,7 @@ void mcla_hook_ws_ui_piece(PPCRegister& r30) {
   if (mode != 'C' && mode != 'L' && mode != 'R') {
     return;
   }
-  const double base = double(mcla::ws::kBaseWidth);
+  const double base = mcla::ws::UiBlockWidth();  // the middle 16:9 block in screen px
   const double wide = double(mcla::ws::Width());
   if (wide <= base) {
     return;
@@ -986,7 +992,7 @@ void mcla_hook_ws_ui_piece(PPCRegister& r30) {
     }
     ring = slot.ring;
   }
-  const double s = base / wide;  // stage px per screen px: the stage spans the whole buffer here
+  const double s = double(mcla::ws::sizing::kBaseWidth) / wide;  // stage px per screen px: the 1280-px stage spans the buffer here
   const double inset = std::clamp(double(REXCVAR_GET(mcla_ws_hud_edge_inset)), 0.0, std::max(0.0, (wide - base) * 0.5));
   if (root) {
     double margin = (wide - base) * 0.5;  // screen px left of the middle block
