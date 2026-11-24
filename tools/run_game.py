@@ -57,26 +57,31 @@ Definitions (log lines; the file log pattern is `[Y-m-d H:M:S.mmm] [level] [cate
                                menu   = `[mcla-state] Startup/Startup_Checks` AFTER the first engine frame (the game
                                         registers its states before the first frame, so earlier lines do not count);
                                free-roam = `[mcla-mode] <from> -> free-roam`.
-  fatal        lines matching `\\[mcla-fatal\\]|\\[FATAL\\]` (the RAGE fatal hook and the SDK's REX_FATAL* macros), plus 1
+  fatal        EVENTS matching `\\[mcla-fatal\\]|\\[FATAL\\]` (the RAGE fatal hook and the SDK's REX_FATAL* macros), plus 1
                when the process exited by itself before the end of the run (a crash or the silent XamShowDirtyDiscErrorUI
-               exit). The SDK's unregistered-function line is a [FATAL] line, so it counts in both numbers.
+               exit). Not counted: the hook status lines written at startup (`[mcla-<tag>] active (...`, `off (--...`,
+               `armed, off by default (...`, `compiled out (...`; the RAGE hook's tag is `fatal`). One event is a burst:
+               matching lines within 1 s of the previous one belong to it (the hook writes a message line and a `raw:`
+               line), so a fatal counts once; summary.json fatal_lines has the raw line count. The SDK's
+               unregistered-function line is a [FATAL] line, so it counts in both numbers.
   unregistered lines containing `unregistered function` (`[FATAL] Call to invalid or unregistered function at guest
                address 0x...`).
   heartbeat_last   whole seconds since process start of the last liveness line after the first engine frame:
-               `[mcla-heartbeat]`, `[mcla-sim]`, `[mcla-state]` or `[mcla-mode]`; 0 when there is none. The engine hook
-               itself logs only the first frame, so a build that logs no periodic line (a `[mcla-heartbeat] frames=<n>`
-               line from the host watchdog would be read as one) shows the time of the last game event here.
-               summary.json also has heartbeat_gap_s = elapsed_s - heartbeat_last_s.
+               `[mcla-heartbeat]` (the first-frame line and the host watchdog's periodic `frames=<n>` line),
+               `[mcla-sim]`, `[mcla-state]` or `[mcla-mode]`; 0 when there is none. The last one before the end of a
+               healthy run is the watchdog's, so summary.json heartbeat_gap_s (= elapsed_s - heartbeat_last_s) is a few
+               seconds at most. The host watchdog's alarm lines (`[mcla-watchdog] N s without a single register moving`)
+               are counted as hang_alarms in summary.json; they do not change the exit code.
   A log is read from its own clock: t = line time - process start time (when run by run_game) or - first line time
   (when summarising a bare log).
 
 summary.json keys: run_id, state (running|done), flow, flow_file, fixture, fixture_copied {files, bytes}, api, config,
   exe, args, seconds, started, ended, elapsed_s, ended_by (timeout|stop-on-reach|exited|interrupted), exit_code (only
-  when the process exited by itself), exit_status, pid, expected, reached, expect_met, ok, fatal, fatal_log,
-  fatal_process, unregistered, heartbeat_last, heartbeat_last_s, heartbeat_gap_s, heartbeat_lines,
-  heartbeat_frames_last, t_title, t_menu, t_free_roam (seconds since process start), mode_changes [[t, from, to]...],
-  error_lines, save_rewrite_start, save_closed, save_restored, user_saves [{path, bytes}], shots, shot_notes, log,
-  log_files, log_missing, log_lines, log_last_s, t0_epoch (process start, epoch s), fatal_samples,
+  when the process exited by itself), exit_status, pid, expected, reached, expect_met, ok, fatal, fatal_log (events),
+  fatal_lines, fatal_process, unregistered, hang_alarms, heartbeat_last, heartbeat_last_s, heartbeat_gap_s,
+  heartbeat_lines, heartbeat_frames_last, t_title, t_menu, t_free_roam (seconds since process start), mode_changes
+  [[t, from, to]...], error_lines, save_rewrite_start, save_closed, save_restored, user_saves [{path, bytes}], shots,
+  shot_notes, log, log_files, log_missing, log_lines, log_last_s, t0_epoch (process start, epoch s), fatal_samples,
   unregistered_samples, error_samples.
 
 From Python (tools/bench.py later):
@@ -138,17 +143,20 @@ _RE_TITLE = re.compile(r"\[mcla-heartbeat\] first engine frame")
 _RE_MENU = re.compile(r"\[mcla-state\] Startup/Startup_Checks\b")
 _RE_MODE = re.compile(r"\[mcla-mode\] (?P<from>[a-z][a-z-]*) -> (?P<to>[a-z][a-z-]*)")
 _RE_FATAL = re.compile(r"\[mcla-fatal\]|\[FATAL\]")
+# What mcla_hooks.cpp AnnounceHooks() writes for every hook at startup, whatever its tag (the RAGE fatal hook's is
+# `fatal`): `[mcla-fatal] active (--mcla_rage_fatal=false turns it off)` is a status line, not a fatal.
+_RE_STATUS = re.compile(r"\[mcla-[A-Za-z0-9_-]+\] (?:active \(|off \(--|armed, off by default \(|compiled out \()")
+_FATAL_EVENT_S = 1.0     # fatal lines this close to the previous one are the same event
 _RE_UNREG = re.compile(r"unregistered function")
 _RE_LIVE = re.compile(r"\[mcla-(?:heartbeat|sim|state|mode)\]")
 _RE_FRAMES = re.compile(r"\[mcla-heartbeat\].*?\bframes=(\d+)")
-_RE_WATCHDOG = re.compile(r"\[(?:vigilante|watchdog|hang)\]")
 # Save-backup patch (SDK `saved-game-backup`): rewrite start, close, restore after a crash.
 _RE_SAVE_START = re.compile(r"content: saved game '.*' is being rewritten")
 _RE_SAVE_CLOSED = re.compile(r"content: '.*' closed; the previous contents of saved game")
 _RE_SAVE_RESTORED = re.compile(r"content: saved game '.*' was being rewritten when the game ended")
 # A cheap byte test before any decoding: only these lines carry facts (a real log is mostly other lines). The level is
 # read from the first bytes of the line instead (`[2026-11-24 12:00:00.123] [error] ...`).
-_IMPORTANT = re.compile(rb"\[mcla-|\[FATAL\]|unregistered function|\[vigilante\]|\[watchdog\]|\[hang\]|content: ")
+_IMPORTANT = re.compile(rb"\[mcla-|\[FATAL\]|unregistered function|content: ")
 
 _SAMPLE_CAP = 10
 _MODE_CAP = 200
@@ -183,8 +191,11 @@ class LogScanner:
         self.t_title: Optional[float] = None
         self.t_menu: Optional[float] = None
         self.t_free_roam: Optional[float] = None
-        self.fatal = 0
+        self.fatal = 0                  # events
+        self.fatal_lines = 0
+        self._fatal_ts: Optional[float] = None
         self.fatal_samples: List[str] = []
+        self.hang_alarms = 0
         self.unregistered = 0
         self.unregistered_samples: List[str] = []
         self.hb_last: Optional[float] = None
@@ -231,7 +242,9 @@ class LogScanner:
             "t_menu": self.t_menu,
             "t_free_roam": self.t_free_roam,
             "fatal_log": self.fatal,
+            "fatal_lines": self.fatal_lines,
             "fatal_samples": list(self.fatal_samples),
+            "hang_alarms": self.hang_alarms,
             "unregistered": self.unregistered,
             "unregistered_samples": list(self.unregistered_samples),
             "heartbeat_last_s": hb,
@@ -280,10 +293,15 @@ class LogScanner:
         rel = self._rel(ts)
         kind: Optional[str] = None
 
-        if _RE_FATAL.search(line):
-            self.fatal += 1
+        if _RE_FATAL.search(line) and not _RE_STATUS.search(line):
+            self.fatal_lines += 1
             if len(self.fatal_samples) < _SAMPLE_CAP:
                 self.fatal_samples.append(line[:300])
+            same_event = ts is not None and self._fatal_ts is not None and ts - self._fatal_ts <= _FATAL_EVENT_S
+            if ts is not None:
+                self._fatal_ts = ts
+            if not same_event:
+                self.fatal += 1
             kind = "fatal"
         if _RE_UNREG.search(line):
             self.unregistered += 1
@@ -328,8 +346,10 @@ class LogScanner:
             elif _RE_SAVE_RESTORED.search(line):
                 self.save_restored += 1
                 kind = kind or "save"
-        if kind is None and _RE_WATCHDOG.search(line):
-            kind = "watchdog"
+        if "[mcla-watchdog]" in line:
+            if "without a single register moving" in line:
+                self.hang_alarms += 1
+            kind = kind or "watchdog"
         return kind
 
 
@@ -925,11 +945,15 @@ def shot_name(t: float) -> str:
     return "t%d.png" % t if float(t).is_integer() else "t%.1f.png" % t
 
 
-def show_live(kind: str, line: str, since_start: float, errors_shown: List[int]) -> None:
-    if kind == "error":
-        if errors_shown[0] >= 25:
+_LIVE_CAPS = {"error": 25, "watchdog": 60}  # kinds that can flood the console: print the first N lines only
+
+
+def show_live(kind: str, line: str, since_start: float, shown: Dict[str, int]) -> None:
+    cap = _LIVE_CAPS.get(kind)
+    if cap is not None:
+        if shown.get(kind, 0) >= cap:
             return
-        errors_shown[0] += 1
+        shown[kind] = shown.get(kind, 0) + 1
     head = _parse_ts(line[:25])
     text = line[26:] if head is not None else line
     print("  t+%-7.1f %s" % (since_start, text[:220]), flush=True)
@@ -1059,7 +1083,7 @@ def _run_locked(opts: RunOptions, work: Path, game_root: Path, exe: Path, flow_f
         shooter = Shooter(lambda: job.pids() or [proc.pid], shots_dir, opts.topmost)
     scanner = LogScanner(started_wall)
     tail = LogTail(log_path, scanner)
-    errors_shown = [0]
+    errors_shown: Dict[str, int] = {}
     ended_by = "timeout"
     reached_at: Optional[float] = None
     next_shot = opts.screenshot_every or 0.0
