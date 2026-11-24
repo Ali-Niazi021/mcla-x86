@@ -5,11 +5,12 @@
 # Format: <second>:<button>[+<button>...][/<hold ms>], '#' comments; seconds count from process start.
 #
 # expect: free-roam
-# seconds: 120
+# seconds: 150
 # fixture: after_intro
 #
 # 'expect' is the state run_game.py needs to see for exit 0: free-roam = the log shows `[mcla-mode] ... -> free-roam`
-# (bench.py checks for `loading -> free-roam` itself). 'seconds' is the default --seconds.
+# (bench.py checks for `-> free-roam` itself). 'seconds' is the default --seconds: bench.py --parked runs this flow for 150 s
+# (--parked-run-seconds) and measures the 60 s from `-> free-roam` + 20 s (--parked-seconds), the "60 s parked" of PLAN 6.
 # E6: the robust sequence of E5: Starts at T+8..24 (the free-roam load takes ~5 s after the one that works; an earlier Start
 # at 12..36 toggled the pause menu inside the first segments, and three runs never left the title), then B (closes a pause
 # menu a late Start opened; a harmless handbrake tap in free roam).
