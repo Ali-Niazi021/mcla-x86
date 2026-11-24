@@ -1,0 +1,565 @@
+// mcla_gfx_tune: the game's own quality knobs as live mcla_gfx_* cvars (docs/mcla/NATIVE_RENDERER.md
+// section 22, ADDRESSES.md "Quality knobs").
+//
+// RAGE keeps its distances, counts and rates in .data variables and in live heap objects. A knob here
+// is one or a few of those words, written once per engine frame by OnFrame() (called from the
+// heartbeat hook, on the game thread), so a cvar change takes effect on the next frame and the
+// game never sees a half-written state. When a knob goes back to its default the game's original value
+// is written back (the original is read at the first write).
+//
+// mcla_gfx_poke is the generic form, used to find the knobs: 'ADDR/TYPE/VALUE' entries joined by '+'
+// (the characters , ; = are taken by the harness's --set-at and the bench variants):
+//     827E0DE0/f/150          one float at 0x827E0DE0
+//     8288D2B4:258/u32/3      '8288D2B4:258' = the word at 0x8288D2B4 plus 0x258 (a heap object's
+//                             field: ':' derefs, each step = u32 at the address so far + the offset;
+//                             write '8288D2B4:0:10' for [[0x8288D2B4]+0] + 0x10)
+// TYPE f (float32), u32, u16 (h), u8 (b), and32 / or32 (flag words: every frame word & VALUE / word | VALUE; only the
+// forced bits go back); VALUE decimal or 0x hex (floats: decimal). A path through a
+// heap object is re-resolved every frame, and restored only while it still resolves to the same
+// address (a freed object is never written back).
+//
+// Named knobs (live; 1.0 / 0 = the game as shipped, every default is a no-op):
+//   mcla_gfx_city_lod         x the hi-LOD draw distance 0x827E0DE0 (300 m; the game's own script command
+//                              City_SetMaxHilodDrawDistance writes it): fewer city objects, impostors and top-down map draws
+//   mcla_gfx_shadow_dist      x the shadow section distance 0x827E0DD4 (200 m): sections farther than this get no cascade /
+//                              top-down map draws at all
+//   mcla_gfx_dl_clear         draw-list bits removed from every object's mask (mid-asm hook at 0x822E0180), see below
+//   mcla_gfx_traffic_lod      x the vehicle LOD thresholds (mid-asm hook at 0x827903E0)
+//   mcla_gfx_ambient_density  x pedestrian density and parked-car fraction of NEW ambient zones (hook 0x826F5CA0)
+// mcla_gfx_dump logs words: 'SPEC/COUNT' joined by '+' (same SPEC), once per change of the string
+// (add '+0/0' to dump again); each line is the address, then 8 words as hex with the float reading.
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "nfsmw_pch.h"
+
+#include <rex/cvar.h>
+#include <rex/logging.h>
+
+#include "mcla_gfx_tune.h"
+#include "mcla_guest.h"
+#include "mcla_hooks.h"
+
+#ifndef MCLA_HOOK_GFX_CULL_MASK
+#define MCLA_HOOK_GFX_CULL_MASK 0
+#endif
+#ifndef MCLA_HOOK_GFX_SHADOW_MODE
+#define MCLA_HOOK_GFX_SHADOW_MODE 0
+#endif
+#ifndef MCLA_HOOK_GFX_DL_ENABLE
+#define MCLA_HOOK_GFX_DL_ENABLE 0
+#endif
+#ifndef MCLA_HOOK_GFX_TRAFFIC_LOD
+#define MCLA_HOOK_GFX_TRAFFIC_LOD 0
+#endif
+#ifndef MCLA_HOOK_GFX_AMBIENT_ZONE
+#define MCLA_HOOK_GFX_AMBIENT_ZONE 0
+#endif
+
+REXCVAR_DEFINE_STRING(mcla_gfx_poke, "none", "MCLA",
+                      "MCLA quality knobs, generic: guest memory writes applied every engine frame, "
+                      "'ADDR/TYPE/VALUE+ADDR/TYPE/VALUE' (TYPE f, u32, u16, u8; ADDR hex, "
+                      "'8288D2B4:258' = [0x8288D2B4]+0x258). The old value is written back when an entry "
+                      "goes away. Live. Used to find the knobs (docs/mcla/NATIVE_RENDERER.md section 22)");
+REXCVAR_DEFINE_DOUBLE(mcla_gfx_city_lod, 1.0, "MCLA",
+                      "MCLA quality knob: scale of the city hi-LOD draw distance (the game's 300 m, 0x827E0DE0). "
+                      "Below 1 = fewer far objects, impostors and top-down map draws, less CPU and GPU. Live");
+REXCVAR_DEFINE_DOUBLE(mcla_gfx_shadow_dist, 1.0, "MCLA",
+                      "MCLA quality knob: scale of the shadow distance (the game's 200 m, 0x827E0DD4): city sections "
+                      "farther than this draw no shadow cascades / top-down maps. Live");
+REXCVAR_DEFINE_INT32(mcla_gfx_shadow_mode, 0, "MCLA",
+                     "MCLA quality knob: 1 = the game's own FAST shadow path (the one it uses at night): no cascaded "
+                     "shadow maps (4 passes of 640x640, ~45 % of the draws), only the fast collector. 0 = as shipped. "
+                     "Live (mid-asm hook 0x822F4B9C)");
+REXCVAR_DEFINE_INT32(mcla_gfx_dl_disable, 0, "MCLA",
+                     "MCLA quality knob: draw-type bits removed from the renderer's draw-type mask [renderer+364] "
+                     "(the day path ORs the shadow types 0x75E0 back every frame; hook 0x822F4C48 filters that). "
+                     "32/64/128/256 = shadow cascade 0..3, 4096/8192/16384 collectors (DECIMAL: the cvar parser reads 0x.. as 0). 0 = as shipped. Live");
+REXCVAR_DEFINE_INT32(mcla_gfx_dl_clear, 0, "MCLA",
+                     "MCLA quality knob: draw-list bits removed from every object's culling result (mid-asm hook "
+                     "0x822E0180). 32/64/128/256 = shadow cascade 0/1/2/3, 16 particle collision map, "
+                     "2/4/8 reflection / env maps, 1024 shadow collector fast (DECIMAL: the cvar parser reads 0x.. as 0). 0 = as shipped. Live");
+REXCVAR_DEFINE_DOUBLE(mcla_gfx_traffic_lod, 1.0, "MCLA",
+                      "MCLA quality knob: scale of the vehicle LOD distances (mid-asm hook 0x827903E0); below 1 = "
+                      "lower LODs sooner. Live");
+REXCVAR_DEFINE_DOUBLE(mcla_gfx_ambient_density, 1.0, "MCLA",
+                      "MCLA quality knob: scale of pedestrian density and the parked-car fraction of ambient zones "
+                      "built after the change (hook 0x826F5CA0: at the next load). 1 = as shipped");
+REXCVAR_DEFINE_STRING(mcla_gfx_dump, "none", "MCLA",
+                      "MCLA debug: log guest words once per change of this string, 'ADDR/COUNT+...' "
+                      "(ADDR as in mcla_gfx_poke). Live");
+
+namespace mcla::gfxtune {
+namespace {
+
+struct Entry {
+  std::string key;   // identity for restore
+  std::string spec;  // 'HEX(:HEX)*'
+  uint32_t address;  // resolved
+  uint8_t bytes[4];  // big-endian value
+  uint8_t size;      // 1, 2 or 4
+  bool indirect;     // resolved through a heap pointer
+  bool scale_mode;   // float: written value = the game's original x `scale`
+  double scale;
+  int op;            // 0 = store, 1 = and32 (word & value every frame), 2 = or32 (word | value)
+  uint32_t mask;
+};
+
+struct Saved {
+  int op;
+  uint32_t mask;
+  std::string spec;
+  uint32_t address;
+  uint8_t bytes[4];
+  uint8_t size;
+  bool indirect;
+};
+
+// The values in force this frame (the cvars).
+struct Effective {
+  double city_lod = 1.0, shadow_dist = 1.0, traffic_lod = 1.0;
+  int shadow_mode = 0;
+  uint32_t dl_disable = 0;
+};
+Effective g_eff;
+
+std::mutex g_mutex;
+std::atomic<uint32_t> g_dl_clear{0};
+std::atomic<uint32_t> g_dl_disable{0};
+std::atomic<int> g_shadow_mode{0};
+std::atomic<float> g_traffic_lod{1.0f};
+std::atomic<float> g_ambient_density{1.0f};
+std::map<std::string, Saved> g_saved;
+std::string g_last_dump = "none";
+std::string g_last_poke = "none";
+
+// 'HEX(:HEX)*' -> address. False when a step cannot be read.
+bool ResolveSpec(const std::string& spec, uint32_t* out, bool* indirect) {
+  uint32_t cur = 0;
+  bool first = true;
+  *indirect = false;
+  size_t pos = 0;
+  while (pos <= spec.size()) {
+    size_t end = spec.find(':', pos);
+    if (end == std::string::npos) {
+      end = spec.size();
+    }
+    const std::string part = spec.substr(pos, end - pos);
+    char* tail = nullptr;
+    const uint32_t value = uint32_t(std::strtoul(part.c_str(), &tail, 16));
+    if (part.empty() || (tail && *tail)) {
+      return false;
+    }
+    if (first) {
+      cur = value;
+      first = false;
+    } else {
+      uint32_t deref = 0;
+      if (!mcla::guest::U32(cur, &deref) || deref < 0x10000) {
+        return false;
+      }
+      cur = deref + value;
+      *indirect = true;
+    }
+    pos = end + 1;
+    if (end == spec.size()) {
+      break;
+    }
+  }
+  *out = cur;
+  return !first;
+}
+
+bool ParseValue(const std::string& type, const std::string& text, Entry* e) {
+  char* tail = nullptr;
+  if (type == "f") {
+    const float v = std::strtof(text.c_str(), &tail);
+    if (text.empty() || (tail && *tail)) {
+      return false;
+    }
+    uint32_t bits;
+    std::memcpy(&bits, &v, 4);
+    bits = __builtin_bswap32(bits);
+    std::memcpy(e->bytes, &bits, 4);
+    e->size = 4;
+    return true;
+  }
+  const unsigned long long v = std::strtoull(text.c_str(), &tail, 0);
+  if (text.empty() || (tail && *tail)) {
+    return false;
+  }
+  if (type == "and32" || type == "or32") {
+    e->op = type == "and32" ? 1 : 2;
+    e->mask = uint32_t(v);
+    e->size = 4;
+    return true;
+  }
+  if (type == "u32" || type == "w") {
+    const uint32_t b = __builtin_bswap32(uint32_t(v));
+    std::memcpy(e->bytes, &b, 4);
+    e->size = 4;
+  } else if (type == "u16" || type == "h") {
+    const uint16_t b = __builtin_bswap16(uint16_t(v));
+    std::memcpy(e->bytes, &b, 2);
+    e->size = 2;
+  } else if (type == "u8" || type == "b") {
+    e->bytes[0] = uint8_t(v);
+    e->size = 1;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+std::vector<std::string> Split(const std::string& s, char sep) {
+  std::vector<std::string> out;
+  size_t pos = 0;
+  while (pos <= s.size()) {
+    size_t end = s.find(sep, pos);
+    if (end == std::string::npos) {
+      end = s.size();
+    }
+    out.push_back(s.substr(pos, end - pos));
+    pos = end + 1;
+  }
+  return out;
+}
+
+void GatherPokes(std::map<std::string, Entry>* want) {
+  const std::string text = REXCVAR_GET(mcla_gfx_poke);
+  if (text.empty() || text == "none") {
+    return;
+  }
+  for (const std::string& item : Split(text, '+')) {
+    const std::vector<std::string> f = Split(item, '/');
+    if (f.size() != 3) {
+      continue;
+    }
+    Entry e{};
+    e.key = "poke:" + f[0] + "/" + f[1];
+    e.spec = f[0];
+    if (!ParseValue(f[1], f[2], &e)) {
+      continue;
+    }
+    if (!ResolveSpec(f[0], &e.address, &e.indirect)) {
+      continue;
+    }
+    (*want)[e.key] = e;
+  }
+}
+
+void AddScale(std::map<std::string, Entry>* want, const char* name, uint32_t address, double scale) {
+  if (!(std::fabs(scale - 1.0) > 1e-6) || !(scale > 0.0)) {
+    return;
+  }
+  Entry e{};
+  e.key = std::string("knob:") + name;
+  e.address = address;
+  e.size = 4;
+  e.scale_mode = true;
+  e.scale = scale;
+  (*want)[e.key] = e;
+}
+
+void GatherKnobs(std::map<std::string, Entry>* want) {
+  // The renderer's draw-type enable mask (+364 of the object at 0x8287E064): clear the cvar's bits now; the hook at
+  // 0x822F4C48 keeps the game from OR-ing them back.
+  const uint32_t disable = g_eff.dl_disable;
+  if (disable != 0) {
+    Entry e{};
+    e.key = "knob:dl_disable";
+    e.spec = "8287E064:16C";
+    e.op = 1;
+    e.mask = ~disable;
+    e.size = 4;
+    if (ResolveSpec(e.spec, &e.address, &e.indirect)) {
+      (*want)[e.key] = e;
+    }
+  }
+  AddScale(want, "city_lod", 0x827E0DE0, g_eff.city_lod);
+  AddScale(want, "shadow_dist", 0x827E0DD4, g_eff.shadow_dist);
+}
+
+void Apply(const std::map<std::string, Entry>& want) {
+  // Restore what is no longer wanted.
+  for (auto it = g_saved.begin(); it != g_saved.end();) {
+    if (want.count(it->first)) {
+      ++it;
+      continue;
+    }
+    const Saved& s = it->second;
+    bool same = true;
+    if (s.indirect) {
+      // A heap object: write back only while the path still leads to the address we wrote.
+      uint32_t now = 0;
+      bool ind = false;
+      same = ResolveSpec(s.spec, &now, &ind) && now == s.address;
+    }
+    if (same && s.op != 0) {
+      // A flag word the game also writes: put back only the bits we forced.
+      uint32_t cur = 0, orig = (uint32_t(s.bytes[0]) << 24) | (uint32_t(s.bytes[1]) << 16) |
+                               (uint32_t(s.bytes[2]) << 8) | s.bytes[3];
+      if (mcla::guest::U32(s.address, &cur)) {
+        cur = s.op == 1 ? (cur | (orig & ~s.mask)) : ((cur & ~s.mask) | (orig & s.mask));
+        const uint32_t be = __builtin_bswap32(cur);
+        mcla::guest::WriteBytes(s.address, &be, 4);
+      }
+      REXLOG_INFO("[mcla-gfx] {}: bits back to the game's value at {:08X}", it->first, s.address);
+    } else if (same) {
+      mcla::guest::WriteBytes(s.address, s.bytes, s.size);
+      REXLOG_INFO("[mcla-gfx] {}: back to the game's value at {:08X}", it->first, s.address);
+    } else {
+      REXLOG_INFO("[mcla-gfx] {}: removed (heap object, not written back)", it->first);
+    }
+    it = g_saved.erase(it);
+  }
+  for (const auto& kv : want) {
+    Entry e = kv.second;
+    bool first_write = false;
+    auto it = g_saved.find(kv.first);
+    if (it != g_saved.end() && it->second.address != e.address) {
+      g_saved.erase(it);  // the object moved: the old original is gone with it
+      it = g_saved.end();
+    }
+    if (it == g_saved.end()) {
+      Saved s{};
+      s.op = e.op;
+      s.mask = e.mask;
+      s.spec = e.spec;
+      s.address = e.address;
+      s.size = e.size;
+      s.indirect = e.indirect;
+      if (!mcla::guest::Read(e.address, s.bytes, e.size)) {
+        continue;
+      }
+      g_saved[kv.first] = s;
+      first_write = true;
+    }
+    if (e.op != 0) {
+      uint32_t cur = 0;
+      if (!mcla::guest::U32(e.address, &cur)) {
+        continue;
+      }
+      cur = e.op == 1 ? (cur & e.mask) : (cur | e.mask);
+      const uint32_t be = __builtin_bswap32(cur);
+      std::memcpy(e.bytes, &be, 4);
+    } else if (e.scale_mode) {
+      // The game's own float (read at the first write) x scale.
+      const auto sv = g_saved.find(kv.first);
+      if (sv == g_saved.end()) {
+        continue;
+      }
+      uint32_t bits = (uint32_t(sv->second.bytes[0]) << 24) | (uint32_t(sv->second.bytes[1]) << 16) |
+                      (uint32_t(sv->second.bytes[2]) << 8) | sv->second.bytes[3];
+      float orig;
+      std::memcpy(&orig, &bits, 4);
+      const float value = float(double(orig) * e.scale);
+      std::memcpy(&bits, &value, 4);
+      bits = __builtin_bswap32(bits);
+      std::memcpy(e.bytes, &bits, 4);
+    }
+    if (first_write) {
+      const Saved& sv = g_saved[kv.first];
+      REXLOG_INFO("[mcla-gfx] {}: {:08X} <- {:02X}{:02X}{:02X}{:02X} (was {:02X}{:02X}{:02X}{:02X})", kv.first, e.address,
+                  e.bytes[0], e.size > 1 ? e.bytes[1] : 0, e.size > 2 ? e.bytes[2] : 0, e.size > 3 ? e.bytes[3] : 0,
+                  sv.bytes[0], sv.size > 1 ? sv.bytes[1] : 0, sv.size > 2 ? sv.bytes[2] : 0, sv.size > 3 ? sv.bytes[3] : 0);
+    }
+    mcla::guest::WriteBytes(e.address, e.bytes, e.size);
+  }
+}
+
+void Dump() {
+  const std::string text = REXCVAR_GET(mcla_gfx_dump);
+  if (text == g_last_dump) {
+    return;
+  }
+  g_last_dump = text;
+  if (text.empty() || text == "none") {
+    return;
+  }
+  for (const std::string& item : Split(text, '+')) {
+    const std::vector<std::string> f = Split(item, '/');
+    if (f.size() != 2) {
+      continue;
+    }
+    uint32_t address = 0;
+    bool indirect = false;
+    const long count = std::strtol(f[1].c_str(), nullptr, 0);
+    if (count <= 0) {
+      continue;
+    }
+    if (!ResolveSpec(f[0], &address, &indirect)) {
+      REXLOG_INFO("[mcla-gfx] dump {}: not resolvable", f[0]);
+      continue;
+    }
+    REXLOG_INFO("[mcla-gfx] dump {} = {:08X}, {} words", f[0], address, count);
+    for (long i = 0; i < count; i += 8) {
+      char line[256];
+      int n = std::snprintf(line, sizeof(line), "%08X:", uint32_t(address + 4 * i));
+      for (long j = i; j < i + 8 && j < count; ++j) {
+        uint32_t w = 0;
+        if (!mcla::guest::U32(address + 4 * uint32_t(j), &w)) {
+          n += std::snprintf(line + n, sizeof(line) - size_t(n), " --------");
+          continue;
+        }
+        float fv;
+        std::memcpy(&fv, &w, 4);
+        if (w != 0 && std::isfinite(fv) && std::fabs(fv) > 1e-4f && std::fabs(fv) < 1e7f) {
+          n += std::snprintf(line + n, sizeof(line) - size_t(n), " %08X(%g)", w, double(fv));
+        } else {
+          n += std::snprintf(line + n, sizeof(line) - size_t(n), " %08X", w);
+        }
+      }
+      REXLOG_INFO("[mcla-gfx] {}", line);
+    }
+  }
+}
+
+}  // namespace
+
+void OnFrame() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  // The per-call hooks read these relaxed atomics, not the cvars.
+  g_dl_clear.store(uint32_t(REXCVAR_GET(mcla_gfx_dl_clear)), std::memory_order_relaxed);
+  {
+    Effective e;
+    e.city_lod = REXCVAR_GET(mcla_gfx_city_lod);
+    e.shadow_dist = REXCVAR_GET(mcla_gfx_shadow_dist);
+    e.traffic_lod = REXCVAR_GET(mcla_gfx_traffic_lod);
+    e.shadow_mode = REXCVAR_GET(mcla_gfx_shadow_mode);
+    e.dl_disable = uint32_t(REXCVAR_GET(mcla_gfx_dl_disable));
+    g_eff = e;
+  }
+  g_dl_disable.store(g_eff.dl_disable, std::memory_order_relaxed);
+  g_shadow_mode.store(g_eff.shadow_mode, std::memory_order_relaxed);
+  g_traffic_lod.store(float(g_eff.traffic_lod), std::memory_order_relaxed);
+  g_ambient_density.store(float(REXCVAR_GET(mcla_gfx_ambient_density)), std::memory_order_relaxed);
+  std::map<std::string, Entry> want;
+  GatherPokes(&want);
+  GatherKnobs(&want);
+  if (!want.empty() || !g_saved.empty()) {
+    Apply(want);
+  }
+  Dump();
+}
+
+}  // namespace mcla::gfxtune
+
+// ---- the five mid-asm hooks (games/mcla/codegen/hooks_gfx.toml) ----------------------------------
+
+namespace {
+mcla::hooks::Registration g_reg_cull("gfx-cull", "mcla_gfx_dl_clear", MCLA_HOOK_GFX_CULL_MASK != 0,
+                                     [] { return REXCVAR_GET(mcla_gfx_dl_clear) != 0; },
+                                     /*default_on=*/false);
+mcla::hooks::Registration g_reg_shadow_mode("gfx-shadow-mode", "mcla_gfx_shadow_mode",
+                                            MCLA_HOOK_GFX_SHADOW_MODE != 0,
+                                            [] { return REXCVAR_GET(mcla_gfx_shadow_mode) != 0; },
+                                            /*default_on=*/false);
+mcla::hooks::Registration g_reg_dl_enable("gfx-dl-disable", "mcla_gfx_dl_disable",
+                                          MCLA_HOOK_GFX_DL_ENABLE != 0,
+                                          [] { return REXCVAR_GET(mcla_gfx_dl_disable) != 0; },
+                                          /*default_on=*/false);
+mcla::hooks::Registration g_reg_traffic("gfx-traffic-lod", "mcla_gfx_traffic_lod",
+                                        MCLA_HOOK_GFX_TRAFFIC_LOD != 0,
+                                        [] { return REXCVAR_GET(mcla_gfx_traffic_lod) != 1.0; },
+                                        /*default_on=*/false);
+mcla::hooks::Registration g_reg_ambient("gfx-ambient", "mcla_gfx_ambient_density",
+                                        MCLA_HOOK_GFX_AMBIENT_ZONE != 0,
+                                        [] { return REXCVAR_GET(mcla_gfx_ambient_density) != 1.0; },
+                                        /*default_on=*/false);
+}  // namespace
+
+#if MCLA_HOOK_GFX_CULL_MASK
+// sub_822E0130 (the batch visibility loop), after `bl 0x822df960`: r3 = the draw-list bits one box
+// belongs to (0x20..0x100 the four shadow cascades, 0x2/0x4/0x8 reflection / env maps ...). Clearing a
+// bit keeps the box out of that list: no draws recorded for it by the game, none replayed by us.
+void mcla_hook_gfx_cull_mask(PPCRegister& r3) {
+  MCLA_HOOK_ENTER();
+  const uint32_t clear = mcla::gfxtune::g_dl_clear.load(std::memory_order_relaxed);
+  if (clear) {
+    r3.u64 = r3.u32 & ~clear;
+  }
+}
+#else
+void mcla_hook_gfx_cull_mask(PPCRegister&) {}
+#endif
+
+#if MCLA_HOOK_GFX_SHADOW_MODE
+// sub_822F3BD8, before `cmplwi cr6,r11,0` at 0x822F4B9C: r11 = the game's night boolean; 1 takes its fast shadow path.
+void mcla_hook_gfx_shadow_mode(PPCRegister& r11) {
+  MCLA_HOOK_ENTER();
+  if (mcla::gfxtune::g_shadow_mode.load(std::memory_order_relaxed) != 0) {
+    r11.u64 = 1;
+  }
+}
+#else
+void mcla_hook_gfx_shadow_mode(PPCRegister&) {}
+#endif
+
+#if MCLA_HOOK_GFX_DL_ENABLE
+// sub_822F3BD8, day path, before `bl 0x822e5ae0` at 0x822F4C48: r4 = the shadow draw-type bits the game ORs into
+// [renderer+364]; the cvar's bits are taken out (the heartbeat cleared them in the mask once).
+void mcla_hook_gfx_dl_enable(PPCRegister& r4) {
+  MCLA_HOOK_ENTER();
+  const uint32_t clear = mcla::gfxtune::g_dl_disable.load(std::memory_order_relaxed);
+  if (clear) {
+    r4.u64 = r4.u32 & ~clear;
+  }
+}
+#else
+void mcla_hook_gfx_dl_enable(PPCRegister&) {}
+#endif
+
+#if MCLA_HOOK_GFX_TRAFFIC_LOD
+// sub_827902F0 (vehicle LOD select), after `lfs f0,40(r26)`: f0 = the LOD distance scale of the
+// vehicle's tuning. The thresholds are [r26+44] x f0 and [r26+48] x f0 (+ 500 m cull).
+void mcla_hook_gfx_traffic_lod(PPCRegister& f0) {
+  MCLA_HOOK_ENTER();
+  const float scale = mcla::gfxtune::g_traffic_lod.load(std::memory_order_relaxed);
+  if (scale != 1.0f) {
+    f0.f64 = double(float(f0.f64) * scale);
+  }
+}
+#else
+void mcla_hook_gfx_traffic_lod(PPCRegister&) {}
+#endif
+
+#if MCLA_HOOK_GFX_AMBIENT_ZONE
+// sub_826F5B18 (ambient zone constructor), before its last `lwz r12,-8(r1)`: r3 = the zone (168 bytes).
+// +0x60 pedestrian density (15), +0x98 parked-car fraction (0.25), scaled by mcla_gfx_ambient_density.
+void mcla_hook_gfx_ambient_zone(PPCRegister& r3) {
+  MCLA_HOOK_ENTER();
+  const float scale = mcla::gfxtune::g_ambient_density.load(std::memory_order_relaxed);
+  if (scale == 1.0f || r3.u32 < 0x10000) {
+    return;
+  }
+  for (const uint32_t offset : {0x60u, 0x98u}) {
+    uint32_t raw = 0;
+    if (!mcla::guest::U32(r3.u32 + offset, &raw)) {
+      continue;
+    }
+    float value;
+    std::memcpy(&value, &raw, 4);
+    value *= scale;
+    std::memcpy(&raw, &value, 4);
+    raw = __builtin_bswap32(raw);
+    mcla::guest::WriteBytes(r3.u32 + offset, &raw, 4);
+  }
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) < 3) {
+    REXLOG_INFO("[mcla-gfx] ambient zone {:08X}: pedestrian density and parked fraction x{}", r3.u32,
+                double(scale));
+  }
+}
+#else
+void mcla_hook_gfx_ambient_zone(PPCRegister&) {}
+#endif

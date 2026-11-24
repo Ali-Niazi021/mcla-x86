@@ -1,0 +1,85 @@
+# Midnight Club: Los Angeles (Xbox 360): the game layer's build contract (PLAN 3.3, 4.1, W1.3).
+#
+# include()d by the root CMakeLists.txt (W1.2); defines no targets and uses only CMAKE_CURRENT_LIST_DIR, so the
+# root can include it from any directory. Sets:
+#
+#   MCLA_HOOK_SOURCES       absolute paths of every hook and profile translation unit (hooks/*.cpp, profile/*.cpp).
+#                           The root compiles them INTO the executable as objects, not through a static archive: the
+#                           hook functions are strong definitions that must win over the generated code's weak
+#                           defaults, and an archive member that nothing references would never be pulled in.
+#   MCLA_HOOK_DEFINITIONS   MCLA_HOOK_<NAME>=1 for every hook switch (target_compile_definitions of the exe).
+#   MCLA_HOOK_INCLUDE_DIRS  hooks/ (nfsc_progress.h, frame_clock_policy.h, mcla_*.h) and profile/ (pc_profile.h,
+#                           game_profile.h). nfsmw_pch.h comes from the generated directory, which the root adds.
+#
+# Every hook file keeps its function when its flag is 0 (an empty body, or `return false`), so the
+# [[midasm_hook]] declarations of mcla/codegen/hooks*.toml link either way; switching a hook off at build time
+# never needs a codegen run. All flags are 1 here. At run time each hook has a cvar, read on every call, with the
+# defaults of the iOS port: the fixes, the CPU levers, the skip-intro and the logging hooks are on (mcla_state_trace
+# and mcla_heartbeat log by default); the hooks that change what the game does are off, so a run with no cvar given
+# plays as shipped: mcla_sim60 (60 fps timing), mcla_widescreen_width, the mcla_gfx_* knobs, and the two A/B render
+# switches mcla_noaa and mcla_fast_clear_off.
+#
+# The hooks, by file (docs/mcla/HOOKS_SPEC.md in the iOS repo, `[mcla-<tag>] active` lines in the log):
+#   core      HEARTBEAT 0x821BDA90, RAGE_FATAL 0x821BD618, READ_RETRY_FATAL 0x821C4FF0 + 0x821C50C8,
+#             UI_LIGHTS_GUARD 0x82725100, SKIP_INTRO 0x822C2F48 + 0x821315E4, FENCE_SPIN 0x82412FB0,
+#             STATE_TRACE 0x8268DDD8, FAST_CLEAR_OFF 0x82418734 (A/B, off), NOAA 0x822E4B80 (A/B, off)
+#   widescreen WS_SCENE_SIZE, WS_RT_POOL, WS_RT_GUARD, WS_EDRAM, WS_ASPECT, WS_CUTSCENE_FOV, WS_MAP_ASPECT, WS_UI
+#             (probes only), WS_TEXCLEAR; one master cvar, mcla_widescreen_width (0 = off = as shipped)
+#   timing    SIM_FRAME_DELTA, SIM_STEP, SIM_CAMERA_POS, SIM_CAMERA_LOOKAT, SIM_CHASSIS, SIM_UI_ADVANCE,
+#             SIM_UI_COUNTDOWN, SIM_RACE_CLOCK, SIM_PRESENT_INTERVAL; one master cvar, mcla_sim60 (off = as shipped)
+#   cpu       CPU_POLL_WAIT 0x82148AB0, CPU_POLL_RELEASE 0x82160140, CPU_PUMP 0x821449C8
+#   gfx       GFX_CULL_MASK, GFX_SHADOW_MODE, GFX_DL_ENABLE, GFX_TRAFFIC_LOD, GFX_AMBIENT_ZONE (the mcla_gfx_* knobs)
+set(MCLA_HOOK_DEFINITIONS
+    # core
+    MCLA_HOOK_HEARTBEAT=1
+    MCLA_HOOK_RAGE_FATAL=1
+    MCLA_HOOK_READ_RETRY_FATAL=1
+    MCLA_HOOK_UI_LIGHTS_GUARD=1
+    MCLA_HOOK_SKIP_INTRO=1
+    MCLA_HOOK_FENCE_SPIN=1
+    MCLA_HOOK_STATE_TRACE=1
+    MCLA_HOOK_FAST_CLEAR_OFF=1
+    MCLA_HOOK_NOAA=1
+    # widescreen
+    MCLA_HOOK_WS_SCENE_SIZE=1
+    MCLA_HOOK_WS_RT_POOL=1
+    MCLA_HOOK_WS_RT_GUARD=1
+    MCLA_HOOK_WS_EDRAM=1
+    MCLA_HOOK_WS_ASPECT=1
+    MCLA_HOOK_WS_CUTSCENE_FOV=1
+    MCLA_HOOK_WS_MAP_ASPECT=1
+    MCLA_HOOK_WS_UI=1
+    MCLA_HOOK_WS_TEXCLEAR=1
+    # 60 fps timing
+    MCLA_HOOK_SIM_FRAME_DELTA=1
+    MCLA_HOOK_SIM_STEP=1
+    MCLA_HOOK_SIM_CAMERA_POS=1
+    MCLA_HOOK_SIM_CAMERA_LOOKAT=1
+    MCLA_HOOK_SIM_CHASSIS=1
+    MCLA_HOOK_SIM_UI_ADVANCE=1
+    MCLA_HOOK_SIM_UI_COUNTDOWN=1
+    MCLA_HOOK_SIM_RACE_CLOCK=1
+    MCLA_HOOK_SIM_PRESENT_INTERVAL=1
+    # CPU levers
+    MCLA_HOOK_CPU_POLL_WAIT=1
+    MCLA_HOOK_CPU_POLL_RELEASE=1
+    MCLA_HOOK_CPU_PUMP=1
+    # quality knobs
+    MCLA_HOOK_GFX_CULL_MASK=1
+    MCLA_HOOK_GFX_SHADOW_MODE=1
+    MCLA_HOOK_GFX_DL_ENABLE=1
+    MCLA_HOOK_GFX_TRAFFIC_LOD=1
+    MCLA_HOOK_GFX_AMBIENT_ZONE=1)
+
+set(MCLA_HOOK_INCLUDE_DIRS
+    "${CMAKE_CURRENT_LIST_DIR}/hooks"
+    "${CMAKE_CURRENT_LIST_DIR}/profile")
+
+# CONFIGURE_DEPENDS: a hook file added later (W4.1, W5.x) is picked up by the next build without a manual re-run
+# of CMake. Sorted, so the link order does not depend on the file system.
+file(GLOB _mcla_hook_sources CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_LIST_DIR}/hooks/*.cpp"
+     "${CMAKE_CURRENT_LIST_DIR}/profile/*.cpp")
+list(SORT _mcla_hook_sources)
+set(MCLA_HOOK_SOURCES ${_mcla_hook_sources})
+unset(_mcla_hook_sources)
