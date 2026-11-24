@@ -1,0 +1,120 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 25,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "windows-base",
+            "hidden": true,
+            "description": "Ninja Multi-Config + Clang 20.1.8 from $MCLA_WORK/toolchain (lld, MSVC 14.44 STL, Windows SDK 10.0.26100). MCLA_WORK (set in this preset's environment) is the work tree of docs/PLAN.md section 5: toolchain, installed SDK, generated code and the build tree all live there, never in git. On another machine put a CMakeUserPresets.json next to this file with a preset that inherits windows-base and sets its own environment.MCLA_WORK.",
+            "generator": "Ninja Multi-Config",
+            "binaryDir": "$env{MCLA_WORK}/build",
+            "environment": {
+                "MCLA_WORK": "C:/Users/Ali/Development/mcla-x86-work"
+            },
+            "cacheVariables": {
+                "MCLA_WORK": "$env{MCLA_WORK}",
+                "CMAKE_MAKE_PROGRAM": "C:/Program Files/Microsoft Visual Studio/2022/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe",
+                "CMAKE_CXX_COMPILER": "$env{MCLA_WORK}/toolchain/llvm-20.1.8/bin/clang++.exe",
+                "CMAKE_RC_COMPILER": "$env{MCLA_WORK}/toolchain/llvm-20.1.8/bin/llvm-rc.exe",
+                "CMAKE_AR": "$env{MCLA_WORK}/toolchain/llvm-20.1.8/bin/llvm-ar.exe",
+                "CMAKE_LINKER_TYPE": "LLD",
+                "CMAKE_CXX_FLAGS": "-march=x86-64-v2",
+                "CMAKE_CXX_STANDARD": "23",
+                "CMAKE_CONFIGURATION_TYPES": "RelWithDebInfo;Release",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "CMAKE_PREFIX_PATH": "$env{MCLA_WORK}/sdk/install",
+                "MCLA_GENERATED_DIR": "$env{MCLA_WORK}/generated/default"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
+            "name": "win-amd64-relwithdebinfo",
+            "displayName": "Windows AMD64 RelWithDebInfo",
+            "description": "Development build: -O2, line tables, PDB. Same build tree as win-amd64-release (both configurations are in $MCLA_WORK/build); this preset only makes RelWithDebInfo the default configuration.",
+            "inherits": "windows-base",
+            "cacheVariables": {
+                "CMAKE_DEFAULT_BUILD_TYPE": "RelWithDebInfo"
+            }
+        },
+        {
+            "name": "win-amd64-release",
+            "displayName": "Windows AMD64 Release",
+            "description": "Bench build: -O3, no debug info, /OPT:ICF. Same build tree as win-amd64-relwithdebinfo; this preset only makes Release the default configuration.",
+            "inherits": "windows-base",
+            "cacheVariables": {
+                "CMAKE_DEFAULT_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "win-amd64-tests",
+            "displayName": "Windows AMD64 unit tests only",
+            "description": "Configures only the pure C++ unit tests (mcla/tests): no SDK, no generated code, no executable. Own build tree, $MCLA_WORK/build-tests.",
+            "inherits": "windows-base",
+            "binaryDir": "$env{MCLA_WORK}/build-tests",
+            "cacheVariables": {
+                "CMAKE_DEFAULT_BUILD_TYPE": "RelWithDebInfo",
+                "MCLA_TESTS_ONLY": "ON"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "win-amd64-relwithdebinfo",
+            "configurePreset": "win-amd64-relwithdebinfo",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "win-amd64-release",
+            "configurePreset": "win-amd64-release",
+            "configuration": "Release"
+        },
+        {
+            "name": "win-amd64-tests",
+            "configurePreset": "win-amd64-tests",
+            "configuration": "RelWithDebInfo"
+        }
+    ],
+    "testPresets": [
+        {
+            "name": "win-amd64-relwithdebinfo",
+            "configurePreset": "win-amd64-relwithdebinfo",
+            "configuration": "RelWithDebInfo",
+            "output": {
+                "outputOnFailure": true
+            },
+            "execution": {
+                "noTestsAction": "error"
+            }
+        },
+        {
+            "name": "win-amd64-release",
+            "configurePreset": "win-amd64-release",
+            "configuration": "Release",
+            "output": {
+                "outputOnFailure": true
+            },
+            "execution": {
+                "noTestsAction": "error"
+            }
+        },
+        {
+            "name": "win-amd64-tests",
+            "configurePreset": "win-amd64-tests",
+            "configuration": "RelWithDebInfo",
+            "output": {
+                "outputOnFailure": true
+            },
+            "execution": {
+                "noTestsAction": "error"
+            }
+        }
+    ]
+}
