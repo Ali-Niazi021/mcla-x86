@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Tue, 24 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0320: Vulkan draws never continue inside an ownership-transfer pass
+
+Source: $IOS tools/carbon/sdk_patches/0008-vulkan-no-draw-in-transfer-pass-pr535-ported.patch (= upstream rexglue-sdk
+  PR #535, open), rebased by W0.3 (iOS-only context lines dropped); its own header kept below
+Licence: BSD-3-Clause (upstream rexglue-sdk PR #535 by datamothra), ported for mcla-x86; owner's changes GPL-3
+Purpose: Vulkan with dynamic rendering: the open render pass remembers the transfer destination view it was begun for,
+  so a draw never continues inside an ownership-transfer pass. Matters because Renan's
+  vulkan-hoist-shared-memory-uploads (default on) keeps passes open longer. Not built before G1.
+Bucket: PORT
+
+0320-vulkan-no-draw-in-transfer-pass.patch (rebase of $IOS/tools/carbon/sdk_patches/0008-vulkan-no-draw-in-transfer-pass-pr535-ported.patch,
+which is upstream rexglue-sdk PR #535 "fix(vulkan): a draw never continues inside an ownership transfer pass", open, by datamothra,
+BSD-3-Clause, onto ReXGlue f5337cd + Renan v0.3.17)
+
+Purpose. With dynamic rendering (vulkan_dynamic_rendering, default true), SubmitBarriersAndEnterRenderTargetCacheRenderPass
+keeps an open pass when the framebuffer matches, so a draw right after an ownership transfer into the same render target
+continues inside the transfer pass (only the transfer destination attached, through the ownership-transfer view, an integer
+format for 16_16 targets): invalid Vulkan. It matters more once uploads stop ending the pass (PR #536), which is what Renan's
+rexglue-vulkan-hoist-shared-memory-uploads.patch does by default (vulkan_hoist_shared_memory_uploads = true).
+
+Change. The open pass remembers the transfer destination view it was begun for (VK_NULL_HANDLE for a draw pass); each
+overload reuses only a pass of its own kind. Same code as the owner's 0008 minus its iOS-only context lines
+(nfsmw_inicio_pase_, PARCHE LOCAL). Vulkan only; D3D12 untouched. Not built or run (syntax check showed no new errors).
+
+---
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index b91f6051..7285a490 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -1136,6 +1136,13 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // but in_render_pass_ is true.
+   VkRenderPass current_render_pass_;
+   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
++  // With dynamic rendering, a transfer pass and a draw pass into the same
++  // framebuffer differ only in their attachments (the transfer binds just the
++  // destination, through an ownership transfer view whose format may be an
++  // integer one), so the framebuffer alone can't tell whether the open pass is
++  // the one needed. The transfer destination view, VK_NULL_HANDLE for a draw
++  // pass.
++  VkImageView current_transfer_dest_view_ = VK_NULL_HANDLE;
+   bool in_render_pass_ = false;
+ 
+   // Upload hoisting (CanHoistSharedMemoryUpload): whether the current render
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index cbced766..399b1093 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -3939,7 +3939,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+   if (use_dynamic_rendering) {
+     if (in_render_pass_ && current_framebuffer_ == framebuffer &&
+-        current_render_pass_ == VK_NULL_HANDLE) {
++        current_render_pass_ == VK_NULL_HANDLE &&
++        current_transfer_dest_view_ == VK_NULL_HANDLE) {
+       return;
+     }
+   } else {
+@@ -3960,6 +3961,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
+   current_framebuffer_ = framebuffer;
++  current_transfer_dest_view_ = VK_NULL_HANDLE;
+ 
+   // Shared memory uploads for the draws in this render pass may be recorded
+   // here, after the barriers before it (CanHoistSharedMemoryUpload).
+@@ -4022,7 +4024,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+   if (use_dynamic_rendering) {
+     if (in_render_pass_ && current_framebuffer_ == framebuffer &&
+-        current_render_pass_ == VK_NULL_HANDLE) {
++        current_render_pass_ == VK_NULL_HANDLE &&
++        current_transfer_dest_view_ == transfer_dest_view) {
+       return;
+     }
+   } else {
+@@ -4043,6 +4046,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
+   current_framebuffer_ = framebuffer;
++  current_transfer_dest_view_ = transfer_dest_view;
+ 
+   if (use_dynamic_rendering) {
+     VkRenderingAttachmentInfo color_attachment = {};

@@ -1,0 +1,203 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Tue, 24 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0310: XMA cross-buffer packet resolution
+
+Source: $IOS tools/parche_xma_paquetes.py, rebased onto Renan's rexglue-xma-decoder-fixes by W0.3; code shape from
+  Xenia Canary src/xenia/apu/xma_context_new.cc (its own header kept below)
+Licence: GPL-3 (owner's own work, part of mcla-x86); code shape from Xenia Canary (BSD-3-Clause, Copyright 2024 Xenia
+  Canary)
+Purpose: XMA: a packet skip that runs past the end of the current input buffer resolves to packet (index - count) of
+  the other buffer, not that buffer's first packet. Cvar xma_cross_buffer_packets (default true; false = SDK
+  behaviour). Not built before G1: A/B it on the first audio test.
+Bucket: PORT
+
+0310-xma-cross-buffer-packets.patch (mcla-x86 W0.3 rebase of $IOS/tools/parche_xma_paquetes.py onto Renan's
+rexglue-xma-decoder-fixes.patch; code shape from Xenia Canary src/xenia/apu/xma_context_new.cc GetPacketHandle /
+GetNextPacket / GetNextPacketReadOffset(data, ...), BSD-3-Clause, "Copyright 2024 Xenia Canary")
+
+Purpose. Each XMA context has two input buffers. A packet's skip count can run past the end of the current one;
+the packet it names is then packet (index - packets left) of the OTHER buffer. ReXGlue v0.10.0 (and Renan's
+patched decoder) returns that buffer's FIRST packet instead, and when the read offset moves on it takes the other
+buffer's first frame, so on every such crossing the wrong packet is decoded. Renan's xma_canary_fixes took the
+skip-chain half of the Canary delta (7015473a7) but not this one; Canary canary_experimental still has it.
+
+Change. Cvar xma_cross_buffer_packets (Audio, default true, sampled per Work() like xma_canary_fixes; false = the
+SDK's behaviour). PacketHandle + GetPacketHandle(data, index, count) resolve (buffer, index); GetNextPacket and a
+new GetNextPacketReadOffset(data, ...) use it; Decode's full-skip (0xFF) and last-frame paths swap to the other
+buffer when the next packet is there and keep the offset computed in it. Not taken from parche_xma_paquetes: its
+diagnostics. Syntax-checked only (clang 20.1.8 -fsyntax-only); not built or run. Verify on the first audio test
+(radio pair, police chatter) with the cvar on and off.
+
+---
+diff --git a/include/rex/audio/xma/context.h b/include/rex/audio/xma/context.h
+index c22c3320..963d1fd3 100644
+--- a/include/rex/audio/xma/context.h
++++ b/include/rex/audio/xma/context.h
+@@ -241,6 +241,14 @@ class XmaContext {
+   }
+ 
+  private:
++  // LOCAL PATCH - MCLA x86 (xma_cross_buffer_packets): a packet index resolved to (buffer, index),
++  // past the current buffer's end into the other one (Xenia Canary's kPacketHandle).
++  struct PacketHandle {
++    uint8_t buffer_index = 0;
++    uint32_t packet_index = 0;
++    bool valid = false;
++  };
++
+   static void SwapInputBuffer(XMA_CONTEXT_DATA* data);
+   static int GetSampleRate(int id);
+   static int16_t GetPacketNumber(size_t size, size_t bit_offset);
+@@ -252,6 +260,10 @@ class XmaContext {
+                                uint32_t current_input_packet_count);
+   uint32_t GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_packet_index,
+                                    uint32_t current_input_packet_count);
++  PacketHandle GetPacketHandle(XMA_CONTEXT_DATA* data, uint32_t packet_index,
++                               uint32_t current_input_packet_count);
++  uint32_t GetNextPacketReadOffset(XMA_CONTEXT_DATA* data, uint32_t next_packet_index,
++                                   uint32_t current_input_packet_count);
+   uint8_t* GetCurrentInputBuffer(XMA_CONTEXT_DATA* data);
+ 
+   void Decode(XMA_CONTEXT_DATA* data);
+@@ -327,6 +339,7 @@ class XmaContext {
+   // lock (a cvar can change between calls, not within one).
+   bool race_fixes_ = false;
+   bool canary_fixes_ = false;
++  bool cross_buffer_packets_ = false;
+ 
+   std::unique_ptr<DumpState> dump_;
+ };
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+index 38248431..093fccef 100644
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -73,6 +73,14 @@ REXCVAR_DEFINE_BOOL(xma_canary_fixes, true, "Audio",
+                     "channel on its own, so left and right drift apart), which is what the SDK v0.10.0 does. "
+                     "Off = the SDK's behaviour");
+ 
++// LOCAL PATCH - MCLA x86 (patches/sdk, from $IOS tools/parche_xma_paquetes.py): a packet reached by a
++// skip count past the end of the current input buffer is the (index - packets left) one of the other
++// buffer, not its first packet (Xenia Canary xma_context_new.cc GetPacketHandle, BSD-3-Clause).
++REXCVAR_DEFINE_BOOL(xma_cross_buffer_packets, true, "Audio",
++                    "XMA: a skip count that runs past the current input buffer lands on the right "
++                    "packet of the other buffer (Xenia Canary's GetPacketHandle). Off = the SDK's "
++                    "behaviour (the other buffer's first packet)");
++
+ namespace rex::audio {
+ 
+ using stream::BitStream;
+@@ -191,6 +199,7 @@ bool XmaContext::Work() {
+   std::lock_guard<std::mutex> lock(lock_);
+   race_fixes_ = REXCVAR_GET(xma_race_fixes);
+   canary_fixes_ = REXCVAR_GET(xma_canary_fixes);
++  cross_buffer_packets_ = REXCVAR_GET(xma_cross_buffer_packets);
+   // Again under the lock: Disable() (the guest's context lock, which then waits in Block() only until
+   // the lock is free) or Release() may have run while this thread waited for it. The context is the
+   // game's to rewrite after either; decoding it anyway read it half-written and merged stale values
+@@ -435,8 +444,47 @@ uint32_t XmaContext::GetAmountOfBitsToRead(uint32_t remaining_stream_bits, uint3
+   return std::min(remaining_stream_bits, frame_size);
+ }
+ 
++XmaContext::PacketHandle XmaContext::GetPacketHandle(XMA_CONTEXT_DATA* data, uint32_t packet_index,
++                                                     uint32_t current_input_packet_count) {
++  PacketHandle result{};
++  uint8_t buffer_index = data->current_buffer;
++  const bool in_next_buffer = packet_index >= current_input_packet_count;
++  if (in_next_buffer) {
++    buffer_index ^= 1;
++    packet_index -= current_input_packet_count;
++  }
++  if (!data->IsInputBufferValid(buffer_index)) {
++    return result;
++  }
++  const uint32_t buffer_address = data->GetInputBufferAddress(buffer_index);
++  if (!buffer_address) {
++    REXAPU_ERROR("XmaContext {}: the packet is expected in the {} buffer, which is marked valid but "
++                 "has a null pointer!",
++                 id(), in_next_buffer ? "next" : "current");
++    return result;
++  }
++  if (packet_index >= data->GetInputBufferPacketCount(buffer_index)) {
++    REXAPU_ERROR("XmaContext {}: the packet is expected in the {} buffer, which is too short for it!",
++                 id(), in_next_buffer ? "next" : "current");
++    return result;
++  }
++  result.buffer_index = buffer_index;
++  result.packet_index = packet_index;
++  result.valid = true;
++  return result;
++}
++
+ const uint8_t* XmaContext::GetNextPacket(XMA_CONTEXT_DATA* data, uint32_t next_packet_index,
+                                          uint32_t current_input_packet_count) {
++  if (cross_buffer_packets_) {
++    const PacketHandle handle = GetPacketHandle(data, next_packet_index, current_input_packet_count);
++    if (!handle.valid) {
++      return nullptr;
++    }
++    return memory()->TranslatePhysical(data->GetInputBufferAddress(handle.buffer_index)) +
++           handle.packet_index * kBytesPerPacket;
++  }
++
+   if (next_packet_index < current_input_packet_count) {
+     return memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()) +
+            next_packet_index * kBytesPerPacket;
+@@ -483,6 +531,17 @@ uint32_t XmaContext::GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_pack
+   return kBitsPerPacketHeader;
+ }
+ 
++uint32_t XmaContext::GetNextPacketReadOffset(XMA_CONTEXT_DATA* data, uint32_t next_packet_index,
++                                             uint32_t current_input_packet_count) {
++  const PacketHandle handle = GetPacketHandle(data, next_packet_index, current_input_packet_count);
++  if (!handle.valid) {
++    return kBitsPerPacketHeader;
++  }
++  return GetNextPacketReadOffset(
++      memory()->TranslatePhysical(data->GetInputBufferAddress(handle.buffer_index)),
++      handle.packet_index, data->GetInputBufferPacketCount(handle.buffer_index));
++}
++
+ memory::RingBuffer XmaContext::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
+   const uint32_t output_capacity = data->output_buffer_block_count * kOutputBytesPerBlock;
+   const uint32_t output_read_offset = data->output_buffer_read_offset * kOutputBytesPerBlock;
+@@ -859,9 +918,15 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+ 
+   // Full packet skip (0xFF) -- no new frames begin in this packet.
+   if (skip_count == 0xFF) {
++    // xma_cross_buffer_packets: the next packet may be the other buffer's first (Xenia Canary).
++    const uint32_t next_packet_index_skip = packet_index + 1;
+     uint32_t next_input_offset =
+-        GetNextPacketReadOffset(current_input_buffer, packet_index + 1, current_input_packet_count);
+-    if (next_input_offset == kBitsPerPacketHeader) {
++        cross_buffer_packets_
++            ? GetNextPacketReadOffset(data, next_packet_index_skip, current_input_packet_count)
++            : GetNextPacketReadOffset(current_input_buffer, next_packet_index_skip,
++                                      current_input_packet_count);
++    if ((cross_buffer_packets_ && next_packet_index_skip >= current_input_packet_count) ||
++        next_input_offset == kBitsPerPacketHeader) {
+       SwapInputBuffer(data);
+     }
+     data->input_buffer_read_offset = next_input_offset;
+@@ -1004,10 +1069,19 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+     return;
+   }
+ 
++  // xma_cross_buffer_packets: a skip past the end of this buffer lands on packet
++  // (next_packet_index - current_input_packet_count) of the other one (Xenia Canary), whose offset is
++  // then relative to that buffer: swap to it.
+   uint32_t next_input_offset =
+-      GetNextPacketReadOffset(current_input_buffer, next_packet_index, current_input_packet_count);
++      cross_buffer_packets_
++          ? GetNextPacketReadOffset(data, next_packet_index, current_input_packet_count)
++          : GetNextPacketReadOffset(current_input_buffer, next_packet_index,
++                                    current_input_packet_count);
+ 
+-  if (next_input_offset == kBitsPerPacketHeader) {
++  if (cross_buffer_packets_ && next_packet_index >= current_input_packet_count &&
++      next_input_offset != kBitsPerPacketHeader) {
++    SwapInputBuffer(data);
++  } else if (next_input_offset == kBitsPerPacketHeader) {
+     SwapInputBuffer(data);
+     if (data->IsAnyInputBufferValid()) {
+       next_input_offset = xma::GetPacketFrameOffset(

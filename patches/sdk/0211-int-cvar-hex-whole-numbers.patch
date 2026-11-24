@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Tue, 24 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0211: integer cvars accept 0x hex and refuse trailing garbage
+
+Source: $IOS games/mcla/sdk_patches/0211-int-cvar-hex-whole-numbers.patch (mcla-ios @ e24c5751), regenerated on the
+  Renan series by W0.3, code unchanged (its own header kept below)
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: cvar: INT32/INT64/UINT32/UINT64 cvars read `0x180` as 384 and refuse `12abc` (command line, environment, TOML
+  and SetFlagByName), instead of silently taking 0 or 12.
+Bucket: AS-IS
+
+0211-int-cvar-hex-whole-numbers.patch (our own, MCLA; E6 task, docs/mcla/LEARNINGS.md energy-e6)
+
+Purpose. An integer cvar read "0x180" as 0 and "12abc" as 12, and the harness still printed `--set-at ... -> set`:
+the setters of the REXCVAR_DEFINE_INT32 / INT64 / UINT32 / UINT64 macros (include/rex/cvar.h) call std::from_chars
+and test only its error code, never where it stopped. A whole bench run of the E4 task (mcla_gfx_dl_disable=0x180)
+tested nothing; the same silent 0 would hit a hex value in the launcher's Extra Args on the phone.
+
+Change (src/core/cvar.cpp only, marked "LOCAL PATCH - MCLA (0211)": one translation unit, no header change, so no
+rebuild of the users of cvar.h): NormalizeIntegerValue runs in ApplyFromSource (command line, environment, late
+registrations) and SetFlagFromSource (SetFlagByName, the harness' --set-at, TOML config) before the value reaches
+ValidateConstraints / the setter:
+  * 0x<hex> (also -0x<hex> for the signed types) becomes its decimal text, so 0x180 = 384 and a hex value is range
+    checked by the setter as before (0xFFFFFFFF into an INT32 is refused, not wrapped);
+  * a decimal value that from_chars does not consume to the end ("12abc", "1.5", "5 ") is refused with
+    `cvar 'NAME': 'TEXT' is not one whole number (decimal, or 0x hex): not set` (SetFlagByName returns false, the harness
+    prints FAILED); a malformed hex value gets the "valid hexadecimal value" warning;
+  * everything else (bool, double, string, a plain decimal) is untouched.
+No effect on the guest. Applies after 0210 (its lines are in other files). Made by hand in
+/Volumes/dev-ssd/mcla/scratch/energy-e6/sdk0211 (diff -u a b). prepare_sdk.py recognises "already applied" by reverse-checking.
+
+Rebased for mcla-x86 (W0.3): regenerated with git diff on ReXGlue f5337cd + Renan v0.3.17 series; the original applies
+too (git apply: hunk 2 at offset +508, after rexglue-cvar-toml-strings), code unchanged.
+
+---
+diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
+index 18585bef..a71d8afc 100644
+--- a/src/core/cvar.cpp
++++ b/src/core/cvar.cpp
+@@ -100,9 +100,59 @@ bool Outranks(Source source, const FlagEntry& entry) {
+   return source >= entry.source;
+ }
+ 
++// LOCAL PATCH - MCLA (games/mcla/sdk_patches/0211): integer cvars take hexadecimal and refuse text that is not one whole number.
++// The setters of the INT32 / INT64 / UINT32 / UINT64 macros (cvar.h) call std::from_chars and look only at its error code, not at
++// where it stopped: "0x180" parsed as 0 (it stops at the 'x') and "12abc" as 12, and SetFlagByName / the command line / the
++// harness' --set-at still reported success (a whole bench run of the E4 task tested nothing, mcla_gfx_dl_disable=0x180 = 0). Every
++// path that applies a value (command line, environment, TOML config, SetFlagByName) calls this first: for an integer cvar the
++// value is one whole decimal integer, or 0x<hex> (a '-' before the 0x is allowed for the signed types), which is turned into its
++// decimal text; anything else is refused with a warning. A value out of range is still refused by the setter.
++bool NormalizeIntegerValue(const FlagEntry& entry, std::string_view& value, std::string& storage) {
++  const bool is_signed = entry.type == FlagType::Int32 || entry.type == FlagType::Int64;
++  if (!is_signed && entry.type != FlagType::Uint32 && entry.type != FlagType::Uint64) {
++    return true;
++  }
++  const char* begin = value.data();
++  const char* end = begin + value.size();
++  const char* p = begin;
++  bool negative = false;
++  if (p != end && *p == '-') {
++    negative = true;
++    ++p;
++  }
++  if (end - p > 2 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
++    uint64_t magnitude = 0;
++    auto [ptr, ec] = std::from_chars(p + 2, end, magnitude, 16);
++    if (ec != std::errc() || ptr != end || (negative && !is_signed)) {
++      REXLOG_WARN("cvar '{}': '{}' is not a valid hexadecimal value for this type: not set", entry.name, value);
++      return false;
++    }
++    storage = (negative ? "-" : "") + std::to_string(magnitude);
++    value = storage;
++    return true;
++  }
++  if (is_signed) {
++    int64_t number = 0;
++    auto [ptr, ec] = std::from_chars(begin, end, number);
++    if (ec == std::errc() && ptr != end) {
++      REXLOG_WARN("cvar '{}': '{}' is not one whole number (decimal, or 0x hex): not set", entry.name, value);
++      return false;
++    }
++  } else {
++    uint64_t number = 0;
++    auto [ptr, ec] = std::from_chars(begin, end, number);
++    if (ec == std::errc() && ptr != end) {
++      REXLOG_WARN("cvar '{}': '{}' is not one whole number (decimal, or 0x hex): not set", entry.name, value);
++      return false;
++    }
++  }
++  return true;
++}
++
+ // Unvalidated apply, for the command line and environment paths.
+ bool ApplyFromSource(FlagEntry& entry, std::string_view value, Source source) {
+-  if (!Outranks(source, entry) || !entry.setter(value)) {
++  std::string storage;  // LOCAL PATCH - MCLA (0211)
++  if (!Outranks(source, entry) || !NormalizeIntegerValue(entry, value, storage) || !entry.setter(value)) {
+     return false;
+   }
+   entry.source = source;
+@@ -832,6 +882,11 @@ ApplyResult SetFlagFromSource(std::string_view name, std::string_view value, Sou
+     return ApplyResult::kRejected;
+   }
+ 
++  std::string integer_text;  // LOCAL PATCH - MCLA (0211): hex -> decimal, trailing garbage refused
++  if (!NormalizeIntegerValue(entry, value, integer_text)) {
++    return ApplyResult::kRejected;
++  }
++
+   if (!ValidateConstraints(entry, value)) {
+     return ApplyResult::kRejected;
+   }

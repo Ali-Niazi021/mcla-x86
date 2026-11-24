@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Tue, 24 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0205: xam dirty-disc error UI logs and flushes before exit
+
+Source: $IOS games/mcla/sdk_patches/0205-xam-dirty-disc-log-flush.patch (mcla-ios @ e24c5751), diff verbatim (its own
+  header kept below)
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: xam: XamShowDirtyDiscErrorUI logs `[xam] dirty-disc error UI requested (fatal from title)` and calls
+  FlushLogging before exit(1), so the RAGE engine's fatal handler is identifiable in the log.
+Bucket: AS-IS
+
+MCLA SDK patch 0205: xam-dirty-disc-log-flush
+
+Purpose: the RAGE engine's fatal handler (stored in 0x8285FEA0 by the game's main) calls the
+import XamShowDirtyDiscErrorUI, and so does a file read that failed 10 times. The SDK's
+implementation logs a generic "disc read error" and calls exit(1), so on iOS every RAGE fatal
+looks like a silent crash (docs/mcla/HOOKS_SPEC.md B1, ADDRESSES.md "Fatal handler pointer").
+This patch makes that exit identifiable and keeps the log:
+  - first line of XamShowDirtyDiscErrorUI_entry: "[xam] dirty-disc error UI requested (fatal
+    from title)" (the line to grep for; games/mcla/hooks/mcla_rage_fatal.cpp logs the game's own
+    message just before it as "[mcla-fatal] ...");
+  - rex::FlushLogging() right before exit(1), so the buffered lines are on disk.
+Behaviour is otherwise unchanged (dialog if there is a UI, then exit(1)).
+
+Source: our own; no prior-art patch.
+
+No cvar. Checked: git apply --check on the SDK after all MW/Carbon patches and 0200-0204 (it
+touches only src/kernel/xam/xam_ui.cpp, which no earlier patch changes).
+
+---
+diff --git a/src/kernel/xam/xam_ui.cpp b/src/kernel/xam/xam_ui.cpp
+index 5a572ce..7006b3c 100644
+--- a/src/kernel/xam/xam_ui.cpp
++++ b/src/kernel/xam/xam_ui.cpp
+@@ -517,6 +517,9 @@ u32 XamShowDeviceSelectorUI_entry(u32 user_index, u32 content_type, u32 content_
+ }
+ 
+ void XamShowDirtyDiscErrorUI_entry(u32 user_index) {
++  // MCLA: the game's RAGE fatal handler lands here (and so do 10 failed reads); the process exits
++  // below, so say so in the log first. This is the line to look for after a silent close.
++  REXKRNL_ERROR("[xam] dirty-disc error UI requested (fatal from title)");
+   REXKRNL_ERROR("XamShowDirtyDiscErrorUI called! user_index={}", uint32_t(user_index));
+   REXKRNL_ERROR("This indicates a disc/file read error - check that all game files exist");
+ 
+@@ -539,6 +542,9 @@ void XamShowDirtyDiscErrorUI_entry(u32 user_index) {
+   }
+   // This is death, and should never return.
+   // TODO(benvanik): cleaner exit.
++  // MCLA: exit() does not run the logger's flush on every path (the dialog is dispatched, then the
++  // process is gone), so everything above and the guest's own last lines would be lost.
++  rex::FlushLogging();
+   exit(1);
+ }
+ 

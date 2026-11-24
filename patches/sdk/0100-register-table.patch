@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Tue, 24 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0100: one register table instead of one SetFunction call per function
+
+Source: $IOS tools/carbon/sdk_patches/0100-register-table.patch (mcla-ios @ e24c5751), diff verbatim
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: Codegen: the generated <project>_register.cpp holds one constant table and a loop instead of ~30k
+  straight-line SetFunction calls (that translation unit took 10+ minutes at -O3). tools/codegen.py reads both forms.
+Bucket: AS-IS
+
+---
+diff --git a/resources/templates/codegen/register_cpp.inja b/resources/templates/codegen/register_cpp.inja
+index 0be31c4..1bc6d2d 100644
+--- a/resources/templates/codegen/register_cpp.inja
++++ b/resources/templates/codegen/register_cpp.inja
+@@ -5,6 +5,20 @@
+ #include "{{ project }}_init.h"
+ #include <rex/system/function_dispatcher.h>
+ 
++// One constant table and a loop instead of one SetFunction call per function:
++// ~72k straight-line virtual calls in a single function took clang 20+ minutes
++// even at -O0; the table compiles in ~2 s (nfsc-ios tools/carbon/sdk_patches).
++namespace {
++struct RexRegisterEntry {
++  uint32_t address;
++  ::PPCFunc* func;
++};
++const RexRegisterEntry kRexRegisterTable[] = {
++{% for fn in functions %}{% if not fn.below_code_base or fn.is_import %}  { {{ fn.address }}, {{ fn.name }} },
++{% endif %}{% endfor %}  { 0, nullptr },
++};
++}  // namespace
++
+ {% if is_dll %}
+ #ifdef _WIN32
+ #define REX_MODULE_EXPORT __declspec(dllexport)
+@@ -17,8 +31,10 @@ void ReXModule_Register(rex::runtime::IModuleRegistrar* registrar) {
+ {% else %}
+ void {{ project }}_RegisterFunctions(rex::runtime::IModuleRegistrar* registrar) {
+ {% endif %}
+-{% for fn in functions %}{% if not fn.below_code_base or fn.is_import %}  registrar->SetFunction({{ fn.address }}, {{ fn.name }});
+-{% endif %}{% endfor %}}
++  for (const RexRegisterEntry& e : kRexRegisterTable) {
++    if (e.func) registrar->SetFunction(e.address, e.func);
++  }
++}
+ 
+ {% if is_dll %}
+ // The runtime uses this baked layout for the dispatch table. It must match the

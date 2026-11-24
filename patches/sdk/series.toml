@@ -1,0 +1,764 @@
+# series.toml - the ordered SDK patch series (PLAN 3.3). Owner: the SDK slice (W1.1); every SDK change goes through here.
+#
+# tools/prepare_sdk.py reads this file: `fetch` clones the pinned trees, `apply` verifies each patch file's SHA-256
+# against this list and applies the entries in this order (git apply, inside `subdir` when set), `status` compares
+# the files with what was recorded at apply time, `build` builds and installs the result.
+#
+# Entry fields (all always present):
+#   name     unique id (also the key of $WORK/sdk/src/.mcla-x86/series.applied)
+#   source   "renan": `path` is relative to RenanQueiroz/mcla-recomp at the pinned commit, read from
+#            $WORK/prior/renan-mcla-recomp (fetched, never vendored); "local": `path` is relative to this repo
+#   path     repo-relative path of the patch file
+#   sha256   SHA-256 of the patch file's bytes. After editing a local patch run `python tools/prepare_sdk.py rehash`
+#   purpose  one line
+#   subdir   directory inside the SDK tree in which `git apply` runs ("" = the SDK root; e.g. "thirdparty/FFmpeg")
+#   bucket   PLAN 4.1: AS-IS (taken unchanged), PORT (logic kept, rebased or re-expressed)
+#
+# Renan's entries are his Windows list in the exact order scripts/make_pc.ps1 applies it (75 patches) minus the three
+# in [[dropped]]. W0.3 proved the drops apply-independent: the other patches applied with 0 failures without them.
+# The local entries follow, rebased on Renan's tree (0 offsets).
+
+[pins]
+sdk_url = "https://github.com/rexglue/rexglue-sdk.git"
+sdk_tag = "v0.10.0"
+sdk_commit = "f5337cdc947ff6d4c4196737e2c807a48f2a1fc2"
+renan_url = "https://github.com/RenanQueiroz/mcla-recomp.git"
+renan_tag = "v0.3.17"
+renan_commit = "0c3bbc9c1e369a7aebd8bbc8097ad823096f13ca"
+
+[[patch]]
+name = "rexglue-v0.10.0-mcla"
+source = "renan"
+path = "patches/rexglue-v0.10.0-mcla.patch"
+sha256 = "84c9609be82bfef2614ee6f4f08d8b92c65a4327eeaaee2e19f4240841a1a364"
+purpose = "Base: vblank timer resync (interrupt storm), perf counters in Release, no debug reg lookup per write; PS5 platform (guarded)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "minmax-blend-factor"
+source = "renan"
+path = "patches/rexglue-minmax-blend-factor.patch"
+sha256 = "6b912c2d50ba6bd8d38e420cbf4cf7692ec7e1d1ee32a9cc0c6109c07a19191f"
+purpose = "White cars: src blend factor in MIN/MAX blend (D3D12+Vulkan)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "gpu-regwrite-bulk"
+source = "renan"
+path = "patches/rexglue-gpu-regwrite-bulk.patch"
+sha256 = "9c3415cf4ce2412b16d9814c02fd8f0f65561aee9f9354d0c3e1fdd970bf76eb"
+purpose = "GPU register writes in bulk (gpu_regwrite_bulk)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "imgui-dialog-repaint-on-demand"
+source = "renan"
+path = "patches/rexglue-imgui-dialog-repaint-on-demand.patch"
+sha256 = "58c100260ad4b6b1c1807564388222f4011b4b2da351976939e0f27397c841b2"
+purpose = "ImGui dialogs may opt out of continuous repaint"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "inline-bit-helpers"
+source = "renan"
+path = "patches/rexglue-inline-bit-helpers.patch"
+sha256 = "442d13002b8942e1c6125d2be24a05e81f8b3e68ee9338db076bec1a533b1290"
+purpose = "lzcnt/tzcnt/bsf inline instead of cross-DLL calls"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "perf-counters-batched"
+source = "renan"
+path = "patches/rexglue-perf-counters-batched.patch"
+sha256 = "f6c19ce5c43a1276205cbd099634a216df1a8d6b3b58d078b04b1f432def34ae"
+purpose = "CP per-event counters batched (no cross-DLL atomics)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "shared-memory-request-fast-path"
+source = "renan"
+path = "patches/rexglue-shared-memory-request-fast-path.patch"
+sha256 = "023bb6d3d2dddad15e311c14cf91bb912400a288290bc1a56310345cd1885e41"
+purpose = "SharedMemory::RequestRanges early-out when all valid"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "threaded-submission-d3d12"
+source = "renan"
+path = "patches/rexglue-threaded-submission-d3d12.patch"
+sha256 = "e07af1f1cfa7334045dbe19b2781e0788a678fce6c984665f75173f3dcefa021"
+purpose = "D3D12 command-list replay/submit on own thread"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "timer-queue-blocking-wait"
+source = "renan"
+path = "patches/rexglue-timer-queue-blocking-wait.patch"
+sha256 = "d10137f85a032888cef73df321959d924ac0be20ade00499b96fa53d17d89b04"
+purpose = "Timer queue sleeps on a condvar instead of spinning"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "shared-memory-fast-path-hot-pages"
+source = "renan"
+path = "patches/rexglue-shared-memory-fast-path-hot-pages.patch"
+sha256 = "2443d358b5c0504391debf8a61f7292ad59783f64f616dd041fc827f9e684d25"
+purpose = "Fast path also with hot pages/widened requests"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "hot-pages-watched-ranges"
+source = "renan"
+path = "patches/rexglue-hot-pages-watched-ranges.patch"
+sha256 = "d7e61afc6e33c9c35ccd03408fbe7e0c838a59ff3127fc264f28f0a2f1a5db50"
+purpose = "Hot-page fix: watched ranges notified"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "cursor-auto-hide"
+source = "renan"
+path = "patches/rexglue-cursor-auto-hide.patch"
+sha256 = "ff8e979e71694e3242ba7284d9a37c4a82d1d46abf970c62f948b9611335b8d3"
+purpose = "Auto-hide mouse cursor during play"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "vulkan-memexport-check-order"
+source = "renan"
+path = "patches/rexglue-vulkan-memexport-check-order.patch"
+sha256 = "1fb4d2ced91a9d080dbb540c43eb4bd0596a4cfa66889887c6f8e457dc85f1e9"
+purpose = "Vulkan: cheap memexport check first per draw"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "vulkan-hoist-shared-memory-uploads"
+source = "renan"
+path = "patches/rexglue-vulkan-hoist-shared-memory-uploads.patch"
+sha256 = "b727bcfecc8bc03815acbac60d9635ef4776f8f687188af4204633e916fb31ff"
+purpose = "Vulkan: shared-memory uploads hoisted out of render passes"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "threaded-submission-vulkan"
+source = "renan"
+path = "patches/rexglue-threaded-submission-vulkan.patch"
+sha256 = "a712eadf3f2c9f3fb3a5cafbebdfbdb76ede8c215f1f774b6277744f3025fd21"
+purpose = "Vulkan threaded submission"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "d3d12-placed-texture-heaps"
+source = "renan"
+path = "patches/rexglue-d3d12-placed-texture-heaps.patch"
+sha256 = "640165ad9de14d03346f5986f3d472d3bfae1735b3eb8e4d8758d0b74131b006"
+purpose = "D3D12 placed texture heaps (d3d12_texture_heaps)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "vulkan-texture-load-storage-copy"
+source = "renan"
+path = "patches/rexglue-vulkan-texture-load-storage-copy.patch"
+sha256 = "be1b86f3c5c641b569e02c25d52e9b625017c9806aad97fe649a84a6a25252b1"
+purpose = "Vulkan texture load via storage copy"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "clear-rectangle-draws"
+source = "renan"
+path = "patches/rexglue-clear-rectangle-draws.patch"
+sha256 = "6c6ca7e4af187d3f90080bd11c49087d4a8d996f60015aa85ad373e050af7a4c"
+purpose = "Ownership transfers that are clears drawn as rectangles"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "texture-load-direct"
+source = "renan"
+path = "patches/rexglue-texture-load-direct.patch"
+sha256 = "0af248754b7272eaaa15c2e815116ceb12e188e9463fb40d4bd705a431d715a0"
+purpose = "Scaled resolved textures loaded directly"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "async-pipelines-no-frame-wait"
+source = "renan"
+path = "patches/rexglue-async-pipelines-no-frame-wait.patch"
+sha256 = "6989ba8c8c36c5fabb2735df31bc636f25a0bc6178a59a7f3854430f4428a0fa"
+purpose = "Async pipelines: no wait at end of submission"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "vulkan-pipeline-storage-parallel-translation"
+source = "renan"
+path = "patches/rexglue-vulkan-pipeline-storage-parallel-translation.patch"
+sha256 = "19599f349f990763465a16ebff0ed56b3a3f3a5e507aea0c635b57139f5b3518"
+purpose = "Vulkan stored-shader translation in parallel at start"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "vulkan-pipeline-cache-file"
+source = "renan"
+path = "patches/rexglue-vulkan-pipeline-cache-file.patch"
+sha256 = "015237fe93bee38024f1be5704fed19db2d011a01a628d03a03af56d0112ac68"
+purpose = "Vulkan VkPipelineCache persisted to disk"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "resolve-4xmsaa-depth-samples"
+source = "renan"
+path = "patches/rexglue-resolve-4xmsaa-depth-samples.patch"
+sha256 = "79d14cbd8a183d7b3126902913fcaf1d4fcdf2efe0936a0efd9582bd554454ad"
+purpose = "Fix resolve_fast_32bpp_4xmsaa depth sample reads"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "direct-resolve"
+source = "renan"
+path = "patches/rexglue-direct-resolve.patch"
+sha256 = "fd49a9afc1b76caabe016c93540c8353366d862af5c064007c85e3495a04683d"
+purpose = "Direct resolve from host RTs (skip EDRAM dump)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "cvar-toml-strings"
+source = "renan"
+path = "patches/rexglue-cvar-toml-strings.patch"
+sha256 = "9dd718a08ce7af326336edf05cf1c8d6873a10bb0e94e53c0569bfade1a1e8d3"
+purpose = "TOML config strings escaped; line-wise config load"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "edram-size"
+source = "renan"
+path = "patches/rexglue-edram-size.patch"
+sha256 = "53d3dcc858f0f9fca724f3790161e7baceff113b0cd3dd00ae31767b79356904"
+purpose = "edram_tiles (default 2048; 4096 for 1080p)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "guest-markers"
+source = "renan"
+path = "patches/rexglue-guest-markers.patch"
+sha256 = "729b8e52ca9da7808e3571e7252ad538a3b97ab1ed738f150baec647c6e9d84c"
+purpose = "Guest PM4 NOP markers (scene/tonemap/UI) to the CP"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "hdr-output"
+source = "renan"
+path = "patches/rexglue-hdr-output.patch"
+sha256 = "53e1872f1923b40801b46929b264182cfe0079fd6ebd383d666c9118dcd7d843"
+purpose = "HDR swap chains (hdr off by default)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "hdr-ui-layer"
+source = "renan"
+path = "patches/rexglue-hdr-ui-layer.patch"
+sha256 = "39b401c381cdbb3f04cd3f3ea71dd445c1bd9c8800f91c48ff71b6c358ba4123"
+purpose = "HDR: UI on its own layer"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "hdr-scene-mcla"
+source = "renan"
+path = "patches/rexglue-hdr-scene-mcla.patch"
+sha256 = "e92dbf9c47e0973602b2c2830cedbd62698c234bfbcfe0fb455964767b4525d0"
+purpose = "HDR: scene before the MCLA tone map"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "temporal-aa"
+source = "renan"
+path = "patches/rexglue-temporal-aa.patch"
+sha256 = "581eb89ff6e6cf7e1384b4ed515a254baf770e584a45b0c3ac7c8664e2d5c5e7"
+purpose = "FSR 3.1 temporal AA (jitter, TAA path)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "temporal-aa-shaders-vk"
+source = "renan"
+path = "patches/rexglue-temporal-aa-shaders-vk.patch"
+sha256 = "100a3fcd1d41667f9ed9bff35675bfc20239fd9cb9633246d8ad54ffb99d06cb"
+purpose = "Pre-generated FSR Vulkan shader headers"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "fullscreen-setting-ui-thread"
+source = "renan"
+path = "patches/rexglue-fullscreen-setting-ui-thread.patch"
+sha256 = "ecc6b6784031248b09ecd05ed6c049cac77d180e5bde9714f832b5b4729a15ec"
+purpose = "fullscreen change applied on the UI thread"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "presenter-ui-overlay"
+source = "renan"
+path = "patches/rexglue-presenter-ui-overlay.patch"
+sha256 = "899a7048600563d876d53957281a0f4229d6def15d0231477fcb6180651538d8"
+purpose = "Presenter UI overlay painted from UI thread without pacing loss"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "frame-generation"
+source = "renan"
+path = "patches/rexglue-frame-generation.patch"
+sha256 = "396f6de9b6e2c873a16e43dc2cfa4d4562a1fb8a1d939333f4edc716329fb427"
+purpose = "FSR 3.1 frame generation (off by default)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "vulkan-paint-pipeline-format"
+source = "renan"
+path = "patches/rexglue-vulkan-paint-pipeline-format.patch"
+sha256 = "8c79ffdeafda6c0fa8a5f1157cf218f30121073f5ea6fa412d6ffdd1a890734d"
+purpose = "Vulkan presenter: record swapchain_format (no per-frame pipeline rebuild)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "vulkan-present-semaphore-per-image"
+source = "renan"
+path = "patches/rexglue-vulkan-present-semaphore-per-image.patch"
+sha256 = "84831672f003194f566bc0b9645c8d50c0ae43572f8d61519611bbcd812a9137"
+purpose = "Vulkan present semaphore per swapchain image"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "d3d12-storage-preload-threads"
+source = "renan"
+path = "patches/rexglue-d3d12-storage-preload-threads.patch"
+sha256 = "3644fb07d6fd609b8eb8efee8f4dfb57a5a232b86e377578699944ab2e3c5e96"
+purpose = "D3D12 storage preload uses all creation threads"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "vulkan-pipeline-storage-keep-unsupported"
+source = "renan"
+path = "patches/rexglue-vulkan-pipeline-storage-keep-unsupported.patch"
+sha256 = "f784cb7613d56e40f0a097df5c7d1eab16fa2b619303bcd7f02d9769ae7c0f8e"
+purpose = "Vulkan storage keeps pipelines this device can't create"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "shader-storage-prepare"
+source = "renan"
+path = "patches/rexglue-shader-storage-prepare.patch"
+sha256 = "ad9679d574c91020a3a7d1f18d47d445733684e6a7d13896ed35f58fcb9ff0f5"
+purpose = "Hooks for shader-pack import/prepare (prewarm)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "content-header-padding"
+source = "renan"
+path = "patches/rexglue-content-header-padding.patch"
+sha256 = "f467cfd9f5f6525b807cc634abd9953eb10252d60223dd1c922455a8db74fbc7"
+purpose = "Content header padding written as zeros"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "user-name"
+source = "renan"
+path = "patches/rexglue-user-name.patch"
+sha256 = "a3d304b19b9ee47f2ddcabfa233002e0bae829a3b2cbab623b4b9aebf4e003a3"
+purpose = "Profile name from a cvar (not 'User')"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "low-latency"
+source = "renan"
+path = "patches/rexglue-low-latency.patch"
+sha256 = "ee39c2dbbdb76b711ed014173590591e28781af48454ba682ae80306535fcb12"
+purpose = "Low-latency mode (Reflex/AntiLag-style CPU wait)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "frame-generation-nonwindows"
+source = "renan"
+path = "patches/rexglue-frame-generation-nonwindows.patch"
+sha256 = "00811c744222cd0eefd679af052e10e5001526252eda6f8e9788684134f69022"
+purpose = "Frame-gen runtime on Linux/PS5; FidelityFX CMake option"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "threaded-submission-d3d12-idle-wait"
+source = "renan"
+path = "patches/rexglue-threaded-submission-d3d12-idle-wait.patch"
+sha256 = "dfb07661191496faa6bcd728c34a04e3e358b8cccec478a78117cadd78e7c96b"
+purpose = "Threaded D3D12: wait for idle before resource reuse (AMD iGPU flash)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "fsr-upscaling"
+source = "renan"
+path = "patches/rexglue-fsr-upscaling.patch"
+sha256 = "b90cc1ed05a585708f6a620915abdf1718d233ffffdba09ca8b5fdc9b79a5e42"
+purpose = "FSR 3.1 upscaling"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "guest-atomics-lock-free"
+source = "renan"
+path = "patches/rexglue-guest-atomics-lock-free.patch"
+sha256 = "2b332818871d528f509a65ce9122a8561a7c2efd1c277f62b84b90e21f65951d"
+purpose = "Guest Interlocked helpers lock-free (guest_atomics_lock_free)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "resolve-direct-batched-loads"
+source = "renan"
+path = "patches/rexglue-resolve-direct-batched-loads.patch"
+sha256 = "8ff909069ae327775def0fc3d9100933dd31e6eebfcfd9726c06316da540a448"
+purpose = "Direct resolve shaders: batched sample loads"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "skip-overwritten-transfers"
+source = "renan"
+path = "patches/rexglue-skip-overwritten-transfers.patch"
+sha256 = "7dd66a997ba94aa60e7160dfcdc03d08b159724e889f997eac67b128d2d24d1a"
+purpose = "Skip ownership transfers fully overwritten"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "d3d12-depth-resolve-read-state"
+source = "renan"
+path = "patches/rexglue-d3d12-depth-resolve-read-state.patch"
+sha256 = "7cf2b3bc1eb706d1587019b7ad8bf1577cf34b1c13b1cb137d2f2ac8d7082392"
+purpose = "D3D12 depth resolve read-state barriers"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "xma-decoder-fixes"
+source = "renan"
+path = "patches/rexglue-xma-decoder-fixes.patch"
+sha256 = "64cd6ce73498f9c8f6a5b580f1b8077e7467eb83a156b03f2ac25fa1819685c4"
+purpose = "XMA: Canary/Edge decoder fixes (radio), race fixes, audio stats/priority"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "alpha-to-mask-tolerance"
+source = "renan"
+path = "patches/rexglue-alpha-to-mask-tolerance.patch"
+sha256 = "a618dd92858da6d124264312210b18498711d2dec19ab449f8403476302692b9"
+purpose = "Alpha-to-mask threshold tolerance (lattice holes)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "resolve-downscale-unit-layout"
+source = "renan"
+path = "patches/rexglue-resolve-downscale-unit-layout.patch"
+sha256 = "6dc015a3e3557c819ee5b3b17a9c420cb8df7440570435c3a8f5b08a556acb2e"
+purpose = "Resolve downscale unit layout fix (>1x)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "resolve-readback-rules"
+source = "renan"
+path = "patches/rexglue-resolve-readback-rules.patch"
+sha256 = "d367c1b48541c3dc27a237f0a865f54b01d93b9c739153708a47f26a125db74e"
+purpose = "readback_resolve_rules (vinyls)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "resolve-unscaled-copy"
+source = "renan"
+path = "patches/rexglue-resolve-unscaled-copy.patch"
+sha256 = "ea6fb39490d6b0fd0599c652254c814fc5cf7acb65bfe5fff0bb620d8be54696"
+purpose = "Rain at >1x: unscaled copy rules"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "vulkan-odepth-scale"
+source = "renan"
+path = "patches/rexglue-vulkan-odepth-scale.patch"
+sha256 = "9ccdd588e1156f911f5cd47eedbef4c2984a5b2ac348628f27709ef8db774e86"
+purpose = "Vulkan oDepth float24 scale (plate/rear-light smear)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "render-target-max-height"
+source = "renan"
+path = "patches/rexglue-render-target-max-height.patch"
+sha256 = "1dadedb8ecc1c0240ecbc2f9dab521ed224056060ec59966d4293ecade720813"
+purpose = "render_target_max_height (VRAM)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "render-target-trim"
+source = "renan"
+path = "patches/rexglue-render-target-trim.patch"
+sha256 = "a195f4105085d39778376cc3acdcb84f29e0f0f75e9ef5b1a6e7b085fdaeb94f"
+purpose = "render_target_trim_seconds frees unused RTs"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "gpu-memory"
+source = "renan"
+path = "patches/rexglue-gpu-memory.patch"
+sha256 = "f5ab1306a3b36c4ad7b4c06f2d9bff794334bf6859626850d3d00205aafe69f3"
+purpose = "VRAM budget log/pressure (gpu_memory_*)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "d3d12-hoist-shared-memory-uploads"
+source = "renan"
+path = "patches/rexglue-d3d12-hoist-shared-memory-uploads.patch"
+sha256 = "96f59e7f43e2c8bbe65fb67789dbe0510ec91a08635a3118c95449ebe56c0761"
+purpose = "D3D12 uploads hoisted"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "texture-load-direct-unscaled"
+source = "renan"
+path = "patches/rexglue-texture-load-direct-unscaled.patch"
+sha256 = "5d7fdeee8f47f1715270670b70b43559428f61a3b647a421eb79c30a9a794094"
+purpose = "Resolved textures loaded directly at 1x"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "occlusion-queries"
+source = "renan"
+path = "patches/rexglue-occlusion-queries.patch"
+sha256 = "4bdbee542519251f16188208ece1eae9a0f2e01cd3f12642c9664b0c32cb5ce8"
+purpose = "Occlusion queries async (sun glare)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "upstream-storage-flush"
+source = "renan"
+path = "patches/rexglue-upstream-storage-flush.patch"
+sha256 = "d0d0b5a9e6240dc5dff05aed8f5af19068eef4be8f54640cff4e61b0f26d5945"
+purpose = "Upstream: shader/pipeline storage flush fixes"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "upstream-host-fp-state"
+source = "renan"
+path = "patches/rexglue-upstream-host-fp-state.patch"
+sha256 = "938c786360e4dc39171dbef155e449336b11f1e0f72be4dbabca5814c3205419"
+purpose = "Upstream: host threads init MXCSR (x86: zero MXCSR unmasks FP exceptions)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "upstream-linux-wine"
+source = "renan"
+path = "patches/rexglue-upstream-linux-wine.patch"
+sha256 = "b2f3b5b8be8241c466457e9ea9f66f53856905aec5cb9aa12b67181159c4a783"
+purpose = "Upstream: Wine SEC_COMMIT, shm_unlink, RenderDoc attach-only (Windows: RenderDoc no longer loaded)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "upstream-small-fixes"
+source = "renan"
+path = "patches/rexglue-upstream-small-fixes.patch"
+sha256 = "b688e155f4ae31766b963a9157ccffe25c4946fc43a9d3e51d508cbeefa6a79f"
+purpose = "Upstream #503/#490: zero-size profile setting; Vulkan exp-bias word 3"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "codegen-csr-lazy"
+source = "renan"
+path = "patches/rexglue-codegen-csr-lazy.patch"
+sha256 = "3ff4f99c1467eea752b1ebf18ad163db72cbda19430a495c98ab0140daceaa40"
+purpose = "Codegen MXCSR options (off by default)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "affinity-warning-once"
+source = "renan"
+path = "patches/rexglue-affinity-warning-once.patch"
+sha256 = "37a1b5a961b4b5637edb9876096c24aa2ff5424b67c9b3476103d3639a2e9d43"
+purpose = "'Too few cores' warning once"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "d3d12-msaa-line-guard"
+source = "renan"
+path = "patches/rexglue-d3d12-msaa-line-guard.patch"
+sha256 = "cb00ba26c006cbe48d532940099dd1c80222c430b6ffb9a01183bdc49d810ccc"
+purpose = "D3D12 AMD MSAA line guard (flashes)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "dxbc-relative-constant-clamp"
+source = "renan"
+path = "patches/rexglue-dxbc-relative-constant-clamp.patch"
+sha256 = "01ecd71c38cfb4a86498f13942b809937a07ddedc0b7e62b3d80fcb9eb95b301"
+purpose = "DXBC c[a0+n] clamp (DEVICE_HUNG)"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "dxbc-bindless-descriptor-index"
+source = "renan"
+path = "patches/rexglue-dxbc-bindless-descriptor-index.patch"
+sha256 = "e23fd14e82d17e3698a07685b62e2d8c6a686a23059dff47a0e6a6eb86ec9137"
+purpose = "DXBC bindless descriptor index off-by-one"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "saved-game-backup"
+source = "renan"
+path = "patches/rexglue-saved-game-backup.patch"
+sha256 = "21603e7e1853240add43874d2a5cd85ac06f7840c74a321425a7b513ab8376bc"
+purpose = "Save kept until rewrite closes; restored after crash"
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "0001-gapfill-claim-code-after-bctr-tail-calls"
+source = "local"
+path = "patches/sdk/0001-gapfill-claim-code-after-bctr-tail-calls.patch"
+sha256 = "4a99b49c79a431e941fc130173bc09b574db3ed44a8bee34bb1d109dc8afa85f"
+purpose = "Codegen: GapFill claims code after `bctr` tail calls (the 4,066 GapFill-only targets of the MCLA codegen config depend on it). Applies on stock f5337cd too."
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "0100-register-table"
+source = "local"
+path = "patches/sdk/0100-register-table.patch"
+sha256 = "40f5382e7ed93e8339527fa34a4e088b2b0d6a125237873d967de88fc979af24"
+purpose = "Codegen: the generated <project>_register.cpp holds one constant table and a loop instead of ~30k straight-line SetFunction calls (that translation unit took 10+ minutes at -O3). tools/codegen.py reads both forms."
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "0205-xam-dirty-disc-log-flush"
+source = "local"
+path = "patches/sdk/0205-xam-dirty-disc-log-flush.patch"
+sha256 = "a9bce44a413b3e6e892d265f0c798e960d8131d663dd44d82e405e07095ba344"
+purpose = "xam: XamShowDirtyDiscErrorUI logs `[xam] dirty-disc error UI requested (fatal from title)` and calls FlushLogging before exit(1), so the RAGE engine's fatal handler is identifiable in the log."
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "0211-int-cvar-hex-whole-numbers"
+source = "local"
+path = "patches/sdk/0211-int-cvar-hex-whole-numbers.patch"
+sha256 = "e138bd0f8f518fe8f6de2d3aa88a29e7006574ffde46a4ad1a637ca77931dda5"
+purpose = "cvar: INT32/INT64/UINT32/UINT64 cvars read `0x180` as 384 and refuse `12abc` (command line, environment, TOML and SetFlagByName), instead of silently taking 0 or 12."
+subdir = ""
+bucket = "AS-IS"
+
+[[patch]]
+name = "0300-guest-stack-top-below-guard"
+source = "local"
+path = "patches/sdk/0300-guest-stack-top-below-guard.patch"
+sha256 = "cb5bf29c7769a91d3c7e38c26a31e7300f927e1bb35a4edf421f653cb3c7a80f"
+purpose = "XThread::Create: the first guest frame sits 256 B below the top of the stack, over zeros, so a stack walk ends inside the stack instead of in the guard page (the \"safehouse\" freeze)."
+subdir = ""
+bucket = "PORT"
+
+[[patch]]
+name = "0310-xma-cross-buffer-packets"
+source = "local"
+path = "patches/sdk/0310-xma-cross-buffer-packets.patch"
+sha256 = "433ad6de542b669036e25da14c0595b5cacd9611f251c093ba1486edb1a5a99a"
+purpose = "XMA: a packet skip that runs past the end of the current input buffer resolves to packet (index - count) of the other buffer, not that buffer's first packet. Cvar xma_cross_buffer_packets (default true; false = SDK behaviour). Not built before G1: A/B it on the first audio test."
+subdir = ""
+bucket = "PORT"
+
+[[patch]]
+name = "0320-vulkan-no-draw-in-transfer-pass"
+source = "local"
+path = "patches/sdk/0320-vulkan-no-draw-in-transfer-pass.patch"
+sha256 = "78ce444fe6905ac347e5365c6b8fec556637f58377bc0b67b78bac747c642920"
+purpose = "Vulkan with dynamic rendering: the open render pass remembers the transfer destination view it was begun for, so a draw never continues inside an ownership-transfer pass. Matters because Renan's vulkan-hoist-shared-memory-uploads (default on) keeps passes open longer. Not built before G1."
+subdir = ""
+bucket = "PORT"
+
+# Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
+
+[[dropped]]
+name = "ffmpeg-ps5-config"
+source = "renan"
+path = "patches/rexglue-ffmpeg-ps5-config.patch"
+sha256 = "83d4505fefbf5bfeea8117995b80c0681835f848b60ea361dcbd7d9ae9f2f46b"
+subdir = "thirdparty/FFmpeg"
+reason = "FFmpeg config header selected only for __PROSPERO__ (PS5); W0.3: the other patches apply with 0 failures without it"
+
+[[dropped]]
+name = "mingw"
+source = "renan"
+path = "patches/rexglue-mingw.patch"
+sha256 = "414fc9630948bab5f94775c5741a41eb691a9252a2bcfa7416008887a0e2a01a"
+subdir = ""
+reason = "llvm-mingw toolchain support; Renan states the msvc build's output is unchanged by it; W0.3: the other patches apply with 0 failures without it"
+
+[[dropped]]
+name = "ffmpeg-mingw-config"
+source = "renan"
+path = "patches/rexglue-ffmpeg-mingw-config.patch"
+sha256 = "663d51a49fcd4aa083b96b3b0bb0d67ba8803837b2e60bf1120898d03f129acc"
+subdir = "thirdparty/FFmpeg"
+reason = "FFmpeg config.h under __MINGW32__ only; W0.3: the other patches apply with 0 failures without it"

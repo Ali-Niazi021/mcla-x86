@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Tue, 24 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0300: first guest frame 256 bytes below the stack top
+
+Source: $IOS tools/ios/patch_ios_stack_top.py run on ReXGlue f5337cd + the Renan series and captured with git diff
+  (W0.3); its own header kept below
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: XThread::Create: the first guest frame sits 256 B below the top of the stack, over zeros, so a stack walk
+  ends inside the stack instead of in the guard page (the "safehouse" freeze).
+Bucket: PORT
+
+0300-guest-stack-top-below-guard.patch (owner's iOS port: $IOS/tools/ios/patch_ios_stack_top.py, expressed as a git diff)
+
+Purpose. Every guest thread's first frame starts 256 bytes below the top of its stack, over zeros, instead of
+exactly at the guard page: the first frame's back-chain then ends in a 0 inside the stack. Before, a stack walk
+(the main thread's job loop at 823C82F8) followed the back-chain into the guard page above the stack and the
+fault handler retried the read forever ("Unhandled guest access violation: read of guest 0x70190000"): the
+"safehouse" freeze. PCR stack base/end the game sees are unchanged.
+
+Made by running patch_ios_stack_top.py (NFSMW_SDK=<scratch SDK>) on ReXGlue f5337cd + Renan v0.3.17 series and
+capturing git diff. Only XThread::Create is changed (XThread::Restore, the savestate path, is not, as on iOS).
+Licence: GPL-3 (owner's own code). Bucket: PORT (AS-IS logic).
+
+---
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 505e0125..1cd6b7c9 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -411,8 +411,16 @@ X_STATUS XThread::Create() {
+   }
+ 
+   // Create thread state - needed for interrupt callbacks and kernel exports
+-  thread_state_ =
+-      std::make_unique<runtime::ThreadState>(thread_id_, stack_base_, pcr_address_, memory());
++  // LOCAL PATCH - iOS: the first frame 256 bytes below the stack's top, over
++  // zeros, so the back-chain ends inside the stack instead of at the guard
++  // page above it (a stack walk read it forever: the "safehouse" freeze;
++  // tools/ios/patch_ios_stack_top.py).
++  constexpr uint32_t kIosStackTop = 0x100;
++  if (stack_base_) {
++    memory()->Fill(stack_base_ - kIosStackTop, kIosStackTop, 0);
++  }
++  thread_state_ = std::make_unique<runtime::ThreadState>(
++      thread_id_, stack_base_ ? stack_base_ - kIosStackTop : 0, pcr_address_, memory());
+ 
+   REXSYS_NOISY_DEBUG("XThread{:08X} ({:X}) Stack: {:08X}-{:08X}", handle(), thread_id_,
+                      stack_limit_, stack_base_);
