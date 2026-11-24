@@ -7,6 +7,12 @@
 // Named presets (W5.1): `--mcla_profile=1080p` or `900p` (cvar below; "" / "default" = the table below, unchanged)
 // adds a second table on top of the first. Same mechanism, so the command line, the environment and the TOML file
 // still win over every entry, and an entry that names a cvar of the base table replaces its value.
+//
+// Frame-rate target (W4.1): `--mcla_fps_target=60` (cvar below; 0 = the shipped timing, nothing is set) is the whole 60 fps
+// profile in one switch. It is a separate axis from the resolution presets: `--mcla_profile=1080p --mcla_fps_target=60`
+// is M6. It is applied in phase 0 (OnConfigurePaths) so that the host's start-up `[mcla-cap]` line, which is logged
+// before OnPreSetup, already reads the cap; a value that only the TOML file gives (loaded after phase 0) is applied in
+// phase 2, with a note. Same mechanism as everything here: the command line, the environment and the TOML file win.
 #include "pc_profile.h"
 
 #include <cstddef>
@@ -24,6 +30,15 @@ REXCVAR_DEFINE_STRING(mcla_profile, "", "MCLA",
                       "'1080p' = true 1920x1080 internal render (back buffer, video mode, render-target height, "
                       "noaa; needs edram_tiles=4096, which the default profile sets). '900p' = 1600x900 "
                       "(the cheaper fallback: present it scaled to 1080p). Read once, in OnPreSetup")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(mcla_fps_target, 0, "MCLA",
+                     "MCLA frame-rate target preset, applied as app defaults at startup (any cvar given explicitly "
+                     "still wins). 0 = the shipped timing: nothing is set (the guest's present interval 2 holds 30 "
+                     "fps; no host cap, mcla_sim60 off). 30 = locked 30 (mcla_fps_cap=30, the shipped timing). 60 = "
+                     "the 60 fps profile: mcla_sim60=true, mcla_fps_cap=60, the A5 present interval on the guest "
+                     "vblank rate (1 at 60 Hz), k(dt) camera and chassis, Flash movies at 30 Hz, countdown and race "
+                     "clock. 120 is reserved (M7) and is not applied. Independent of mcla_profile (the resolution)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace mcla {
@@ -158,6 +173,67 @@ constexpr Preset kPresets[] = {
      sizeof(k900pDefaults) / sizeof(k900pDefaults[0])},
 };
 
+// ---- frame-rate targets (W4.1) --------------------------------------------------------------------------------
+//
+// What the iOS port's 60 fps profile is: the launcher row "Frame rate: 60" (games/mcla/catalog.cpp:120, kFps60) sets
+// two cvars, `ios_fps_cap=60` (the host's frame cap: here mcla_fps_cap) and `mcla_sim60=true`. The rest is hook
+// defaults that mcla_sim60 switches on by itself (TIMING.md 6): the quantised world step n/60 s with n substeps (T1
+// sim_step, A2 frame_delta), the k(dt) chase camera and chassis (T2/T3, mcla_smoothing_fix), Flash movies held at 30
+// Hz (T4 ui_movie_advance) and the countdown's dt (T5, mcla_ui_30hz), the race clock (T6, mcla_race_clock=retail),
+// the game-thread pacer (mcla_sim_pace), and the A5 present interval (mcla_present_interval=-1 auto: round(guest
+// vblank Hz / 60) = 1). The rows below name all of them, so the profile does not depend on the hooks' defaults and
+// the log lists the whole set.
+//
+// Left out on purpose (iOS only, none of them exists in this build): the battery / thermal cap limit, the renderer's
+// resolution-governor "room" input to the 60 -> 30 rule, the 120 Hz guest-vblank lock of ios_fps_cap=40/120,
+// nfsmw_performance_mode, the 30 fps menu cap. Not touched, by contract (PLAN W4.1, TIMING.md): the reset guard at
+// 0x821BDB08 and r24 at 0x822C2430.
+constexpr CvarDefault kFps30Defaults[] = {
+    // The host limiter at 30 with the shipped timing (mcla_sim60 stays off): M4. src/host/frame_cap.h.
+    {"mcla_fps_cap", "30"},
+};
+
+constexpr CvarDefault kFps60Defaults[] = {
+    // The master switch of every hook of the 60 fps timing (mcla_t_common.h). Source: iOS catalog.cpp:120.
+    {"mcla_sim60", "true"},
+    // The host limiter at the swap. With mcla_sim60 the world's cap follows it (mcla_sim_cap stays 0), and the limiter
+    // runs at min(this, the world's cap): a 60 -> 30 hold lowers both. Source: iOS catalog.cpp:120 (ios_fps_cap);
+    // mcla_t_common.cpp PaceAtSwap; the table in mcla_t_common.h ("on 60 0").
+    {"mcla_fps_cap", "60"},
+    // A5, auto (the hook's own default): the guest's presentation interval 2 is lowered to
+    // round(video_mode_refresh_rate / 60) = 1 on every swap that had an engine-timer frame; loads and logos keep 2.
+    // 0 would switch the hook off and the guest would hold 30 fps. mcla_t_present_interval.cpp.
+    {"mcla_present_interval", "-1"},
+    // The guest vblank rate in Hz, which the A5 hook reads too (interval = round(this / 60)). The SDK default, pinned
+    // so that the interval does not move with an SDK default; 120 belongs to the reserved 120 target (M7). SDK
+    // src/ui/window.cpp (60.0); patch 0400 (the precise vblank runs on the 1/this grid).
+    {"video_mode_refresh_rate", "60"},
+    // T2/T3: chase camera position and look-at, chassis ground depth: k(dt) = 1 - (1 - k30)^(30 dt).
+    {"mcla_smoothing_fix", "true"},
+    // T4/T5: Flash movies (HUD, menus) step 30 times a second; the countdown gets the time since its last step.
+    {"mcla_ui_30hz", "true"},
+    // T6: 0.99 of real time with the fraction carried (the console's 33 ms per 1/30 s).
+    {"mcla_race_clock", "retail"},
+    // The game thread sleeps to an even 1/60 s deadline each frame so n does not flip with the render thread's jitter.
+    {"mcla_sim_pace", "true"},
+};
+
+struct FpsTarget {
+  int fps;              // the value of mcla_fps_target
+  const char* summary;  // for the log
+  const CvarDefault* entries;
+  size_t count;
+};
+
+constexpr FpsTarget kFpsTargets[] = {
+    {30, "locked 30 (M4): the host limiter holds the shipped 1/30 s timing to an even 30 fps", kFps30Defaults,
+     sizeof(kFps30Defaults) / sizeof(kFps30Defaults[0])},
+    {60,
+     "60 fps (M5): world step n/60 s (mcla_sim60) with k(dt) camera and chassis, Flash movies at 30 Hz, countdown and "
+     "race clock corrected, guest present interval 1 on the 60 Hz guest vblank, host limiter at 60",
+     kFps60Defaults, sizeof(kFps60Defaults) / sizeof(kFps60Defaults[0])},
+};
+
 enum class Outcome { kApplied, kMissing, kRejected };
 
 struct Applied {
@@ -231,6 +307,122 @@ std::vector<Applied>& LoggingResults() {
 }
 bool g_logging_phase_ran = false;
 
+// The frame-rate target's entries and the value of mcla_fps_target they were applied for (-1: not applied yet).
+struct FpsPhase {
+  int target = -1;
+  std::vector<Applied> results;
+};
+FpsPhase& FpsApplied() {
+  static FpsPhase phase;
+  return phase;
+}
+
+const FpsTarget* FindFpsTarget(int fps) {
+  for (const FpsTarget& target : kFpsTargets) {
+    if (target.fps == fps) {
+      return &target;
+    }
+  }
+  return nullptr;
+}
+
+// Applies the entries of the target that mcla_fps_target names right now (none for 0 or a value that is no target:
+// LogFpsTarget says which). Nothing is logged here (phase 0 has no log yet).
+void ApplyFpsTarget() {
+  FpsPhase& phase = FpsApplied();
+  phase.target = REXCVAR_GET(mcla_fps_target);
+  phase.results.clear();
+  const FpsTarget* target = FindFpsTarget(phase.target);
+  if (target == nullptr) {
+    return;
+  }
+  const std::string origin = "fps target " + std::to_string(target->fps);
+  for (size_t i = 0; i < target->count; ++i) {
+    phase.results.push_back({&target->entries[i], Apply(target->entries[i]), origin});
+  }
+}
+
+void AddItem(std::string* list, const std::string& item) {
+  if (!list->empty()) {
+    *list += ", ";
+  }
+  *list += item;
+}
+
+// One entry's place in the summary line: what the target set, what somebody else's value kept, what failed.
+void Describe(const Applied& applied, std::string* set, std::string* kept, std::string* problems) {
+  const CvarDefault& entry = *applied.entry;
+  if (applied.outcome == Outcome::kMissing) {
+    AddItem(problems, std::string("MISSING ") + entry.name);
+    return;
+  }
+  if (applied.outcome == Outcome::kRejected) {
+    AddItem(problems, std::string("REJECTED ") + entry.name + "=" + entry.value);
+    return;
+  }
+  const std::string now = std::string(entry.name) + "=" + rex::cvar::GetFlagByName(entry.name);
+  const rex::cvar::Source source = rex::cvar::GetFlagSource(entry.name);
+  if (source == rex::cvar::Source::kDefault) {
+    AddItem(set, now);
+  } else {
+    AddItem(kept, now + " (" + SourceName(source) + "; the target's " + entry.value + ")");
+  }
+}
+
+// Phase 2: the per-entry lines, then ONE `[mcla-profile] fps target N (source): ...` line that lists everything the
+// target set (and what a user value kept). The value may have changed since phase 0: the TOML file is loaded between
+// the two phases, so it is applied now in that case.
+void LogFpsTarget(Tally* tally) {
+  const int target = REXCVAR_GET(mcla_fps_target);
+  const char* source = SourceName(rex::cvar::GetFlagSource("mcla_fps_target"));
+  FpsPhase& phase = FpsApplied();
+  bool late = false;
+  if (phase.target != target) {
+    ApplyFpsTarget();
+    late = true;
+  }
+  if (target == 0) {
+    REXLOG_INFO("[mcla-profile] fps target 0 ({}): the shipped timing, no frame-rate preset (mcla_sim60 and "
+                "mcla_fps_cap keep their own values)",
+                source);
+    return;
+  }
+  const FpsTarget* chosen = FindFpsTarget(target);
+  if (chosen == nullptr) {
+    REXLOG_ERROR("[mcla-profile] error: mcla_fps_target={} ({}) is {} (known: 0, 30, 60); the shipped timing is used",
+                 target, source,
+                 target == 120 ? "reserved for M7 (it needs a 120 Hz guest vblank and the 1/120 world grid)"
+                               : "not a frame-rate target");
+    return;
+  }
+  std::string set, kept, problems;
+  for (const Applied& applied : phase.results) {
+    Log(applied, tally);
+    Describe(applied, &set, &kept, &problems);
+  }
+  std::string line = std::string("[mcla-profile] fps target ") + std::to_string(target) + " (" + source + "): " +
+                     chosen->summary + " | set: " + (set.empty() ? "nothing" : set);
+  if (!kept.empty()) {
+    line += " | user-set, kept: " + kept;
+  }
+  if (!problems.empty()) {
+    line += " | problems: " + problems;
+  }
+  if (late) {
+    line += " | applied in OnPreSetup (the TOML file gave it): the start-up [mcla-cap] line read the shipped values";
+  }
+  if (problems.empty()) {
+    REXLOG_INFO("{}", line);
+  } else {
+    REXLOG_WARN("{}", line);
+  }
+  if (target >= 60 && !rex::cvar::Query<bool>("mcla_sim60")) {
+    REXLOG_WARN("[mcla-profile] mcla_fps_target={} but mcla_sim60 is false: the world keeps the shipped 1/30 s step and "
+                "the guest's present interval 2, so the run is 30 fps and the host limiter never waits",
+                target);
+  }
+}
+
 // The preset named by mcla_profile (nullptr: none), with the log lines that say how it was chosen.
 const Preset* SelectPreset() {
   const std::string name = REXCVAR_GET(mcla_profile);
@@ -272,6 +464,7 @@ void ApplyPcProfileLogging() {
   for (const CvarDefault& entry : kLoggingDefaults) {
     LoggingResults().push_back({&entry, Apply(entry), std::string()});
   }
+  ApplyFpsTarget();
 }
 
 void ApplyPcProfile() {
@@ -303,6 +496,7 @@ void ApplyPcProfile() {
       Log({&entry, Apply(entry), origin}, &tally);
     }
   }
+  LogFpsTarget(&tally);
   REXLOG_INFO("[mcla-profile] {} cvars: {} applied, {} user-set, {} missing, {} rejected",
               tally.applied + tally.user_set + tally.missing + tally.rejected, tally.applied, tally.user_set,
               tally.missing, tally.rejected);
