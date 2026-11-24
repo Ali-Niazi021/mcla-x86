@@ -35,16 +35,20 @@ class Watchdog {
 
   // Starts the sampling thread (no-op if it already runs). Call after the kernel state exists (OnPostSetup).
   void Start();
-  // Stops and joins the thread (no-op if it does not run). Safe to call from any thread but the watchdog's own.
+  // Stops the sampling thread and returns once it has finished. Idempotent and safe to call concurrently from any
+  // threads (OnGuestThreadExit runs on the module thread, OnShutdown on the UI thread): exactly one caller joins, the
+  // others wait for the thread to be gone. A call from the sampling thread itself detaches it instead of joining.
   void Stop();
 
  private:
   void Main();
 
   std::thread thread_;
+  std::thread::id worker_id_;  // the sampling thread's id, to recognise a Stop() from inside it
   std::mutex mutex_;
   std::condition_variable wake_;
   bool stop_ = false;
+  bool running_ = false;  // Start() ran and Main() has not returned yet
 };
 
 }  // namespace mcla_host

@@ -49,15 +49,14 @@ constexpr int kSecondsBetweenHeartbeatLines = 10;
 constexpr uint64_t kFnvOffset = 1469598103934665603ull;
 constexpr uint64_t kFnvPrime = 1099511628211ull;
 
-// Copies guest-visible memory that may be unmapped. Only plain locals here: a function with __try cannot also own
-// objects that need unwinding.
+// Copies guest-visible memory that may be unmapped or decommitted. ReadProcessMemory on the current process is a
+// kernel-side copy: it FAILS (false) on a bad page instead of faulting, so it is atomic with respect to another thread
+// decommitting the page and never reaches the SDK's vectored exception handlers (MMIO, write watch), which must not see
+// a probe. A __try would do neither (and in a TU built without -fasync-exceptions may not catch a fault in an inlined
+// load). Same approach as mcla/hooks/mcla_guest.h.
 bool SafeCopy(void* destination, const void* source, size_t size) {
-  __try {
-    std::memcpy(destination, source, size);
-    return true;
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    return false;
-  }
+  SIZE_T copied = 0;
+  return ReadProcessMemory(GetCurrentProcess(), source, destination, size, &copied) != FALSE && copied == size;
 }
 
 // Big-endian 32-bit word of guest memory at `address`. False if the host page is not readable.
@@ -315,22 +314,39 @@ Watchdog::~Watchdog() {
 
 void Watchdog::Start() {
   std::lock_guard lock(mutex_);
-  if (thread_.joinable()) {
+  if (running_) {
     return;
   }
   stop_ = false;
+  running_ = true;
   thread_ = std::thread([this] { Main(); });
+  worker_id_ = thread_.get_id();
 }
 
 void Watchdog::Stop() {
+  std::thread worker;
+  bool from_worker = false;
   {
     std::lock_guard lock(mutex_);
     stop_ = true;
+    worker = std::move(thread_);  // whoever gets here first owns the join: two join() calls would terminate
+    from_worker = std::this_thread::get_id() == worker_id_;
   }
   wake_.notify_all();
-  if (thread_.joinable()) {
-    thread_.join();
+  if (from_worker) {
+    // Called from the sampling thread itself (nothing does today): it cannot join itself.
+    if (worker.joinable()) {
+      worker.detach();
+    }
+    return;
   }
+  if (worker.joinable()) {
+    worker.join();
+  }
+  // A concurrent Stop() may own the thread and still be joining it: wait for Main to return as well, so that no caller
+  // leaves (and goes on to tear the runtime down) while the watchdog is still sampling.
+  std::unique_lock lock(mutex_);
+  wake_.wait(lock, [this] { return !running_; });
 }
 
 void Watchdog::Main() {
@@ -346,7 +362,12 @@ void Watchdog::Main() {
     Sample(state);
     lock.lock();
   }
+  lock.unlock();
   REXLOG_INFO("[mcla-watchdog] stopped");
+  lock.lock();
+  running_ = false;
+  lock.unlock();
+  wake_.notify_all();
 }
 
 }  // namespace mcla_host
