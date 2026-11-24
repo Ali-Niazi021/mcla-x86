@@ -219,3 +219,26 @@ registers = ["r3", "r31"]
 address = 0x82305430
 name = "mcla_hook_ws_pool_slot"
 registers = ["r4", "r5", "r6", "r7"]
+
+# [W5.1] mcla_ws_edram_limit: sub_82410D70 (the title's create-surface, CreateRenderTarget /
+# CreateDepthStencilSurface), BEFORE `cmplwi cr6,r11,2048` (the end of the surface against the console's
+# 2048 EDRAM tiles; `ble cr6,0x82410E48` follows). r3 = base, r30 = size, r11 = base + size, all in tiles.
+# true = jump to 0x82410E48, the success branch (the surface is owned: `oris r11,r11,0x8000`, base stored)
+# and skip the compare; false = the game's own check runs. Build flag MCLA_HOOK_WS_EDRAM_LIMIT, cvar
+# mcla_ws_edram_limit. mcla/hooks/mcla_ws_edram_limit.cpp
+[[midasm_hook]]
+address = 0x82410E34
+name = "mcla_hook_ws_edram_limit"
+registers = ["r3", "r30", "r11"]
+jump_address_on_true = 0x82410E48
+
+# [W5.1, optional] mcla_ws_single_tile: sub_8217A470 (BeginTiledRendering), BEFORE `addi r11,r7,159` (the
+# first instruction after the tile height / tile count arithmetic at 0x8217A680..0x8217A6FC; the 1x branch
+# `b 0x8217A700` at 0x8217A67C lands here too). r7 = target width, r8 = target height, r18 = the renderer's
+# MSAA mode, r19 = the target's format, r25 / r28 = height / width. Void hook: it may rewrite r7 / r8 and the
+# tile-count word (BE32 0x827D42A4). Build flag MCLA_HOOK_WS_SINGLE_TILE, cvar mcla_ws_single_tile (default
+# off). mcla/hooks/mcla_ws_single_tile.cpp
+[[midasm_hook]]
+address = 0x8217A700
+name = "mcla_hook_ws_single_tile"
+registers = ["r7", "r8", "r18", "r19", "r25", "r28"]
