@@ -44,11 +44,11 @@ Wave 1 (M0 SDK builds, M1 codegen clean + exe links). Wave 0 done except E2 (run
 
 ### Doing
 
-- W0.7 VER: E2, Renan's build on this laptop (cold build running).
+- G1: REV of wave 1 running; SDK build (`prepare_sdk.py build`) running under the heavy lock.
 
 ### Todo
 
-- Wave 1: W1.1 SDK, W1.2 BUILD+HOST, W1.3 GAME, W1.4 TOOLS; then G1 (REV → VER → ORC).
+- G1 VER: codegen baseline + full + gate, both configs, ctest → M0/M1.
 - W0.8 E1 Xenia baseline: waits for Ali.
 
 ### Done
@@ -62,6 +62,13 @@ Wave 1 (M0 SDK builds, M1 codegen clean + exe links). Wave 0 done except E2 (run
 - W0.5 CODEGEN: 8 TOMLs, `codegen.py`, `tools/re/*`; `check_codegen_toml` → `4961 entries, 0 duplicates`;
   `default.pe` SHA-256 `5a9de5cd05f32ae66d2a7fd3b09a569e18239ffa258bb1a0efb9126de1cff319`.
 - W0.6 TESTS: 3 tests + CTest; pass in scratch with Clang 20.1.8 (1113 + 103 + 49 checks).
+- W1.1 SDK: `series.toml` (72 Renan + 7 local), `prepare_sdk.py`; fetch+apply → `series 79/79 applied, 0 drifted`,
+  fingerprint `b973b0ae1c8e04ed`.
+- W1.2 BUILD+HOST: presets, CMake, `src/host` (scripted pad is a synthetic `InputDriver`: SDL3 is static and private
+  inside `rexruntime.dll`).
+- W1.3 GAME: 56/56 hook symbols defined with the declared signatures; PC profile (13 cvars).
+- W1.4 TOOLS: `run_game.py`, 5 flows.
+- W0.7 VER (E2): Renan's build, cold 450 s / 9.2 GB. **D1 fails** (see Decisions).
 - G0: pass (see Milestones).
 
 ## Ownership in force
@@ -76,8 +83,8 @@ PLAN §7.2. Shared contracts for wave 1:
 
 ## Next actions
 
-1. Wave 1 implementers (4 IMP) + REV of wave 0.
-2. G1: VER runs `prepare_sdk.py fetch apply build`, codegen baseline + full + gate, both configs, ctest.
+1. G1 (VER) once the SDK build and REV are in.
+2. Wave 2 (M2/M3) with W2.2 bench port in parallel. Because D1 failed, pull GPU levers (W5.2–W5.4) into wave 3.
 
 ## Decisions changed since PLAN
 
@@ -103,3 +110,10 @@ PLAN §7.2. Shared contracts for wave 1:
 - **LARecomp-derived fixes inside Renan's game layer** (car-shader-bind, warp, checkpoint) are re-implemented from
   addresses if needed, never copied.
 - **`run_game.py` passes** `--cache_root=$WORK/user/cache` so shader storage survives fresh per-run user dirs.
+- **D1 (E2) failed: the 880M is GPU-bound.** Renan's build: D3D12 720p uncapped 69.6 fps (GPU 100 %), Vulkan 58.1;
+  1440p (2x) 24.8, FSR-1080p 22.2; 720p cap 60 holds (p99 17.9 ms, GPU 87 %). Per PLAN D1: GPU levers (W5.2–W5.4,
+  `mcla_noaa` first) move into wave 3, and PLAN §3.8 fallback 1 (1600x900 + FSR1/CAS) is the expected 1080p path.
+  True 1920x1080 stays the first thing measured in E4, with `noaa`.
+- **Default API: D3D12** (beat Vulkan by 20 % at 720p in E2, against PLAN §3.5's Vulkan prior). E3 still runs at M5.
+- **Scripted pad = synthetic `rex::input::InputDriver`** (SDL3 lives statically inside `rexruntime.dll` with no
+  exports), not an SDL virtual joystick (PLAN §3.6, §4.1).
