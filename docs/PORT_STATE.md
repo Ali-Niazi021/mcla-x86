@@ -24,15 +24,15 @@ Owner: ORC. The plan is [PLAN.md](PLAN.md); this file tracks where execution sta
 
 ## Current phase
 
-Wave 1 (M0 SDK builds, M1 codegen clean + exe links). Wave 0 done except E2 (running).
+Wave 2 (M2 title screen, M3 free roam + soak). Waves 0–1 done.
 
 ## Milestones
 
 | ID | Goal | Status | Date |
 |---|---|---|---|
 | G0 | Game dump gate | **pass**: `OK default.xex sha256=c386f400…a432 title=545407F8 media=5940C9DB version=8 disc=1/1`; `extracted 12 files, 6561615524 bytes` → `$GAME/game` | 2026-11-24 |
-| M0 | SDK builds | todo | |
-| M1 | Codegen clean, exe links, tests pass | todo | |
+| M0 | SDK builds | **pass**: `series 79/79 applied, 0 drifted`, fingerprint `b973b0ae1c8e04ed`, built with clang 20.1.8 in 4 min; `rexglue.exe --help` exit 0 | 2026-11-24 |
+| M1 | Codegen clean, exe links, tests pass | **pass**: `codegen ok: cpp=121 functions=30204 unresolved=0 fingerprint=da9ab3c2…`; `gate: high 0 medium 0`; RelWithDebInfo 62 s, Release 68 s, 0 warnings; `100% tests passed` (3/3) | 2026-11-24 |
 | M2 | Title screen | todo | |
 | M3 | Free-roam driving, 10 min soak | todo | |
 | M4 | Locked 30 fps at 720p | todo | |
@@ -44,11 +44,12 @@ Wave 1 (M0 SDK builds, M1 codegen clean + exe links). Wave 0 done except E2 (run
 
 ### Doing
 
-- G1: REV of wave 1 running; SDK build (`prepare_sdk.py build`) running under the heavy lock.
+- W1 fix: HOST watchdog (`ReadProcessMemory` instead of `__try`; thread-safe `Stop`).
+- W2.2 TOOLS: `bench.py`.
 
 ### Todo
 
-- G1 VER: codegen baseline + full + gate, both configs, ctest → M0/M1.
+- W2.1 VER: `title_to_menu` (M2), `new_profile_to_freeroam`, fixture `after_intro`, 10 min soak, parity shots (M3).
 - W0.8 E1 Xenia baseline: waits for Ali.
 
 ### Done
