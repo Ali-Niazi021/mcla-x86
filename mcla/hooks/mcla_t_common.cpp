@@ -30,6 +30,7 @@
 #include "mcla_guest.h"
 #include "mcla_hooks.h"
 #include "mcla_t_common.h"
+#include "frame_cap.h"
 
 REXCVAR_DEFINE_BOOL(mcla_sim60, false, "MCLA",
                     "MCLA 60 fps timing master switch (docs/mcla/TIMING.md). Off (default) = the game's "
@@ -46,13 +47,15 @@ REXCVAR_DEFINE_INT32(mcla_physics_substeps, 0, "MCLA",
                      "physics step stays the shipped 1/60 s), 1..4 = always that many (2 at n = 1 runs "
                      "physics at 120 Hz like MCLA-4iOS). Never 0 substeps: no wheels");
 REXCVAR_DEFINE_INT32(mcla_sim_cap, 0, "MCLA",
-                     "MCLA timing: the frame cap the world assumes with mcla_sim60: 30, 60 or 120. 0 = none "
-                     "known = 60 (n follows the real frame time). --mcla_sim_cap=30 checks that 30 equals the "
-                     "shipped timing");
+                     "MCLA timing: the frame cap the world assumes with mcla_sim60: 30, 60 or 120. 0 = the host's cap "
+                     "(mcla_fps_cap); when that is 0 too = none known = 60 (n follows the real frame time). A value "
+                     "here wins over mcla_fps_cap for the world (and lowers the host limiter to it, never raises it). "
+                     "--mcla_sim_cap=30 checks that 30 equals the shipped timing");
 REXCVAR_DEFINE_BOOL(mcla_sim_pace, true, "MCLA",
                     "MCLA timing: with mcla_sim60 the game thread sleeps to an even frame deadline "
                     "(1/60 s, 1/30 s at a 30 cap) at the start of every engine frame, so n does not "
-                    "flip with the render thread's jitter. false = the swap-side cap alone");
+                    "flip with the render thread's jitter. false = the host's swap-side limiter alone "
+                    "(mcla_fps_cap)");
 REXCVAR_DEFINE_INT32(mcla_sim_hold30_s, 30, "MCLA",
                      "MCLA timing: at a cap of 60, when more than 10% of the frames of a log window needed "
                      "n >= 2 the world holds a 30 fps cap for this many seconds (a steady 30 beats a 40-50 "
@@ -173,7 +176,11 @@ rex::memory::Memory* GuestMemory() {
   return kernel ? kernel->memory() : nullptr;
 }
 
-int SettingCap() { return REXCVAR_GET(mcla_sim_cap); }
+// The cap the world assumes: mcla_sim_cap when set, else the host's frame cap (mcla_fps_cap), else 0 = none known.
+int SettingCap() {
+  const int sim_cap = REXCVAR_GET(mcla_sim_cap);
+  return sim_cap != 0 ? sim_cap : mcla_host::FrameCapSetting();
+}
 
 double GuestTickFrequency() {
   static const double frequency = double(rex::chrono::Clock::guest_tick_frequency());
@@ -363,56 +370,19 @@ void DecideHold(int64_t now_ns) {
 // ---- the pacer's sleep ---------------------------------------------------------------------------
 
 // The pacer holds the game thread to an even frame grid (16.67 ms at 60, 8.33 ms at 120). A plain Sleep() ends on
-// the system timer tick (15.6 ms; 1 ms once the host called timeBeginPeriod), far too coarse for that. A
-// high-resolution waitable timer (Windows 10 1803 and later) covers all but the last kSpinTailNs; that tail is
-// spun on the clock with a pause per lap, so the thread wakes within a few tens of microseconds of the deadline
-// for about 2 % of a core at 60 fps.
-constexpr int64_t kSpinTailNs = 300'000;
-
-#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
-#endif
-
+// the system timer tick (15.6 ms; 1 ms once the host called timeBeginPeriod), far too coarse for that: the host's
+// precise sleep (src/host/win32_time.h) waits on a high-resolution waitable timer for all but the last
+// mcla_fps_cap_tail_us and spins the tail on QPC.
 int64_t SteadyNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
 
-// One timer per thread that paces (in practice the game thread), closed with the thread.
-struct PaceTimer {
-  HANDLE handle = nullptr;
-  PaceTimer() {
-    handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    if (!handle) {
-      REXLOG_WARN("[mcla-sim] no high-resolution waitable timer (error {}): the pacer sleeps in whole milliseconds",
-                  GetLastError());
-    }
-  }
-  ~PaceTimer() {
-    if (handle) CloseHandle(handle);
-  }
-  PaceTimer(const PaceTimer&) = delete;
-  PaceTimer& operator=(const PaceTimer&) = delete;
-};
-
 // Sleeps the calling thread until `deadline_ns` on the steady clock (the clock OnFrameStart's `now_ns` is read from).
 void SleepUntil(int64_t deadline_ns) {
-  thread_local PaceTimer timer;
   const int64_t remaining_ns = deadline_ns - SteadyNs();
-  if (remaining_ns > kSpinTailNs) {
-    const int64_t wait_ns = remaining_ns - kSpinTailNs;
-    if (timer.handle) {
-      LARGE_INTEGER due;
-      due.QuadPart = -std::max<int64_t>(1, wait_ns / 100);  // relative, in 100 ns units
-      if (SetWaitableTimer(timer.handle, &due, 0, nullptr, nullptr, FALSE)) {
-        WaitForSingleObject(timer.handle, INFINITE);
-      }
-    } else {
-      Sleep(DWORD(wait_ns / 1'000'000));  // whole milliseconds, rounded down: never past the deadline by design
-    }
-  }
-  while (SteadyNs() < deadline_ns) {
-    YieldProcessor();
+  if (remaining_ns > 0) {
+    mcla_host::PreciseSleepFor(double(remaining_ns) * 1e-9, mcla_host::PacerSpinTailSeconds());
   }
 }
 
@@ -486,6 +456,24 @@ int EffectiveCap() {
   return cap;
 }
 
+int HostCapSetting() { return mcla_host::FrameCapSetting(); }
+
+void PaceAtSwap() {
+  int fps = mcla_host::FrameCapSetting();
+  if (fps <= 0) {
+    return;  // no host limiter (mcla_fps_cap 0, the shipped run): the swap is untouched
+  }
+  if (Enabled()) {
+    // The limiter follows the world: a 60 -> 30 hold, a 120 -> 60 tier or an explicit mcla_sim_cap lowers it, so the
+    // frames the world steps for 1/30 s are not released every 1/60 s. It is never raised above mcla_fps_cap.
+    const int world = EffectiveCap();
+    if (world > 0 && world < fps) {
+      fps = world;
+    }
+  }
+  mcla_host::PaceAtSwap(fps);
+}
+
 void NoteRawDelta(double ms) { t_raw_ms = std::clamp(ms, 0.0, kMaxRawMs); }
 
 int NextStep(int* substeps, int* quantum_hz) {
@@ -557,9 +545,9 @@ void OnFrameStart(int64_t now_ns) {
       g_deadline_ns = 0;
       ResetWindow(now_ns);
       REXLOG_INFO("[mcla-sim] on: world step n/60 s (n = 1..4) with n substeps (above a 60 cap: n/120 s, n = 1..8, "
-                  "ceil(n/2) substeps); cap {} (mcla_sim_cap {}), "
+                  "ceil(n/2) substeps); cap {} (mcla_sim_cap {}, mcla_fps_cap {}), "
                   "pacer {}, force_n {}, substeps {}",
-                  EffectiveCap() > 0 ? EffectiveCap() : 60, REXCVAR_GET(mcla_sim_cap),
+                  EffectiveCap() > 0 ? EffectiveCap() : 60, REXCVAR_GET(mcla_sim_cap), HostCapSetting(),
                   REXCVAR_GET(mcla_sim_pace) ? "on" : "off", REXCVAR_GET(mcla_sim_force_n),
                   REXCVAR_GET(mcla_physics_substeps) ? std::to_string(REXCVAR_GET(mcla_physics_substeps))
                                                       : std::string("auto"));

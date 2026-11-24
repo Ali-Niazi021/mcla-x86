@@ -8,10 +8,30 @@
 // physics step stays 1/60 s), and the per-frame systems that assume 30 updates a second are corrected
 // (camera and chassis smoothing, Flash movie steps, the race-start countdown, the race clock).
 //
-// The frame rate IS the cap: `mcla_sim_cap` (30, 60 or 120; 0 = none known = 60, the world follows the
-// real frame time). The host's frame limiter sits at the swap (the PC host, W3.3); the pacer below
-// sleeps the game thread to the cap's even deadline. mcla_sim60 needs a cap of 60 to be worth
-// anything; at a cap of 30 every hook returns what the game computed (the run equals the shipped one,
+// THE FRAME CAP. The frame rate IS the cap, and two cvars name it (W3.3):
+//
+//   mcla_fps_cap  (host, src/host/frame_cap.h; 0, 30, 60, 120; default 0)  the HOST limiter: holds every guest swap
+//                 to an even grid (high-resolution timer + QPC spin tail), from PaceAtSwap() below. 0 = no limiter,
+//                 the shipped run: the guest's present interval and vblank pace the game.
+//   mcla_sim_cap  (here; 0, 30, 60, 120; default 0)  the cap the WORLD assumes with mcla_sim60: the quantiser's
+//                 grid, the game-thread pacer, the present interval. 0 = follow mcla_fps_cap; if that is 0 too, 60
+//                 (none known: the world follows the real frame time).
+//
+//   mcla_sim60  mcla_fps_cap  mcla_sim_cap  world cap      host limiter    the run
+//   off         0             any           (unused)       none            as shipped (present interval 2)
+//   off         30            any           (unused)       30              M4: locked 30, the shipped timing
+//   off         60 or 120     any           (unused)       never waits     as shipped: 30 (without sim60 only 30 is
+//                                                                          a valid cap; the step is a fixed 1/30 s)
+//   on          0             0             60 (unknown)   none            M5 minimum: pacer + vblank hold 60
+//   on          60            0             60             60              M5: sim60 + cap 60
+//   on          30            0             30             30              the shipped timing, quantised
+//   on          120           0             120 (1/120)    120             P1 grid, needs a 120 Hz guest vblank
+//   on          X             Y             Y              min(X, world)   Y overrides the world's cap (diagnostic)
+//
+// The limiter's rate is mcla_fps_cap lowered to EffectiveCap() while mcla_sim60 is on: the 60 -> 30 hold and the
+// 120 -> 60 tier lower it for their duration, and it is never raised. It runs on the thread that presents, from the
+// swap hook (mcla_t_present_interval.cpp), so with mcla_sim_pace=false the swap-side limiter holds the rate alone. A
+// cap of 30 under mcla_sim60 makes every hook return what the game computed (the run equals the shipped one,
 // `[mcla-sim]` reads n2 only).
 #pragma once
 
@@ -85,10 +105,17 @@ bool WriteU32(uint32_t address, uint32_t value);  // guarded store: false if the
 bool SetSubsteps(int count);
 
 // ---- the frame (heartbeat, A2, T1)
-// The frame cap the world runs at: `mcla_sim_cap` (0 = none known: 60, so n follows the real frame
-// time; the host's own frame cap is fed in by W3.3); 30 while the missed-frames hold is on; 60 while a
-// 120 cap is held at 60 (P1). Above 60 the world runs on the 1/120 grid (TIMING.md section 15).
+// The frame cap the world runs at: `mcla_sim_cap`, else the host's cap `mcla_fps_cap`, else 0 = none known (60, so n
+// follows the real frame time); 30 while the missed-frames hold is on; 60 while a 120 cap is held at 60 (P1).
+// Above 60 the world runs on the 1/120 grid (TIMING.md section 15).
 int EffectiveCap();
+// mcla_fps_cap as the host understands it: 0 (no host limiter), 30, 60 or 120.
+int HostCapSetting();
+// The host's frame limiter (W3.3, src/host/frame_cap.h): holds the calling thread's swap to the grid of
+// min(mcla_fps_cap, EffectiveCap() with mcla_sim60 on), then returns. Called once per guest swap, on the thread that
+// presents, from the present-interval hook (mcla_t_present_interval.cpp), before the swap packet is written. Without
+// a host cap (mcla_fps_cap 0) it is one cvar read and returns at once.
+void PaceAtSwap();
 // A2: the real time of the frame that is starting, in ms, already clamped (thread-local hand-off to
 // the T1 call of the same Update).
 void NoteRawDelta(double ms);

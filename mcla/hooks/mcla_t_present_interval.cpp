@@ -30,10 +30,16 @@
 // Swaps with no engine-timer frame since the previous swap (legals, logos, blocking loads: TIMING 4.5)
 // keep the shipped 2, otherwise those loops would run at double speed.
 //
+// Frame cap (W3.3): the same site is where the host holds the frame rate, because it runs on the thread that presents,
+// once per swap, before the swap packet is written, and the SDK has no swap callback of its own. The first thing the
+// hook does, whatever the interval mode, is mcla::sim::PaceAtSwap() (mcla_t_common.cpp): with --mcla_fps_cap=30|60|120
+// it holds the swap to that grid (src/host/frame_cap.h), with the default 0 it returns at once. The idea and the site
+// are Renan Queiroz's mcla-recomp (GPL-3, src/frame_timing.cpp:848-863, config/frame_timing.toml:41-47).
+//
 // Guest vblank rate: the SDK's video_mode_refresh_rate cvar (60 Hz unless set).
 //
 // Off: --mcla_present_interval=0 (always the game's 2), --mcla_sim60=false (default, auto mode), or
-// MCLA_HOOK_SIM_PRESENT_INTERVAL=0 at build time.
+// MCLA_HOOK_SIM_PRESENT_INTERVAL=0 at build time (which also removes the frame cap: no swap hook, no limiter).
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -60,7 +66,7 @@ mcla::hooks::Registration g_registration(
     "present-interval", "mcla_present_interval", MCLA_HOOK_SIM_PRESENT_INTERVAL != 0,
     [] {
       const int32_t mode = REXCVAR_GET(mcla_present_interval);
-      return mode > 0 || (mode < 0 && mcla::sim::Enabled());
+      return mode > 0 || (mode < 0 && mcla::sim::Enabled()) || mcla::sim::HostCapSetting() > 0;
     },
     /*default_on=*/false);
 
@@ -112,6 +118,8 @@ void Report(int64_t now_ns, double vblank_hz, int cap) {
 
 void mcla_hook_present_interval(PPCRegister& r11) {
   MCLA_HOOK_ENTER();
+  // The host frame cap first: it only waits (mcla_fps_cap > 0) and never touches r11.
+  mcla::sim::PaceAtSwap();
   const int32_t mode = REXCVAR_GET(mcla_present_interval);
   if (mode == 0) {
     return;

@@ -107,6 +107,10 @@ bool HighResolutionTimerAvailable() {
   return CurrentThreadTimer().high_resolution;
 }
 
+bool WaitableTimerAvailable() {
+  return CurrentThreadTimer().handle != nullptr;
+}
+
 void SleepUntilQpc(uint64_t target_qpc, double spin_tail_seconds) {
   ThreadTimer& timer = CurrentThreadTimer();
   const double tail_seconds =
@@ -138,6 +142,12 @@ void SleepUntilQpc(uint64_t target_qpc, double spin_tail_seconds) {
 
 void PreciseSleepFor(double seconds, double spin_tail_seconds) {
   SleepUntilQpc(QpcNow() + SecondsToQpc(seconds), spin_tail_seconds);
+}
+
+void SpinUntilQpc(uint64_t target_qpc) {
+  while (QpcNow() < target_qpc) {
+    YieldProcessor();
+  }
 }
 
 }  // namespace mcla_host

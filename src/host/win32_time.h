@@ -38,11 +38,18 @@ inline constexpr double kDefaultSpinTailSeconds = 0.0004;
 // the timer fires on the system timer grid (1 ms after BeginTimerResolution(1)) and the spin tail is widened to 2 ms.
 bool HighResolutionTimerAvailable();
 
+// True if a waitable timer of any kind exists for this thread. Without one SleepUntilQpc spins for the whole wait.
+bool WaitableTimerAvailable();
+
 // Returns once QpcNow() >= target_qpc. Waits on a per-thread high-resolution waitable timer until `spin_tail_seconds`
 // before the target, then spins (YieldProcessor). Never returns early; returns at once if the target has passed.
 void SleepUntilQpc(uint64_t target_qpc, double spin_tail_seconds = kDefaultSpinTailSeconds);
 
 // SleepUntilQpc(QpcNow() + seconds).
 void PreciseSleepFor(double seconds, double spin_tail_seconds = kDefaultSpinTailSeconds);
+
+// Returns once QpcNow() >= target_qpc, spinning (YieldProcessor) the whole time: a core is busy until then. The
+// frame cap's `mode=spin` (mcla_fps_cap_spin) and the fallback of a thread with no waitable timer.
+void SpinUntilQpc(uint64_t target_qpc);
 
 }  // namespace mcla_host

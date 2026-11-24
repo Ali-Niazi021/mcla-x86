@@ -29,6 +29,7 @@
 #include <rex/version.h>
 
 #include "pc_profile.h"  // mcla/profile (GAME slice): mcla::ApplyPcProfileLogging(), mcla::ApplyPcProfile()
+#include "frame_cap.h"
 #include "win32_time.h"
 
 // Fingerprint of the SDK patch series this build was linked against (CMake: md5 of .mcla-x86/series.applied).
@@ -51,6 +52,22 @@ REXCVAR_DEFINE_BOOL(mcla_watchdog, true, "MCLA",
                     "Hang watchdog: dumps every guest thread to the log when nothing moves any more. It also writes "
                     "the '[mcla-heartbeat] frames=<n>' line every 10 s that tools/run_game.py reads, so leave it on "
                     "for scripted runs");
+
+// The frame cap (frame_cap.h, W3.3). The limiter itself is called from the game layer, at the guest's swap.
+REXCVAR_DEFINE_INT32(mcla_fps_cap, 0, "MCLA",
+                     "Host frame cap at the guest's swap: 0 = none (shipped: the guest's present interval and vblank "
+                     "pace the game), 30, 60 or 120. With --mcla_sim60=true it is also the cap the world assumes "
+                     "(unless mcla_sim_cap says otherwise); without it only 30 is meaningful (the shipped step is "
+                     "1/30 s). 120 needs --video_mode_refresh_rate=120. Live")
+    .range(0, 240);
+REXCVAR_DEFINE_BOOL(mcla_fps_cap_spin, false, "MCLA",
+                    "Frame cap: wait by spinning on the clock alone (log mode=spin) instead of a high-resolution "
+                    "timer plus a short spin. Burns a core; for A/B of the timer's precision. Live");
+REXCVAR_DEFINE_INT32(mcla_fps_cap_tail_us, 1000, "MCLA",
+                     "Frame cap and sim pacer: microseconds at the end of every wait that are spun after the timer "
+                     "wakes (the high-resolution timer wakes late by up to ~0.8 ms with a short tail; 1000 us "
+                     "measured p99 lateness 0.1 ms). Larger = more even frames, more CPU. Live")
+    .range(100, 4000);
 
 namespace {
 
@@ -135,6 +152,7 @@ void McLaApp::OnPostInitLogging() {
   if (!timer_throttling_opt_out_) {
     REXLOG_WARN("[mcla] could not opt out of timer-resolution throttling (error {})", timer_throttling_error_);
   }
+  mcla_host::LogFrameCapStartup();
 
   if (!input_error_.empty()) {
     // OnConfigurePaths could not read or parse the script: nothing has started yet, fail at once (exit 2, the code the

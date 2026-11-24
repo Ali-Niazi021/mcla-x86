@@ -5,14 +5,15 @@
 //
 //   OnConfigurePaths   timer resolution (1 ms, kept while the window is hidden), log cvars of the PC profile
 //                      (the log is created right after this hook), --input-file parsing
-//   OnPostInitLogging  start-up banner
+//   OnPostInitLogging  start-up banner, the frame cap line ([mcla-cap], frame_cap.h)
 //   OnPreSetup         input system (scripted pad, every pad is player 1), the GPU plugin loaded with the backend
 //                      of --mcla_gpu_backend, the PC profile of cvar defaults (the GPU cvars must be set before the
 //                      plugin's Runtime::Setup reads them: edram_tiles, render_target_max_height)
 //   OnPostSetup        hang watchdog, input script clock
 //   OnShutdown         stops both, gives the timer resolution back
 //
-// Host cvars: mcla_gpu_backend (d3d12 | vulkan | any), mcla_watchdog (bool). Both in mcla_app.cpp.
+// Host cvars, all in mcla_app.cpp: mcla_gpu_backend (d3d12 | vulkan | any), mcla_watchdog (bool), and the frame cap's
+// mcla_fps_cap (0 | 30 | 60 | 120), mcla_fps_cap_spin, mcla_fps_cap_tail_us (frame_cap.h explains the limiter).
 #pragma once
 
 #include <cstdint>
