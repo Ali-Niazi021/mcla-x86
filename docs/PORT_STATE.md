@@ -24,7 +24,7 @@ Owner: ORC. The plan is [PLAN.md](PLAN.md); this file tracks where execution sta
 
 ## Current phase
 
-Wave 2 (M2 title screen, M3 free roam + soak). Waves 0–1 done.
+Wave 3 (M4 locked 30, timing infrastructure, CPU levers), with the 1080p work (W5.1/W5.2) pulled forward after D1.
 
 ## Milestones
 
@@ -33,8 +33,8 @@ Wave 2 (M2 title screen, M3 free roam + soak). Waves 0–1 done.
 | G0 | Game dump gate | **pass**: `OK default.xex sha256=c386f400…a432 title=545407F8 media=5940C9DB version=8 disc=1/1`; `extracted 12 files, 6561615524 bytes` → `$GAME/game` | 2026-11-24 |
 | M0 | SDK builds | **pass**: `series 79/79 applied, 0 drifted`, fingerprint `b973b0ae1c8e04ed`, built with clang 20.1.8 in 4 min; `rexglue.exe --help` exit 0 | 2026-11-24 |
 | M1 | Codegen clean, exe links, tests pass | **pass**: `codegen ok: cpp=121 functions=30204 unresolved=0 fingerprint=da9ab3c2…`; `gate: high 0 medium 0`; RelWithDebInfo 62 s, Release 68 s, 0 warnings; `100% tests passed` (3/3) | 2026-11-24 |
-| M2 | Title screen | todo | |
-| M3 | Free-roam driving, 10 min soak | todo | |
+| M2 | Title screen | **pass** (b2.1, D3D12): `first engine frame` t+4.4 s, `Startup/Startup_Checks` t+30.6 s, 13/13 profile cvars, `fatal=0 unregistered=0`; title visible; audio endpoint opened. Owner check (audible music/SFX) pending | 2026-11-24 |
+| M3 | Free-roam driving, 10 min soak | **pass** (b2.1): new profile → `cutscene -> free-roam` 136.9 s, save-backup lines ×2, drove 52 mph, pause open/close; fixture `after_intro`; 600 s soak `fatal=0` (run w2.1-m3c); parity with E2: cars coloured, no missing geometry/flashes. Owner check (radio balance) pending | 2026-11-24 |
 | M4 | Locked 30 fps at 720p | todo | |
 | M5 | 60 fps at 720p | todo | |
 | M6 | 60 fps at 1080p on the 880M | todo | |
@@ -44,12 +44,15 @@ Wave 2 (M2 title screen, M3 free roam + soak). Waves 0–1 done.
 
 ### Doing
 
-- W1 fix: HOST watchdog (`ReadProcessMemory` instead of `__try`; thread-safe `Stop`).
-- W2.2 TOOLS: `bench.py`.
+- W3.3 HOST+GAME: host frame cap `mcla_fps_cap`, paced at `mcla_hook_present_interval`.
+- W5.1 GAME: W x H widescreen (`mcla_scene_height`, up to 1920x1080), EDRAM-limit hook body, 1080p/900p profiles.
+- TOOLS fix: flow re-timing for x86, PrintWindow screenshots, keep display awake.
 
 ### Todo
 
-- W2.1 VER: `title_to_menu` (M2), `new_profile_to_freeroam`, fixture `after_intro`, 10 min soak, parity shots (M3).
+- SDK rebuild with 0400/0410/0420 (series 82, fingerprint `cfeae5d95249d70a`), then W3.4 VER: M4 bench + CPU-lever A/B.
+- CODEGEN: TOML entry for the EDRAM-limit hook at `0x82410E34` (spec from W5.1).
+- GAME (low): skip-intro hook causes 3 boot-time `Resolve region is empty` / `PM4_DRAW_INDX_2 … Failed in backend` errors.
 - W0.8 E1 Xenia baseline: waits for Ali.
 
 ### Done
@@ -57,6 +60,9 @@ Wave 2 (M2 title screen, M3 free roam + soak). Waves 0–1 done.
 - W0.0 ORC: `$WORK` tree, PORT_STATE/LEARNINGS skeletons, role files in `.omp/agents/` (local only).
 - W0.1 VER: LLVM 20.1.8 (gpg-verified), PresentMon 2.6.0, Xenia Canary `02d2cb5` in `$WORK/toolchain`; env in BUILDS.md.
 - W0.2 TOOLS: `xiso.py`, `guard_no_game_data.py` + `.githooks/pre-commit` (`core.hooksPath` set), `heavy_lock.py`.
+- W2.1 VER: M2 + M3 pass (runs w2.1-m2a/m2b/m3a/m3b/m3c); fixture `$WORK/fixtures/after_intro`.
+- W2.2 TOOLS: `bench.py` (PresentMon by PID, QPC alignment, `--gate m4|m5`).
+- W3.2/W5.2 SDK: patches 0400 (precise guest vblank), 0410 (`nfsmw_cp_event_seq` export), 0420 (MmQueryAllocationSize).
 - W0.3 RES: Renan's 75 apply clean in `make_pc.ps1` order; drop 3; 7 owner patches apply on top
   (`$WORK/scratch/W0.3/REPORT.md`, `owner-patches/`).
 - W0.4 RES: PC cvar table, host responsibilities, hook overlap (`$WORK/scratch/W0.4/REPORT.md`).
