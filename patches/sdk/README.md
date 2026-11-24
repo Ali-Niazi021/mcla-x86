@@ -21,7 +21,7 @@ everything before the first `diff --git`. The diff bytes are LF and exact (`.git
   was applied is never re-applied on top of the old one: `status` reports it as drifted.
 - **New patches go last**, so the record in `$WORK/sdk/src/.mcla-x86/series.applied` stays a prefix and `apply` only
   adds. Wave 3 added its Windows patches after `0320`: `0400` (cvars `guest_vblank_precise`, `guest_vblank_spin_us`; log
-  line `[guest-vblank] period p50=.. p99=.. late=.. resync=.. n=..` every 10 s), `0410` (the data symbol
+  line `[guest-vblank] period p50=.. p99=.. late=.. resync=.. early=.. n=..` every 10 s), `0410` (the data symbol
   `nfsmw_cp_event_seq` exported by `rexgpu-xenos.dll`), `0420` (cvar `mm_query_allocation_size_from_address`).
 - **Renan's pin** changes only by editing `[pins]` and every Renan SHA-256 together; his patches apply in his order.
 - `status` prints `sdk f5337cd: series <applied>/<total> applied, <k> drifted` and `series fingerprint <hex16>`. The

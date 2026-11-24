@@ -8,10 +8,11 @@ Source: Ours, written for this SDK (W3.2). The idea (absolute grid, a precise wa
   Mach real-time threads and os_sync)
 Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
 Purpose: Windows: the guest vblank thread fires on an absolute grid of 1/video_mode_refresh_rate seconds from a QPC
-  origin (high-resolution waitable timer to ~0.3 ms before each point, QPC spin for the rest), at MMCSS "Games" and
-  time-critical priority; a vblank over one period late resyncs the grid (no burst); one
-  `[guest-vblank] period p50=.. p99=.. late=.. resync=.. n=..` line every 10 s. Cvars guest_vblank_precise (true),
-  guest_vblank_spin_us (300). vsync=false keeps the SDK loop (warns once). Not built before the first W3 build.
+  origin (high-resolution waitable timer to ~0.3 ms before each point, QPC spin for the rest), in MMCSS "Games" at
+  time-critical priority while it waits and at above-normal while the game's interrupt callback runs (MarkVblank); a
+  vblank over one period late resyncs the grid (no burst); one
+  `[guest-vblank] period p50=.. p99=.. late=.. resync=.. early=.. n=..` line every 10 s. Cvars guest_vblank_precise
+  (true), guest_vblank_spin_us (300). vsync=false keeps the SDK loop (warns once). Not built before the first W3 build.
 Bucket: REDO
 
 0400-guest-vblank-precise-win32.patch (mcla-x86 W3.2; redoes the idea of $IOS 0208/0209 for Windows)
@@ -32,18 +33,30 @@ Change (src/graphics/graphics_system.cpp, Windows only; the other platforms' cod
   * Late handling: a vblank that is less than one period late fires at once and the grid stays (the next point is on
     time); more than one period late re-anchors the grid on now and fires once (resync counted), the missed vblanks
     are never replayed. The period follows Clock::guest_time_scalar() (guest time), a change starts a new grid.
-  * The vblank thread engages on its first precise wait: SetThreadPriority(TIME_CRITICAL) first, then
-    AvSetMmThreadCharacteristicsW(L"Games") (MMCSS manages the thread afterwards); both are undone when the loop goes
-    back to the SDK's, or the thread ends. Both outcomes are logged (`[guest-vblank] precise grid: ...`).
+  * The vblank thread engages on its first precise wait: AvSetMmThreadCharacteristicsW(L"Games") first, then
+    SetThreadPriority(TIME_CRITICAL). The order matters: joining MMCSS rewrites the thread's priority (measured with
+    NtQueryInformationThread on Windows 11: kernel priority 17, whatever was set before), a SetThreadPriority after the
+    join holds (300 vblanks of toggling: MMCSS never changed it again). Both are undone when the loop goes back to the
+    SDK's, or the thread ends. Both outcomes are logged (`[guest-vblank] precise grid: ...`).
+  * No guest code at time-critical priority: MarkVblank runs the game's interrupt callback on this thread, under the
+    guest's locks, so a normal-priority thread holding one would keep a time-critical thread waiting. The loop drops
+    the thread to THREAD_PRIORITY_ABOVE_NORMAL (EnterGuest) around MarkVblank and back to time-critical (LeaveGuest) for
+    the wait and the spin: two SetThreadPriority calls per vblank. MMCSS stays joined throughout (it rewrites the
+    priority once, at the join). In the harness the kernel priority was 15 in the wait phase and 9 (above-normal)
+    inside the callback stand-in, for every vblank.
   * Cvar guest_vblank_precise (GPU, bool, default true, live; false = the SDK's loop as before). With vsync=false the
     SDK's loop is kept untouched (the guest vblank fires every 1 ms, as before) and a warning says so once.
-  * Statistics: `[guest-vblank] period p50=<ms> p99=<ms> late=<n> resync=<n> n=<count>` every 10 s (nearest-rank
-    percentiles of the periods between the QPC stamps taken when each vblank fired, ms with 3 decimals; late = periods
-    over 1.05x nominal; n = periods in the window). The SDK's own loop (guest_vblank_precise=false, vsync=false) feeds
-    the same line, for an A/B of the two.
+  * Statistics: `[guest-vblank] period p50=<ms> p99=<ms> late=<n> resync=<n> early=<n> n=<count>` every 10 s
+    (nearest-rank percentiles of the periods between the QPC stamps taken when each vblank fired, ms with 3 decimals;
+    late = periods over 1.05x nominal; early = periods under 0.95x nominal (the vblank after a late one, or a burst);
+    n = periods in the window). The SDK's own loop (guest_vblank_precise=false, vsync=false) feeds the same line, for
+    an A/B of the two.
   * src/graphics/CMakeLists.txt: rexgpu-xenos links avrt on Windows.
 
-Not built or run (clang++ 20.1.8 -fsyntax-only of the TU with the SDK's Release flags: no new diagnostics).
+Not built or run in the game (clang++ 20.1.8 -fsyntax-only of the TU with the SDK's Release flags: no new diagnostics;
+the PreciseVblank class compiled into a standalone harness on the build machine, 60 Hz, 12 s, steady:
+`period p50=16.667 p99=16.818 late=0 resync=0 early=0 n=601`; a 25 ms stall: late=1 early=1 resync=0; a 40 ms stall:
+late=1 resync=1).
 Verify: `[guest-vblank] precise grid: 60.000 Hz ... MMCSS Games joined ... time-critical priority set` at start-up, then
 p50 16.66-16.68, p99 <= 17.2, resync 0 in a steady 60 fps scene; A/B with --guest_vblank_precise=false.
 
@@ -62,7 +75,7 @@ index a910d57d..fc8a81c0 100644
 +    target_link_libraries(rexgpu-xenos PRIVATE avrt)
 +endif()
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index e00560b3..536bf387 100644
+index e00560b3..ba5b44d1 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -31,6 +31,23 @@
@@ -89,7 +102,7 @@ index e00560b3..536bf387 100644
  REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
      .allowed({"none", "fxaa", "fxaa_extreme"})
      .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-@@ -39,6 +56,22 @@ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
+@@ -39,6 +56,24 @@ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                      "Store shaders persistently and load them when loading games to avoid "
                      "runtime spikes and freezes when playing the game not for the first time.");
  
@@ -98,8 +111,10 @@ index e00560b3..536bf387 100644
 +REXCVAR_DEFINE_BOOL(guest_vblank_precise, true, "GPU",
 +                    "Windows: the guest vblank fires on an absolute grid of 1/video_mode_refresh_rate seconds "
 +                    "from a QPC origin. A high-resolution waitable timer sleeps to guest_vblank_spin_us before "
-+                    "each point and the thread spins on QPC for the rest, at MMCSS 'Games' and time-critical "
-+                    "priority. A vblank more than one period late restarts the grid (no catch-up burst). "
++                    "each point and the thread spins on QPC for the rest; the thread is in MMCSS 'Games' at "
++                    "time-critical priority while it waits and at above-normal priority while the guest's "
++                    "interrupt callback runs. A vblank more than one period late restarts the grid (no "
++                    "catch-up burst). "
 +                    "false = the SDK's 1 ms polling loop. Not used with vsync=false (the guest vblank then "
 +                    "free-runs at 1 kHz as before; a warning says so)");
 +REXCVAR_DEFINE_INT32(guest_vblank_spin_us, 300, "GPU",
@@ -112,7 +127,7 @@ index e00560b3..536bf387 100644
  namespace {
  
  rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
-@@ -58,6 +91,256 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
+@@ -58,6 +93,280 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
  }
  }  // namespace
  
@@ -165,7 +180,9 @@ index e00560b3..536bf387 100644
 +  PreciseVblank(const PreciseVblank&) = delete;
 +  PreciseVblank& operator=(const PreciseVblank&) = delete;
 +
-+  // The calling thread goes to time-critical priority and joins MMCSS "Games"; a new grid starts now. Idempotent.
++  // The calling thread joins MMCSS "Games" and goes to time-critical priority; a new grid starts now. Idempotent.
++  // The order matters: joining MMCSS rewrites the thread's priority (measured on Windows 11: kernel priority 17), so
++  // a SetThreadPriority made before the join is lost and one made after it holds.
 +  void Engage() {
 +    if (engaged_) {
 +      return;
@@ -173,12 +190,11 @@ index e00560b3..536bf387 100644
 +    engaged_ = true;
 +    HANDLE thread = GetCurrentThread();
 +    previous_priority_ = GetThreadPriority(thread);
-+    const bool raised = SetThreadPriority(thread, THREAD_PRIORITY_TIME_CRITICAL) != 0;
-+    const uint32_t priority_error = raised ? 0 : uint32_t(GetLastError());
-+    // The priority first: once the thread is in MMCSS the scheduler manages it.
 +    DWORD task_index = 0;
 +    mmcss_ = AvSetMmThreadCharacteristicsW(L"Games", &task_index);
 +    const uint32_t mmcss_error = mmcss_ ? 0 : uint32_t(GetLastError());
++    raised_ = SetThreadPriority(thread, THREAD_PRIORITY_TIME_CRITICAL) != 0;
++    const uint32_t priority_error = raised_ ? 0 : uint32_t(GetLastError());
 +    scalar_ = GuestTimeScalar();
 +    period_ticks_ = nominal_ticks_ / scalar_;
 +    origin_ = QpcNow();
@@ -186,13 +202,13 @@ index e00560b3..536bf387 100644
 +    BreakPeriod();
 +    REXGPU_INFO(
 +        "[guest-vblank] precise grid: {:.3f} Hz (period {:.4f} ms), {}, QPC spin for the last {} us (+ the timer's "
-+        "overshoot), MMCSS Games {}, time-critical priority {}",
++        "overshoot), MMCSS Games {}, time-critical priority {} (above-normal while the guest's interrupt runs)",
 +        refresh_rate_hz_, 1e3 * period_ticks_ / double(qpc_hz_),
 +        timer_ ? "high-resolution waitable timer" : "Sleep(1) (no high-resolution timer)",
 +        REXCVAR_GET(guest_vblank_spin_us),
 +        mmcss_ ? fmt::format("joined (task index {})", uint32_t(task_index))
 +               : fmt::format("NOT joined (error {})", mmcss_error),
-+        raised ? std::string("set") : fmt::format("NOT set (error {})", priority_error));
++        raised_ ? std::string("set") : fmt::format("NOT set (error {})", priority_error));
 +  }
 +
 +  // The calling thread leaves MMCSS and gets its priority back. True if it was engaged.
@@ -201,6 +217,7 @@ index e00560b3..536bf387 100644
 +      return false;
 +    }
 +    engaged_ = false;
++    raised_ = false;
 +    if (mmcss_) {
 +      AvRevertMmThreadCharacteristics(mmcss_);
 +      mmcss_ = nullptr;
@@ -248,6 +265,22 @@ index e00560b3..536bf387 100644
 +    }
 +    ++index_;
 +    return fired;
++  }
++
++  // MarkVblank runs the game's interrupt callback on this thread, under the guest's locks. It must not do that at the
++  // grid's time-critical priority: a normal-priority thread holding a guest lock would keep a time-critical thread
++  // waiting. EnterGuest drops to above-normal for the callback and LeaveGuest goes back for the wait. MMCSS stays
++  // joined throughout: it rewrites the thread's priority once, at the join (measured: over 300 vblanks of this toggle
++  // it did not change the priority again).
++  void EnterGuest() {
++    if (raised_) {
++      SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
++    }
++  }
++  void LeaveGuest() {
++    if (raised_) {
++      SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
++    }
 +  }
 +
 +  // A vblank of the grid fired at `fired` (WaitForVblank's result) and the guest has seen it.
@@ -314,6 +347,9 @@ index e00560b3..536bf387 100644
 +      if (ms > nominal_ms * 1.05) {
 +        ++late_;
 +      }
++      if (ms < nominal_ms * 0.95) {
++        ++early_;
++      }
 +    }
 +    last_fired_ = fired;
 +    if (window_start_ == 0) {
@@ -331,12 +367,13 @@ index e00560b3..536bf387 100644
 +      const auto rank = [&](double p) {
 +        return periods_ms_[std::clamp<size_t>(size_t(std::ceil(p * double(n))), 1, n) - 1];
 +      };
-+      REXGPU_INFO("[guest-vblank] period p50={:.3f} p99={:.3f} late={} resync={} n={}", rank(0.50), rank(0.99),
-+                  late_, resync_, n);
++      REXGPU_INFO("[guest-vblank] period p50={:.3f} p99={:.3f} late={} resync={} early={} n={}", rank(0.50), rank(0.99),
++                  late_, resync_, early_, n);
 +    }
 +    periods_ms_.clear();
 +    late_ = 0;
 +    resync_ = 0;
++    early_ = 0;
 +  }
 +
 +  int64_t qpc_hz_ = 0;
@@ -353,6 +390,7 @@ index e00560b3..536bf387 100644
 +  uint32_t block_waits_ = 0;
 +  bool engaged_ = false;
 +  bool warned_no_vsync_ = false;
++  bool raised_ = false;  // the thread is at time-critical priority (EnterGuest / LeaveGuest toggle it)
 +  HANDLE mmcss_ = nullptr;
 +  int previous_priority_ = THREAD_PRIORITY_NORMAL;
 +  // The period statistics.
@@ -361,6 +399,7 @@ index e00560b3..536bf387 100644
 +  int64_t window_start_ = 0;
 +  uint32_t late_ = 0;
 +  uint32_t resync_ = 0;
++  uint32_t early_ = 0;
 +};
 +
 +}  // namespace
@@ -369,7 +408,7 @@ index e00560b3..536bf387 100644
  namespace rex::graphics {
  
  // Nvidia Optimus/AMD PowerXpress support.
-@@ -158,7 +441,31 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+@@ -158,7 +467,33 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
              std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
          uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
          uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
@@ -387,7 +426,9 @@ index e00560b3..536bf387 100644
 +              if (fired == 0 || !vsync_worker_running_) {
 +                break;
 +              }
++              precise_vblank.EnterGuest();
 +              MarkVblank();
++              precise_vblank.LeaveGuest();
 +              precise_vblank.EndVblank(fired);
 +              continue;
 +            }
@@ -401,7 +442,7 @@ index e00560b3..536bf387 100644
            uint64_t current_time = chrono::Clock::QueryGuestTickCount();
            uint64_t interval_ticks =
                REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
-@@ -170,9 +477,16 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+@@ -170,9 +505,16 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
            if (behind < 0 || uint64_t(behind) > guest_tick_frequency / 4) {
              last_frame_time = current_time;
              behind = 0;
