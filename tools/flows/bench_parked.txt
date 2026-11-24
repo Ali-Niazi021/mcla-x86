@@ -1,7 +1,7 @@
 # MCLA bench flow, parked (tools/bench.py): Start presses that reach free roam, then B taps, then nothing: the car stays in
 # the free-roam crowd (a heavy, stationary scene: 3,500-4,800 draws on the Mac), so A/B segments see the same scene.
-# Ported from the owner's iOS port (tools/mcla/bench_flow_parked.txt). Run it with the after_intro fixture (run_game.py
-# copies it into a fresh user dir).
+# Ported from the owner's iOS port (tools/mcla/bench_flow_parked.txt), re-timed for the x86 build from the W2.1 bring-up (b2.1,
+# D3D12, after_intro fixture). Run it with the after_intro fixture (run_game.py copies it into a fresh user dir).
 # Format: <second>:<button>[+<button>...][/<hold ms>], '#' comments; seconds count from process start.
 #
 # expect: free-roam
@@ -11,16 +11,16 @@
 # 'expect' is the state run_game.py needs to see for exit 0: free-roam = the log shows `[mcla-mode] ... -> free-roam`
 # (bench.py checks for `-> free-roam` itself). 'seconds' is the default --seconds: bench.py --parked runs this flow for 150 s
 # (--parked-run-seconds) and measures the 60 s from `-> free-roam` + 20 s (--parked-seconds), the "60 s parked" of PLAN 6.
-# E6: the robust sequence of E5: Starts at T+8..24 (the free-roam load takes ~5 s after the one that works; an earlier Start
-# at 12..36 toggled the pause menu inside the first segments, and three runs never left the title), then B (closes a pause
-# menu a late Start opened; a harmless handbrake tap in free roam).
-# Known trap: the title polls the pad every 2-4 updates, so Start is held 300 ms and repeated.
-8:start/300
-12:start/300
-16:start/300
-20:start/300
-24:start/300
-30:b/300
-34:b/300
-38:b/300
-42:b/300
+# Timeline on x86 (W2.1): the title ('PRESS start') is first on screen ~27 s after process start; the first Start that takes is
+# the one at 28 s; with the fixture `loading -> free-roam` comes at ~36.5 s, and any Start after ~37 s opens PAUSE. So: Start/300
+# at 28, 30, 32, 34 (a press before the title exists is lost; the title polls the pad every 2-4 updates, so Start is held
+# 300 ms), then B taps at 40..49 close a pause a late Start opened (B only closes; in free roam it is a harmless handbrake tap).
+# A slower boot than ~34 s misses every Start: the run never reaches free roam and bench.py marks it INVALID.
+28:start/300
+30:start/300
+32:start/300
+34:start/300
+40:b/300
+43:b/300
+46:b/300
+49:b/300
