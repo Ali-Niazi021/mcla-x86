@@ -101,3 +101,28 @@ PS3_GAME/
 PS3_DISC.SFB
 cmake-build-*/
 .vs/
+
+# --- x86 port work dirs and run artefacts (PLAN §5) ----------------------------
+/work/
+/mcla-x86-work/
+*.csv
+*.etl
+*.dmp
+*.mdmp
+*.png
+!docs/images/*.png
+*.jpg
+*.dds
+*.pso
+*.cache
+user/
+fixtures/
+runs/
+cache/
+shaderstorage/
+mcla.toml
+nfsmw.toml
+*.xex.*
+
+# --- omp agent definitions (local only) ----------------------------------------
+.omp/agents/
