@@ -1,0 +1,142 @@
+# Midnight Club: Los Angeles Recomp - codegen manifest
+# (Complete Edition, Xbox 360, title 545407F8, media 5940C9DB, v0.0.0.8)
+#
+# Template, never given to rexglue as is. tools/codegen.py reads it, replaces
+# the placeholder tokens below, writes the result to
+# $WORK/generated/manifest/mcla_manifest.toml next to verbatim copies of the
+# included TOMLs, and runs `rexglue codegen` on that copy. MCLA is its own
+# REFERENCE game: no edition translation, no patch_game_* steps. Do not launch
+# by hand.
+#
+# PLACEHOLDER TOKENS (the three path keys in [project] / [entrypoint] below;
+# only tools/codegen.py reads them, and it fails on any token left over):
+#   @GAME_ROOT@  directory that holds default.xex = the codegen's VFS root.
+#                $GAME/game when default.xex is there, else $GAME
+#                ($GAME = C:/Users/Ali/Development/dumps/mcla-x360, or
+#                MCLA_GAME / --game). Absolute, forward slashes.
+#   @XEX@        absolute path of default.xex.
+#   @OUT_DIR@    $WORK/generated/default, written relative to the resolved
+#                manifest's folder (the SDK's generated/rexglue.cmake glue
+#                prefixes this key with CMAKE_CURRENT_SOURCE_DIR).
+#                $WORK = C:/Users/Ali/Development/mcla-x86-work, or
+#                MCLA_WORK / --work.
+# `includes` is copied as written. `tools/codegen.py --baseline` writes
+# includes = ["overrides.toml"] instead: no harvest, huecos or hooks.
+#
+# default.xex SHA-256 c386f4001fa569e6ad4b982f441f67412f00b3f47c166134555cd4b59854a432
+# Image range: base 0x82000000, image size 0x9E0000 (10,354,688 bytes)
+# (0x82000000 - 0x829E0000). Entry 0x821322B8.
+# Sections: .text 82130000-827BDCE4, BINK 827BDE00-827CD054 (CODE outside
+# .text, like Carbon's .embsec_), .pdata 82102A00-82129D38 (20,071 entries).
+#
+# ----------------------------------------------------------------------------
+# WHERE THINGS GO (read before editing any codegen TOML)
+# ----------------------------------------------------------------------------
+# * The SDK reads the manifest's [entrypoint] table as the root config. Every
+#   root key (cr_as_local, setjmp_address, longjmp_address, ...) must sit in
+#   [entrypoint] (below), above any sub-table. A loose key placed after a
+#   [functions] / [rexcrt] / [[midasm_hook]] header belongs to THAT table and
+#   is ignored silently. Root keys live ONLY here: do not repeat them in the
+#   included files (tools/re/check_codegen_toml.py flags duplicates across
+#   the manifest's includes).
+# * Keyed tables ([functions], [rexcrt]) and arrays of tables
+#   ([[midasm_hook]], [[switch_tables]], [[invalid_instructions]]) live in the
+#   included files: overrides.toml (hand-written), harvest.toml (prior-art
+#   function hints), huecos.toml (generated gaps / indirect-call targets).
+#   Includes load first; the same key in two files = last file wins.
+# * Never declare a `{ size = / end = }` that spans another function start
+#   (Carbon dev002: a sized harvest entry swallowed 0x827C1848 and died with
+#   "Call to invalid or unregistered function").
+#
+# ----------------------------------------------------------------------------
+# [[midasm_hook]]  (ReXGlue 0.10.0, src/codegen/config.cpp + function_graph.cpp)
+# ----------------------------------------------------------------------------
+# A call to a C++ function spliced into the generated code in the middle of a
+# guest function. The MCLA prior art (LARecomp, Renan's port) is mid-asm based;
+# Carbon used return-address overrides instead. Both stay available. Declare
+# hooks in overrides.toml, ONE entry per guest address (same address in two
+# files = last wins):
+#
+#   [[midasm_hook]]
+#   address = 0x82XXXXXX             # REQUIRED. Guest instruction address, inside a
+#                                    #   function the codegen recompiles. Must be
+#                                    #   4-byte aligned.
+#   name = "mcla_hook_foo"           # REQUIRED. C++ symbol to call. Declared by the
+#                                    #   codegen as `extern void NAME(args);`, or
+#                                    #   `extern bool NAME(args);` when any
+#                                    #   *_on_true / *_on_false key is set. You define it
+#                                    #   in the runtime (one hook per file in
+#                                    #   games/mcla/, flag MCLA_HOOK_<NAME>).
+#   registers = ["r3", "r4", "cr6"]  # OPTIONAL. Registers passed BY REFERENCE, in
+#                                    #   order. Accepted names and the C++ types you
+#                                    #   must use in the definition:
+#                                    #     r0..r31, reserved -> PPCRegister&
+#                                    #     f0..f31           -> PPCRegister&
+#                                    #     v0..v127          -> PPCVRegister&
+#                                    #     cr0..cr7          -> PPCCRRegister&
+#                                    #     ctr               -> PPCRegister&
+#                                    #     xer               -> PPCXERRegister&
+#                                    #     fpscr             -> PPCFPSCRRegister&
+#                                    #   No ctx/base argument is passed.
+#   # Unconditional flow after the call (void hook). At most one of:
+#   return = true                    # `return;` out of the guest function
+#   jump_address = 0x82XXXXXX        # `goto` that address's label in the SAME function
+#   # Conditional flow (bool hook): `if (hook(...)) { <on_true> } else { <on_false> }`.
+#   # Each branch is optional; an unset branch falls through to the instruction.
+#   return_on_true = true            # or jump_address_on_true  = 0x82XXXXXX
+#   return_on_false = true           # or jump_address_on_false = 0x82XXXXXX
+#   after_instruction = false        # OPTIONAL (default false). false: the hook runs
+#                                    #   BEFORE the instruction at `address` executes;
+#                                    #   true: right AFTER it.
+#
+# Rules enforced by the codegen: a branch cannot both return and jump; direct
+# (return / jump_address) and conditional (*_on_true/false) keys cannot be
+# mixed in one entry. Jump targets become labels of the hooked function, so
+# they must be inside it. With cr_as_local = true the cr* arguments are the
+# function's local CR copies (what the following instructions read); that
+# is the point of passing them by reference.
+#
+# Example (disabled):
+#   [[midasm_hook]]
+#   address = 0x82XXXXXX
+#   name = "mcla_hook_example"
+#   registers = ["r3", "r31"]
+#   return_on_true = true
+#
+# Key names confirmed against the SDK sources src/codegen/config.cpp
+# (ApplyToml, "[[midasm_hook]]") and builders/context.cpp (emit_mid_asm_hook).
+# ----------------------------------------------------------------------------
+
+[project]
+# "nfsmw", not "mcla", on purpose: the name prefixes the generated headers and
+# symbols (nfsmw_pch.h, nfsmw_init.h, REX_DEFINE_APP(nfsmw, ...)), and the
+# shared iOS/Mac app code and the anchored SDK patches use those names.
+# Internal names stay MW's (renaming breaks anchored patches).
+name = "nfsmw"
+sdk_version = "0.10.0"
+game_root = "@GAME_ROOT@"
+
+[entrypoint]
+file_path = "@XEX@"
+out_directory_path = "@OUT_DIR@"
+
+includes = ["overrides.toml", "harvest.toml", "huecos.toml", "hooks.toml", "hooks_widescreen.toml", "hooks_timing.toml", "hooks_gfx.toml"]
+
+# --- Root keys (must stay above every sub-table) -----------------------------
+# cr_as_local ONLY. Do NOT enable ctr_as_local / xer_as_local /
+# reserved_as_local / non_volatile_as_local / non_argument_as_local: on Carbon
+# (same ReXGlue 0.10.0) ctr/xer/cr/reserved/non_volatile_as_local made FMVs
+# show green/purple blocks and broke boot, and non_argument_as_local crashed at
+# start (docs/carbon/LEARNINGS.md, PLAN.md Phase 2.3). Do not change without a
+# Mac-harness A/B.
+cr_as_local = true
+
+# CRT setjmp/longjmp: NOT PRESENT in this game (task 2.4), so setjmp_address /
+# longjmp_address stay unset. Evidence: find_rexcrt.py finds neither signature;
+# no code saves or restores f14.. / r14.. through a caller buffer (the XDK
+# setjmp body `stfd f14,0(r3); stfd f15,8(r3)` that Carbon has at setjmp+0x1C
+# does not occur); RtlUnwind has one caller, an unreferenced 10-instruction
+# wrapper (0x8274ABB0); none of the seven prior projects sets either key.
+# If one ever turns up: both keys go here, plus
+#   "0x<setjmp>" = { share_registers = true }
+# in [functions] of overrides.toml (cr_as_local zeroes its jmp_buf cr fields).

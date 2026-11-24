@@ -1,0 +1,44 @@
+# MCLA quality-knob mid-asm hooks (docs/mcla/NATIVE_RENDERER.md section 22, ADDRESSES.md "Quality knobs"). Included
+# from mcla_manifest.toml. FLAT schema, only [[midasm_hook]] entries. C++ side: games/mcla/hooks/mcla_gfx_tune.cpp.
+# All three are no-ops until their cvar leaves its default (mcla_gfx_dl_clear 0, mcla_gfx_traffic_lod 1,
+# mcla_gfx_ambient_density 1).
+
+# [G1] mcla_gfx_dl_clear: sub_822E0130 (batch visibility loop), BEFORE `clrlwi r11,r3,16` at 0x822E0180, the
+# first instruction after `bl 0x822df960`: r3 = the draw-list bitmask of one box (bits 0x20..0x100 = dtSHADOWMAP0..3
+# of the type table at 0x827E19E4, 0x2 reflection map, 0x4/0x8 env maps). The hook clears cvar bits.
+[[midasm_hook]]
+address = 0x822E0180
+name = "mcla_hook_gfx_cull_mask"
+registers = ["r3"]
+
+# [G2] mcla_gfx_traffic_lod: sub_827902F0 (vehicle LOD select), BEFORE `cmplwi cr6,r28,0` at 0x827903E0, after
+# `lfs f0,40(r26)`: f0 = the vehicle's LOD distance scale (thresholds [r26+44] x f0, [r26+48] x f0).
+[[midasm_hook]]
+address = 0x827903E0
+name = "mcla_hook_gfx_traffic_lod"
+registers = ["f0"]
+
+# [G3] mcla_gfx_ambient_density: sub_826F5B18 (ambient zone constructor), BEFORE the last `lwz r12,-8(r1)` at
+# 0x826F5CA0 (after the epilogue helper): r3 = the zone object.
+[[midasm_hook]]
+address = 0x826F5CA0
+name = "mcla_hook_gfx_ambient_zone"
+registers = ["r3"]
+
+# [G4] mcla_gfx_shadow_mode: sub_822F3BD8 (the per-frame lighting / shadow-mode update), BEFORE `cmplwi cr6,r11,0`
+# at 0x822F4B9C: r11 = the game's "night" boolean (time of day outside the day window, from `bl 0x822f10d0` against
+# [obj+14568] / [obj+14564]). Night takes the game's FAST shadow path (0x822F4BA8..0x822F4BC0: `sub_822E5AF0(renderer, 0x71E0)`
+# removes the four cascades and the three collectors from the renderer's draw-type mask [renderer+364], `sub_822E5AE0(.., 0xC00)`
+# keeps dtSHADOWCOLLECTORFAST + dtSHADOWPREPASS). The hook forces r11 = 1 with mcla_gfx_shadow_mode = 1.
+[[midasm_hook]]
+address = 0x822F4B9C
+name = "mcla_hook_gfx_shadow_mode"
+registers = ["r11"]
+
+# [G5] mcla_gfx_dl_disable: same function, the DAY path BEFORE `bl 0x822e5ae0` at 0x822F4C48 (r4 = 0x75E0 = the shadow
+# draw types, loaded at 0x822F4BF4): the game ORs them into [renderer+364] every frame. The hook removes the cvar's bits
+# from r4 (the heartbeat clears them once in [renderer+364]); with 0 the game ORs them back by itself.
+[[midasm_hook]]
+address = 0x822F4C48
+name = "mcla_hook_gfx_dl_enable"
+registers = ["r4"]

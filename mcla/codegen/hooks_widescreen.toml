@@ -1,0 +1,221 @@
+# MCLA hooks_widescreen mid-asm hooks (docs/mcla/WIDESCREEN.md). Included from mcla_manifest.toml.
+# Each hook: own file in games/mcla/hooks/ (mcla_ws_*.cpp), MCLA_HOOK_WS_<NAME> flag, master cvar
+# mcla_widescreen_width (0 = off = the game as shipped; every hook below is then a no-op).
+#
+# FLAT schema, only [[midasm_hook]] entries, NO root keys (see mcla_manifest.toml). One entry per
+# guest address; none of these addresses is in hooks.toml or hooks_timing.toml
+# (tools/mcla/check_codegen_toml.py). C++ linkage, global namespace, registers by reference in order:
+#     void mcla_hook_x(PPCRegister& r3, ...)    (no *_on_true / *_on_false key = void)
+# With the build flag 0 the C++ function stays and does nothing, so this file never changes to
+# switch a hook off. Sites checked against the image words and the generated listing (gd.py): each
+# address lies inside the generated function named in its comment.
+
+# [W1] mcla_ws_scene_size: sub_8217AC30 (device init), `lis r11,-32124` right after the second
+# getter of the dev options `width` / `height` (bl 0x821C0750 at 0x8217ACC0 / 0x8217ACD8) and before
+# the first read of the option words at 0x8217ACEC. r1 = the guest stack pointer: the video mode the
+# game was given is at [r1+96] (width) and [r1+100] (height). The hook writes W and 720 into the
+# words 0x827D426C / 0x827D4270 (= the dev options -width / -height). games/mcla/hooks/mcla_ws_scene_size.cpp
+[[midasm_hook]]
+address = 0x8217ACDC
+name = "mcla_hook_ws_scene_size"
+registers = ["r1"]
+
+# [W2] mcla_ws_rt_pool: sub_822E47E0 (renderer constructor), `mr r5,r29` before the shared render
+# target pool is created (bl 0x821851C8): r29 = 0x9D8000 (10,321,920 bytes, HD). The hook scales it
+# by the largest growth of a 32-texel-aligned target (1.4 at 1560), rounded up to 64 KiB. r29 is
+# rewritten at 0x822E4998. games/mcla/hooks/mcla_ws_rt_pool.cpp
+[[midasm_hook]]
+address = 0x822E4980
+name = "mcla_hook_ws_rt_pool"
+registers = ["r29"]
+
+# [W8] mcla_ws_rt_pool_guard: sub_82177EB0 (RAGE render-target texture create), AFTER
+# `lwz r11,-24876(r23)` (r11 = the current pool BE32[0x82839ED4], 0 = none; next: cmplwi / beq to the
+# XMemAlloc path at 0x8217818C, else bl sub_82183748 = bump the pool, which has no bounds check).
+# r3 = the texture's size in bytes. The hook sets r11 = 0 when the texture would pass the pool's
+# end, so the game's own no-pool path gives it its own block. Build flag MCLA_HOOK_WS_RT_GUARD, cvar
+# mcla_ws_rt_pool_guard. games/mcla/hooks/mcla_ws_rt_pool.cpp
+[[midasm_hook]]
+address = 0x82178170
+name = "mcla_hook_ws_rt_pool_guard"
+registers = ["r3", "r11"]
+after_instruction = true
+
+# [W7] mcla_ws_edram: the D3D EDRAM tile allocator (WIDESCREEN.md section 13). Build flag
+# MCLA_HOOK_WS_EDRAM, cvars mcla_ws_edram_reuse (1 / 2 / 0) and mcla_ws_edram_log.
+# games/mcla/hooks/mcla_ws_edram.cpp
+#   sub_821784B8 (device surfaces), BEFORE `lis r9,-32124`, the instruction after the second
+#   `bl 0x82410D70`: the device depth surface is at BE32[0x8283935C], r3 = the device colour surface
+#   (stored to 0x82839250 at 0x82178574). The hook gives the tiles of one of them back to the
+#   allocator (object BE32[0x828CDA38]) and closes the tiles past 2048.
+[[midasm_hook]]
+address = 0x82178564
+name = "mcla_hook_ws_edram_device_surfaces"
+registers = ["r3"]
+
+#   sub_82410D70 (D3D create surface), BEFORE `mr r3,r31` at the common success exit (the label
+#   0x82410E9C: reached from 0x82410DE0, 0x82410E74, 0x82410E8C and by fall-through from
+#   0x82410E98): r31 = the new surface. Probe: logs size, format, MSAA and EDRAM tiles.
+[[midasm_hook]]
+address = 0x82410E9C
+name = "mcla_hook_ws_edram_surface"
+registers = ["r31"]
+
+# [W3a-d] mcla_ws_aspect: the four `lfs` of the 16:9 constant 0x8201E7EC, each on the widescreen
+# branch after `bl IsWidescreen` (0x82178848). after_instruction: the hook overwrites the float
+# register with W/H. Four host functions so the mask cvar (mcla_ws_aspect_mask, one bit each) can
+# tell the sites apart. games/mcla/hooks/mcla_ws_aspect.cpp
+[[midasm_hook]]
+address = 0x822E5E68          # bit 1: scene camera, sub_822E5E10 (lfs f12)
+name = "mcla_hook_ws_aspect_camera"
+registers = ["f12"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x82233EB4          # bit 2: rear-view mirror ortho, sub_82233E18 (lfs f0)
+name = "mcla_hook_ws_aspect_mirror"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x82214BB8          # bit 4: sub_82214AC0 (lfs f10), not analysed
+name = "mcla_hook_ws_aspect_82214bb8"
+registers = ["f10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8223E5E0          # bit 8: sub_8223E230 (lfs f13), compared with the viewport's aspect
+name = "mcla_hook_ws_aspect_8223e5e0"
+registers = ["f13"]
+after_instruction = true
+
+# [W4] mcla_ws_cutscene_fov: sub_822C0320, BEFORE `fdivs f12,f28,f1` (0x822C04E8): f1 = the
+# viewport's aspect from GetAspect (bl 0x82171600 at 0x822C04E4); the hook sets f1 = 16/9 so the
+# cutscene's vertical angle (authored horizontal angle / f1) stays the 16:9 one. Nothing reads f1
+# after the division. games/mcla/hooks/mcla_ws_cutscene_fov.cpp
+[[midasm_hook]]
+address = 0x822C04E8
+name = "mcla_hook_ws_cutscene_fov"
+registers = ["f1"]
+
+# [W5] mcla_ws_map_aspect: sub_826206B0 (pause map visible box), AFTER `lfs f27,-1336(r11)` on the
+# widescreen branch (constant 0x8201FAC8); mask bit 16 of mcla_ws_aspect_mask.
+# games/mcla/hooks/mcla_ws_map_aspect.cpp
+[[midasm_hook]]
+address = 0x82620700
+name = "mcla_hook_ws_map_aspect"
+registers = ["f27"]
+after_instruction = true
+
+# [W6] mcla_ws_ui: probes (counts and logs) plus the UI squeeze, which is OFF by default
+# (mcla_ws_ui_squeeze=0; WIDESCREEN.md section 13.4). Build flag MCLA_HOOK_WS_UI, cvar
+# mcla_ws_ui_probe. games/mcla/hooks/mcla_ws_ui.cpp
+#   sub_82721258(r3 movie, r4 kind): Flash movie draw dispatcher; kind 0,1 2D / 3 / 6 3D scene.
+#   Opens the per-thread "inside a movie draw" bracket.
+[[midasm_hook]]
+address = 0x82721258
+name = "mcla_hook_ws_ui_movie_draw"
+registers = ["r3", "r4"]
+
+#   The instruction after each of the eight `bl sub_82721258` (callers.py): closes the bracket.
+#   The dispatcher tail-calls the kind functions, so it has no exit of its own. One name per site.
+[[midasm_hook]]
+address = 0x821FB4F0          # sub_821FB1C8, after bl at 0x821FB4EC
+name = "mcla_hook_ws_ui_movie_done_1"
+
+[[midasm_hook]]
+address = 0x821FB518          # sub_821FB1C8, after bl at 0x821FB514
+name = "mcla_hook_ws_ui_movie_done_2"
+
+[[midasm_hook]]
+address = 0x821FB55C          # sub_821FB1C8, after bl at 0x821FB558
+name = "mcla_hook_ws_ui_movie_done_3"
+
+[[midasm_hook]]
+address = 0x82225114          # sub_822250E0, after bl at 0x82225110
+name = "mcla_hook_ws_ui_movie_done_4"
+
+[[midasm_hook]]
+address = 0x8222522C          # sub_82225170, after bl at 0x82225228
+name = "mcla_hook_ws_ui_movie_done_5"
+
+[[midasm_hook]]
+address = 0x822275CC          # sub_82227428, after bl at 0x822275C8
+name = "mcla_hook_ws_ui_movie_done_6"
+
+[[midasm_hook]]
+address = 0x8223D7E4          # sub_8223D780, after bl at 0x8223D7E0
+name = "mcla_hook_ws_ui_movie_done_7"
+
+[[midasm_hook]]
+address = 0x8223D824          # sub_8223D780, after bl at 0x8223D820
+name = "mcla_hook_ws_ui_movie_done_8"
+
+#   sub_822E55D0(r3 renderer, r4 phase): renderer phase begin; 0x20000000 = the UI phase [P]
+[[midasm_hook]]
+address = 0x822E55D0
+name = "mcla_hook_ws_ui_phase"
+registers = ["r4"]
+
+#   sub_824162D8(r3 device, f1 x, f2 y, f3 width, f4 height, f5 min z, f6 max z): D3D set viewport,
+#   function entry; 2 callers (0x824165AC D3DVIEWPORT9 wrapper, 0x824165DC). The hook may narrow
+#   f1 / f3 (squeeze) before the function reads them (0x824162F4 fmr f31,f1; 0x824163F0 fctiwz f3).
+[[midasm_hook]]
+address = 0x824162D8
+name = "mcla_hook_ws_ui_viewport"
+registers = ["f1", "f2", "f3", "f4"]
+
+#   sub_82413660: D3D set scissor (r3 = device, r4 left, r6 right [P]); 9 callers. Counted only.
+[[midasm_hook]]
+address = 0x82413660
+name = "mcla_hook_ws_ui_scissor"
+
+# [W6b] the UI squeeze's two new sites (WIDESCREEN.md section 15). Both are new: they only exist in the
+# generated code after a re-codegen (the C++ bodies in mcla_ws_ui.cpp are already there and unreferenced
+# until then, so the tree keeps linking). Cvars: mcla_ws_hud_edges / mcla_ws_hud_edge_inset and the
+# squeeze mask mcla_ws_ui_squeeze (0 = off, nothing changes).
+#   sub_825FB348 (the Flash player's draw of one instance and, recursively, its children), BEFORE
+#   `lhz r9,170(r30)`, the instruction after `bl 0x825F8B20`: the instance's world matrix is computed
+#   (world x stored at 0x825FB430, instance +48), the instance and its children are not drawn yet.
+#   r30 = the instance (`mr r30,r3` at the entry, callee-saved). Moves the HUD pieces to the screen edges
+#   while the last UI-phase viewport was a centre squeeze (parent clip "HUD", name in the piece table).
+[[midasm_hook]]
+address = 0x825FB484
+name = "mcla_hook_ws_ui_piece"
+registers = ["r30"]
+
+#   sub_82227428 (the layer render for the phases 0x100000 / 0x8000000 / 0x20000000), UI-phase branch
+#   (r4 == 0x20000000), BEFORE `li r4,1`, three instructions before `bl sub_8217C658` that sets the
+#   grcViewport (r25 + 12700) of NAVSYS2DMOVIE; the FindMovie("NAVSYS2DMOVIE") and the dispatcher call
+#   (kind 0, 0x822275C8) follow. The set precedes the dispatcher, so it is outside the movie bracket:
+#   this marks it (cleared by the instruction after the dispatcher's bl, 0x822275CC) so it is left at
+#   full width, like the movie's own mode F.
+[[midasm_hook]]
+address = 0x82227594
+name = "mcla_hook_ws_ui_navsys_viewport"
+
+# [W9] mcla_ws_texclear: sub_82177EB0 (RAGE texture create), the zero-fill of a texture it got from
+# D3D: memset(base, 0, MmQueryAllocationSize(base)). BEFORE `mr r5,r3` (the instruction after
+# `bl 0x82132600`): r3 = the size, r29 (base) / r31 (mip chain) = the address. For a texture placed
+# inside the title's block of its first four physical allocations (sub_82130B50) the SDK answers
+# with the whole block and the memset runs past the block's end: the hook cuts r3 to what is left
+# of the allocation (WIDESCREEN.md section 14: the "guard word trashed" fatal from 1432 px).
+# Build flag MCLA_HOOK_WS_TEXCLEAR, cvar mcla_ws_texclear_clamp. games/mcla/hooks/mcla_ws_texclear.cpp
+[[midasm_hook]]
+address = 0x8217829C
+name = "mcla_hook_ws_texclear_base"
+registers = ["r3", "r29"]
+
+[[midasm_hook]]
+address = 0x821782C0
+name = "mcla_hook_ws_texclear_mips"
+registers = ["r3", "r31"]
+
+#   sub_82305230 (render-target setup), BEFORE `bl 0x82130000` (the shipped build's empty log
+#   function; format 0x82041DD0 "Render Target Pool (%d, '%s') has %d bytes free (%d used)"), once
+#   per slot 0..8 of the shared pool: r4 = slot, r5 = name (static string, table 0x827E5618),
+#   r6 = bytes free, r7 = bytes used. Probe only (cvar mcla_ws_heap_probe).
+[[midasm_hook]]
+address = 0x82305430
+name = "mcla_hook_ws_pool_slot"
+registers = ["r4", "r5", "r6", "r7"]

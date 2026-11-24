@@ -1,0 +1,92 @@
+# MCLA hooks_timing mid-asm hooks (docs/mcla/TIMING.md). Included from mcla_manifest.toml.
+# Each hook: own file in games/mcla/hooks/, MCLA_HOOK_<NAME> flag, cvar default OFF until verified.
+#
+# FLAT schema, only [[midasm_hook]] entries, NO root keys (see mcla_manifest.toml). One entry per guest
+# address; none of these is in hooks.toml or hooks_widescreen.toml (tools/mcla/check_codegen_toml.py).
+# C++ linkage, global namespace, registers by reference in the listed order:
+#     bool mcla_hook_x(PPCRegister& r3, ...)   when a *_on_true key is set
+#     void mcla_hook_x(PPCRegister& r3, ...)   otherwise
+# MASTER cvar mcla_sim60 (default OFF = the game as shipped: fixed step 1/30 s, 2 physics substeps of
+# 1/60 s). Every hook below is a no-op (one cvar read) until it is switched on; with the build flag 0
+# the C++ function stays and does nothing, so this file never changes to switch a hook off.
+# Sites read from the generated listing with the image words (scratch/ws-timing/gd.py): each address
+# lies inside the generated function named in its comment. The registers' roles are in the header of
+# each hook file (games/mcla/hooks/mcla_t_*.cpp). The A1 heartbeat (hooks.toml, 0x821BDA90) carries
+# the game-thread pacer, the substep reset and the `[mcla-sim]` line.
+
+# [A2] mcla_t_frame_delta: AFTER `subf r8,r10,r11` in rage::sysTimeManager::Update (sub_821BDA90);
+# r8 = elapsed guest ticks (signed 64 bit), clamped to 1/8 s; also the quantiser's input (the real
+# frame time measured with the host's tick rate). games/mcla/hooks/mcla_t_frame_delta.cpp
+[[midasm_hook]]
+address = 0x821BDAB0
+name = "mcla_hook_frame_delta"
+registers = ["r8"]
+after_instruction = true
+
+# [T1] mcla_t_sim_step: AFTER `lfs f11,32(r3)` at the head of the timer's fixed-step path (path 2) in
+# sub_821BDA90; r3 = the timer, f11 = the step (the shipped 1/30). The hook sets f11 = n/60 and the
+# frame-rate object's substep word = n. games/mcla/hooks/mcla_t_sim_step.cpp
+[[midasm_hook]]
+address = 0x821BDB90
+name = "mcla_hook_sim_step"
+registers = ["r3", "f11"]
+after_instruction = true
+
+# [T2a] mcla_t_camera_pos: BEFORE `addi r9,r1,80` in sub_82320298 (the chase camera), the join of the
+# game's two factor branches; f13 = the factor it chose, cr6.lt = (round(1/dt) < 60).
+# games/mcla/hooks/mcla_t_camera_pos.cpp
+[[midasm_hook]]
+address = 0x82320468
+name = "mcla_hook_camera_pos"
+registers = ["f13", "cr6"]
+
+# [T2b] mcla_t_camera_lookat: BEFORE `li r9,288` in sub_82320298, the join of the second factor's
+# branches; f0 = the factor, cr6.lt = (round(1/dt) < 60). games/mcla/hooks/mcla_t_camera_lookat.cpp
+[[midasm_hook]]
+address = 0x823204F4
+name = "mcla_hook_camera_lookat"
+registers = ["f0", "cr6"]
+
+# [T3] mcla_t_chassis_depth: BEFORE `lis r11,-32256` in sub_82563298 (chassis ground depth), the join
+# of the two alpha constants (0.10 / 0.05); f0 = alpha, cr6.lt = (round(1/dt) < 60) (r11 is already
+# overwritten on both paths). games/mcla/hooks/mcla_t_chassis_depth.cpp
+[[midasm_hook]]
+address = 0x82563720
+name = "mcla_hook_chassis_depth"
+registers = ["f0", "cr6"]
+
+# [T4] mcla_t_ui_movie_advance: BEFORE `beq cr6,0x825edc78` in sub_825EDC08 (swfCONTEXT update);
+# r31 = the context, r25 = the one-frame flag. true = jump to 0x825EDD44, the function's "no movie
+# frame is due" exit (clears byte +136, releases the entry lock). games/mcla/hooks/mcla_t_ui_movie_advance.cpp
+[[midasm_hook]]
+address = 0x825EDC6C
+name = "mcla_hook_ui_movie_advance"
+registers = ["r31", "r25"]
+jump_address_on_true = 0x825EDD44
+
+# [T5] mcla_t_ui_countdown_dt: BEFORE `addi r4,r8,-9924` in sub_82212298; r3 = the HUD movie's
+# swfCONTEXT, f1 = the value of the script variable countdownUpdate (the script adds it once per
+# movie step). games/mcla/hooks/mcla_t_ui_countdown_dt.cpp
+[[midasm_hook]]
+address = 0x822124DC
+name = "mcla_hook_ui_countdown_dt"
+registers = ["r3", "f1"]
+
+# [T6] mcla_t_race_clock: BEFORE `fctiwz f13,f0` in sub_82256220; f0 = the step in ms (float), r31 =
+# the race object whose clock [r31+3748] gets the truncated value. games/mcla/hooks/mcla_t_race_clock.cpp
+[[midasm_hook]]
+address = 0x822562E8
+name = "mcla_hook_race_clock"
+registers = ["f0", "r31"]
+
+# [A5] mcla_t_present_interval: AFTER `li r11,2` in sub_824199B0 (the Present prelude sub_82419E90 ->
+# sub_824199B0 runs before every D3DDevice_Swap); the next instruction is `b 0x82419AB4`, which builds
+# the swap-callback argument from r11 (bits 8..11 = vblanks per swap). The shipped 2 locks the guest
+# at 30 fps on a 60 Hz vblank (the CP waits in WAIT_REG_MEM [shared+4] == 0 until the target vblank);
+# the hook lowers it to 1 for a 60 fps cap. docs/mcla/TIMING.md section 11.
+# games/mcla/hooks/mcla_t_present_interval.cpp. NEEDS A RE-CODEGEN (new entry).
+[[midasm_hook]]
+address = 0x82419AA0
+name = "mcla_hook_present_interval"
+registers = ["r11"]
+after_instruction = true

@@ -1,0 +1,62 @@
+# ============================================================================
+#  Midnight Club: Los Angeles Recomp - manual codegen declarations
+#
+#  Included from mcla_manifest.toml via includes = ["overrides.toml", ...].
+#  Included files use the FLAT schema (sections at the root).
+#
+#  Valid address range: 0x82000000 - 0x829E0000
+#  (image base 0x82000000 + 0x9E0000 = 10,354,688 bytes of image).
+#  Code lives in .text 82130000-827BDCE4 AND in BINK 827BDE00-827CD054.
+#
+#  Empty on purpose until Phase 2.4/2.5 (G-CODEGEN). Add only evidence-backed
+#  entries, each with a comment saying where the address comes from.
+# ============================================================================
+
+# WARNING: this file has NO root keys. Root keys (cr_as_local, setjmp_address,
+# longjmp_address) live in mcla_manifest.toml under [entrypoint]. A loose key
+# written below a table header would belong to that table and be ignored
+# silently by the codegen. Never add root keys here.
+
+# --- [rexcrt] (reviewed in task 2.4: addresses verified, NOT enabled) --------
+# Name -> guest address of a CRT/kernel-wrapper function. The codegen renames
+# it to rexcrt_<Name>, drops it from recompilation, and the runtime must
+# provide REX_HOOK(rexcrt_<Name>). Known names: memcpy memmove memset memchr
+# XMemCpy XMemSet XMemSet128 memset_vmx memcpy_s memmove_s, str*/wcs*/lstr*,
+# Win32 file/fiber wrappers; the heap group (RtlAllocateHeap RtlFreeHeap
+# RtlSizeHeap RtlReAllocateHeap) is all-or-nothing.
+#
+# Verified in our image (find_rexcrt.py + reading the code, ADDRESSES.md):
+#   memcpy 0x823DA950  leaf, no .pdata, 0x488 bytes; 592 bl + 5 b, all to its
+#                      first instruction; `std r3,-8(r1)` ... `ld r3,-8(r1); blr`
+#   memset 0x823D9890  leaf, no .pdata, 0xA0 bytes; 349 bl + 7 b; the 40 words
+#                      are identical to Carbon's memset 0x8279C520
+#
+# Why the two lines below stay commented: the SDK's hook wrapper returns a
+# pointer result as `host - base` (include/rex/ppc/function.h,
+# HostToGuestFunction), but pointer ARGUMENTS at guest >= 0xE0000000 get +0x1000
+# on arm64 Apple (PhysicalHostOffset). For a destination in that range the hook
+# therefore returns dst + 0x1000 in r3. MCLA code uses that return value
+# (memcpy: 22 call sites read r3, 3 pass it on, 12 return it, 5 tail calls;
+# memset: 6 pass it on, 3 return it, 7 tail calls). Enable both once the SDK
+# return path subtracts the offset (or the hooks leave r3 alone); until then the
+# recompiled originals are exact. Carbon maps memcpy with the same hazard.
+# [rexcrt]
+# memcpy = 0x823DA950
+# memset = 0x823D9890
+#
+# Heap group, do NOT enable (LARecomp has it; Renan / holdmysocks / kiMb4LL boot
+# without any [rexcrt]): RtlAllocateHeap 0x82134860, RtlFreeHeap 0x82135150,
+# RtlSizeHeap 0x82133B00, RtlReAllocateHeap 0x82135440. The SDK would strip all
+# four and serve every guest heap from one host o1heap in a 256 MB guest region
+# (heap handle and all flags but HEAP_ZERO_MEMORY ignored, a 16-byte size
+# header and o1heap's power-of-two block rounding per allocation), while the
+# other guest heap code (create / destroy / validate) keeps working on the
+# guest's own structures.
+
+# --- [[midasm_hook]] ---------------------------------------------------------
+# Declarations go at the END of this file (array-of-tables headers); the
+# schema is documented in mcla_manifest.toml. None yet.
+
+[functions]
+# No setjmp / longjmp in this game (task 2.4, see mcla_manifest.toml), so there
+# is no `{ share_registers = true }` entry to add for it.

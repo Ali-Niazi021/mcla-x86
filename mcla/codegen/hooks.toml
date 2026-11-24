@@ -1,0 +1,148 @@
+# ============================================================================
+#  Midnight Club: Los Angeles Recomp - mid-asm hook declarations (task 5.0, first hooked build)
+#
+#  Included from mcla_manifest.toml (includes = [..., "hooks.toml"]); FLAT schema, only
+#  [[midasm_hook]] entries, NO root keys (see the warning in overrides.toml). One entry per guest
+#  address; the C++ side is one file per hook in games/mcla/hooks/ (mcla_<name>.cpp), declared there
+#  with C++ linkage in the global namespace, taking the listed registers as PPCRegister& in order:
+#
+#      bool mcla_hook_x(PPCRegister& r3, ...)   when a *_on_true / *_on_false key is set
+#      void mcla_hook_x(PPCRegister& r3, ...)   otherwise
+#
+#  Spec, evidence and the "why" of every entry: docs/mcla/HOOKS_SPEC.md (section id in brackets) and
+#  docs/mcla/ADDRESSES.md. Every hook has a build flag MCLA_HOOK_<NAME> (games/mcla/sources.cmake)
+#  and a cvar mcla_<name>; with the flag 0 the C++ function stays and does nothing, so the
+#  declarations here never need to change to switch a hook off.
+#
+#  Valid sites are instructions of functions the codegen recompiles (all of these are, checked in
+#  the baseline codegen). `after_instruction = true` runs the hook after the instruction at the
+#  address.
+# ============================================================================
+
+# [A1] mcla_heartbeat: first instruction (mftb r11) of rage::sysTimeManager::Update(this = r3, ...)
+# (a gap function: hint rex_sub_821BDA90 in harvest.toml). r3 == 0x827D7500 is the one engine timer.
+# Once per engine frame; the host watchdog arms on the first beat. games/mcla/hooks/mcla_heartbeat.cpp
+[[midasm_hook]]
+address = 0x821BDA90
+name = "mcla_hook_heartbeat"
+registers = ["r3"]
+
+# [B1] mcla_rage_fatal: sub_821BD618 (RAGE's never-returning fatal printf). Hooked AFTER its first
+# instruction (mflr r12) so r12 = return address. r3 = format, r4..r6 = first arguments.
+# games/mcla/hooks/mcla_rage_fatal.cpp
+[[midasm_hook]]
+address = 0x821BD618
+name = "mcla_hook_rage_fatal"
+registers = ["r3", "r4", "r5", "r6", "r12"]
+after_instruction = true
+
+# [B2] mcla_read_retry_fatal: `lwz r11,-352(r26)` in sub_821C4F98 = the game gives up on a ReadFile
+# after 10 failures (r29 handle, r28 buffer, r27 length); log only. games/mcla/hooks/mcla_read_retry_fatal.cpp
+[[midasm_hook]]
+address = 0x821C4FF0
+name = "mcla_hook_read_retry_fatal"
+registers = ["r29", "r28", "r27"]
+
+# [B2] second site, same shape in sub_821C5038 (handle, offset, buffer, length): the roles are
+# r30 handle, r29 buffer, r28 length (read from the generated code; HOOKS_SPEC lists r29/r28/r27
+# for both, which is right for the first only). Log only.
+[[midasm_hook]]
+address = 0x821C50C8
+name = "mcla_hook_read_retry_fatal_offset"
+registers = ["r30", "r29", "r28"]
+
+# [C1] mcla_ui_lights_guard: before `bl 0x825EF9F0` in sub_827250A8; r3 = the movie's "lights" member.
+# true = skip the lighting pass (jump to the `li r3,1` at 0x82725144). games/mcla/hooks/mcla_ui_lights_guard.cpp
+[[midasm_hook]]
+address = 0x82725100
+name = "mcla_hook_ui_lights_guard"
+registers = ["r3"]
+jump_address_on_true = 0x82725144
+
+# [D1] mcla_skip_intro: before `lwz r11,2836(r31)` in the init function sub_822C2EA8; true = jump to
+# 0x822C2F7C (past the start of the render-thread legals). games/mcla/hooks/mcla_skip_intro.cpp
+[[midasm_hook]]
+address = 0x822C2F48
+name = "mcla_hook_skip_intro"
+jump_address_on_true = 0x822C2F7C
+
+# [D2] mcla_intro_pass_mask: before `bl 0x822E5B00` in main (sub_82131508), after `li r4,-1`;
+# r4 becomes 0xFEFFFFFF. Same file as D1 (cvar mcla_skip_intro).
+[[midasm_hook]]
+address = 0x821315E4
+name = "mcla_hook_intro_pass_mask"
+registers = ["r4"]
+
+# [E4] mcla_fence_spin: head of the spin loop of sub_82412F98 (one GPU fence poll); true = jump to
+# the fence checks at 0x82412FD8. games/mcla/hooks/mcla_fence_spin.cpp
+[[midasm_hook]]
+address = 0x82412FB0
+name = "mcla_hook_fence_spin"
+jump_address_on_true = 0x82412FD8
+
+# [F1] mcla_state_trace: before `stw r10,12(r9)` in vhsmState::Activate (0x8268DD70); r31 = the
+# state being activated. Read only. games/mcla/hooks/mcla_state_trace.cpp
+[[midasm_hook]]
+address = 0x8268DDD8
+name = "mcla_hook_state_trace"
+registers = ["r31"]
+
+# ---------------------------------------------------------------------------------------------
+# A/B switches for the grey-blocks / 1x-rendering investigation (docs/mcla/RENDER_NOTES.md).
+# Both cvars default OFF (the game's own behaviour); the next combined Mac run turns them on.
+# ---------------------------------------------------------------------------------------------
+
+# [R-GREY] mcla_fast_clear_off: AFTER `lwz r11,-13972(r11)` in sub_82418640 (r11 = [0x827EC96C],
+# the D3D fast-clear enable word); the hook sets r11 = 0 so the following `cmpwi; beq 0x82418894`
+# takes the plain path: one clear rectangle in the target's own MSAA mode and pitch.
+# games/mcla/hooks/mcla_fast_clear_off.cpp
+[[midasm_hook]]
+address = 0x82418734
+name = "mcla_hook_fast_clear_off"
+registers = ["r11"]
+after_instruction = true
+
+# [R-GREY] mcla_noaa: AFTER `lwz r11,4(r10)` in sub_822E4AB0 (r11 = the game's `noaa` dev option,
+# node 0x8287E0F8); the hook sets r11 = 1 so `cmplwi; bne 0x822E4BA0` stores 1 (no MSAA) in
+# renderer+384. games/mcla/hooks/mcla_noaa.cpp
+[[midasm_hook]]
+address = 0x822E4B80
+name = "mcla_hook_noaa"
+registers = ["r11"]
+after_instruction = true
+
+# ---------------------------------------------------------------------------------------------
+# CPU levers E1-E3 (docs/mcla/HOOKS_SPEC.md section E): the main thread's ring-space wait sleeps until
+# the pump releases a slot instead of looping around Sleep(0); statistics of the pump's rounds.
+# Shared state and the "[mcla-cpu] 10 s" line: games/mcla/hooks/mcla_cpu_common.{h,cpp}.
+# ---------------------------------------------------------------------------------------------
+
+# [E1] mcla_cpu_poll_wait: BEFORE `li r3,0` (then `bl 0x821C91B8` = Sleep(0)) inside the ring-wait loop
+# of sub_82148A10. r31 = ctx (byte [ctx+199] selects the ring), r27 = the slot the producer wants,
+# r26 = the deadline (guest us clock + 1000), r3 = the last clock reading. true = skip the Sleep(0)
+# and continue at 0x82148AB8 (the guest re-reads the read index and the clock itself).
+# games/mcla/hooks/mcla_cpu_poll_wait.cpp
+[[midasm_hook]]
+address = 0x82148AB0
+name = "mcla_hook_cpu_poll_wait"
+registers = ["r31", "r27", "r26", "r3"]
+jump_address_on_true = 0x82148AB8
+
+# [E2] mcla_cpu_poll_release: AFTER `stw r11,4(r6)` in sub_82160088 (the pump freeing ring slots);
+# r6 = 0x82836814 (ring 0). Wakes the waiter of E1. games/mcla/hooks/mcla_cpu_poll_release.cpp
+[[midasm_hook]]
+address = 0x82160140
+name = "mcla_hook_cpu_poll_release"
+registers = ["r6"]
+after_instruction = true
+
+# [E3] mcla_cpu_pump: AFTER `lwz r3,84(r1)` in sub_82144888 (the pump's round, timer audioFrameTimer);
+# r3 = whole ms left of the 7.0 ms budget, the argument of the `bl 0x821C91B8` (Sleep) that follows.
+# false = the game's own Sleep (statistics only, the default); true = skip it (jump to the epilogue
+# 0x821449D0) after a wake-on-demand wait. games/mcla/hooks/mcla_cpu_pump.cpp
+[[midasm_hook]]
+address = 0x821449C8
+name = "mcla_hook_cpu_pump"
+registers = ["r3"]
+after_instruction = true
+jump_address_on_true = 0x821449D0
