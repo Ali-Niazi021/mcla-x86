@@ -20,7 +20,7 @@
 //   GameSceneTiling()    the game's own tile loop (BeginTiledRendering, sub_8217A470 at 0x8217A680..0x8217A700 V,
 //                        the mode with flag bit 0 clear): the largest tile whose colour AND depth take 1024 EDRAM
 //                        tiles each, and how many tiles that makes of the target. 1280x720: 1x one tile, 2x two,
-//                        4x three; 1920x1080: 1x TWO tiles of 672 rows, 2x four, 4x six.
+//                        4x three; 1920x1080: 1x TWO tiles of 672 rows, 2x four, 4x seven (160-row tiles).
 //   SingleTile*()        whether the whole target fits one tile in a larger host EDRAM (colour + depth, each
 //                        within the console's 2048 tiles as far as a host render target reaches).
 //   TextureBlock*()      the title's block of its first four physical allocations (front buffers + the device
