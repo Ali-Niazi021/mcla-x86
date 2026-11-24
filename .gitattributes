@@ -1,0 +1,5 @@
+# Patches must reach `git apply` byte-exact (CRLF conversion breaks hunks); context lines start with a space.
+*.patch -text -whitespace
+# Git for Windows runs hooks with sh: keep LF.
+.githooks/* text eol=lf
+*.sh text eol=lf
