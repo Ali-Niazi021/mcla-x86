@@ -69,7 +69,8 @@ Stable 60 (PLAN 6): "a 300 s scripted drive plus 60 s parked in the busiest stre
   row is the one PLAN 6's definition is applied to (`--gate m5`: avg >= 59.5, p99 <= 20, <= 0.5 % over 25 ms, max <= 100, world/real
   1.000 +- 0.005; `--gate m4`: avg 29.9..30.1, p99 <= 35, <= 0.5 % over 50 ms, world/real 1.000 +- 0.005). `--gate` prints `gate <m> <id>:
   PASS|FAIL (...)` for the drive runs, or with `--parked` for the pooled rows only (never the parked segment alone); exit 4 on a FAIL.
-  A `world_real` of n/a is listed as `[unchecked: world_real]`, not as a pass or a fail.
+  A metric that cannot be checked FAILS the gate: with no `world_real` (no `[mcla-sim]` lines: the variant lacks `mcla_sim60=true`) the
+  line is `gate <m> <id>: FAIL [unchecked: world_real] (needs a variant with mcla_sim60=true)`.
 
 docs/METRICS.md rows (never hand-edited; `--no-metrics` skips, `--metrics-file F` / env MCLA_METRICS_FILE appends elsewhere)
   Appended under `## Runs` (created, with the table header, if missing), after the last row of its table. The header of the existing
@@ -973,7 +974,7 @@ def make_row(res: Result, build_id: str, api: str, fixture: Optional[str], note:
     return {
         "run_id": res.run_id, "build_id": build_id, "flow": res.flow, "api": {"d3d12": "D3D12", "vulkan": "Vulkan"}.get(api, api),
         "resolution": internal_resolution(res.cvars, a.get("wide")), "cap": cap_label(res.cvars, a.get("sim_cap")),
-        "cvars": format_cvars(res.cvars), "avg_fps": f2(m["avg_fps"], 1), "p50_ms": f2(m["p50_ms"]), "p99_ms": f2(m["p99_ms"]),
+        "cvars": format_cvars(res.cvars), "avg_fps": f2(m["avg_fps"], 2), "p50_ms": f2(m["p50_ms"]), "p99_ms": f2(m["p99_ms"]),
         "pct25": f2(m["pct_over_25ms"]), "pct50": f2(m["pct_over_50ms"]), "max_ms": f2(m["max_ms"], 1),
         "world_real": f2(m["world_real"], 4), "gpu_busy": f2(m["gpu_busy_pct"], 1), "notes": "; ".join(notes),
     }
@@ -1000,13 +1001,16 @@ def gate_check(gate: str, m: Dict) -> Tuple[List[str], List[str]]:
 
 
 def gate_line(gate: str, res: Result) -> Tuple[str, bool]:
+    """The `gate` line and whether the result passes: a failed check or a metric that could not be checked is a FAIL."""
     failed, unchecked = gate_check(gate, metrics_of(res.analysis))
-    text = "gate %s %s: %s" % (gate, res.run_id, "FAIL" if failed else "PASS")
+    ok = not failed and not unchecked
+    text = "gate %s %s: %s" % (gate, res.run_id, "PASS" if ok else "FAIL")
     if failed:
         text += " (" + "; ".join(failed) + ")"
     if unchecked:
-        text += " [unchecked: %s]" % ", ".join(unchecked)
-    return text, not failed
+        text += " [unchecked: %s] (%s)" % (", ".join(unchecked), "needs a variant with mcla_sim60=true"
+                                           if "world_real" in unchecked else "the metric is missing")
+    return text, ok
 
 
 def pooled(results: Sequence[Result], run_id: str, kind: str, flow: str, variant: Variant, rep: int) -> Result:
