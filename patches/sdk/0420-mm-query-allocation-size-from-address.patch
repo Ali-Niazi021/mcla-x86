@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Tue, 24 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0420: MmQueryAllocationSize returns the bytes from the queried address to the end of its allocation
+
+Source: Ours, written for this SDK (W5.2, pulled into wave 3). The root cause is the iOS port's W9 finding ($IOS
+  docs/mcla/WIDESCREEN.md section 14, docs/mcla/LEARNINGS.md 2026-11-16 ws3), which left the SDK fix to the
+  orchestrator; Xenia's 1080p patch for this title carries its own replacement of the call (knowledge only)
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched file is ReXGlue SDK code (BSD-3-Clause, from Xenia)
+Purpose: xboxkrnl MmQueryAllocationSize(address) returns the bytes from `address` to the end of the allocation it lies
+  in, not the size of the whole allocation: the same value when `address` is the allocation's base. Cvar
+  mm_query_allocation_size_from_address (Kernel, bool, default true; false = the SDK's whole-allocation size). Logs
+  the first four calls that differ. Keeps the W9 texclear hook as the belt. Not built before the first W5 build.
+Bucket: REDO
+
+0420-mm-query-allocation-size-from-address.patch (mcla-x86 W5.2; the SDK-side root fix of the iOS W9 texclear finding)
+
+Purpose. The title's texture create (sub_82177EB0) zero-fills a new D3D texture with memset(base, 0,
+MmQueryAllocationSize(base)). The game gives its first four physical 4 KiB D3D allocations fixed places inside ONE block
+of 4 x S (S = align32(W) x 736 x 4: front buffer A at S, B at 3 S, the colour surface's texture at 2 S, the depth
+surface's texture at 0), so `base` is an interior address. Xenia's BaseHeap::QuerySize (what this SDK's export called)
+returns region_page_count of the page the address is on: the size of the whole block, 4 S, for any address inside it.
+For the colour texture that is 2 S bytes past the end of the block: over D3D's ring buffers and, from align32(W) = 1440 on,
+the heap at 0xA8F20000 (the "guard word trashed" boot fatal at 1432+ px, WIDESCREEN.md section 14). What the title
+needs is the bytes from the address to the end of the allocation.
+
+Change (src/kernel/xboxkrnl/xboxkrnl_memory.cpp, MmQueryAllocationSize_entry; BaseHeap::QuerySize, which other code uses,
+is untouched, and so are the headers: no rebuild of the SDK's dependents):
+  * With mm_query_allocation_size_from_address (default true) and a non-zero whole-allocation size, the heap's
+    QueryRegionInfo(address) gives the allocation's base and size; for an address above the base the result is
+    allocation_size - (address - allocation_base) (0 if the address is somehow past the end). A committed or reserved
+    page only (info.state != 0); a free page keeps the SDK's value (0). The allocation's base returns exactly the old
+    value, so nothing that passes a base changes.
+  * The first four calls whose result differs are logged: `[mm] MmQueryAllocationSize(0x...) lies 0x... bytes inside its
+    allocation (0x..., 0x... bytes): 0x... bytes left (the whole-allocation size would be 0x...)`.
+  * Cvar mm_query_allocation_size_from_address (Kernel, bool, default true). false = the SDK's behaviour.
+The game layer's W9 texclear hook (clamps the same size after the call) stays as the belt; it sees a size that is already
+right and leaves it alone.
+
+Not built or run (clang++ 20.1.8 -fsyntax-only of the TU with the SDK's Release flags: 0 diagnostics before and after).
+Verify: 1568x720 boots without the `guard word trashed` fatal with the hook's clamp off (`--mcla_ws_texclear_clamp=0`) and
+the `[mm] MmQueryAllocationSize(...)` line in the log; the default 1280x720 flow is unchanged; the control
+(`--mm_query_allocation_size_from_address=false`) reproduces the old size.
+
+---
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+index 8684edab..8488f9ab 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+@@ -13,8 +13,10 @@
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
+ #include <cstring>
++#include <atomic>
+ 
+ #include <rex/assert.h>
++#include <rex/cvar.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+@@ -23,6 +25,14 @@
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xtypes.h>
+ 
++// LOCAL PATCH - MCLA (0420): MmQueryAllocationSize for an address inside an allocation.
++REXCVAR_DEFINE_BOOL(mm_query_allocation_size_from_address, true, "Kernel",
++                    "MmQueryAllocationSize returns the bytes from the queried address to the end of its "
++                    "allocation (what the title expects: RAGE's texture create zero-fills "
++                    "MmQueryAllocationSize(base) bytes from a base that lies inside a bigger block), not the "
++                    "size of the whole allocation. The same value when the address is the allocation's base. "
++                    "false = the SDK's whole-allocation size.");
++
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ 
+@@ -460,6 +470,26 @@ u32 MmQueryAllocationSize_entry(mapped_void base_address) {
+     size = 0;
+   }
+ 
++  // LOCAL PATCH - MCLA (0420): the SDK's BaseHeap::QuerySize is the size of the whole allocation the address lies in.
++  // For an address inside it the bytes left are fewer, and the caller (a memset of that many bytes) would run past
++  // the allocation by the offset. For the allocation's base nothing changes.
++  if (size && REXCVAR_GET(mm_query_allocation_size_from_address)) {
++    const uint32_t address = base_address.guest_address();
++    memory::HeapAllocationInfo info = {};
++    if (heap->QueryRegionInfo(address, &info) && info.state != 0 && address > info.allocation_base) {
++      const uint32_t offset = address - info.allocation_base;
++      const uint32_t left = offset < info.allocation_size ? info.allocation_size - offset : 0;
++      static std::atomic<uint32_t> logged{0};
++      if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
++        REXKRNL_INFO(
++            "[mm] MmQueryAllocationSize({:#010x}) lies {:#x} bytes inside its allocation ({:#010x}, {:#x} bytes): "
++            "{:#x} bytes left (the whole-allocation size would be {:#x})",
++            address, offset, info.allocation_base, info.allocation_size, left, size);
++      }
++      size = left;
++    }
++  }
++
+   return size;
+ }
+ 

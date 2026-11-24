@@ -12,11 +12,11 @@
 #   sha256   SHA-256 of the patch file's bytes. After editing a local patch run `python tools/prepare_sdk.py rehash`
 #   purpose  one line
 #   subdir   directory inside the SDK tree in which `git apply` runs ("" = the SDK root; e.g. "thirdparty/FFmpeg")
-#   bucket   PLAN 4.1: AS-IS (taken unchanged), PORT (logic kept, rebased or re-expressed)
+#   bucket   PLAN 4.1: AS-IS (taken unchanged), PORT (logic kept, rebased or re-expressed), REDO (new code for Windows)
 #
 # Renan's entries are his Windows list in the exact order scripts/make_pc.ps1 applies it (75 patches) minus the three
 # in [[dropped]]. W0.3 proved the drops apply-independent: the other patches applied with 0 failures without them.
-# The local entries follow, rebased on Renan's tree (0 offsets).
+# The local entries follow, rebased on Renan's tree (0 offsets). 0400 and later are the wave-3 Windows patches.
 
 [pins]
 sdk_url = "https://github.com/rexglue/rexglue-sdk.git"
@@ -736,6 +736,33 @@ sha256 = "78ce444fe6905ac347e5365c6b8fec556637f58377bc0b67b78bac747c642920"
 purpose = "Vulkan with dynamic rendering: the open render pass remembers the transfer destination view it was begun for, so a draw never continues inside an ownership-transfer pass. Matters because Renan's vulkan-hoist-shared-memory-uploads (default on) keeps passes open longer. Not built before G1."
 subdir = ""
 bucket = "PORT"
+
+[[patch]]
+name = "0400-guest-vblank-precise-win32"
+source = "local"
+path = "patches/sdk/0400-guest-vblank-precise-win32.patch"
+sha256 = "cc4975c83bdd7e3b9c806c86898c2c534df67b5bc8c23ad7e0eb3e8239f098b2"
+purpose = "Windows guest vblank (graphics_system.cpp): an absolute grid of 1/video_mode_refresh_rate from a QPC origin, a CREATE_WAITABLE_TIMER_HIGH_RESOLUTION wait to ~0.3 ms before each point then a QPC spin, thread at MMCSS \"Games\" + time-critical, resync (never a burst) when over one period late, `[guest-vblank] period p50=.. p99=.. late=.. resync=.. n=..` every 10 s. Cvars guest_vblank_precise (true), guest_vblank_spin_us (300). vsync=false keeps the SDK loop and warns once. rexgpu-xenos links avrt. Not built before the first W3 build."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0410-cp-event-seq-export"
+source = "local"
+path = "patches/sdk/0410-cp-event-seq-export.patch"
+sha256 = "a989ca94b7c477874dfbfc5b281da1fe3b50753c916c20f9d194385cabec9311"
+purpose = "rexgpu-xenos.dll exports the C data symbol nfsmw_cp_event_seq (std::atomic<uint32_t>); the command processor bumps it and WakeByAddressAll's it after EVENT_WRITE_SHD, MEM_WRITE, a matched COND_WRITE and REG_TO_MEM, for mcla/hooks/mcla_fence_spin.cpp (GetProcAddress + WaitOnAddress). rexgpu-xenos links Synchronization. No cvar. Not built before the first W3 build."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0420-mm-query-allocation-size-from-address"
+source = "local"
+path = "patches/sdk/0420-mm-query-allocation-size-from-address.patch"
+sha256 = "833a8f2d6af9954824ca0c97d3954212dbf623c0eba61816b81ac064630b6416"
+purpose = "xboxkrnl MmQueryAllocationSize(address) returns the bytes from the address to the end of its allocation, not the whole allocation's size (root fix of the W9 texclear finding: RAGE's texture create memsets that many bytes from an address inside a bigger block); the allocation's base returns the old value. Cvar mm_query_allocation_size_from_address (true; false = SDK behaviour). Logs the first four calls that differ. Not built before the first W5 build."
+subdir = ""
+bucket = "REDO"
 
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 

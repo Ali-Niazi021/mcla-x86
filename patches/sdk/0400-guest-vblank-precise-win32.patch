@@ -1,0 +1,420 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Tue, 24 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0400: precise guest vblank on Win32 (absolute grid, high-resolution timer, QPC spin, MMCSS)
+
+Source: Ours, written for this SDK (W3.2). The idea (absolute grid, a precise wait, a statistics line) is $IOS
+  games/mcla/sdk_patches/0208-guest-vblank-grid-stats.patch (+0209) redone for Win32; no code is shared (that one is
+  Mach real-time threads and os_sync)
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: Windows: the guest vblank thread fires on an absolute grid of 1/video_mode_refresh_rate seconds from a QPC
+  origin (high-resolution waitable timer to ~0.3 ms before each point, QPC spin for the rest), at MMCSS "Games" and
+  time-critical priority; a vblank over one period late resyncs the grid (no burst); one
+  `[guest-vblank] period p50=.. p99=.. late=.. resync=.. n=..` line every 10 s. Cvars guest_vblank_precise (true),
+  guest_vblank_spin_us (300). vsync=false keeps the SDK loop (warns once). Not built before the first W3 build.
+Bucket: REDO
+
+0400-guest-vblank-precise-win32.patch (mcla-x86 W3.2; redoes the idea of $IOS 0208/0209 for Windows)
+
+Purpose. The SDK's vblank thread (GraphicsSystem::SetupGuestGpu, "GPU VSync") wakes every Sleep(1 ms), measures the
+elapsed guest ticks against the period and replays every vblank it finds due. On Windows that is a guest vblank that
+lands 0-2 ms after its time (Sleep granularity and a normal-priority thread) and, after a late wake, two vblanks in a
+row: the game's frame pacer sees a period wandering over ~15-18 ms. The first guest frame of a 60 Hz lock can only be as
+steady as this clock.
+
+Change (src/graphics/graphics_system.cpp, Windows only; the other platforms' code is byte-identical):
+  * class PreciseVblank (anonymous namespace). An absolute grid: point n is origin + n * qpc_hz / refresh_rate, the
+    origin one QueryPerformanceCounter reading (re-taken when the loop engages and on a resync). Each wait: a
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION timer to (point - guest_vblank_spin_us - overshoot), then YieldProcessor
+    spinning on QPC to the point. `overshoot` is the largest lateness of the timer's last 64 wakes, capped at 1.5 ms,
+    so a timer that wakes 0.4 ms late costs a longer spin, not a late vblank. No high-resolution timer (Windows older
+    than 10 1803): Sleep(1) to 3 ms before the point, then the spin.
+  * Late handling: a vblank that is less than one period late fires at once and the grid stays (the next point is on
+    time); more than one period late re-anchors the grid on now and fires once (resync counted), the missed vblanks
+    are never replayed. The period follows Clock::guest_time_scalar() (guest time), a change starts a new grid.
+  * The vblank thread engages on its first precise wait: SetThreadPriority(TIME_CRITICAL) first, then
+    AvSetMmThreadCharacteristicsW(L"Games") (MMCSS manages the thread afterwards); both are undone when the loop goes
+    back to the SDK's, or the thread ends. Both outcomes are logged (`[guest-vblank] precise grid: ...`).
+  * Cvar guest_vblank_precise (GPU, bool, default true, live; false = the SDK's loop as before). With vsync=false the
+    SDK's loop is kept untouched (the guest vblank fires every 1 ms, as before) and a warning says so once.
+  * Statistics: `[guest-vblank] period p50=<ms> p99=<ms> late=<n> resync=<n> n=<count>` every 10 s (nearest-rank
+    percentiles of the periods between the QPC stamps taken when each vblank fired, ms with 3 decimals; late = periods
+    over 1.05x nominal; n = periods in the window). The SDK's own loop (guest_vblank_precise=false, vsync=false) feeds
+    the same line, for an A/B of the two.
+  * src/graphics/CMakeLists.txt: rexgpu-xenos links avrt on Windows.
+
+Not built or run (clang++ 20.1.8 -fsyntax-only of the TU with the SDK's Release flags: no new diagnostics).
+Verify: `[guest-vblank] precise grid: 60.000 Hz ... MMCSS Games joined ... time-critical priority set` at start-up, then
+p50 16.66-16.68, p99 <= 17.2, resync 0 in a steady 60 fps scene; A/B with --guest_vblank_precise=false.
+
+---
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index a910d57d..fc8a81c0 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -192,3 +192,8 @@ if(REXGLUE_USE_D3D12)
+         dxguid
+     )
+ endif()
++
++# LOCAL PATCH - MCLA (0400): the precise guest vblank joins MMCSS (AvSetMmThreadCharacteristicsW).
++if(WIN32)
++    target_link_libraries(rexgpu-xenos PRIVATE avrt)
++endif()
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index e00560b3..536bf387 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -31,6 +31,23 @@
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
++#if REX_PLATFORM_WIN32
++// LOCAL PATCH - MCLA (0400): the precise guest vblank (waitable timer, QPC, MMCSS).
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++
++#include <avrt.h>
++
++#include <atomic>
++#include <cmath>
++#include <vector>
++#endif
++
+ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
+     .allowed({"none", "fxaa", "fxaa_extreme"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+@@ -39,6 +56,22 @@ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
+                     "Store shaders persistently and load them when loading games to avoid "
+                     "runtime spikes and freezes when playing the game not for the first time.");
+ 
++#if REX_PLATFORM_WIN32
++// LOCAL PATCH - MCLA (0400): precise guest vblank on Windows.
++REXCVAR_DEFINE_BOOL(guest_vblank_precise, true, "GPU",
++                    "Windows: the guest vblank fires on an absolute grid of 1/video_mode_refresh_rate seconds "
++                    "from a QPC origin. A high-resolution waitable timer sleeps to guest_vblank_spin_us before "
++                    "each point and the thread spins on QPC for the rest, at MMCSS 'Games' and time-critical "
++                    "priority. A vblank more than one period late restarts the grid (no catch-up burst). "
++                    "false = the SDK's 1 ms polling loop. Not used with vsync=false (the guest vblank then "
++                    "free-runs at 1 kHz as before; a warning says so)");
++REXCVAR_DEFINE_INT32(guest_vblank_spin_us, 300, "GPU",
++                     "With guest_vblank_precise: microseconds before each vblank at which the timer wait ends "
++                     "and the QPC spin begins (the timer's measured overshoot is added to it). 0 = trust the "
++                     "timer")
++    .range(0, 4000);
++#endif
++
+ namespace {
+ 
+ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
+@@ -58,6 +91,256 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
+ }
+ }  // namespace
+ 
++#if REX_PLATFORM_WIN32
++// LOCAL PATCH - MCLA (0400): the Windows guest vblank. The SDK's own loop (below) sleeps 1 ms at a time and replays
++// every vblank it finds due, so the guest sees a period that wanders between ~16 and ~18 ms and bursts after a late
++// wake. PreciseVblank keeps an absolute grid of 1/refresh seconds from a QPC origin: a high-resolution waitable timer
++// sleeps to a little before the next grid point and a QPC spin does the rest. A vblank more than one period late
++// restarts the grid, it is never made up with a burst.
++namespace {
++
++int64_t QpcFrequency() {
++  LARGE_INTEGER frequency;
++  QueryPerformanceFrequency(&frequency);
++  return frequency.QuadPart;
++}
++
++int64_t QpcNow() {
++  LARGE_INTEGER counter;
++  QueryPerformanceCounter(&counter);
++  return counter.QuadPart;
++}
++
++class PreciseVblank {
++ public:
++  explicit PreciseVblank(double refresh_rate_hz) {
++    qpc_hz_ = QpcFrequency();
++    refresh_rate_hz_ = refresh_rate_hz;
++    nominal_ticks_ = double(qpc_hz_) / refresh_rate_hz;
++    period_ticks_ = nominal_ticks_;
++    max_overshoot_ticks_ = qpc_hz_ * 3 / 2000;  // 1.5 ms
++    timer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                    TIMER_ALL_ACCESS);
++    if (!timer_) {
++      REXGPU_WARN(
++          "[guest-vblank] no high-resolution waitable timer (error {}): the precise vblank sleeps with Sleep(1) "
++          "and spins for the last 3 ms",
++          uint32_t(GetLastError()));
++    }
++    periods_ms_.reserve(4096);
++  }
++
++  ~PreciseVblank() {
++    Release();
++    if (timer_) {
++      CloseHandle(timer_);
++    }
++  }
++
++  PreciseVblank(const PreciseVblank&) = delete;
++  PreciseVblank& operator=(const PreciseVblank&) = delete;
++
++  // The calling thread goes to time-critical priority and joins MMCSS "Games"; a new grid starts now. Idempotent.
++  void Engage() {
++    if (engaged_) {
++      return;
++    }
++    engaged_ = true;
++    HANDLE thread = GetCurrentThread();
++    previous_priority_ = GetThreadPriority(thread);
++    const bool raised = SetThreadPriority(thread, THREAD_PRIORITY_TIME_CRITICAL) != 0;
++    const uint32_t priority_error = raised ? 0 : uint32_t(GetLastError());
++    // The priority first: once the thread is in MMCSS the scheduler manages it.
++    DWORD task_index = 0;
++    mmcss_ = AvSetMmThreadCharacteristicsW(L"Games", &task_index);
++    const uint32_t mmcss_error = mmcss_ ? 0 : uint32_t(GetLastError());
++    scalar_ = GuestTimeScalar();
++    period_ticks_ = nominal_ticks_ / scalar_;
++    origin_ = QpcNow();
++    index_ = 1;
++    BreakPeriod();
++    REXGPU_INFO(
++        "[guest-vblank] precise grid: {:.3f} Hz (period {:.4f} ms), {}, QPC spin for the last {} us (+ the timer's "
++        "overshoot), MMCSS Games {}, time-critical priority {}",
++        refresh_rate_hz_, 1e3 * period_ticks_ / double(qpc_hz_),
++        timer_ ? "high-resolution waitable timer" : "Sleep(1) (no high-resolution timer)",
++        REXCVAR_GET(guest_vblank_spin_us),
++        mmcss_ ? fmt::format("joined (task index {})", uint32_t(task_index))
++               : fmt::format("NOT joined (error {})", mmcss_error),
++        raised ? std::string("set") : fmt::format("NOT set (error {})", priority_error));
++  }
++
++  // The calling thread leaves MMCSS and gets its priority back. True if it was engaged.
++  bool Release() {
++    if (!engaged_) {
++      return false;
++    }
++    engaged_ = false;
++    if (mmcss_) {
++      AvRevertMmThreadCharacteristics(mmcss_);
++      mmcss_ = nullptr;
++    }
++    SetThreadPriority(GetCurrentThread(), previous_priority_);
++    BreakPeriod();
++    return true;
++  }
++
++  // Waits for the next point of the grid and returns the QPC stamp of the moment it was reached, 0 if `running` was
++  // cleared during the wait.
++  int64_t WaitForVblank(const std::atomic<bool>& running) {
++    int64_t now = QpcNow();
++    const double scalar = GuestTimeScalar();
++    if (scalar != scalar_) {
++      // The guest clock was re-scaled and the guest's vblank is in guest time: a new grid at the new period.
++      scalar_ = scalar;
++      period_ticks_ = nominal_ticks_ / scalar;
++      origin_ = now;
++      index_ = 1;
++      BreakPeriod();
++    }
++    const int64_t period = std::max<int64_t>(1, int64_t(period_ticks_));
++    const int64_t deadline = origin_ + int64_t(std::llround(double(index_) * period_ticks_));
++    if (now - deadline > period) {
++      // More than a period late (a stall, a long interrupt, the machine paused): the vblank fires now and the grid
++      // restarts from it. The vblanks that were missed are never replayed in a burst.
++      ++resync_;
++      origin_ = now;
++      index_ = 1;
++      return now;
++    }
++    const int64_t spin_ticks = int64_t(REXCVAR_GET(guest_vblank_spin_us)) * qpc_hz_ / 1000000;
++    const int64_t wake = deadline - spin_ticks - overshoot_ticks_;
++    if (now < wake) {
++      SleepUntil(wake);
++      NoteOvershoot(std::max<int64_t>(0, QpcNow() - wake));
++      if (!running.load(std::memory_order_relaxed)) {
++        return 0;
++      }
++    }
++    int64_t fired;
++    while ((fired = QpcNow()) < deadline) {
++      YieldProcessor();
++    }
++    ++index_;
++    return fired;
++  }
++
++  // A vblank of the grid fired at `fired` (WaitForVblank's result) and the guest has seen it.
++  void EndVblank(int64_t fired) { NoteVblank(fired, 1e3 * period_ticks_ / double(qpc_hz_)); }
++
++  // vsync=false: the SDK's loop is kept (a 1 kHz free-running vblank); the grid has no meaning there.
++  void WarnNoVsyncOnce() {
++    if (!warned_no_vsync_) {
++      warned_no_vsync_ = true;
++      REXGPU_WARN(
++          "[guest-vblank] guest_vblank_precise is on but vsync is off: the guest vblank free-runs at 1 kHz as in "
++          "the SDK (the precise grid needs vsync=true)");
++    }
++  }
++
++  // The SDK's loop (guest_vblank_precise off, or vsync off) reports through the same line.
++  void NoteLegacyVblank(double nominal_ms) { NoteVblank(QpcNow(), nominal_ms); }
++  void NoteLegacyResync() { ++resync_; }
++
++ private:
++  static double GuestTimeScalar() {
++    const double scalar = rex::chrono::Clock::guest_time_scalar();
++    return scalar > 0.0 ? scalar : 1.0;
++  }
++
++  void SleepUntil(int64_t wake) {
++    const int64_t remaining = wake - QpcNow();
++    if (remaining <= 0) {
++      return;
++    }
++    if (timer_) {
++      LARGE_INTEGER due;  // relative, in 100 ns units
++      due.QuadPart = -std::max<int64_t>(1, remaining * 10000000 / qpc_hz_);
++      if (SetWaitableTimer(timer_, &due, 0, nullptr, nullptr, FALSE)) {
++        WaitForSingleObject(timer_, DWORD(remaining * 1000 / qpc_hz_) + 100);
++        return;
++      }
++    }
++    // No usable timer: poll with Sleep(1) until 3 ms are left; the spin does the rest.
++    while (wake - QpcNow() > qpc_hz_ * 3 / 1000) {
++      Sleep(1);
++    }
++  }
++
++  // How late the timer woke the thread, as the largest overshoot of the last 64 waits: the next waits end that much
++  // earlier (up to 1.5 ms) and the spin makes up for it.
++  void NoteOvershoot(int64_t overshoot_ticks) {
++    block_overshoot_ticks_ = std::max(block_overshoot_ticks_, overshoot_ticks);
++    if (++block_waits_ >= 64) {
++      overshoot_ticks_ = std::min(block_overshoot_ticks_, max_overshoot_ticks_);
++      block_overshoot_ticks_ = 0;
++      block_waits_ = 0;
++    }
++  }
++
++  // The next period is not measured against the last vblank (the grid or the loop changed).
++  void BreakPeriod() { last_fired_ = 0; }
++
++  // The period between vblanks (QPC stamps taken when each one fired), reported every 10 s.
++  void NoteVblank(int64_t fired, double nominal_ms) {
++    if (last_fired_ != 0) {
++      const double ms = 1e3 * double(fired - last_fired_) / double(qpc_hz_);
++      periods_ms_.push_back(ms);
++      if (ms > nominal_ms * 1.05) {
++        ++late_;
++      }
++    }
++    last_fired_ = fired;
++    if (window_start_ == 0) {
++      window_start_ = fired;
++    } else if (fired - window_start_ >= 10 * qpc_hz_) {
++      ReportPeriods();
++      window_start_ = fired;
++    }
++  }
++
++  void ReportPeriods() {
++    const size_t n = periods_ms_.size();
++    if (n != 0) {
++      std::sort(periods_ms_.begin(), periods_ms_.end());
++      const auto rank = [&](double p) {
++        return periods_ms_[std::clamp<size_t>(size_t(std::ceil(p * double(n))), 1, n) - 1];
++      };
++      REXGPU_INFO("[guest-vblank] period p50={:.3f} p99={:.3f} late={} resync={} n={}", rank(0.50), rank(0.99),
++                  late_, resync_, n);
++    }
++    periods_ms_.clear();
++    late_ = 0;
++    resync_ = 0;
++  }
++
++  int64_t qpc_hz_ = 0;
++  double refresh_rate_hz_ = 60.0;
++  double nominal_ticks_ = 0.0;  // QPC ticks per vblank at guest time scalar 1
++  double period_ticks_ = 0.0;   // ... at the scalar in force
++  double scalar_ = 1.0;
++  int64_t origin_ = 0;    // QPC of grid point 0
++  uint64_t index_ = 1;    // the grid point WaitForVblank waits for
++  HANDLE timer_ = nullptr;
++  int64_t overshoot_ticks_ = 0;
++  int64_t block_overshoot_ticks_ = 0;
++  int64_t max_overshoot_ticks_ = 0;
++  uint32_t block_waits_ = 0;
++  bool engaged_ = false;
++  bool warned_no_vsync_ = false;
++  HANDLE mmcss_ = nullptr;
++  int previous_priority_ = THREAD_PRIORITY_NORMAL;
++  // The period statistics.
++  std::vector<double> periods_ms_;
++  int64_t last_fired_ = 0;
++  int64_t window_start_ = 0;
++  uint32_t late_ = 0;
++  uint32_t resync_ = 0;
++};
++
++}  // namespace
++#endif  // REX_PLATFORM_WIN32
++
+ namespace rex::graphics {
+ 
+ // Nvidia Optimus/AMD PowerXpress support.
+@@ -158,7 +441,31 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++#if REX_PLATFORM_WIN32
++        PreciseVblank precise_vblank(refresh_rate_hz);  // LOCAL PATCH - MCLA (0400)
++#endif
+         while (vsync_worker_running_) {
++#if REX_PLATFORM_WIN32
++          // LOCAL PATCH - MCLA (0400): the absolute grid, a high-resolution timer and a QPC spin. vsync=false keeps
++          // the loop below (a 1 kHz vblank), as does guest_vblank_precise=false.
++          if (REXCVAR_GET(guest_vblank_precise)) {
++            if (REXCVAR_GET(vsync)) {
++              precise_vblank.Engage();
++              const int64_t fired = precise_vblank.WaitForVblank(vsync_worker_running_);
++              if (fired == 0 || !vsync_worker_running_) {
++                break;
++              }
++              MarkVblank();
++              precise_vblank.EndVblank(fired);
++              continue;
++            }
++            precise_vblank.WarnNoVsyncOnce();
++          }
++          if (precise_vblank.Release()) {
++            // Back on the loop below: its clock restarts from now.
++            last_frame_time = chrono::Clock::QueryGuestTickCount();
++          }
++#endif
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+           uint64_t interval_ticks =
+               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+@@ -170,9 +477,16 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+           if (behind < 0 || uint64_t(behind) > guest_tick_frequency / 4) {
+             last_frame_time = current_time;
+             behind = 0;
++#if REX_PLATFORM_WIN32
++            precise_vblank.NoteLegacyResync();  // LOCAL PATCH - MCLA (0400)
++#endif
+           }
+           while (uint64_t(behind) >= interval_ticks) {
+             MarkVblank();
++#if REX_PLATFORM_WIN32
++            precise_vblank.NoteLegacyVblank(1e3 * double(interval_ticks) /
++                                            double(guest_tick_frequency));  // LOCAL PATCH - MCLA (0400)
++#endif
+             last_frame_time += interval_ticks;
+             behind -= int64_t(interval_ticks);
+           }
