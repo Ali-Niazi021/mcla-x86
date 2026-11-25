@@ -917,7 +917,10 @@ def cmd_build(args: argparse.Namespace) -> int:
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_path = L.logs / ("sdk-build-%s.log" % ts)
 
-    with heavy_lock.hold("sdk-build", cmd=["prepare_sdk.py", "build", "--config", args.config], work=str(L.work)):
+    # Always the GLOBAL lock ($MCLA_WORK or the default), even when --work points at a scratch tree: a scratch SDK build
+    # is a heavy job on the same machine as the benches.
+    with heavy_lock.hold("sdk-build " + L.work.name, cmd=["prepare_sdk.py", "build", "--config", args.config],
+                         work=heavy_lock.work_dir(None)):
         token = os.environ.get(heavy_lock.ENV_TOKEN)
         if token:
             env[heavy_lock.ENV_TOKEN] = token
