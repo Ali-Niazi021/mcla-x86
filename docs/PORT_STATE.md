@@ -24,7 +24,8 @@ Owner: ORC. The plan is [PLAN.md](PLAN.md); this file tracks where execution sta
 
 ## Current phase
 
-Wave 3 (M4 locked 30, timing infrastructure, CPU levers), with the 1080p work (W5.1/W5.2) pulled forward after D1.
+**PAUSED by the owner (2026-11-25).** Waves 3–5 in progress. Resume from "Next actions" below. No job is running and
+the heavy lock is free.
 
 ## Milestones
 
@@ -35,25 +36,45 @@ Wave 3 (M4 locked 30, timing infrastructure, CPU levers), with the 1080p work (W
 | M1 | Codegen clean, exe links, tests pass | **pass**: `codegen ok: cpp=121 functions=30204 unresolved=0 fingerprint=da9ab3c2…`; `gate: high 0 medium 0`; RelWithDebInfo 62 s, Release 68 s, 0 warnings; `100% tests passed` (3/3) | 2026-11-24 |
 | M2 | Title screen | **pass** (b2.1, D3D12): `first engine frame` t+4.4 s, `Startup/Startup_Checks` t+30.6 s, 13/13 profile cvars, `fatal=0 unregistered=0`; title visible; audio endpoint opened. Owner check (audible music/SFX) pending | 2026-11-24 |
 | M3 | Free-roam driving, 10 min soak | **pass** (b2.1): new profile → `cutscene -> free-roam` 136.9 s, save-backup lines ×2, drove 52 mph, pause open/close; fixture `after_intro`; 600 s soak `fatal=0` (run w2.1-m3c); parity with E2: cars coloured, no missing geometry/flashes. Owner check (radio balance) pending | 2026-11-24 |
-| M4 | Locked 30 fps at 720p | todo | |
-| M5 | 60 fps at 720p | todo | |
-| M6 | 60 fps at 1080p on the 880M | todo | |
+| M4 | Locked 30 fps at 720p | **open**: run w3.4-m4 met avg 30.00 and world/real 1.0004 but p99 was 35.1–35.2 ms (limit 35.0). Root cause: the CP's `Sleep(1)` swap-gate poll. Fixed by SDK patch 0430 (series 84), not yet re-gated | |
+| M5 | 60 fps at 720p | **close, not met**: `mcla_fps_target=60,mcla_present_immediate=-1,mcla_ws_single_tile=true` gives a stable run (w4.2-m5g-immst-stable) of avg 59.42, p99 25.25, world/real 0.9998 (bar: ≥59.5, ≤20). The run without the hold (w4.2-m5m2-immst) gets 60.00 / p99 22.66 | |
+| M6 | 60 fps at 1080p on the 880M | **open**: native 1080p now boots to free roam (w4.2-smoke1080, `fatal=0`) after the physical-pool fix; not benched yet. The owner's target is 720p + FSR 3 → 1080p | |
 | M7 | Polish | todo | |
 
 ## Task board
 
 ### Doing
 
-- W3.3 HOST+GAME: host frame cap `mcla_fps_cap`, paced at `mcla_hook_present_interval`.
-- W5.1 GAME: W x H widescreen (`mcla_scene_height`, up to 1920x1080), EDRAM-limit hook body, 1080p/900p profiles.
-- TOOLS fix: flow re-timing for x86, PrintWindow screenshots, keep display awake.
+(nothing: paused)
 
-### Todo
+### Todo (next actions, in order)
 
-- SDK rebuild with 0400/0410/0420 (series 82, fingerprint `cfeae5d95249d70a`), then W3.4 VER: M4 bench + CPU-lever A/B.
-- CODEGEN: TOML entry for the EDRAM-limit hook at `0x82410E34` (spec from W5.1).
-- GAME (low): skip-intro hook causes 3 boot-time `Resolve region is empty` / `PM4_DRAW_INDX_2 … Failed in backend` errors.
-- W0.8 E1 Xenia baseline: waits for Ali.
+1. **Owner's quick 1080p60 test on the new power adapter**, reporting back to Ali if 1080p60 changed. This was interrupted
+   by the pause. Build at HEAD (`python tools/codegen.py`, then a Release rebuild), then
+   `python tools/bench.py --flow bench_drive --fixture after_intro --seconds 240 --no-warmup` with these variants:
+   - `n1080:mcla_profile=1080p,mcla_fps_target=60,mcla_present_immediate=-1,mcla_sim_hold30_s=0`
+   - `n1080st` (the same, plus `mcla_ws_single_tile=true`)
+   - `n1080fsr:mcla_profile=1080p-fsr,…`
+   - `fsr1:mcla_profile=720p-fsr1,…`
+   - `immnoaa` (the 720p reference)
+
+   Record the power adapter in the notes.
+2. **M4 re-gate on series 84** (0430/0440): `bench.py … --parked --gate m4 --variant sim30:mcla_sim60=true,mcla_sim_cap=30,mcla_fps_cap=30`.
+3. **M5 closing:** the p99 tail and the 60→30 hold drops. Check the census (`[mcla-swap]`) and the `[mcla-input-fix]` lines
+   (the input-fix hooks are new since the last codegen). Candidates are the hold thresholds and the remaining GPU-heavy
+   streets. The bar is `--gate m5` on `immst` with the hold on.
+4. **M6 per the owner:** FSR 3 (`mcla_profile=1080p-fsr`, render markers) against 720p+FSR1. Check `temporal_aa_debug=4/7`
+   and look for ghosting in shots. Optional: FSR 4.1 on the 800M series (licence and SM 6.6 checks first).
+5. **Controllers:** hand test of XInput, Xbox, DS4 and DualSense (owner).
+6. **60 fps gameplay fixes not yet done.** These are LARecomp-derived in Renan's port, so re-derive them from the PPC:
+   - **Warp hang:** override `sub_8221BE98`; it calls `sub_8221B790`/`sub_8221B8C8`. The warper state is at
+     `*(0x8286D8D4)+0x51240`, with the state word at +288.
+   - **Checkpoint sweep:** override `sub_822653A8`, plus a mid-asm hook at `0x82688200` in `sub_826881A8` (`r1`, `r31`,
+     `r27`).
+   - **Bike gyro:** `sub_823688B8`, constants at `0x8236895C` (`f13`, 0.40) and `0x823689F0` (`f0`, 0.15), with
+     k(dt) = 1-(1-k30)^(30dt).
+7. GAME (low): the skip-intro hook causes 3 boot-time `Resolve region is empty` errors.
+8. W0.8 E1 Xenia baseline: waits for Ali.
 
 ### Done
 
@@ -90,8 +111,9 @@ PLAN §7.2. Shared contracts for wave 1:
 
 ## Next actions
 
-1. G1 (VER) once the SDK build and REV are in.
-2. Wave 2 (M2/M3) with W2.2 bench port in parallel. Because D1 failed, pull GPU levers (W5.2–W5.4) into wave 3.
+See "Todo (next actions, in order)" in the task board. Note for resuming: the SDK install at `$WORK/sdk/install` is
+series 84 (`5e4b01ee959eb13a`); since the last codegen, new hooks were added (input fixes, physical pool), so run
+`python tools/codegen.py` before the next build. The role files are in `.omp/agents/` (local, gitignored).
 
 ## Decisions changed since PLAN
 
