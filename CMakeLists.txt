@@ -89,7 +89,13 @@ else()
   # The hook and profile sources are objects of the executable itself, not a library: a hook is a strong definition
   # that must replace the weak default inside the generated code, and an archive member nothing references is never
   # pulled in. The SDK's entry point and ReXApp are added by rexglue_configure_target().
-  add_executable(mcla WIN32 ${MCLA_HOST_SOURCES} ${MCLA_HOOK_SOURCES})
+  # The application manifest (UTF-8 active code page, supportedOS) is a source: CMake hands a .manifest to the linker as
+  # /MANIFESTINPUT, merged into the one lld embeds (/MANIFEST:EMBED). It carries its own trustInfo, so the linker's
+  # default UAC manifest is switched off below: merged beside it, that one lands in the wrong namespace and the program
+  # does not start (side-by-side error 14001), as the launcher found.
+  set(MCLA_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/src/host/mcla.manifest")
+  add_executable(mcla WIN32 ${MCLA_HOST_SOURCES} ${MCLA_HOOK_SOURCES} "${MCLA_MANIFEST}")
+  target_link_options(mcla PRIVATE "LINKER:/MANIFESTUAC:NO")
 
   set_source_files_properties(${MCLA_HOST_SOURCES} PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Wno-unused-parameter")
   target_include_directories(mcla PRIVATE
