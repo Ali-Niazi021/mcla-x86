@@ -9,6 +9,14 @@ Owner: ORC (merges what tasks report). One entry per non-obvious finding, newest
 
 ---
 
+### W3.4-fix Present jitter was the CP's Sleep(1) poll, not the display
+**Symptom** M4 p99 35.1–35.2 ms (limit 35.0) at cap 30 with an exact guest vblank on an exact 120.000 Hz panel.
+**Cause** `MsBetweenPresents` lag-1 autocorrelation −0.50 = independent per-swap delay; the swap gate's `WAIT_REG_MEM`
+(wait 0x100) is served by `Sleep(1)` polls (`command_processor.cpp:2305-2325`), so the release is seen 0–2 ms late.
+**Fix** Patch 0430 wakes it with `WaitOnAddress` from `MarkVblank`; 0440 locks the guest vblank to a line fitted to
+`WaitForVBlank` wakes (wake scatter sd 0.155 ms: never fire on a raw wake). **Check** acf1 before blaming a beat.
+**Evidence** `$WORK/scratch/W3.2/present_jitter.md`, probe: Sleep(1) consumer p99 35.5 vs WaitOnAddress 33.44.
+
 ### W3.2-fix MMCSS join rewrites the thread priority
 **Symptom** Log said "time-critical priority set" but the vblank thread ran at kernel priority 17 (MMCSS), not 15.
 **Cause** `AvSetMmThreadCharacteristicsW` overwrites a priority set before it. Separately, guest interrupt code ran at
