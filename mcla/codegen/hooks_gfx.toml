@@ -42,3 +42,13 @@ registers = ["r11"]
 address = 0x822F4C48
 name = "mcla_hook_gfx_dl_enable"
 registers = ["r4"]
+
+# [G6] mcla_gfx_shadow_res: sub_825F6940 (rage::CShadowMap constructor), BEFORE `stw r10,592(r31)` at 0x825F69A0
+# (the shadow map's width): r10 = 640 from `li r10,640` at 0x825F696C, untouched since; the `stw r10,596(r31)`
+# at 0x825F69A8 stores the height from the same register, so one hook sets both (512 or 384; 640 = as shipped).
+# Read once, when the shadow system's constructor creates the map. NEEDS A RE-CODEGEN (new entry).
+# mcla/hooks/mcla_gfx_shadow_res.cpp, cvar mcla_gfx_shadow_res.
+[[midasm_hook]]
+address = 0x825F69A0
+name = "mcla_hook_gfx_shadow_res"
+registers = ["r10"]
