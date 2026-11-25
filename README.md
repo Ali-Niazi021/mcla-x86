@@ -2,8 +2,9 @@
 
 **Midnight Club: Los Angeles (Xbox 360, Complete Edition), statically recompiled to native x86-64 Windows** with the
 [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk), a patch series on top of it, and a game layer of hooks shared in
-spirit with the owner's iOS port. It boots, plays (free roam, races, saves) and runs at 60 fps on a Radeon 880M laptop
-at 720p–900p; 1080p is close (see [docs/PORT_STATE.md](docs/PORT_STATE.md) for the current numbers).
+spirit with the owner's iOS port. It boots, reaches free roam, drives and saves (races not yet tested). On a Radeon 880M
+laptop it holds 60 fps at 720p, and 1080p averages 60 fps with occasional dips; a 30 fps console-like mode is also
+available (numbers in [docs/PORT_STATE.md](docs/PORT_STATE.md)).
 
 > **You need your own copy of the game.** This repository contains no game files and no translated game code.
 > Everything is read from your own dump of a disc you own. Do not ask for, or share, game files here.
