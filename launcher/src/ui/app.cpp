@@ -62,6 +62,27 @@ double AsDouble(const Json& v) { return v.is_number() ? v.get<double>() : 0.0; }
 
 std::string AsString(const Json& v) { return v.is_string() ? v.get<std::string>() : std::string(); }
 
+// InputText over a std::string (grows on demand: no fixed buffer, no silent truncation of long paths).
+int StringResizeCallback(ImGuiInputTextCallbackData* data) {
+  if (data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
+    auto* str = static_cast<std::string*>(data->UserData);
+    str->resize(static_cast<size_t>(data->BufTextLen));
+    data->Buf = str->data();
+  }
+  return 0;
+}
+
+bool InputTextString(const char* label, const char* hint, std::string* str, ImGuiInputTextFlags flags) {
+  return ImGui::InputTextWithHint(label, hint, str->data(), str->capacity() + 1, flags | ImGuiInputTextFlags_CallbackResize, StringResizeCallback, str);
+}
+
+constexpr const char* kPresentEffectId = "present_effect";
+constexpr const char* kTemporalAaId = "temporal_aa";
+constexpr const char* kFsrTwiceWarning =
+    "FSR 1 output scaling is on together with the FSR temporal upscaler: the picture is upscaled twice and looks softer. "
+    "Set the output scaling filter to Bilinear, or turn the upscaler off.";
+constexpr const char* kFsrTwiceShort = "FSR 1 output scaling and the FSR upscaler are both on: the picture is upscaled twice.";
+
 // Decimal places a float setting shows: from its step (0.05 -> 2), 2 when the step is not given.
 int DecimalsFor(const SettingDef& def) {
   if (def.type != SettingType::Float) return 0;
@@ -87,8 +108,10 @@ double SnapToStep(double nv, double before, double lo, double hi, double step, i
   }
   if (nv >= hi) return hi;
   if (nv <= lo) return lo;
-  double snapped = lo + std::round((nv - lo) / step) * step;
-  snapped = std::round(snapped / unit) * unit;
+  // Round on the decimal grid by multiplying/dividing by a power of ten (35 / 100 is exactly the double nearest 0.35;
+  // 35 * 0.01 would give 0.35000000000000003 and end up in the settings file and on the command line).
+  const double scale = std::pow(10.0, decimals);
+  const double snapped = std::round((lo + std::round((nv - lo) / step) * step) * scale) / scale;
   return std::clamp(snapped, lo, hi);
 }
 
@@ -108,15 +131,23 @@ std::string ValueText(const SettingDef& def, const Json& v) {
   return s.empty() ? std::string("(empty)") : s;
 }
 
-// "Default: X" + range + cvar: the technical footer of a setting's tooltip.
-std::string TechInfo(const SettingDef& def) {
+// "Default: X" + range + the command-line option with the current value: the technical footer of a setting's tooltip.
+std::string TechInfo(const SettingDef& def, const Json& current) {
   std::string s = "Default: " + ValueText(def, def.default_value);
   if (def.type == SettingType::Int || def.type == SettingType::Float) {
     s += "   Range: " + FormatCvarValue(Json(def.min)) + " \u2013 " + FormatCvarValue(Json(def.max));
   }
-  s += def.cvar ? "\nCommand line: --" + *def.cvar + "=\u2026" : std::string("\nLauncher setting (not passed to the game)");
-  if (def.emit == EmitMode::Always && def.cvar) s += "  (always passed)";
-  return s;
+  if (!def.cvar) return s + "\nLauncher setting (not passed to the game)";
+  const std::string arg = "--" + *def.cvar + "=" + FormatCvarValue(current);
+  switch (def.emit) {
+    case EmitMode::Always:
+      return s + "\nCommand line: " + arg + "  (always passed)";
+    case EmitMode::Never:
+      return s + "\nNot passed on the command line";
+    case EmitMode::NonDefault:
+      break;
+  }
+  return s + "\nCommand line: " + arg + (SameValue(current, def.default_value) ? "  (passed only when changed)" : std::string());
 }
 
 }  // namespace
@@ -264,6 +295,15 @@ std::vector<LauncherApp::StatusLine> LauncherApp::BuildStatus() const {
       lines.push_back({StatusLine::Level::Error, std::move(text), goto_cat});
     }
   }
+  if (FsrDoubleUpscale()) {
+    int goto_cat = -1;
+    if (const SettingDef* pe = schema_.FindSetting(kPresentEffectId)) {
+      for (size_t i = 0; i < schema_.categories.size(); ++i) {
+        if (schema_.categories[i].id == pe->category) goto_cat = static_cast<int>(i);
+      }
+    }
+    lines.push_back({StatusLine::Level::Warn, kFsrTwiceShort, goto_cat});
+  }
   if (!launch_error_.empty()) lines.push_back({StatusLine::Level::Warn, "Launch failed: " + launch_error_, -1});
   if (!save_error_.empty()) lines.push_back({StatusLine::Level::Warn, "Could not save settings: " + save_error_, -1});
   if (game_running_) lines.push_back({StatusLine::Level::Info, "The game is running (PID " + std::to_string(game_.pid()) + ").", -1});
@@ -272,9 +312,27 @@ std::vector<LauncherApp::StatusLine> LauncherApp::BuildStatus() const {
 
 // ------------------------------------------------------------------------------------------------ actions
 
+bool LauncherApp::GamepadAllowed() const { return GetForegroundWindow() == static_cast<HWND>(hwnd_) && !game_running_; }
+
+bool LauncherApp::FsrDoubleUpscale() const {
+  const SettingDef* pe = schema_.FindSetting(kPresentEffectId);
+  const SettingDef* taa = schema_.FindSetting(kTemporalAaId);
+  if (!pe || !taa || !IsActive(schema_, values_, *taa)) return false;
+  const Json& a = EffectiveValue(*pe, values_);
+  const Json& b = EffectiveValue(*taa, values_);
+  return a.is_string() && b.is_string() && a.get<std::string>() == "fsr" && b.get<std::string>() == "fsr";
+}
+
 void LauncherApp::DoLaunch() {
   Flush();
-  RefreshValidation(true);
+  RefreshValidation(true);  // the folder may have changed on disk since the last check: never launch on a stale result
+  for (const StatusLine& s : BuildStatus()) {
+    if (s.level == StatusLine::Level::Error) {
+      Toast("Not launched: " + s.text, StatusLine::Level::Error, 10.0f);
+      return;
+    }
+  }
+  if (game_running_ || schema_.version == 0) return;
   if (preview_dirty_) BuildPreviewText();
   launch_error_.clear();
   std::string err;
@@ -325,14 +383,15 @@ void LauncherApp::DoResetAll() {
 
 void LauncherApp::HandleShortcuts() {
   const ImGuiIO& io = ImGui::GetIO();
+  const bool pad_ok = GamepadAllowed();
   if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) focus_search_ = true;
   if (!schema_.categories.empty() && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
-    if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false)) SelectCategory(category_ + 1);
-    if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false)) SelectCategory(category_ - 1);
+    if (pad_ok && ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false)) SelectCategory(category_ + 1);
+    if (pad_ok && ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false)) SelectCategory(category_ - 1);
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_PageDown, false)) SelectCategory(category_ + 1);
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_PageUp, false)) SelectCategory(category_ - 1);
   }
-  gamepad_hints_ = ImGui::GetCurrentContext()->NavInputSource == ImGuiInputSource_Gamepad;
+  gamepad_hints_ = pad_ok && ImGui::GetCurrentContext()->NavInputSource == ImGuiInputSource_Gamepad;
 }
 
 // ------------------------------------------------------------------------------------------------ frame
@@ -462,7 +521,13 @@ void LauncherApp::DrawHeader(float width, float height) {
   }
 
   // Preset combo + label.
-  const float combo_w = std::clamp(width * 0.2f, S(200), S(270));
+  // Wide enough for the longest preset name, but never so wide that it squeezes the search box out of the header.
+  const float preset_label_w = ImGui::CalcTextSize("Preset").x;
+  float longest = ImGui::CalcTextSize("Custom").x;
+  for (const Preset& p : schema_.presets) longest = std::max(longest, ImGui::CalcTextSize(p.label.c_str()).x);
+  const float combo_want = longest + ImGui::GetStyle().FramePadding.x * 2.0f + frame_h + S(8);
+  const float combo_room = (x - S(12)) - (S(26) + title_w + S(34)) - S(110) - S(22) - (S(10) + preset_label_w);
+  const float combo_w = std::clamp(combo_want, S(150), std::max(S(150), combo_room));
   x -= S(12) + combo_w;
   ImGui::SetCursorPos(ImVec2(x, y));
   ImGui::SetNextItemWidth(combo_w);
@@ -700,6 +765,7 @@ std::vector<LauncherApp::CardExtra> LauncherApp::CardExtras(const SettingDef& de
       for (const std::string& issue : data_check_.issues) extras.push_back({issue, pal::kError});
     }
   }
+  if (FsrDoubleUpscale() && (def.id == kPresentEffectId || def.id == kTemporalAaId)) extras.push_back({kFsrTwiceWarning, pal::kWarn});
   return extras;
 }
 
@@ -778,7 +844,7 @@ void LauncherApp::DrawSettingCard(const SettingDef& def, bool show_category) {
   ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
   ImGui::InvisibleButton("##info", ImVec2(text_w, std::max(left_h, 1.0f)));
   ImGui::PopItemFlag();
-  ItemTooltip(show_descriptions_ ? std::string() : def.help, TechInfo(def));
+  ItemTooltip(show_descriptions_ ? std::string() : def.help, TechInfo(def, EffectiveValue(def, values_)));
 
   // Right block: the control, vertically centred, with a per-setting reset to its left.
   const ImVec2 wpos(p.x + avail - pad - widget_w, p.y + std::round((card_h - frame_h) * 0.5f));
@@ -876,13 +942,12 @@ void LauncherApp::DrawControl(const SettingDef& def, ImVec2 pos, float widget_w,
     case SettingType::String:
     case SettingType::Path: {
       const bool is_path = def.type == SettingType::Path;
-      char buf[1024];
-      std::snprintf(buf, sizeof(buf), "%s", AsString(cur).c_str());
+      std::string text = AsString(cur);
       const float browse_w = is_path ? ImGui::CalcTextSize("Browse\u2026").x + ImGui::GetStyle().FramePadding.x * 2.0f + S(24) : 0.0f;
       const float input_w = widget_w - (is_path ? browse_w + S(8) : 0.0f);
       ImGui::SetNextItemWidth(input_w);
-      if (ImGui::InputTextWithHint("##v", is_path ? "Choose a folder" : "", buf, sizeof(buf), ImGuiInputTextFlags_AutoSelectAll)) {
-        SetValue(def, Json(std::string(buf)));
+      if (InputTextString("##v", is_path ? "Choose a folder" : "", &text, ImGuiInputTextFlags_AutoSelectAll)) {
+        SetValue(def, Json(text));
       }
       if (!show_descriptions_) ItemTooltip(def.help);
       if (is_path) {
@@ -1048,7 +1113,8 @@ void LauncherApp::DrawFooter(float width, float height) {
   ImGui::PopStyleColor();
   ImGui::PopFont();
 
-  const bool shortcut = (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Enter, false)) || ImGui::IsKeyPressed(ImGuiKey_GamepadStart, false);
+  const bool shortcut = (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Enter, false)) ||
+                        (GamepadAllowed() && ImGui::IsKeyPressed(ImGuiKey_GamepadStart, false));
   if (can_launch && (clicked || shortcut)) DoLaunch();
 
   ImGui::EndChild();

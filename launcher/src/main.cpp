@@ -43,6 +43,7 @@ ID3D11DeviceContext* g_context = nullptr;
 IDXGISwapChain* g_swap_chain = nullptr;
 ID3D11RenderTargetView* g_rtv = nullptr;
 bool g_occluded = false;
+bool g_device_lost = false;
 
 HWND g_hwnd = nullptr;
 std::unique_ptr<launcher::ui::LauncherApp> g_app;
@@ -111,9 +112,31 @@ void CleanupDevice() {
   if (g_device) { g_device->Release(); g_device = nullptr; }
 }
 
+// The GPU went away (driver reset, TDR, adapter removed): rebuild the device, the swap chain and the renderer objects.
+bool RecoverDevice() {
+  ImGui_ImplDX11_Shutdown();
+  CleanupDevice();
+  if (!CreateDevice(g_hwnd)) return false;
+  if (!ImGui_ImplDX11_Init(g_device, g_context)) return false;
+  g_device_lost = false;
+  g_occluded = false;
+  return true;
+}
+
 void RenderFrame() {
-  if (g_in_frame || !g_device || !g_app) return;
+  if (g_in_frame || !g_app) return;
   g_in_frame = true;
+
+  if (g_device_lost && !RecoverDevice()) {
+    g_in_frame = false;
+    MessageBoxW(g_hwnd, L"The graphics device was lost and could not be recreated.", kWindowTitle, MB_ICONERROR | MB_OK);
+    DestroyWindow(g_hwnd);
+    return;
+  }
+  if (!g_device) {
+    g_in_frame = false;
+    return;
+  }
 
   if (g_pending_scale > 0.0f) {  // DPI changed: re-rasterise the fonts and re-scale the style between frames
     ImGui_ImplDX11_InvalidateDeviceObjects();
@@ -121,9 +144,11 @@ void RenderFrame() {
     g_pending_scale = 0.0f;
   }
 
-  // The window must not react to a gamepad while another application (the game) has the focus.
+  // The gamepad drives the launcher only while its window is the foreground window and no game it started is running:
+  // the Win32 backend polls XInput regardless of focus, so the UI additionally ignores the raw gamepad keys then.
   ImGuiIO& io = ImGui::GetIO();
-  if (g_active) io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+  const bool gamepad_ok = GetForegroundWindow() == g_hwnd && !g_app->game_running();
+  if (gamepad_ok) io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
   else io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
 
   ImGui_ImplDX11_NewFrame();
@@ -141,6 +166,7 @@ void RenderFrame() {
   }
   const HRESULT hr = g_swap_chain->Present(1, g_occluded ? DXGI_PRESENT_TEST : 0);
   g_occluded = (hr == DXGI_STATUS_OCCLUDED);
+  if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) g_device_lost = true;  // recovered at the next frame
   g_in_frame = false;
 }
 
@@ -151,8 +177,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     case WM_SIZE:
       if (g_device && wparam != SIZE_MINIMIZED) {
         CleanupRenderTarget();
-        g_swap_chain->ResizeBuffers(0, LOWORD(lparam), HIWORD(lparam), DXGI_FORMAT_UNKNOWN, 0);
-        CreateRenderTarget();
+        const HRESULT hr = g_swap_chain->ResizeBuffers(0, LOWORD(lparam), HIWORD(lparam), DXGI_FORMAT_UNKNOWN, 0);
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) g_device_lost = true;
+        else CreateRenderTarget();
         if (g_in_size_move) RenderFrame();  // the modal sizing loop starves the main loop: keep drawing while dragging
       }
       return 0;

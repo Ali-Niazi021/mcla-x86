@@ -84,6 +84,10 @@ class LauncherApp {
   void DrawModals();
   void DrawSettingCard(const SettingDef& def, bool show_category);
   void HandleShortcuts();
+  // The gamepad may drive the launcher only while its window is the foreground window and no game it started is running.
+  bool GamepadAllowed() const;
+  // present_effect=fsr together with temporal_aa=fsr (both active): the picture would be upscaled twice.
+  bool FsrDoubleUpscale() const;
   void DrawControl(const SettingDef& def, ImVec2 pos, float widget_w, float frame_h);
   std::vector<CardExtra> CardExtras(const SettingDef& def) const;
 
