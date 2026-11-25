@@ -39,7 +39,9 @@ Design.
   * Recording (d3d12/render_target_cache.cpp NoteSwapDirectResolve, called for every resolve that copied): a resolve qualifies when it
     was direct, read one single-sampled k_8_8_8_8 colour render target at the resolve's own base (no offset in the render target
     or the EDRAM, at the texture's origin), at 1x, not stretched by the FSR upscaling (TaaSqueezingScene), to a k_8_8_8_8
-    destination with no red/blue swap, no exponent bias, not an array slice. Then the destination texel (x, y) is the render
+    destination with no exponent bias, not an array slice. A red/blue swap in the resolve (RB_COPY_DEST_INFO copy_dest_swap,
+    which Direct3D 9 sets for ARGB front buffers) is allowed: the swap's SRV component mapping gets the same swap composed
+    into it ({2, 1, 0, 3} on the channels the fetch constant's swizzle reads), so it is exact. Then the destination texel (x, y) is the render
     target's texel (x, y) and the bytes are the same up to the endian swap that the swap's fetch constant undoes (compared at
     the swap: base address, pitch, endianness; the texture may not be larger than the resolved area). One record per destination
     address (4, the least recent replaced), so another small 8_8_8_8 resolve does not evict the front buffer's.
@@ -73,6 +75,20 @@ Design.
     sample would give (a 10-bit value over 1023, exact), the same alpha 1, to the same B8G8R8A8 render target. The only thing
     the old paint added was the bilinear filter at texel centres, which only hands the texel on (the weights are 0 and 1 on any
     GPU that rounds the fraction to 8 bits). Not proven without a run: swap_direct_present_check says it.
+
+Diagnostics (added after V3b-dwsw showed 0 of ~600 swaps/10 s qualifying with no "can be shown" line, so no resolve ever
+passed the rules): every picture-sized (640x360 or more) colour resolve that doesn't qualify is noted with a reason, and the
+swap's "why not" names the reason for the swap texture's address instead of a general one ("front buffer resolve not direct ...",
+"... render target isn't a single-sampled k_8_8_8_8 one", "... starts inside the render target (a source offset)", "... EDRAM
+base isn't the surface's", "... destination isn't a k_8_8_8_8 non-array texture", "... exponent bias", "... destination offset",
+"... memory isn't valid GPU-written data when recorded", "... squeezed (FSR upscaled) scene", "... resolution scale above 1").
+Each NEW reason for a destination is logged once (at most 12) with the resolve's fields:
+  swap_direct_present: the resolve to 0x08F28000 (1920x1080, destination pitch 1920, endian 2, format 6, swap red/blue 1, exp bias 0,
+  array 0, destination offset 0,0) doesn't qualify: <reason>; EDRAM base B (the surface's S), area offset 0,0, source <render target
+  name> (colour format N, 1x MSAA, depth 0), source offset 0x00000000
+and the first 3 swaps without a record log the swap texture next to the records and rejects:
+  swap_direct_present: the swap's texture 0x08F28000 1920x1080 pitch 1920 endian 2 has no record (<reason>): record ...; rejected ...;
+Read those two lines in the next run to see which condition fails.
 
 Checks to run (VER), in this order, each on a frozen frame and on the moving bench:
   1. swap_direct_present=true swap_direct_present_fused=false swap_direct_present_check=60: the log has
@@ -165,7 +181,7 @@ index 43e05a40..92cab70b 100644
    std::vector<D3D12_RESOURCE_BARRIER> barriers_;
  
 diff --git a/include/rex/graphics/d3d12/render_target_cache.h b/include/rex/graphics/d3d12/render_target_cache.h
-index 0716fd5d..6eb40383 100644
+index 0716fd5d..9124e1e9 100644
 --- a/include/rex/graphics/d3d12/render_target_cache.h
 +++ b/include/rex/graphics/d3d12/render_target_cache.h
 @@ -13,6 +13,7 @@
@@ -189,7 +205,7 @@ index 0716fd5d..6eb40383 100644
  class D3D12RenderTargetCache final : public RenderTargetCache {
   public:
    D3D12RenderTargetCache(const RegisterFile& register_file, const memory::Memory& memory,
-@@ -98,6 +105,35 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+@@ -98,6 +105,38 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
    bool HdrRestoreColorTarget(uint32_t key, D3D12_GPU_DESCRIPTOR_HANDLE underlay_srv,
                               D3D12_RECT rect);
  
@@ -213,6 +229,9 @@ index 0716fd5d..6eb40383 100644
 +    DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN;
 +    // Opaque, for UseSwapDirectSource.
 +    void* render_target = nullptr;
++    // The resolve swapped red and blue (RB_COPY_DEST_INFO copy_dest_swap): the texture's channels 0 and 2 are the render
++    // target's 2 and 0, which the SRV's component mapping (the caller's) has to undo.
++    bool swap_red_blue = false;
 +  };
 +  // Whether the swap's texture can be shown from the render target (true), or why not (a string literal). Changes
 +  // nothing.
@@ -225,7 +244,7 @@ index 0716fd5d..6eb40383 100644
    // For host render targets.
  
    bool gamma_render_target_as_unorm16() const { return gamma_render_target_as_unorm16_; }
-@@ -285,8 +321,19 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+@@ -285,8 +324,19 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
      D3D12_RESOURCE_STATES SetResourceState(D3D12_RESOURCE_STATES new_state) {
        D3D12_RESOURCE_STATES old_state = resource_state_;
        resource_state_ = new_state;
@@ -245,7 +264,7 @@ index 0716fd5d..6eb40383 100644
  
      uint32_t temporary_srv_descriptor_index() const { return temporary_srv_descriptor_index_; }
      void SetTemporarySRVDescriptorIndex(uint32_t index) { temporary_srv_descriptor_index_ = index; }
-@@ -314,6 +361,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+@@ -314,6 +364,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
      uint32_t temporary_srv_descriptor_index_ = UINT32_MAX;
      uint32_t temporary_srv_descriptor_index_stencil_ = UINT32_MAX;
      uint32_t temporary_sort_index_ = 0;
@@ -254,7 +273,7 @@ index 0716fd5d..6eb40383 100644
    };
  
    enum TransferCBVRegister : uint32_t {
-@@ -828,6 +877,54 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+@@ -828,6 +880,68 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
    ID3D12PipelineState* resolve_rov_clear_32bpp_pipeline_ = nullptr;
    // Clearing 64bpp color.
    ID3D12PipelineState* resolve_rov_clear_64bpp_pipeline_ = nullptr;
@@ -272,6 +291,7 @@ index 0716fd5d..6eb40383 100644
 +    uint32_t dest_base = 0;
 +    uint32_t dest_pitch_div_32 = 0;
 +    uint32_t endianness = 0;
++    bool dest_swap = false;
 +    uint32_t width = 0;
 +    uint32_t height = 0;
 +    // The invalidation count of the memory range written, when it was written.
@@ -306,6 +326,19 @@ index 0716fd5d..6eb40383 100644
 +      record.valid = false;
 +    }
 +  }
++  // The last picture-sized colour resolve (640x360 or more) to each destination that didn't qualify, and the reason
++  // (a string literal), for the swap to say why it found no record, and one log line of the resolve's fields for each
++  // new reason (NoteSwapDirectRejected).
++  struct SwapDirectReject {
++    uint32_t dest_base = 0;
++    const char* reason = nullptr;
++  };
++  SwapDirectReject swap_direct_rejects_[kSwapDirectRecordCount];
++  uint32_t swap_direct_reject_logs_ = 0;
++  void NoteSwapDirectRejected(const draw_util::ResolveInfo& resolve_info,
++                              D3D12RenderTarget* direct_source,
++                              const DirectResolveSourceConstants& direct_source_constants,
++                              const char* reason);
  };
  
  }  // namespace rex::graphics::d3d12
@@ -546,7 +579,7 @@ index 0effdac0..c0312905 100644
    // callback makes next (thread c).
    static void LogPresentFromCallback(uint64_t refresh_number);
 diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
-index 4d57be39..0fea5f41 100644
+index 4d57be39..ff86be4c 100644
 --- a/src/graphics/d3d12/command_processor.cpp
 +++ b/src/graphics/d3d12/command_processor.cpp
 @@ -94,6 +94,26 @@ REXCVAR_DEFINE_BOOL(d3d12_hoist_shared_memory_uploads_stats, false, "GPU/D3D12",
@@ -761,7 +794,7 @@ index 4d57be39..0fea5f41 100644
          return true;
        });
  
-@@ -6426,4 +6555,257 @@ void D3D12CommandProcessor::WriteGammaRampSRV(bool is_pwl,
+@@ -6426,4 +6555,276 @@ void D3D12CommandProcessor::WriteGammaRampSRV(bool is_pwl,
    device->CreateShaderResourceView(gamma_ramp_buffer_.Get(), &desc, handle);
  }
  
@@ -798,10 +831,29 @@ index 4d57be39..0fea5f41 100644
 +  direct.check = check_interval && (++swap_direct_check_counter_ % check_interval) == 0;
 +  direct.in_place = !direct.check;
 +  direct.fuse = REXCVAR_GET(swap_direct_present_fused);
-+  // The swap texture's SRV, on the render target: the fetch constant's swizzle on the same host format.
++  // The swap texture's SRV, on the render target: the fetch constant's swizzle on the same host format. If the
++  // resolve swapped red and blue, the texture's channels 0 and 2 are the render target's 2 and 0: each component the
++  // mapping takes from channel c takes it from the render target's component {2, 1, 0, 3}[c] instead (0 and 1 constants
++  // stay).
++  uint32_t srv_mapping = direct.texture_info.shader_4_component_mapping;
++  if (direct.source.swap_red_blue) {
++    static constexpr uint32_t kSwapRedBlue[4] = {2, 1, 0, 3};
++    uint32_t swapped_mapping =
++        D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
++    for (uint32_t i = 0; i < 4; ++i) {
++      uint32_t component =
++          (srv_mapping >> (D3D12_SHADER_COMPONENT_MAPPING_SHIFT * i)) &
++          D3D12_SHADER_COMPONENT_MAPPING_MASK;
++      if (component < 4) {
++        component = kSwapRedBlue[component];
++      }
++      swapped_mapping |= component << (D3D12_SHADER_COMPONENT_MAPPING_SHIFT * i);
++    }
++    srv_mapping = swapped_mapping;
++  }
 +  direct.srv_desc.Format = direct.source.srv_format;
 +  direct.srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-+  direct.srv_desc.Shader4ComponentMapping = direct.texture_info.shader_4_component_mapping;
++  direct.srv_desc.Shader4ComponentMapping = srv_mapping;
 +  direct.srv_desc.Texture2D.MostDetailedMip = 0;
 +  direct.srv_desc.Texture2D.MipLevels = 1;
 +  direct.srv_desc.Texture2D.PlaneSlice = 0;
@@ -1020,7 +1072,7 @@ index 4d57be39..0fea5f41 100644
 +
  }  // namespace rex::graphics::d3d12
 diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
-index e31ee04e..90271f2c 100644
+index e31ee04e..40df9b89 100644
 --- a/src/graphics/d3d12/render_target_cache.cpp
 +++ b/src/graphics/d3d12/render_target_cache.cpp
 @@ -49,6 +49,18 @@ REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native ste
@@ -1065,7 +1117,7 @@ index e31ee04e..90271f2c 100644
          }
        } else {
          REXGPU_ERROR(
-@@ -6795,4 +6816,196 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
+@@ -6795,4 +6816,311 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
    return all_pipelines_available;
  }
  
@@ -1107,8 +1159,24 @@ index e31ee04e..90271f2c 100644
 +    ClearSwapDirectRecords();
 +    return;
 +  }
-+  if (!direct_source || IsDrawResolutionScaled() || command_processor_.TaaSqueezingScene() ||
-+      resolve_info.IsCopyingDepth()) {
++  if (resolve_info.IsCopyingDepth()) {
++    return;
++  }
++  // What isn't a picture the swap can be made from is noted for the swap's "why not" (and, for a new reason, logged
++  // with the resolve's fields, once): see NoteSwapDirectRejected.
++  auto reject = [&](const char* reason) {
++    NoteSwapDirectRejected(resolve_info, direct_source, direct_source_constants, reason);
++  };
++  if (!direct_source) {
++    reject("front buffer resolve not direct (the render targets were dumped, no one render target owns the area)");
++    return;
++  }
++  if (IsDrawResolutionScaled()) {
++    reject("front buffer resolve at a resolution scale above 1");
++    return;
++  }
++  if (command_processor_.TaaSqueezingScene()) {
++    reject("front buffer resolve in a squeezed (FSR upscaled) scene");
 +    return;
 +  }
 +  const RenderTargetKey key = direct_source->key();
@@ -1117,6 +1185,7 @@ index e31ee04e..90271f2c 100644
 +      key.GetColorFormat() != xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
 +      !GetDirectResolveSourceConversion(key, conversion) ||
 +      conversion != DirectResolveSourceConversion::k_8_8_8_8) {
++    reject("front buffer resolve's render target isn't a single-sampled k_8_8_8_8 one");
 +    return;
 +  }
 +  const reg::RB_COPY_DEST_INFO& dest_info = resolve_info.copy_dest_info;
@@ -1124,12 +1193,25 @@ index e31ee04e..90271f2c 100644
 +      resolve_info.copy_dest_coordinate_info;
 +  if (direct_source_constants.offset != 0 ||
 +      resolve_info.coordinate_info.edram_offset_x_div_8 != 0 ||
-+      resolve_info.coordinate_info.edram_offset_y_div_8 != 0 ||
-+      resolve_info.color_edram_info.GetBaseTiles() !=
-+          (resolve_info.color_original_base & (edram_tile_count() - 1)) ||
-+      dest_info.copy_dest_format != xenos::ColorFormat::k_8_8_8_8 || dest_info.copy_dest_array ||
-+      dest_info.copy_dest_swap || dest_info.copy_dest_exp_bias != 0 ||
-+      dest_coordinate.offset_x_div_8 != 0 || dest_coordinate.offset_y_div_8 != 0) {
++      resolve_info.coordinate_info.edram_offset_y_div_8 != 0) {
++    reject("front buffer resolve starts inside the render target (a source offset)");
++    return;
++  }
++  if (resolve_info.color_edram_info.GetBaseTiles() !=
++      (resolve_info.color_original_base & (edram_tile_count() - 1))) {
++    reject("front buffer resolve's EDRAM base isn't the surface's (the resolved area doesn't start at its origin)");
++    return;
++  }
++  if (dest_info.copy_dest_format != xenos::ColorFormat::k_8_8_8_8 || dest_info.copy_dest_array) {
++    reject("front buffer resolve's destination isn't a k_8_8_8_8 non-array texture");
++    return;
++  }
++  if (dest_info.copy_dest_exp_bias != 0) {
++    reject("front buffer resolve with a destination exponent bias");
++    return;
++  }
++  if (dest_coordinate.offset_x_div_8 != 0 || dest_coordinate.offset_y_div_8 != 0) {
++    reject("front buffer resolve starts inside its destination texture's tiles (a destination offset)");
 +    return;
 +  }
 +  const uint32_t width = resolve_info.coordinate_info.width_div_8 * 8;
@@ -1144,6 +1226,7 @@ index e31ee04e..90271f2c 100644
 +  // nothing invalidates while the range is checked, the watch's range is set and the count is read.
 +  auto global_lock = rex::thread::global_critical_region::AcquireDirect();
 +  if (!shared_memory.AreAllPagesValidAndGpuWritten(range_start, range_length)) {
++    reject("front buffer resolve's memory isn't valid GPU-written data when recorded (a CPU write, or hot pages)");
 +    return;
 +  }
 +  if (!swap_direct_watch_handle_) {
@@ -1190,6 +1273,7 @@ index e31ee04e..90271f2c 100644
 +  record.invalidations = watch.invalidations.load(std::memory_order_acquire);
 +  record.sequence = ++swap_direct_sequence_;
 +  static std::atomic<uint32_t> logged{0};
++  record.dest_swap = dest_info.copy_dest_swap != 0;
 +  if (!replaced && logged.fetch_add(1, std::memory_order_relaxed) < 8) {
 +    REXGPU_INFO(
 +        "swap_direct_present: a resolve of the host render target {} to 0x{:08X} ({}x{}, pitch {}, "
@@ -1210,8 +1294,34 @@ index e31ee04e..90271f2c 100644
 +    }
 +  }
 +  if (index == SIZE_MAX) {
-+    why_not_out =
-+        "no qualifying resolve (8_8_8_8, direct, one render target) to the swap texture's address";
++    why_not_out = "no resolve of this address has been seen (not recorded, not rejected)";
++    for (const SwapDirectReject& reject : swap_direct_rejects_) {
++      if (reject.reason && reject.dest_base == texture.base_address) {
++        why_not_out = reject.reason;
++      }
++    }
++    // Once, for the first few swaps: the swap's texture next to what is recorded and rejected.
++    static std::atomic<uint32_t> logged{0};
++    if (logged.fetch_add(1, std::memory_order_relaxed) < 3) {
++      std::string known;
++      for (const SwapDirectRecord& record : swap_direct_records_) {
++        if (record.valid) {
++          known += fmt::format(" record 0x{:08X} {}x{} pitch {} endian {} swap {};", record.dest_base,
++                               record.width, record.height, record.dest_pitch_div_32 * 32,
++                               record.endianness, record.dest_swap);
++        }
++      }
++      for (const SwapDirectReject& reject : swap_direct_rejects_) {
++        if (reject.reason) {
++          known += fmt::format(" rejected 0x{:08X}: {};", reject.dest_base, reject.reason);
++        }
++      }
++      REXGPU_INFO(
++          "swap_direct_present: the swap's texture 0x{:08X} {}x{} pitch {} endian {} has no record "
++          "({}):{}",
++          texture.base_address, texture.width, texture.height, texture.pitch_div_32 * 32,
++          texture.endianness, why_not_out, known.empty() ? std::string(" nothing recorded or rejected") : known);
++    }
 +    return false;
 +  }
 +  const SwapDirectRecord& record = swap_direct_records_[index];
@@ -1251,6 +1361,7 @@ index e31ee04e..90271f2c 100644
 +  source_out.srv_format =
 +      GetColorOwnershipTransferDXGIFormat(xenos::ColorRenderTargetFormat::k_8_8_8_8);
 +  source_out.render_target = render_target;
++  source_out.swap_red_blue = record.dest_swap;
 +  return true;
 +}
 +
@@ -1259,6 +1370,62 @@ index e31ee04e..90271f2c 100644
 +  auto* render_target = static_cast<D3D12RenderTarget*>(source.render_target);
 +  command_processor_.PushTransitionBarrier(
 +      render_target->resource(), render_target->SetResourceState(state), state);
++}
++
++void D3D12RenderTargetCache::NoteSwapDirectRejected(
++    const draw_util::ResolveInfo& resolve_info, D3D12RenderTarget* direct_source,
++    const DirectResolveSourceConstants& direct_source_constants, const char* reason) {
++  const uint32_t width = resolve_info.coordinate_info.width_div_8 * 8;
++  const uint32_t height = resolve_info.height_div_8 * 8;
++  if (width < 640 || height < 360) {
++    return;
++  }
++  const uint32_t dest_base = resolve_info.copy_dest_base;
++  SwapDirectReject* entry = nullptr;
++  for (SwapDirectReject& candidate : swap_direct_rejects_) {
++    if (candidate.reason && candidate.dest_base == dest_base) {
++      entry = &candidate;
++      break;
++    }
++  }
++  for (SwapDirectReject& candidate : swap_direct_rejects_) {
++    if (!entry && !candidate.reason) {
++      entry = &candidate;
++    }
++  }
++  if (!entry) {
++    entry = &swap_direct_rejects_[0];
++  }
++  const bool changed = entry->reason != reason || entry->dest_base != dest_base;
++  entry->dest_base = dest_base;
++  entry->reason = reason;
++  if (!changed || swap_direct_reject_logs_ >= 12) {
++    return;
++  }
++  ++swap_direct_reject_logs_;
++  const reg::RB_COPY_DEST_INFO& dest_info = resolve_info.copy_dest_info;
++  const draw_util::ResolveCopyDestCoordinateInfo& dest_coordinate =
++      resolve_info.copy_dest_coordinate_info;
++  std::string source = "no direct source";
++  if (direct_source) {
++    const RenderTargetKey key = direct_source->key();
++    source = fmt::format("source {} (colour format {}, {}x MSAA, depth {})", key.GetDebugName(),
++                         uint32_t(key.GetColorFormat()), 1u << uint32_t(key.msaa_samples),
++                         key.is_depth);
++  }
++  REXGPU_INFO(
++      "swap_direct_present: the resolve to 0x{:08X} ({}x{}, destination pitch {}, endian {}, format {}, "
++      "swap red/blue {}, exp bias {}, array {}, destination offset {},{}) doesn't qualify: {}; "
++      "EDRAM base {} (the surface's {}), area offset {},{}, {}, source offset 0x{:08X}",
++      dest_base, width, height, dest_coordinate.pitch_aligned_div_32 * 32,
++      uint32_t(dest_info.copy_dest_endian), uint32_t(dest_info.copy_dest_format),
++      uint32_t(dest_info.copy_dest_swap), int32_t(dest_info.copy_dest_exp_bias),
++      uint32_t(dest_info.copy_dest_array), uint32_t(dest_coordinate.offset_x_div_8) * 8,
++      uint32_t(dest_coordinate.offset_y_div_8) * 8, reason,
++      resolve_info.color_edram_info.GetBaseTiles(), resolve_info.color_original_base,
++      uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8) * 8,
++      uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8) * 8, source,
++      direct_source_constants.offset);
 +}
 +
  }  // namespace rex::graphics::d3d12
