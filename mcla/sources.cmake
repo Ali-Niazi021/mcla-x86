@@ -28,6 +28,8 @@
 #             mcla_widescreen_width (0 = off = as shipped), plus mcla_scene_height for W x H
 #   timing    SIM_FRAME_DELTA, SIM_STEP, SIM_CAMERA_POS, SIM_CAMERA_LOOKAT, SIM_CHASSIS, SIM_UI_ADVANCE,
 #             SIM_UI_COUNTDOWN, SIM_RACE_CLOCK, SIM_PRESENT_INTERVAL; one master cvar, mcla_sim60 (off = as shipped)
+#             SIM_PRESENT_IMMEDIATE 0x82419AC0 + census 0x82419920 (W4.5): the guest's present-immediate threshold
+#             on timed swaps, cvar mcla_present_immediate (0 = as shipped, -1 = auto; mcla_sim60 on)
 #   cpu       CPU_POLL_WAIT 0x82148AB0, CPU_POLL_RELEASE 0x82160140, CPU_PUMP 0x821449C8
 #   gfx       GFX_CULL_MASK, GFX_SHADOW_MODE, GFX_DL_ENABLE, GFX_TRAFFIC_LOD, GFX_AMBIENT_ZONE (the mcla_gfx_* knobs)
 set(MCLA_HOOK_DEFINITIONS
@@ -63,6 +65,7 @@ set(MCLA_HOOK_DEFINITIONS
     MCLA_HOOK_SIM_UI_COUNTDOWN=1
     MCLA_HOOK_SIM_RACE_CLOCK=1
     MCLA_HOOK_SIM_PRESENT_INTERVAL=1
+    MCLA_HOOK_SIM_PRESENT_IMMEDIATE=1
     # CPU levers
     MCLA_HOOK_CPU_POLL_WAIT=1
     MCLA_HOOK_CPU_POLL_RELEASE=1

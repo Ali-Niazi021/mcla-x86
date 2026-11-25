@@ -30,6 +30,10 @@
 // Swaps with no engine-timer frame since the previous swap (legals, logos, blocking loads: TIMING 4.5)
 // keep the shipped 2, otherwise those loops would run at double speed.
 //
+// Timed swaps (W4.5): the same decision, "an engine-timer frame ran since the previous swap", is published through
+// mcla::sim::NoteSwapTimed() (mcla_t_swap_target.h, a thread-local flag) on every swap that reaches this site, for the
+// present-immediate hook of mcla_t_present_immediate.cpp (0x82419AC0), which consumes it a few instructions later.
+//
 // Frame cap (W3.3): the same site is where the host holds the frame rate, because it runs on the thread that presents,
 // once per swap, before the swap packet is written, and the SDK has no swap callback of its own. The first thing the
 // hook does, whatever the interval mode, is mcla::sim::PaceAtSwap() (mcla_t_common.cpp): with --mcla_fps_cap=30|60|120
@@ -53,6 +57,7 @@
 
 #include "mcla_hooks.h"
 #include "mcla_t_common.h"
+#include "mcla_t_swap_target.h"
 
 REXCVAR_DEFINE_INT32(mcla_present_interval, -1, "MCLA",
                      "MCLA: the game's presentation interval (vblanks per swap; shipped 2). -1 = auto: "
@@ -120,6 +125,13 @@ void mcla_hook_present_interval(PPCRegister& r11) {
   MCLA_HOOK_ENTER();
   // The host frame cap first: it only waits (mcla_fps_cap > 0) and never touches r11.
   mcla::sim::PaceAtSwap();
+  // Is this swap timed (an engine-timer frame ran since the previous swap)? Published for the present-immediate hook
+  // (mcla_t_present_immediate.cpp, 0x82419AC0, a few instructions later in sub_824199B0 on this same thread), whatever
+  // the interval mode: the lever depends on the swap, not on what this hook does to the interval.
+  const uint64_t timer_frames = mcla::FrameCount();
+  const uint64_t previous = g_last_timer_frames.exchange(timer_frames, std::memory_order_relaxed);
+  const bool timed = timer_frames != previous;
+  mcla::sim::NoteSwapTimed(timed);
   const int32_t mode = REXCVAR_GET(mcla_present_interval);
   if (mode == 0) {
     return;
@@ -137,12 +149,10 @@ void mcla_hook_present_interval(PPCRegister& r11) {
   }
   // A swap with no engine-timer frame since the previous one (legals, logos, blocking loads) is paced
   // by the interval alone: keep the shipped value there.
-  const uint64_t timer_frames = mcla::FrameCount();
-  const uint64_t previous = g_last_timer_frames.exchange(timer_frames, std::memory_order_relaxed);
   const int cap = mcla::sim::EffectiveCap();
   const double vblank_hz = GuestVblankHz();
   int chosen = shipped;
-  if (timer_frames == previous) {
+  if (!timed) {
     g_untimed.fetch_add(1, std::memory_order_relaxed);
   } else {
     // P1: 120 at a 120 Hz guest vblank (interval 1), 60 -> 2, 30 -> 4 there; at 60 Hz only ever lowered (as before).

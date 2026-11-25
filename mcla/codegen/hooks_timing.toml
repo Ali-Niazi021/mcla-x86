@@ -90,3 +90,45 @@ address = 0x82419AA0
 name = "mcla_hook_present_interval"
 registers = ["r11"]
 after_instruction = true
+
+# [A6a] mcla_t_present_immediate: AFTER `rlwinm r10,r10,9,25,31` (word 554A4E7E) in sub_824199B0, the
+# fourth instruction of the join block that starts at the label 0x82419AB4 (A5 sits on one of its arms).
+# r10 = the 7-bit D3DRS_PRESENTIMMEDIATETHRESHOLD from [dev+11852] and nothing else (the 64-bit value is
+# already masked to 0x7F; the shipped threshold is 0, the render-state default): the interval is in
+# r11 (bits 8..11 after `rlwinm r11,r11,8,0,23`) and `or r11,r10,r11` at 0x82419AC8 builds the swap-
+# callback argument (interval << 8) | threshold, so writing r10 = 100 here changes only the callback's
+# copy, never [dev+11852] or its getter. The callback sub_82419818 (CP thread) holds a late frame back
+# one vblank when the percentage into the vblank period r7 (clamped to 100) is above the threshold;
+# with 100 a late frame is released at once and an on-time frame still waits for the real 60 Hz vblank
+# (scratch W4.4 REPORT option (b), docs/PLAN.md section 6 M5). Not a branch target (the label is
+# 0x82419AB4); every interval arm passes through it. A5 (0x82419AA0, the interval-2 arm) runs just
+# before, on the same presenting thread, and publishes the "timed swap" flag this hook consumes (clear
+# on the arms without A5), so untimed swaps keep the shipped threshold.
+# mcla/hooks/mcla_t_present_immediate.cpp, flag MCLA_HOOK_SIM_PRESENT_IMMEDIATE, cvar
+# mcla_present_immediate (0 = untouched). NEEDS A RE-CODEGEN (new entry).
+[[midasm_hook]]
+address = 0x82419AC0
+name = "mcla_hook_present_immediate"
+registers = ["r10"]
+after_instruction = true
+
+# [A6b] mcla_t_swap_census (same file as A6a): AFTER `stw r11,16556(r31)` (word 917F40AC) in the swap
+# callback sub_82419818, the store of the swap target [dev+16556]; CP thread, under the spinlock
+# [dev+16712]. READ-ONLY census: it counts and never writes (a store changes no register, so the values
+# are the same before and after). The registers, all as the callback has just computed them:
+#   r7  = percentage into the current vblank period, 1..100: (mftb - [dev+16552]) * 100 / (freq / Hz) + 1
+#   r8  = the previous swap's target, [dev+16556] as it was before this store
+#   r10 = the vblank counter [dev+16548] (reloaded by the `lwz` just before the store)
+#   r11 = the new swap target: r8 + r30 on time, else r10, plus 1 when held to the next vblank
+#   r27 = the threshold the callback was given (argument bits 0..7): the value A6a leaves in r10
+#   r30 = the interval (argument bits 8..11): vblanks per swap
+# Classes (32-bit unsigned compares, as the guest's own `cmplw`): on time when r8 + r30 > r10; else
+# late, released at once when r11 == r10 (interval 0 too), late, held to the next vblank when
+# r11 == r10 + 1 (that is r7 > r27). r7 and r8 survive to here because the callback slot [dev+16540]
+# (the only call in between) is never set. mcla/hooks/mcla_t_present_immediate.cpp, flag
+# MCLA_HOOK_SIM_PRESENT_IMMEDIATE. NEEDS A RE-CODEGEN (new entry).
+[[midasm_hook]]
+address = 0x82419920
+name = "mcla_hook_swap_census"
+registers = ["r7", "r8", "r10", "r11", "r27", "r30"]
+after_instruction = true
