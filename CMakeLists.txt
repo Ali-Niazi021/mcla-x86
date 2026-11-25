@@ -84,7 +84,8 @@ else()
       src/host/watchdog.cpp
       src/host/input_script.cpp
       src/host/win32_time.cpp
-      src/host/win32_wait.cpp)
+      src/host/win32_wait.cpp
+      src/host/window_fit.cpp)
 
   # The hook and profile sources are objects of the executable itself, not a library: a hook is a strong definition
   # that must replace the weak default inside the generated code, and an archive member nothing references is never

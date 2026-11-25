@@ -31,6 +31,7 @@
 #include "pc_profile.h"  // mcla/profile (GAME slice): mcla::ApplyPcProfileLogging(), mcla::ApplyPcProfile()
 #include "frame_cap.h"
 #include "win32_time.h"
+#include "window_fit.h"
 
 // Fingerprint of the SDK patch series this build was linked against (CMake: md5 of .mcla-x86/series.applied).
 #ifndef MCLA_SDK_SERIES
@@ -200,6 +201,16 @@ void McLaApp::OnPreSetup(rex::RuntimeConfig& config) {
 
   // The PC profile: cvar defaults that need the plugin's cvars to exist and must come before Runtime::Setup.
   mcla::ApplyPcProfile();
+}
+
+std::optional<rex::PathConfig> McLaApp::OnFinalizePaths(const rex::PathConfig& defaults,
+                                                        std::function<void(rex::PathConfig)> /*resume*/) {
+  // The SDK has just created and opened the window (SetupPresentation) and will construct the runtime right after this
+  // returns: the last moment to size the window before the first frame can be presented. Paths pass through unchanged.
+  if (window()) {
+    mcla_host::FitWindowToGuestPixels(*window());
+  }
+  return defaults;
 }
 
 void McLaApp::OnPostSetup() {

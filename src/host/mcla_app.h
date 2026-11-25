@@ -17,7 +17,9 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include <rex/rex_app.h>
@@ -37,6 +39,9 @@ class McLaApp : public rex::ReXApp {
   void OnConfigurePaths(rex::PathConfig& paths) override;
   void OnPostInitLogging() override;
   void OnPreSetup(rex::RuntimeConfig& config) override;
+  // The window exists and is open, the runtime does not: where the window is made pixel-exact (window_fit.h).
+  std::optional<rex::PathConfig> OnFinalizePaths(const rex::PathConfig& defaults,
+                                                 std::function<void(rex::PathConfig)> resume) override;
   void OnPostSetup() override;
   void OnGuestThreadExit(rex::system::XThread* thread) override;
   void OnShutdown() override;
