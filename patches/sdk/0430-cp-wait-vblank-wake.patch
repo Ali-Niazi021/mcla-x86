@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Tue, 24 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0430: wake a sleeping WAIT_REG_MEM when the guest's vblank handler returns (the swap gate)
+
+Source: Ours, written for this SDK (ORC fix after the W3.4 M4 gate failure). The idea is the iOS port's vblank-woken
+  WAIT_REG_MEM ($IOS tools/ios/patch_ios_waits.py, NfsmwAvisarVblank in $IOS games/mcla/sdk_patches/0208); nothing is
+  copied
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: ExecutePacketType3_WAIT_REG_MEM sleeps with Sleep(wait / 0x100 ms) when wait >= 0x100, and the title's swap
+  gate (memory [shared+4] == 0, wait 0x100) is such a wait: the guest's vblank handler releases it, and the poll noticed
+  that 0-2 ms late, a new delay for every swap. This makes the sleep a WaitOnAddress on a counter that
+  GraphicsSystem::MarkVblank bumps (and WakeByAddressAll's) after the guest's vblank interrupt returned; the old sleep
+  length stays as the time-out. Cvar cp_wait_vblank_wake (GPU, bool, default true; false = the SDK's Sleep poll).
+  Windows only. Not built before the next SDK build.
+Bucket: REDO
+
+0430-cp-wait-vblank-wake.patch (mcla-x86 ORC fix; evidence in $WORK/scratch/W3.2/present_jitter.md)
+
+Evidence (W3.4 PresentMon CSVs, 1280x720, cap 30, steady window after +60 s, ~8,900 frames each):
+  * MsBetweenPresents mean 33.333, sd 0.825, p1 31.47, p99 35.14, max 40.4; lag-1 autocorrelation -0.505; the sum of
+    two consecutive intervals has sd 0.820 (independent intervals would give 1.166). That is the signature of present
+    k = grid point k + an independent delay d_k: interval = 33.333 + d_k - d_(k-1), autocorrelation exactly -0.5.
+  * sd 0.825 gives sd(d) = 0.58 ms = a delay uniform over about 2 ms, and a triangular interval distribution on
+    33.33 +- 2.0 has p99 = 35.05 and p1 = 31.6: the measured 35.14 and 31.47. The same numbers with the host frame cap
+    off (sd 0.859, p99 35.18): the host limiter is not the source.
+  * The guest's vblank was exact (p50 = p99 = 16.667) and the panel is 120.000 Hz (fitted 119.999 / 120.000), so nothing
+    beats; the delay is between the vblank that releases the swap gate and the command processor swapping.
+  * The command processor waits for that release in WAIT_REG_MEM with wait 0x100, i.e. Sleep(1 ms) polls at the host's
+    1 ms timer tick (command_processor.cpp, ExecutePacketType3_WAIT_REG_MEM). A standalone probe (a flag published on a
+    33.333 ms grid, a consumer polling it with Sleep(1)): detection delay mean 0.93 ms, p99 2.42, intervals between
+    detections sd 0.900, p99 35.5; the same consumer with WaitOnAddress: delay mean 0.017 ms, p99 0.039, intervals sd
+    0.031 ms, p99 33.44.
+
+Change (src/graphics/command_processor.cpp, src/graphics/graphics_system.cpp; Windows only):
+  * GraphicsSystem::MarkVblank calls rex::graphics::NotifyGuestVblankReleased() after DispatchInterruptCallback (the
+    guest's vblank handler, which writes the swap gate's word, has returned). It does fetch_add(1, release) on a
+    counter and WakeByAddressAll. Declared in graphics_system.cpp, defined in command_processor.cpp: no header changes.
+  * WAIT_REG_MEM: in the sleeping branch (wait >= 0x100, vsync on) with cp_wait_vblank_wake: WaitOnAddress on the
+    counter, with the value read BEFORE the register/memory value, so a release in between returns at once; the time-out
+    is the old sleep length (wait / 0x100 ms). Waits for anything else are unchanged in effect (they poll at the same
+    time-out). vsync off keeps MaybeYield; wait < 0x100 keeps its spin.
+  * Cost: one atomic add and one WakeByAddressAll per guest vblank.
+
+Not built or run in the game (clang++ 20.1.8 -fsyntax-only with the SDK's Release flags: the same diagnostics as before).
+Verify: PresentMon MsBetweenPresents at cap 30 sd well under 0.3 ms and p99 <= 33.8 (was 0.825 / 35.1), A/B with
+--cp_wait_vblank_wake=false.
+
+---
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 60246b5a..02739dfe 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -296,6 +296,29 @@ inline void NfsmwCpPublishEvent() {}
+ }  // namespace
+ #endif
+ 
++// LOCAL PATCH - MCLA (0430): a WAIT_REG_MEM that sleeps (wait >= 0x100) is woken when the guest's vblank handler has
++// run, not left to a Sleep(1 ms) poll. The title's swap gate is such a wait (memory == 0, wait 0x100): the guest's vblank
++// handler releases it, and a poll at the host's 1-2 ms timer tick noticed the release 0-2 ms late, a different delay
++// for every swap, so the presents were 33.3 ms +- 2 ms apart (triangular, lag-1 autocorrelation -0.5) however exact the
++// guest vblank was.
++#if REX_PLATFORM_WIN32
++REXCVAR_DEFINE_BOOL(cp_wait_vblank_wake, true, "GPU",
++                    "Windows: a WAIT_REG_MEM that sleeps (wait >= 0x100; the title's swap gate) wakes when the "
++                    "guest's vblank handler returns instead of when its 1 ms sleep ends (which noticed the "
++                    "gate's release 0-2 ms late: swaps, hence presents, jittered by +-2 ms). The sleep stays "
++                    "as the time-out. false = the SDK's Sleep poll.");
++namespace {
++std::atomic<uint32_t> g_guest_vblank_release_seq{0};
++}  // namespace
++namespace rex::graphics {
++// Called by the vblank thread after the guest's vblank interrupt returned (graphics_system.cpp).
++void NotifyGuestVblankReleased() {
++  g_guest_vblank_release_seq.fetch_add(1, std::memory_order_release);
++  WakeByAddressAll(&g_guest_vblank_release_seq);
++}
++}  // namespace rex::graphics
++#endif
++
+ namespace rex::graphics {
+ 
+ using namespace rex::graphics::xenos;
+@@ -2264,6 +2287,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+ 
+   bool matched = false;
+   do {
++#if REX_PLATFORM_WIN32
++    // Before the value is read: a release that lands after this load changes the word the wait below sleeps on.
++    const uint32_t release_seq = g_guest_vblank_release_seq.load(std::memory_order_acquire);
++#endif
+     uint32_t value = 0;
+     if (is_memory) {
+       value =
+@@ -2310,7 +2337,16 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+           // User wants it fast and dangerous.
+           rex::thread::MaybeYield();
+         } else {
++#if REX_PLATFORM_WIN32
++          if (REXCVAR_GET(cp_wait_vblank_wake)) {
++            uint32_t seen = release_seq;
++            WaitOnAddress(&g_guest_vblank_release_seq, &seen, sizeof(seen), wait / 0x100);
++          } else {
++            rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
++          }
++#else
+           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
++#endif
+         }
+         rex::thread::SyncMemory();
+         ReturnFromWait();
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index ba5b44d1..446129c3 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -668,6 +668,11 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+                                          rex::countof(args));
+ }
+ 
++#if REX_PLATFORM_WIN32
++// LOCAL PATCH - MCLA (0430): defined in command_processor.cpp; wakes a WAIT_REG_MEM that sleeps.
++void NotifyGuestVblankReleased();
++#endif
++
+ void GraphicsSystem::MarkVblank() {
+   // TODO: Enable profiling once ported
+   // SCOPE_profile_cpu_f("gpu");
+@@ -681,6 +686,10 @@ void GraphicsSystem::MarkVblank() {
+   //     something wrong and the CP will block waiting for code that
+   //     needs to be run in the interrupt.
+   DispatchInterruptCallback(0, 2);
++#if REX_PLATFORM_WIN32
++  // The guest's handler has run (it releases the title's swap gate): wake the command processor's sleeping wait.
++  NotifyGuestVblankReleased();  // LOCAL PATCH - MCLA (0430)
++#endif
+ }
+ 
+ void GraphicsSystem::ClearCaches() {

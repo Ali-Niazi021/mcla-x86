@@ -1,0 +1,543 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Tue, 24 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0440: guest vblank locked to the display's real vblank (phase and rate), every k-th one
+
+Source: Ours, written for this SDK (ORC fix after the W3.4 M4 gate failure; the display-lock design of the ORC task).
+  The idea of following the display's vblank is $IOS's display-locked guest vblank (docs/mcla/TIMING.md, ios_vblank_*);
+  nothing is copied (that one is CADisplayLink)
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: With guest_vblank_precise and guest_vblank_display_lock (GPU, bool, default true) the guest's vblank grid takes
+  its phase and rate from the real vblank of the display the game window is on, every k-th vblank when the display
+  refreshes at k x video_mode_refresh_rate within 0.5 % (120 Hz panel: k = 2). A helper thread waits on
+  IDXGIOutput::WaitForVBlank; the vblank thread fits a line to its last 128 vblanks and times the guest's vblank on that
+  line with the timer + QPC spin of 0400. Falls back to the QPC grid (src=qpc) when the rate does not fit, the display
+  stops, or the output fails. `[guest-vblank] ... n=<count> src=display|qpc`. Cvar guest_vblank_display_offset_us (0).
+  Windows only. Not built before the next SDK build.
+Bucket: REDO
+
+0440-guest-vblank-display-lock.patch (mcla-x86 ORC fix; evidence in $WORK/scratch/W3.2/present_jitter.md)
+
+Why. Presents in the W3.4 runs are composed by the DWM (PresentMon: "Composed: Flip", SyncInterval 0, flags 0x204, never
+blocking) and shown at the panel's vblank, 120.000 Hz (fitted from MsUntilDisplayed). The guest's QPC grid is 2 x 60.000
+against it, so it never beats, but its PHASE against the panel is whatever the vblank thread's first QPC reading made
+it, a different one every run. The share of frames held more than 40 ms was 8.2 % in the one run with MsUntilDisplayed
+p50 20.0 ms and 20-24 % in the runs with p50 10-11 ms, at the same 33.3 ms present cadence and the same present
+jitter (sd 0.83-0.86 ms): consistent with the present landing at a different distance from the DWM's composition
+deadline in each run (an inference from those two columns; the DWM's deadline is not measured). With the grid locked to
+the display, the guest's vblank, hence the swap gate's release and the present, comes at a fixed offset after the
+panel's vblank in every run, tunable with guest_vblank_display_offset_us (and on a 59.94 / 119.88 Hz panel the guest
+follows the panel instead of beating against it once every ~16 s).
+
+Design. The wake-ups of WaitForVBlank are not good enough to time the guest's vblank on directly: measured on this
+machine (a 120 Hz panel, 2,399 waits) they scatter with sd 0.155 ms, p99 0.36 ms, max 0.56 ms around an exact
+119.9993 Hz line, and a guest vblank fired on every second wake would inherit that (period sd 0.22 ms). So:
+  * Helper thread (DisplayVblankThread, "GPU Display VBlank", time-critical): the DXGI output of the game window's
+    monitor, WaitForVBlank in a loop, publishes the QPC time of each wake in a ring (count + 256 stamps). WaitForVBlank
+    has no time-out, so it is not on the vblank thread: a display that turns off must not stop the guest's vblank.
+  * The game window is the largest visible top-level window of the process, looked up every 2 s (MonitorFromWindow); the
+    helper is restarted when the window changes monitor. If no output is found or WaitForVBlank fails: warning, retry in 5 s.
+  * Vblank thread (PreciseVblank::UpdateDisplayLock, once per vblank): takes the new stamps, keeps a least-squares line
+    time(j) = fit_t + (j - fit_j) x fit_period through the last 128 (a stamp more than 2 ms off the line is a late
+    wake-up and is dropped; nine in a row restart the line), usable from 48 stamps with rms scatter under 1 ms.
+  * Lock: k = round(guest period / fitted display period) with 1 <= k <= 16 and |k x display period - guest period| <=
+    0.5 % of the guest period. Then the guest's vblank number n is the display vblank lock_tick + n k, timed with the same
+    waitable timer + QPC spin as the QPC grid (so it keeps the grid's precision: the line's noise is the stamps' noise
+    / sqrt(128)), plus guest_vblank_display_offset_us. The guest's period is k x the display's, so it follows a
+    59.94 Hz panel. A vblank more than one period late fires at once and re-seats lock_tick (resync, no burst).
+  * Unlock (-> the QPC grid, anchored at the last vblank, `display lock off (reason)` logged): no stamp for 4 display
+    periods + 50 ms (at once), the rate not fitting for 30 vblanks in a row, the cvar off, the helper failing.
+  * The stats line gains ` src=display|qpc` after n=.
+  * src/graphics/CMakeLists.txt: rexgpu-xenos links dxgi on Windows (it already does with D3D12; a Vulkan-only build
+    needs it now).
+Harness (the class compiled standalone, a small visible window on this machine's 120 Hz panel, an independent
+WaitForVBlank observer, 60 Hz guest, display lock on): guest period mean 16.6669 sd 0.0113 ms (p99 16.685, max 16.901 right
+after the lock) against sd 0.0014 for the QPC grid; guest vblank minus the nearest display vblank: mean +0.012 sd
+0.164 ms (the observer's own wake-up noise; the QPC grid sits at a fixed but arbitrary phase, -0.94 ms in that run, and
+differs run to run). 30 Hz guest: k = 4, sd 0.156; 120 Hz guest: k = 1, sd 0.153; 144 Hz guest: no integer multiple,
+`display lock not used`, src=qpc; offset 2000 us: +2.019 ms; a 60 ms stall of the guest: resync 1, lock kept.
+
+Not built or run in the game (clang++ 20.1.8 -fsyntax-only with the SDK's Release flags: no new diagnostics).
+Verify: `display lock on: output 120.0xx Hz ... every 2 of them` then `... src=display` in the 10 s lines, p50 16.666-16.667,
+p99 <= 16.9; PresentMon MsBetweenDisplayChange share > 40 ms the same in every run (and low); A/B
+--guest_vblank_display_lock=false (src=qpc).
+
+---
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index a43d2be6..108cbe94 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -202,3 +202,9 @@ endif()
+ if(WIN32)
+     target_link_libraries(rexgpu-xenos PRIVATE Synchronization)
+ endif()
++
++# LOCAL PATCH - MCLA (0440): the display-locked guest vblank waits on IDXGIOutput::WaitForVBlank (also linked above for
++# D3D12 builds; a Vulkan-only build has no other reason to link it).
++if(WIN32)
++    target_link_libraries(rexgpu-xenos PRIVATE dxgi)
++endif()
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 446129c3..6da40e11 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -42,10 +42,14 @@
+ #include <windows.h>
+ 
+ #include <avrt.h>
++#include <dxgi.h>
++#include <wrl/client.h>
+ 
+ #include <atomic>
+ #include <cmath>
+ #include <vector>
++#include <array>
++#include <thread>
+ #endif
+ 
+ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
+@@ -72,6 +76,17 @@ REXCVAR_DEFINE_INT32(guest_vblank_spin_us, 300, "GPU",
+                      "and the QPC spin begins (the timer's measured overshoot is added to it). 0 = trust the "
+                      "timer")
+     .range(0, 4000);
++// LOCAL PATCH - MCLA (0440): the display's vertical blank.
++REXCVAR_DEFINE_BOOL(guest_vblank_display_lock, true, "GPU",
++                    "Windows, with guest_vblank_precise: the guest's vblank grid follows the real vblank of the "
++                    "display the game window is on (IDXGIOutput::WaitForVBlank on a helper thread; the grid's "
++                    "phase and rate are fitted to its last 128 vblanks), every k-th one, when the display's "
++                    "refresh rate is k x video_mode_refresh_rate within 0.5 % (120 Hz: k = 2). Otherwise, or "
++                    "when the display stops, the QPC grid runs (`src=qpc` in the [guest-vblank] line).");
++REXCVAR_DEFINE_INT32(guest_vblank_display_offset_us, 0, "GPU",
++                     "With guest_vblank_display_lock: microseconds the guest's vblank comes after the display's "
++                     "(the phase of the game's presents against the display's refresh).")
++    .range(0, 8000);
+ #endif
+ 
+ namespace {
+@@ -113,6 +128,80 @@ int64_t QpcNow() {
+   return counter.QuadPart;
+ }
+ 
++// LOCAL PATCH - MCLA (0440): the display's vertical blank, for guest_vblank_display_lock.
++// The game window: the largest visible top-level window this process owns (the SDL window).
++HWND FindGameWindow() {
++  struct Search {
++    DWORD process_id;
++    HWND best;
++    LONG best_area;
++  } search = {GetCurrentProcessId(), nullptr, 0};
++  EnumWindows(
++      [](HWND window, LPARAM param) -> BOOL {
++        auto* s = reinterpret_cast<Search*>(param);
++        DWORD process_id = 0;
++        GetWindowThreadProcessId(window, &process_id);
++        RECT rect;
++        if (process_id != s->process_id || !IsWindowVisible(window) || IsIconic(window) ||
++            GetWindow(window, GW_OWNER) != nullptr || !GetWindowRect(window, &rect)) {
++          return TRUE;
++        }
++        const LONG area = (rect.right - rect.left) * (rect.bottom - rect.top);
++        if (area > s->best_area) {
++          s->best_area = area;
++          s->best = window;
++        }
++        return TRUE;
++      },
++      reinterpret_cast<LPARAM>(&search));
++  return search.best;
++}
++
++// IDXGIOutput::WaitForVBlank has no time-out, so it runs on a thread of its own: a display that turns off must not
++// stop the guest's vblank. The thread publishes the QPC time at which it woke for each vblank; the vblank thread reads
++// them and fits a line. The thread ends at its next vblank after `stop`, or when the output fails.
++struct DisplayVblankState {
++  static constexpr uint64_t kRing = 256;
++  std::atomic<uint64_t> count{0};  // vblanks seen; vblank j (1-based) is stamps[j % kRing]
++  std::array<std::atomic<int64_t>, kRing> stamps{};
++  std::atomic<bool> stop{false};
++  std::atomic<bool> failed{false};
++};
++
++void DisplayVblankThread(std::shared_ptr<DisplayVblankState> state, HMONITOR monitor) {
++  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
++  SetThreadDescription(GetCurrentThread(), L"GPU Display VBlank");
++  Microsoft::WRL::ComPtr<IDXGIOutput> output;
++  Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
++  if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
++    Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
++    for (UINT a = 0; !output && SUCCEEDED(factory->EnumAdapters(a, adapter.ReleaseAndGetAddressOf())); ++a) {
++      Microsoft::WRL::ComPtr<IDXGIOutput> candidate;
++      for (UINT o = 0; SUCCEEDED(adapter->EnumOutputs(o, candidate.ReleaseAndGetAddressOf())); ++o) {
++        DXGI_OUTPUT_DESC desc;
++        if (SUCCEEDED(candidate->GetDesc(&desc)) && desc.Monitor == monitor) {
++          output = candidate;
++          break;
++        }
++      }
++    }
++  }
++  if (!output) {
++    state->failed.store(true, std::memory_order_release);
++    return;
++  }
++  while (!state->stop.load(std::memory_order_relaxed)) {
++    if (FAILED(output->WaitForVBlank())) {
++      state->failed.store(true, std::memory_order_release);
++      return;
++    }
++    const int64_t t = QpcNow();
++    const uint64_t j = state->count.load(std::memory_order_relaxed) + 1;
++    state->stamps[j % DisplayVblankState::kRing].store(t, std::memory_order_relaxed);
++    state->count.store(j, std::memory_order_release);
++  }
++}
++
+ class PreciseVblank {
+  public:
+   explicit PreciseVblank(double refresh_rate_hz) {
+@@ -134,6 +223,7 @@ class PreciseVblank {
+ 
+   ~PreciseVblank() {
+     Release();
++    StopDisplay();
+     if (timer_) {
+       CloseHandle(timer_);
+     }
+@@ -180,6 +270,7 @@ class PreciseVblank {
+     }
+     engaged_ = false;
+     raised_ = false;
++    StopDisplay();
+     if (mmcss_) {
+       AvRevertMmThreadCharacteristics(mmcss_);
+       mmcss_ = nullptr;
+@@ -189,8 +280,8 @@ class PreciseVblank {
+     return true;
+   }
+ 
+-  // Waits for the next point of the grid and returns the QPC stamp of the moment it was reached, 0 if `running` was
+-  // cleared during the wait.
++  // Waits for the next point of the grid (the QPC grid, or with the display lock every k-th vblank of the display) and
++  // returns the QPC stamp of the moment it was reached, 0 if `running` was cleared during the wait.
+   int64_t WaitForVblank(const std::atomic<bool>& running) {
+     int64_t now = QpcNow();
+     const double scalar = GuestTimeScalar();
+@@ -202,14 +293,30 @@ class PreciseVblank {
+       index_ = 1;
+       BreakPeriod();
+     }
+-    const int64_t period = std::max<int64_t>(1, int64_t(period_ticks_));
+-    const int64_t deadline = origin_ + int64_t(std::llround(double(index_) * period_ticks_));
++    UpdateDisplayLock(now);
++    int64_t deadline;
++    int64_t period;
++    int64_t target_tick = 0;
++    if (locked_) {
++      target_tick = lock_tick_ + int64_t(k_);
++      deadline = DisplayTickTime(target_tick) +
++                 int64_t(REXCVAR_GET(guest_vblank_display_offset_us)) * qpc_hz_ / 1000000;
++      period = std::max<int64_t>(1, int64_t(double(k_) * fit_period_));
++    } else {
++      deadline = origin_ + int64_t(std::llround(double(index_) * period_ticks_));
++      period = std::max<int64_t>(1, int64_t(period_ticks_));
++    }
+     if (now - deadline > period) {
+       // More than a period late (a stall, a long interrupt, the machine paused): the vblank fires now and the grid
+       // restarts from it. The vblanks that were missed are never replayed in a burst.
+       ++resync_;
+-      origin_ = now;
+-      index_ = 1;
++      if (locked_) {
++        lock_tick_ = NearestDisplayTick(now);
++      } else {
++        origin_ = now;
++        index_ = 1;
++      }
++      last_wait_return_ = now;
+       return now;
+     }
+     const int64_t spin_ticks = int64_t(REXCVAR_GET(guest_vblank_spin_us)) * qpc_hz_ / 1000000;
+@@ -225,7 +332,12 @@ class PreciseVblank {
+     while ((fired = QpcNow()) < deadline) {
+       YieldProcessor();
+     }
+-    ++index_;
++    if (locked_) {
++      lock_tick_ = target_tick;
++    } else {
++      ++index_;
++    }
++    last_wait_return_ = fired;
+     return fired;
+   }
+ 
+@@ -246,7 +358,10 @@ class PreciseVblank {
+   }
+ 
+   // A vblank of the grid fired at `fired` (WaitForVblank's result) and the guest has seen it.
+-  void EndVblank(int64_t fired) { NoteVblank(fired, 1e3 * period_ticks_ / double(qpc_hz_)); }
++  void EndVblank(int64_t fired) {
++    const double nominal_ticks = locked_ ? double(k_) * fit_period_ : period_ticks_;
++    NoteVblank(fired, 1e3 * nominal_ticks / double(qpc_hz_));
++  }
+ 
+   // vsync=false: the SDK's loop is kept (a 1 kHz free-running vblank); the grid has no meaning there.
+   void WarnNoVsyncOnce() {
+@@ -263,6 +378,219 @@ class PreciseVblank {
+   void NoteLegacyResync() { ++resync_; }
+ 
+  private:
++  // The display's vblanks (guest_vblank_display_lock): a least-squares line through the last kFitTicks of the stamps the
++  // helper thread published, time(j) = fit_t_ + (j - fit_j_) * fit_period_ for the display's vblank number j. Noise in
++  // one stamp (the thread's wake-up, sd 0.15 ms measured) averages out; the guest's vblank is timed by the QPC timer
++  // and spin from this line, so it keeps the grid's precision and takes the display's phase and rate.
++  struct Tick {
++    int64_t j;
++    int64_t t;
++  };
++  static constexpr size_t kFitTicks = 128;
++
++  void ClearFit() {
++    tick_count_ = 0;
++    tick_head_ = 0;
++    rejected_ticks_ = 0;
++    fit_valid_ = false;
++  }
++
++  void UpdateFit() {
++    fit_valid_ = false;
++    if (tick_count_ < 48) {
++      return;
++    }
++    const Tick first = ticks_[tick_head_];
++    const Tick last = ticks_[(tick_head_ + tick_count_ - 1) % kFitTicks];
++    if (last.j - first.j < 40) {
++      return;
++    }
++    const double n = double(tick_count_);
++    double sx = 0, sy = 0, sxx = 0, sxy = 0;
++    for (size_t i = 0; i < tick_count_; ++i) {
++      const Tick& s = ticks_[(tick_head_ + i) % kFitTicks];
++      const double x = double(s.j - first.j), y = double(s.t - first.t);
++      sx += x;
++      sy += y;
++      sxx += x * x;
++      sxy += x * y;
++    }
++    const double det = n * sxx - sx * sx;
++    if (det <= 0.0) {
++      return;
++    }
++    const double slope = (n * sxy - sx * sy) / det;
++    const double intercept = (sy - slope * sx) / n;
++    double squares = 0;
++    for (size_t i = 0; i < tick_count_; ++i) {
++      const Tick& s = ticks_[(tick_head_ + i) % kFitTicks];
++      const double r = double(s.t - first.t) - (intercept + slope * double(s.j - first.j));
++      squares += r * r;
++    }
++    const double ms = double(qpc_hz_) / 1000.0;
++    // A period of 1.5-50 ms (20-666 Hz) and an rms scatter under 1 ms, else it is not a display's vblank.
++    if (slope < 1.5 * ms || slope > 50.0 * ms || std::sqrt(squares / n) > ms) {
++      return;
++    }
++    fit_j_ = first.j;
++    fit_t_ = double(first.t) + intercept;
++    fit_period_ = slope;
++    fit_valid_ = true;
++  }
++
++  // One more vblank of the display. A stamp more than 2 ms off the line is a late wake-up and is left out; nine in a row
++  // mean the display's timing changed, and the line is started again.
++  void AcceptTick(int64_t j, int64_t t) {
++    last_tick_t_ = t;
++    if (fit_valid_) {
++      const double predicted = fit_t_ + double(j - fit_j_) * fit_period_;
++      if (std::fabs(double(t) - predicted) > double(qpc_hz_) / 500.0) {
++        if (++rejected_ticks_ > 8) {
++          ClearFit();
++        }
++        return;
++      }
++      rejected_ticks_ = 0;
++    }
++    ticks_[(tick_head_ + tick_count_) % kFitTicks] = Tick{j, t};
++    if (tick_count_ < kFitTicks) {
++      ++tick_count_;
++    } else {
++      tick_head_ = (tick_head_ + 1) % kFitTicks;
++    }
++    UpdateFit();
++  }
++
++  int64_t DisplayTickTime(int64_t j) const {
++    return int64_t(std::llround(fit_t_ + double(j - fit_j_) * fit_period_));
++  }
++
++  int64_t NearestDisplayTick(int64_t t) const {
++    return fit_j_ + int64_t(std::llround((double(t) - fit_t_) / fit_period_));
++  }
++
++  void StopDisplay() {
++    if (display_) {
++      display_->stop.store(true, std::memory_order_relaxed);  // the thread ends at its next vblank
++      display_.reset();
++    }
++    display_monitor_ = nullptr;
++    ClearFit();
++    if (locked_) {
++      UnlockDisplay("the display source was released");
++    }
++  }
++
++  void LockDisplay(uint32_t k, int64_t now) {
++    if (!locked_) {
++      BreakPeriod();
++    }
++    locked_ = true;
++    k_ = k;
++    bad_evaluations_ = 0;
++    lock_tick_ = NearestDisplayTick(last_wait_return_ != 0 ? last_wait_return_ : now);
++    REXGPU_INFO(
++        "[guest-vblank] display lock on: output {:.4f} Hz ({:.5f} ms a vblank), the guest's vblank every {} of them = "
++        "{:.4f} Hz (asked for {:.3f} Hz), {} us after the display's",
++        double(qpc_hz_) / fit_period_, 1e3 * fit_period_ / double(qpc_hz_), k, double(qpc_hz_) / (double(k) * fit_period_),
++        double(qpc_hz_) / period_ticks_, REXCVAR_GET(guest_vblank_display_offset_us));
++  }
++
++  void UnlockDisplay(const char* why) {
++    locked_ = false;
++    bad_evaluations_ = 0;
++    origin_ = last_wait_return_ != 0 ? last_wait_return_ : QpcNow();
++    index_ = 1;
++    BreakPeriod();
++    REXGPU_INFO("[guest-vblank] display lock off ({}): back on the QPC grid", why);
++  }
++
++  // Each vblank: the display source (window -> monitor -> a helper thread on its output), its newest vblanks, and
++  // whether the grid may follow it. Fallbacks to the QPC grid: the display's refresh is no k x the guest's within 0.5 %,
++  // it stops delivering vblanks, WaitForVBlank fails, or the cvar is off.
++  void UpdateDisplayLock(int64_t now) {
++    if (!REXCVAR_GET(guest_vblank_display_lock)) {
++      if (display_ || locked_) {
++        StopDisplay();
++      }
++      return;
++    }
++    if (now >= display_next_look_) {
++      display_next_look_ = now + 2 * qpc_hz_;
++      HWND window = FindGameWindow();
++      HMONITOR monitor = window ? MonitorFromWindow(window, MONITOR_DEFAULTTONULL) : nullptr;
++      if (display_ && monitor != display_monitor_) {
++        StopDisplay();  // the window moved to another display (or is gone): start over there
++      }
++      if (!display_ && monitor) {
++        display_ = std::make_shared<DisplayVblankState>();
++        display_monitor_ = monitor;
++        display_consumed_ = 0;
++        try {
++          std::thread(DisplayVblankThread, display_, monitor).detach();
++        } catch (...) {
++          display_->failed.store(true, std::memory_order_release);
++        }
++      }
++    }
++    if (!display_) {
++      return;
++    }
++    if (display_->failed.load(std::memory_order_acquire)) {
++      REXGPU_WARN(
++          "[guest-vblank] the display's vblank can't be waited for (no DXGI output for the game window's monitor, or "
++          "WaitForVBlank failed): the QPC grid stays, next try in 5 s");
++      StopDisplay();
++      display_next_look_ = now + 5 * qpc_hz_;
++      return;
++    }
++    const int64_t count = int64_t(display_->count.load(std::memory_order_acquire));
++    if (count - display_consumed_ > 200) {  // this thread was away for long: the oldest stamps are gone
++      display_consumed_ = count - 100;
++      ClearFit();
++    }
++    while (display_consumed_ < count) {
++      ++display_consumed_;
++      AcceptTick(display_consumed_,
++                 display_->stamps[uint64_t(display_consumed_) % DisplayVblankState::kRing].load(
++                     std::memory_order_relaxed));
++    }
++    bool ok = false;
++    bool stale = false;
++    uint32_t k = 0;
++    const char* why = "no usable display vblanks yet";
++    if (fit_valid_) {
++      if (now - last_tick_t_ > int64_t(4.0 * fit_period_) + qpc_hz_ / 20) {
++        stale = true;
++        why = "the display stopped delivering vblanks";
++      } else {
++        const double kd = std::round(period_ticks_ / fit_period_);
++        if (kd >= 1.0 && kd <= 16.0 && std::fabs(kd * fit_period_ - period_ticks_) <= 0.005 * period_ticks_) {
++          ok = true;
++          k = uint32_t(kd);
++        } else {
++          why = "the display's refresh rate is not an integer multiple of the guest's (within 0.5 %)";
++          if (!locked_ && !mismatch_logged_) {
++            mismatch_logged_ = true;
++            REXGPU_INFO(
++                "[guest-vblank] display lock not used: the display refreshes at {:.4f} Hz, not an integer multiple of "
++                "the guest's {:.3f} Hz within 0.5 %: the QPC grid stays",
++                double(qpc_hz_) / fit_period_, double(qpc_hz_) / period_ticks_);
++          }
++        }
++      }
++    }
++    if (ok) {
++      bad_evaluations_ = 0;
++      mismatch_logged_ = false;
++      if (!locked_ || k != k_) {
++        LockDisplay(k, now);
++      }
++    } else if (locked_ && (stale || ++bad_evaluations_ >= 30)) {
++      UnlockDisplay(why);  // a stale display is dropped at once, a rate that doesn't fit gets half a second
++    }
++  }
++
+   static double GuestTimeScalar() {
+     const double scalar = rex::chrono::Clock::guest_time_scalar();
+     return scalar > 0.0 ? scalar : 1.0;
+@@ -329,8 +657,8 @@ class PreciseVblank {
+       const auto rank = [&](double p) {
+         return periods_ms_[std::clamp<size_t>(size_t(std::ceil(p * double(n))), 1, n) - 1];
+       };
+-      REXGPU_INFO("[guest-vblank] period p50={:.3f} p99={:.3f} late={} resync={} early={} n={}", rank(0.50), rank(0.99),
+-                  late_, resync_, early_, n);
++      REXGPU_INFO("[guest-vblank] period p50={:.3f} p99={:.3f} late={} resync={} early={} n={} src={}", rank(0.50),
++                  rank(0.99), late_, resync_, early_, n, locked_ ? "display" : "qpc");
+     }
+     periods_ms_.clear();
+     late_ = 0;
+@@ -362,6 +690,26 @@ class PreciseVblank {
+   uint32_t late_ = 0;
+   uint32_t resync_ = 0;
+   uint32_t early_ = 0;
++  // The display lock (0440).
++  std::shared_ptr<DisplayVblankState> display_;
++  HMONITOR display_monitor_ = nullptr;
++  int64_t display_next_look_ = 0;  // QPC: when to look for the window / its monitor again
++  int64_t display_consumed_ = 0;   // the display's vblanks taken from the helper thread so far
++  std::array<Tick, kFitTicks> ticks_{};
++  size_t tick_head_ = 0;
++  size_t tick_count_ = 0;
++  int64_t last_tick_t_ = 0;
++  uint32_t rejected_ticks_ = 0;
++  bool fit_valid_ = false;
++  double fit_t_ = 0.0;       // QPC time of the display's vblank number fit_j_
++  double fit_period_ = 0.0;  // QPC ticks between the display's vblanks
++  int64_t fit_j_ = 0;
++  bool locked_ = false;
++  uint32_t k_ = 1;           // the guest's vblank is every k-th vblank of the display
++  int64_t lock_tick_ = 0;    // the display's vblank number of the guest's last vblank
++  uint32_t bad_evaluations_ = 0;
++  bool mismatch_logged_ = false;
++  int64_t last_wait_return_ = 0;  // QPC stamp WaitForVblank last returned
+ };
+ 
+ }  // namespace

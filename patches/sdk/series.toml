@@ -764,6 +764,24 @@ purpose = "xboxkrnl MmQueryAllocationSize(address) returns the bytes from the ad
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0430-cp-wait-vblank-wake"
+source = "local"
+path = "patches/sdk/0430-cp-wait-vblank-wake.patch"
+sha256 = "cc5a7cff57e776de2022d8741821f4d6eedbd23cc25ff5561a1165f438bd85f4"
+purpose = "Windows: the command processor's sleeping WAIT_REG_MEM (wait >= 0x100; the title's swap gate, released by the guest's vblank handler) wakes via WaitOnAddress when GraphicsSystem::MarkVblank returns instead of noticing the release at its next 1 ms Sleep tick, which was 0-2 ms late for every swap (presents 33.3 ms +- 2 ms apart, p99 35.1; the M4 gate). The sleep length stays as the time-out. Cvar cp_wait_vblank_wake (true; false = SDK behaviour). Not built before the next SDK build."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0440-guest-vblank-display-lock"
+source = "local"
+path = "patches/sdk/0440-guest-vblank-display-lock.patch"
+sha256 = "bbbae5175551d9a4c8647d0b473e332e3bb44bc60fa36867d1a6f8848ef22ef2"
+purpose = "Windows: the guest vblank grid of 0400 takes its phase and rate from the real vblank of the display the game window is on (helper thread on IDXGIOutput::WaitForVBlank, a line fitted to its last 128 vblanks, every k-th vblank when the display refreshes at k x video_mode_refresh_rate within 0.5 %); falls back to the QPC grid. Stats line gains src=display|qpc. Cvars guest_vblank_display_lock (true), guest_vblank_display_offset_us (0). rexgpu-xenos links dxgi. Not built before the next SDK build."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]
