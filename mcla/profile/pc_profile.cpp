@@ -6,7 +6,9 @@
 //
 // Named presets (W5.1): `--mcla_profile=1080p` or `900p` (cvar below; "" / "default" = the table below, unchanged)
 // adds a second table on top of the first. Same mechanism, so the command line, the environment and the TOML file
-// still win over every entry, and an entry that names a cvar of the base table replaces its value.
+// still win over every entry, and an entry that names a cvar of the base table replaces its value. W5.6 adds `1080p-fsr`
+// (the 1080p preset plus the FSR 3.1 temporal upscaler; a preset may name a parent whose entries it builds on) and
+// `720p-fsr1` (the shipped 1280x720 render upscaled by the presenter's FSR 1).
 //
 // Frame-rate target (W4.1): `--mcla_fps_target=60` (cvar below; 0 = the shipped timing, nothing is set) is the whole 60 fps
 // profile in one switch. It is a separate axis from the resolution presets: `--mcla_profile=1080p --mcla_fps_target=60`
@@ -29,7 +31,11 @@ REXCVAR_DEFINE_STRING(mcla_profile, "", "MCLA",
                       "any cvar given explicitly still wins). '' or 'default' = the default profile only. "
                       "'1080p' = true 1920x1080 internal render (back buffer, video mode, render-target height, "
                       "noaa; needs edram_tiles=4096, which the default profile sets). '900p' = 1600x900 "
-                      "(the cheaper fallback: present it scaled to 1080p). Read once, in OnPreSetup")
+                      "(the cheaper fallback: present it scaled to 1080p). '1080p-fsr' = the 1080p render with the "
+                      "SDK's FSR 3.1 temporal upscaler: the scene is drawn at 1280x720 and upscaled to 1920x1080 "
+                      "(temporal_aa=fsr, 1.5x, RCAS 0.3, single-tile scene; needs the render markers, "
+                      "mcla_render_markers). '720p-fsr1' = the shipped 1280x720 render, noaa, upscaled by the "
+                      "presenter's FSR 1 (present_effect=fsr) to a 1920x1080 window. Read once, in OnPreSetup")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_INT32(mcla_fps_target, 0, "MCLA",
@@ -101,6 +107,13 @@ constexpr CvarDefault kProfileDefaults[] = {
     // Keyboard play for a human at the laptop. Source: iOS common/src/nfsmw_app.h:185;
     // SDK src/input/mnk/mnk_input_driver.cpp:26 (false).
     {"mnk_mode", "true"},
+    // The SDK's SDL gamepad driver loads this extra mappings file at start and logs "SDL GameControllerDB: file
+    // 'gamecontrollerdb.txt' does not exist" on every run; an empty path skips only that file. SDL3's own mapping
+    // table (SDL_gamepad_db.h, loaded by SDL_InitGamepadMappings) is independent of it, so no pad is lost: generic
+    // XInput, Xbox, DualShock 4 and DualSense all map from the built-in table. Source: SDK
+    // src/input/sdl/sdl_input_driver.cpp:23,98-113 (default "gamecontrollerdb.txt", empty skips the block);
+    // W5.5 report section B.
+    {"hid_mappings_file", ""},
 };
 
 // ---- presets (W5.1) -------------------------------------------------------------------------------------------
@@ -159,18 +172,59 @@ constexpr CvarDefault k900pDefaults[] = {
     {"mcla_ws_ui_probe", "false"},
 };
 
+// 1080p-fsr (W5.6): the 1080p render above (the back buffer, the post-processing and the HUD at 1920x1080), with the 3D
+// scene drawn at 1280x720 and upscaled to 1920x1080 by the SDK's FSR 3.1 temporal pass (owner decision, M6: the 720p
+// scene upscaled with FSR 3). The pass runs where the game draws its motion blur, between the scene and the tone map, found
+// through the guest render markers (mcla_fsr_markers.cpp; mcla_render_markers is auto = on while temporal_aa=fsr).
+// Source: W5.5 report A3 (recipe), Renan's patches temporal-aa + fsr-upscaling.
+//   temporal_aa=fsr              the SDK's FSR 3.1 (ffx-api, amd_fidelityfx_dx12.dll), D3D12 only. Transient: the TOML file
+//                                cannot set it, an app default (SetDefaultValue) and the command line can.
+//   temporal_aa_upscale=1.5      Quality: the output over 1.5 = 1280x720 for a 1920x1080 output. The scene's draws go into
+//                                the top-left 1280x720 of 1920x1080 render targets, its resolves are stretched back.
+//   temporal_aa_sharpness=0.3    RCAS after FSR (SDK default 0.2).
+//   mcla_ws_single_tile=true     the squeeze wants ONE 1x scene surface whose pitch is the output width
+//                                (src/graphics/temporal_aa.cpp:329-350); without it 1080p is two tiles at 1x.
+// The SDK needs host render targets, not ROV, and direct_host_resolve=true (its default, untouched here).
+static_assert(1920 * 2 / 3 == 1280 && 1080 * 2 / 3 == 720, "1.5x of 1920x1080 is the 1280x720 scene");
+constexpr CvarDefault k1080pFsrDefaults[] = {
+    {"temporal_aa", "fsr"},
+    {"temporal_aa_upscale", "1.5"},
+    {"temporal_aa_sharpness", "0.3"},
+    {"mcla_ws_single_tile", "true"},
+};
+
+// 720p-fsr1 (W5.6): the cheap comparison (W5.5 A4). The game stays at the shipped 1280x720 (nothing in the table sets
+// the size), noaa, and the presenter upscales the finished picture, HUD included, with FSR 1 (EASU + RCAS) to the window.
+// The SDK's fullscreen default takes the desktop size and EASU scales to that; add --fullscreen=false for the 1920x1080
+// window. present_effect is read when the presenter is created, after OnPreSetup. Source: W5.5 report A4.
+constexpr CvarDefault k720pFsr1Defaults[] = {
+    {"mcla_noaa", "true"},
+    {"present_effect", "fsr"},
+    {"window_width", "1920"},
+    {"window_height", "1080"},
+};
+
 struct Preset {
   const char* name;     // the value of mcla_profile
   const char* summary;  // for the log
   const CvarDefault* entries;
   size_t count;
+  const char* parent;  // the preset whose entries are applied first (nullptr: none); an own entry replaces its
 };
 
 constexpr Preset kPresets[] = {
     {"1080p", "true 1920x1080 internal render, 1x (noaa), edram_tiles=4096 + the EDRAM limit hook",
-     k1080pDefaults, sizeof(k1080pDefaults) / sizeof(k1080pDefaults[0])},
+     k1080pDefaults, sizeof(k1080pDefaults) / sizeof(k1080pDefaults[0]), nullptr},
     {"900p", "1600x900 internal render, 1x (noaa): the cheaper fallback, present scaled to 1080p", k900pDefaults,
-     sizeof(k900pDefaults) / sizeof(k900pDefaults[0])},
+     sizeof(k900pDefaults) / sizeof(k900pDefaults[0]), nullptr},
+    {"1080p-fsr",
+     "the 1080p render with the scene drawn at 1280x720 and upscaled to 1920x1080 by FSR 3.1 (temporal_aa=fsr, 1.5x, "
+     "RCAS 0.3, single-tile scene; the render markers are written while temporal_aa=fsr)",
+     k1080pFsrDefaults, sizeof(k1080pFsrDefaults) / sizeof(k1080pFsrDefaults[0]), "1080p"},
+    {"720p-fsr1",
+     "the shipped 1280x720 render, noaa, upscaled by the presenter's FSR 1 (EASU + RCAS, present_effect=fsr) to the "
+     "window (1920x1080; fullscreen takes the desktop size)",
+     k720pFsr1Defaults, sizeof(k720pFsr1Defaults) / sizeof(k720pFsr1Defaults[0]), nullptr},
 };
 
 // ---- frame-rate targets (W4.1) --------------------------------------------------------------------------------
@@ -216,6 +270,10 @@ constexpr CvarDefault kFps60Defaults[] = {
     {"mcla_race_clock", "retail"},
     // The game thread sleeps to an even 1/60 s deadline each frame so n does not flip with the render thread's jitter.
     {"mcla_sim_pace", "true"},
+    // W5.6: the two 60 fps input fixes (mcla_input_title_latch.cpp, mcla_input_menu_repeat.cpp). Their default -1 is
+    // "on while mcla_sim60 is on", so these rows only name them in the log; 0 switches one off, 1 forces it on.
+    {"mcla_input_title_latch", "-1"},
+    {"mcla_input_menu_repeat", "-1"},
 };
 
 struct FpsTarget {
@@ -444,17 +502,63 @@ const Preset* SelectPreset() {
   return nullptr;
 }
 
-// The preset's entry for a cvar of the default table, if it has one.
-const CvarDefault* PresetEntryFor(const Preset* preset, const char* name) {
+// A preset's entry as applied: the entry and the preset of the parent chain that gave it.
+struct PresetEntry {
+  const CvarDefault* entry;
+  const Preset* from;
+};
+
+// What a preset applies: its parent's entries first (recursively), then its own; an entry of the same cvar replaces the
+// parent's. Empty for nullptr.
+std::vector<PresetEntry> ResolveEntries(const Preset* preset) {
+  std::vector<PresetEntry> resolved;
   if (preset == nullptr) {
-    return nullptr;
+    return resolved;
+  }
+  if (preset->parent != nullptr) {
+    for (const Preset& other : kPresets) {
+      if (std::string(other.name) == preset->parent) {
+        resolved = ResolveEntries(&other);
+        break;
+      }
+    }
   }
   for (size_t i = 0; i < preset->count; ++i) {
-    if (std::string(preset->entries[i].name) == name) {
-      return &preset->entries[i];
+    const CvarDefault& entry = preset->entries[i];
+    bool replaced = false;
+    for (PresetEntry& have : resolved) {
+      if (std::string(have.entry->name) == entry.name) {
+        have = {&entry, preset};
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced) {
+      resolved.push_back({&entry, preset});
+    }
+  }
+  return resolved;
+}
+
+// The resolved preset's entry for a cvar of the default table, if it has one.
+const PresetEntry* FindEntry(const std::vector<PresetEntry>& entries, const char* name) {
+  for (const PresetEntry& have : entries) {
+    if (std::string(have.entry->name) == name) {
+      return &have;
     }
   }
   return nullptr;
+}
+
+// temporal_aa=fsr only does something between the render markers (mcla_fsr_markers.cpp): say so when they are forced off.
+void CheckFsrMarkers() {
+  if (rex::cvar::GetFlagByName("temporal_aa") != "fsr") {
+    return;
+  }
+  if (rex::cvar::GetFlagByName("mcla_render_markers") == "0") {
+    REXLOG_WARN("[mcla-profile] temporal_aa=fsr but mcla_render_markers=0: FSR only arms between the guest's render "
+                "markers, so it will do nothing (mcla_render_markers=-1 writes them while temporal_aa=fsr)");
+  }
 }
 
 }  // namespace
@@ -478,25 +582,28 @@ void ApplyPcProfile() {
     Log(applied, &tally);
   }
   const Preset* preset = SelectPreset();
+  const std::vector<PresetEntry> preset_entries = ResolveEntries(preset);
   for (const CvarDefault& entry : kProfileDefaults) {
-    if (PresetEntryFor(preset, entry.name) != nullptr) {
+    if (FindEntry(preset_entries, entry.name) != nullptr) {
       continue;  // the preset's value replaces this one (logged with the preset's entries below)
     }
     Log({&entry, Apply(entry), std::string()}, &tally);
   }
-  if (preset != nullptr) {
-    for (size_t i = 0; i < preset->count; ++i) {
-      const CvarDefault& entry = preset->entries[i];
-      std::string origin = std::string(preset->name) + " preset";
-      for (const CvarDefault& base : kProfileDefaults) {
-        if (std::string(base.name) == entry.name) {
-          origin += ", replaces the default profile's " + std::string(base.value);
-        }
-      }
-      Log({&entry, Apply(entry), origin}, &tally);
+  for (const PresetEntry& applied : preset_entries) {
+    const CvarDefault& entry = *applied.entry;
+    std::string origin = std::string(preset->name) + " preset";
+    if (applied.from != preset) {
+      origin += std::string(", from the ") + applied.from->name + " preset";
     }
+    for (const CvarDefault& base : kProfileDefaults) {
+      if (std::string(base.name) == entry.name) {
+        origin += ", replaces the default profile's " + std::string(base.value);
+      }
+    }
+    Log({&entry, Apply(entry), origin}, &tally);
   }
   LogFpsTarget(&tally);
+  CheckFsrMarkers();
   REXLOG_INFO("[mcla-profile] {} cvars: {} applied, {} user-set, {} missing, {} rejected",
               tally.applied + tally.user_set + tally.missing + tally.rejected, tally.applied, tally.user_set,
               tally.missing, tally.rejected);
