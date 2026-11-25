@@ -845,6 +845,15 @@ purpose = "D3D12 pixel shader DXBC translation options, each a cvar (default fal
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "04c0-spin-trims"
+source = "local"
+path = "patches/sdk/04c0-spin-trims.patch"
+sha256 = "89675cf661a2e21a6ccf279ff218ed4cd7c528b8df6741ff5f108618a2edcfde"
+purpose = "Spin trims (R7 items 1 and 3). Guest vblank (0400): guest_vblank_spin_us default 300 -> 100; the timer-overshoot estimate is the 90th percentile (58th of 64) of the last 64 wake-ups instead of their maximum, capped at 0.5 ms instead of 1.5 ms, and starts at 0.2 ms until the first 64 are measured. Command processor: new cvar cp_idle_spin_loops (default 64, hot reload; 0 = one yield then sleep) replaces the literal 500 SwitchToThread loops before the 5 ms event wait. The [guest-vblank] and other log line formats are unchanged."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]

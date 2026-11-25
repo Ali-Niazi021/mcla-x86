@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Tue, 24 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 04c0: spin trims: guest vblank spin 300 -> 100 us with a p90 overshoot estimate capped at 0.5 ms; cvar cp_idle_spin_loops (64) for the command processor's idle spin
+
+Source: Ours, written for this SDK (R7 items 1 and 3, $WORK/scratch/R7/REPORT.md). Builds on 0400 (the precise guest vblank) and the SDK's CommandProcessor::WorkerThreadMain
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: R7 measured where mcla.exe burns CPU while waiting (GPU-bound gameplay, package watts that the iGPU could use).
+  Two cheap spins are trimmed, both safe and both off the picture path.
+  (1) Guest vblank (graphics_system.cpp, PreciseVblank): the high-resolution timer wait ended guest_vblank_spin_us (300) plus
+  the largest timer overshoot of the last 64 waits (capped at 1.5 ms) before the vblank and the thread spun on QPC at
+  time-critical priority for the rest: 4-6.5 % of a core at every frame rate. Now guest_vblank_spin_us defaults to 100, the
+  overshoot estimate is the 90th percentile (the 58th of 64) of the last 64 timer overshoots instead of the maximum, and its cap
+  is 0.5 ms; until the first 64 waits are measured the estimate is 0.2 ms, so the first second keeps the old 0.3 ms margin.
+  About one vblank in ten may now wake the spin up to a few hundred microseconds later than the old margin allowed: it can
+  fire up to that much after the grid point, well inside a display period (the [guest-vblank] late= counter, which counts
+  a vblank more than a period late, does not move for that; p99 shows it). The log lines keep their formats.
+  (2) Command processor (command_processor.cpp, WorkerThreadMain): with the ring empty it called SwitchToThread 500 times
+  (174-195 us) before sleeping on write_ptr_index_event_, which every kick sets. New cvar cp_idle_spin_loops (default 64,
+  about 22 us, hot reload; 0 = one yield then sleep; the SDK's literal was 500) replaces the literal. The occlusion-query poll
+  (every 64th loop) keeps its cadence, so an idle episode now polls it once before sleeping instead of 7 times.
+  Not built or run.
+Bucket: REDO
+
+04c0-spin-trims.patch (mcla-x86 ORC; R7 items 1 and 3)
+
+Expected effect (estimates from R7, not measured here): about 0.03 cores saved by (1) and at most 0.02 cores by (2), a
+few tenths of a watt in all. Check with the guest vblank statistics: p99 stays below 16.9 ms and late= stays low (R7's
+acceptance: late per 600 below 10; PresentMon MsBetweenDisplayChange p99 unchanged at 60 fps in a menu and in free roam),
+and with ms/frame at the cap for the CPU-bound case ((2) adds 5-30 us of wake latency per kick there).
+---
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 02739dfe..15a5ec75 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -57,6 +57,14 @@
+ #endif
+ 
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
++// LOCAL PATCH - MCLA (04c0): the command processor's idle spin.
++REXCVAR_DEFINE_UINT32(cp_idle_spin_loops, 64, "GPU",
++                      "When the ring is empty, the command processor yields this many times (SwitchToThread: 174-195 us "
++                      "per 500 on a Ryzen AI 9) looking for a new kick before it sleeps on its write-pointer event "
++                      "(which every kick sets). The SDK's value is 500. 0 = one yield, then sleep. More spin catches a "
++                      "kick sooner and burns a little CPU while the GPU is the bottleneck")
++    .range(0, 100000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_INT32(shader_storage_progress, 0, "GPU",
+                      "While stored pipelines are created at start, print a progress line on "
+                      "standard output every this many pipelines (0: off; for a front end, "
+@@ -834,9 +842,10 @@ void CommandProcessor::WorkerThreadMain() {
+       // event is too high.
+       PrepareForWait();
+       uint32_t loop_count = 0;
++      const uint32_t spin_loops = REXCVAR_GET(cp_idle_spin_loops);
+       do {
+         // If we spin around too much, revert to a "low-power" state.
+-        if (loop_count > 500) {
++        if (loop_count > spin_loops) {
+           const int wait_time_ms = 5;
+           rex::thread::Wait(write_ptr_index_event_.get(), true,
+                             std::chrono::milliseconds(wait_time_ms));
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 6da40e11..6e9afc70 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -71,9 +71,10 @@ REXCVAR_DEFINE_BOOL(guest_vblank_precise, true, "GPU",
+                     "catch-up burst). "
+                     "false = the SDK's 1 ms polling loop. Not used with vsync=false (the guest vblank then "
+                     "free-runs at 1 kHz as before; a warning says so)");
+-REXCVAR_DEFINE_INT32(guest_vblank_spin_us, 300, "GPU",
++REXCVAR_DEFINE_INT32(guest_vblank_spin_us, 100, "GPU",
+                      "With guest_vblank_precise: microseconds before each vblank at which the timer wait ends "
+-                     "and the QPC spin begins (the timer's measured overshoot is added to it). 0 = trust the "
++                     "and the QPC spin begins (the timer's measured overshoot, the 90th percentile of its last "
++                     "64 wake-ups up to 0.5 ms, is added to it; 300 before 04c0). 0 = trust the "
+                      "timer")
+     .range(0, 4000);
+ // LOCAL PATCH - MCLA (0440): the display's vertical blank.
+@@ -209,7 +210,8 @@ class PreciseVblank {
+     refresh_rate_hz_ = refresh_rate_hz;
+     nominal_ticks_ = double(qpc_hz_) / refresh_rate_hz;
+     period_ticks_ = nominal_ticks_;
+-    max_overshoot_ticks_ = qpc_hz_ * 3 / 2000;  // 1.5 ms
++    max_overshoot_ticks_ = qpc_hz_ / 2000;  // 0.5 ms
++    overshoot_ticks_ = qpc_hz_ / 5000;      // 0.2 ms until the first 64 waits have been measured
+     timer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                     TIMER_ALL_ACCESS);
+     if (!timer_) {
+@@ -615,13 +617,16 @@ class PreciseVblank {
+     }
+   }
+ 
+-  // How late the timer woke the thread, as the largest overshoot of the last 64 waits: the next waits end that much
+-  // earlier (up to 1.5 ms) and the spin makes up for it.
++  // How late the timer woke the thread, as the 90th percentile (the 58th of 64) of the overshoots of the last 64 waits:
++  // the next waits end that much earlier (up to 0.5 ms) and the spin makes up for it. About one wait in ten is later
++  // than that and gets less spin than it needs (it is up to the overshoot's excess late, well inside a display tick),
++  // which is what keeps the spin short.
+   void NoteOvershoot(int64_t overshoot_ticks) {
+-    block_overshoot_ticks_ = std::max(block_overshoot_ticks_, overshoot_ticks);
+-    if (++block_waits_ >= 64) {
+-      overshoot_ticks_ = std::min(block_overshoot_ticks_, max_overshoot_ticks_);
+-      block_overshoot_ticks_ = 0;
++    overshoots_[block_waits_] = overshoot_ticks;
++    if (++block_waits_ >= overshoots_.size()) {
++      std::array<int64_t, 64> sorted = overshoots_;
++      std::sort(sorted.begin(), sorted.end());
++      overshoot_ticks_ = std::min(sorted[57], max_overshoot_ticks_);
+       block_waits_ = 0;
+     }
+   }
+@@ -675,7 +680,7 @@ class PreciseVblank {
+   uint64_t index_ = 1;    // the grid point WaitForVblank waits for
+   HANDLE timer_ = nullptr;
+   int64_t overshoot_ticks_ = 0;
+-  int64_t block_overshoot_ticks_ = 0;
++  std::array<int64_t, 64> overshoots_{};  // the overshoots of the current block of waits
+   int64_t max_overshoot_ticks_ = 0;
+   uint32_t block_waits_ = 0;
+   bool engaged_ = false;
