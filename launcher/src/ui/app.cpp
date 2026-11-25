@@ -62,6 +62,17 @@ double AsDouble(const Json& v) { return v.is_number() ? v.get<double>() : 0.0; }
 
 std::string AsString(const Json& v) { return v.is_string() ? v.get<std::string>() : std::string(); }
 
+// CheckPathSettings messages start with "<setting label>: "; a card already shows its label, the status bar needs it.
+std::string WithoutLabel(const std::string& message, const std::string& label) {
+  const std::string prefix = label + ": ";
+  return message.rfind(prefix, 0) == 0 ? message.substr(prefix.size()) : message;
+}
+std::string WithLabel(const std::string& message, const std::string& label) {
+  return message.rfind(label + ": ", 0) == 0 ? message : label + ": " + message;
+}
+
+constexpr const char* kUserDataRootCvar = "user_data_root";
+
 // InputText over a std::string (grows on demand: no fixed buffer, no silent truncation of long paths).
 int StringResizeCallback(ImGuiInputTextCallbackData* data) {
   if (data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
@@ -259,20 +270,41 @@ void LauncherApp::RefreshValidation(bool force) {
   const double now = ImGui::GetTime();
   const SettingDef* root_def = DataRootDef();
   const std::string root = root_def ? AsString(EffectiveValue(*root_def, values_)) : std::string();
-  if (!force && checked_once_ && root == checked_root_ && now - last_validation_ < 1.5) return;
+  // What the checks read: every path value, so an edit is re-checked at once and the disk at most every 1.5 s.
+  std::string key;
+  for (const SettingDef& s : schema_.settings) {
+    if (s.type == SettingType::Path) key += AsString(EffectiveValue(s, values_)) + '\n';
+  }
+  if (!force && checked_once_ && key == checked_paths_key_ && now - last_validation_ < 1.5) return;
 
   const std::filesystem::path exe = FindGameExe();
   if (exe != game_exe_) preview_dirty_ = true;
   game_exe_ = exe;
-  data_check_ = ValidateGameDataRoot(root.empty() ? std::filesystem::path() : PathFromUtf8(root));
+  const std::filesystem::path base = LauncherDir();  // relative paths resolve from here, where the game starts too
+  data_check_ = ValidateGameDataRoot(root.empty() ? std::filesystem::path() : PathFromUtf8(root), exe);
+
+  // The other path settings (the data root's own issues are in data_check_).
+  path_issues_.clear();
+  const std::string root_id = root_def ? root_def->id : std::string();
+  for (PathProblem& p : CheckPathSettings(schema_, values_, exe, base)) {
+    if (p.setting_id != root_id) path_issues_[p.setting_id].push_back(std::move(p.message));
+  }
+  for (const SettingDef& s : schema_.settings) {
+    if (s.type != SettingType::Path || !s.cvar || *s.cvar != kUserDataRootCvar || !IsActive(schema_, values_, s)) continue;
+    const std::string v = AsString(EffectiveValue(s, values_));
+    const DataRootCheck c = ValidateUserDataRoot(v.empty() ? std::filesystem::path() : ResolvePath(PathFromUtf8(v), base), exe);
+    if (!c.ok) path_issues_[s.id] = c.issues;  // also covers "not a folder"; replaces the generic non-ASCII line
+  }
   checked_root_ = root;
+  checked_paths_key_ = std::move(key);
   checked_once_ = true;
   last_validation_ = now;
 }
 
 void LauncherApp::BuildPreviewText() {
   const std::filesystem::path exe = game_exe_.empty() ? LauncherDir() / L"mcla.exe" : game_exe_;
-  args_ = BuildArgs(schema_, values_);
+  arg_notes_.clear();
+  args_ = BuildArgs(schema_, values_, &arg_notes_, LauncherDir());
   preview_text_ = WideToUtf8(FormatCommandLine(exe, args_));
   preview_dirty_ = false;
 }
@@ -295,6 +327,16 @@ std::vector<LauncherApp::StatusLine> LauncherApp::BuildStatus() const {
       lines.push_back({StatusLine::Level::Error, std::move(text), goto_cat});
     }
   }
+  for (const auto& [id, issues] : path_issues_) {  // problems in the other folders: they block Launch like the data root does
+    const SettingDef* d = schema_.FindSetting(id);
+    if (!d) continue;
+    int goto_cat = -1;
+    for (size_t i = 0; i < schema_.categories.size(); ++i) {
+      if (schema_.categories[i].id == d->category) goto_cat = static_cast<int>(i);
+    }
+    for (const std::string& m : issues) lines.push_back({StatusLine::Level::Error, WithLabel(m, d->label), goto_cat});
+  }
+  for (const std::string& n : arg_notes_) lines.push_back({StatusLine::Level::Warn, n, -1});
   if (FsrDoubleUpscale()) {
     int goto_cat = -1;
     if (const SettingDef* pe = schema_.FindSetting(kPresentEffectId)) {
@@ -765,6 +807,9 @@ std::vector<LauncherApp::CardExtra> LauncherApp::CardExtras(const SettingDef& de
       for (const std::string& issue : data_check_.issues) extras.push_back({issue, pal::kError});
     }
   }
+  if (const auto issues = path_issues_.find(def.id); issues != path_issues_.end()) {
+    for (const std::string& m : issues->second) extras.push_back({WithoutLabel(m, def.label), pal::kError});
+  }
   if (FsrDoubleUpscale() && (def.id == kPresentEffectId || def.id == kTemporalAaId)) extras.push_back({kFsrTwiceWarning, pal::kWarn});
   return extras;
 }
@@ -1035,6 +1080,18 @@ void LauncherApp::DrawFooter(float width, float height) {
   ImGui::PopTextWrapPos();
   ImGui::PopStyleColor();
   ImGui::PopFont();
+  if (!arg_notes_.empty()) {  // why a setting is missing from the line above (an empty value is not passed)
+    ImGui::PushFont(fonts_.caption);
+    ImGui::PushStyleColor(ImGuiCol_Text, pal::kWarn);
+    ImGui::PushTextWrapPos(0.0f);
+    for (const std::string& n : arg_notes_) {
+      const std::string line = "Note: " + n;
+      ImGui::TextUnformatted(line.c_str(), line.c_str() + line.size());
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
+    ImGui::PopFont();
+  }
   ImGui::EndChild();
 
   // Launch.

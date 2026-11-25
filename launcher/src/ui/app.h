@@ -4,6 +4,7 @@
 #pragma once
 
 #include <filesystem>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -120,6 +121,9 @@ class LauncherApp {
   std::filesystem::path game_exe_;
   DataRootCheck data_check_;
   std::string checked_root_;
+  std::string checked_paths_key_;                                // all path values at the last check
+  std::map<std::string, std::vector<std::string>> path_issues_;  // setting id -> problems (every path setting but the data root)
+  std::vector<std::string> arg_notes_;                           // BuildArgs: why a setting is not on the command line
   bool checked_once_ = false;
   double last_validation_ = 0.0;
   std::string launch_error_;
