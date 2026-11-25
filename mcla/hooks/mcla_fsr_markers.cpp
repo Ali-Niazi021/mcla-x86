@@ -42,9 +42,11 @@
 // __imp__sub_822E55D0 and runs unchanged after the marker, so that site needs no sharing. The three originals' arguments
 // are kept: the override only reads r3 / r4, and the make-room path saves and restores the whole context.
 //
-// Gate. cvar mcla_render_markers (INT32, default -1 = auto): 1 on, 0 off, -1 on only while `temporal_aa` is `fsr`
-// (read once at the start of each frame, so the game's own setting of temporal_aa takes effect on the next frame). With
-// the gate off every override is one relaxed load and the call of the original. Log, once, at the first scene marker:
+// Gate. cvar mcla_render_markers (INT32, default -1 = auto): 1 on, 0 off, -1 on only while `temporal_aa` is `fsr` or the
+// SDK's `tonemap_transfer_skip` (patch 04e0: skips the full-screen ownership transfer the tone map's render target bind
+// causes, and needs kTonemapBegin to find the tone map) is on (read once at the start of each frame, so the game's own
+// setting of temporal_aa takes effect on the next frame). With the gate off every override is one relaxed load and the call
+// of the original. Log, once, at the first scene marker:
 // `[mcla-fsr] render markers: scene begin/end at ...`.
 //
 // Build switch: MCLA_HOOK_FSR_MARKERS=0 compiles the overrides out (the generated weak functions run as shipped).
@@ -70,8 +72,9 @@
 REXCVAR_DEFINE_INT32(mcla_render_markers, -1, "MCLA",
                      "MCLA: write the guest's render markers (no-op PM4 packets 'REXM' at the 3D scene's start, "
                      "its end and the tone map) into the GPU command stream, which the SDK's FSR 3.1 temporal AA / "
-                     "upscaling needs to find the scene. 1 = on, 0 = off, -1 = auto: on only while temporal_aa is "
-                     "'fsr' (default; inert otherwise). Draws nothing. Read once per frame");
+                     "upscaling and its tonemap_transfer_skip need to find the scene and the tone map. 1 = on, "
+                     "0 = off, -1 = auto: on only while temporal_aa is 'fsr' or tonemap_transfer_skip is on "
+                     "(default; inert otherwise). Draws nothing. Read once per frame");
 
 namespace {
 
@@ -116,7 +119,7 @@ bool MarkersWanted() {
   if (mode == 0) {
     return false;
   }
-  return rex::cvar::GetFlagByName("temporal_aa") == "fsr";
+  return rex::cvar::GetFlagByName("temporal_aa") == "fsr" || rex::cvar::Query<bool>("tonemap_transfer_skip");
 }
 
 mcla::hooks::Registration g_registration("fsr-markers", "mcla_render_markers", MCLA_HOOK_FSR_MARKERS != 0,
@@ -189,9 +192,9 @@ void EmitMarker(PPCContext& ctx, uint8_t* base, uint32_t kind, uint32_t value) {
         "[mcla-fsr] render markers: scene begin/end at the start of renderer phase 0x{:08X} / 0x{:08X} (tone map "
         "0x{:08X}): a 3-word PM4 NOP 'REXM' is written into the command buffer of the D3D device 0x{:08X} before "
         "sub_822E55D0 runs each phase, on the thread that runs the frame function sub_822C0980 only "
-        "(mcla_render_markers={}, temporal_aa={})",
+        "(mcla_render_markers={}, temporal_aa={}, tonemap_transfer_skip={})",
         kPhaseScene, kPhasePost, kPhaseTonemap, device, REXCVAR_GET(mcla_render_markers),
-        rex::cvar::GetFlagByName("temporal_aa"));
+        rex::cvar::GetFlagByName("temporal_aa"), rex::cvar::GetFlagByName("tonemap_transfer_skip"));
   }
 }
 

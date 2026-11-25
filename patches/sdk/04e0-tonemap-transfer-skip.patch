@@ -1,0 +1,397 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Wed, 25 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 04e0: tonemap_transfer_skip: skip the full-screen ownership transfer that binding the tone map's 8888 target causes (the tone map rewrites every pixel); poison check, [tonemap-skip] log
+
+Source: Ours, written for this SDK (O4; R2 finding 1 and R4 change 3 of $WORK/scratch/R2/REPORT.md and R4/REPORT.md, P1 for the
+  cost). Builds on 0450's analysis (RenderTargetCache::GetOverwrittenRectangle, Renan Queiroz's rexglue-skip-overwritten-
+  transfers idea, re-done in 0450). Not run in the game: clang++ 20.1.8 -fsyntax-only (the SDK's Release flags) of the four
+  changed translation units, nothing more
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: At 1080p single tile (mcla_ws_single_tile) the scene colour (7e3, host R16G16B16A16F, 1920x1088) and the game's tone
+  map / HUD target (8_8_8_8, 1920x1080) are the same EDRAM tiles 1632..3263 at pitch 24. Binding the 8888 target for the tone
+  map takes the range over from the scene colour, so ChangeOwnership queues a transfer of all 1632 tiles (2.09 Mpx RGBA16F ->
+  RGBA8, about 16.7 MB read and 8.4 MB written, a raster pass and its barriers: 0.55-0.6 ms of the P1 frame when it is
+  present), and the tone map then overwrites every pixel of it. skip_overwritten_transfers (0450) does that for every
+  rectangle draw and is not usable (S1: +6 ms GPU). This patch does it for the tone map only.
+  New cvars (both hot reload): tonemap_transfer_skip (bool, default false) and tonemap_transfer_skip_poison (bool, default
+  false). When tonemap_transfer_skip is on and skip_overwritten_transfers is off (the generic one takes precedence and
+  behaves as before), RenderTargetCache::Update does the following for a draw, and for no other:
+    1. the title's tone map marker (GuestMarkerKind::kTonemapBegin, written by the game hook mcla/hooks/mcla_fsr_markers.cpp
+       at the start of renderer phase 0x10000000) has been seen in this frame: CommandProcessor::hdr_frame_.tonemap, which
+       OnGuestMarker sets and the swap clears. The backends' IssueDraw (D3D12 and Vulkan) hand it over with the new
+       RenderTargetCache::SetUpdateAfterTonemapMarker(), like SetUpdatePixelShader, for every draw (Update forgets it);
+    2. the draw is a rectangle list (VGT_DRAW_INITIATOR) and its ownership change would need transfers
+       (WouldOwnershipChangeRequireTransfers), i.e. it is the draw that binds the target (a tone map draw that finds the
+       range already owned has nothing to skip);
+    3. its pixel shader is E5EBEFAE4D165CBA (the tone map's; the HDR scene check in command_processor.cpp keys the same
+       shader; the vertex shader, 1FAB9787BCA32D7C, is not keyed: the analysis runs whatever it is on the CPU);
+    4. GetOverwrittenRectangle proves that it rewrites a rectangle of its colour targets completely (3 auto-indexed vertices
+       that are corners of one axis-aligned rectangle, no user clip planes, no depth or stencil, every component of every
+       written colour target replaced, blend One/Zero/Add, no kill / alpha test / alpha to mask, not clipped by the near or
+       far plane, the vertices not depending on fetches, MSAA up to 4x - 0450's analysis, unchanged), AND the new optional
+       output whole_out says that the rectangle starts at 0,0 and reaches the far side of everything it is cut to (viewport,
+       scissor, render target): the whole screen. A rectangle that proves less (e.g. a 1 pixel short edge) is kept (the
+       transfer is made as before), whatever the analysis says, and said so in the log.
+  Then the rectangle goes to ChangeOwnership as the cutout, exactly as 0450's does: nothing is copied into it; what the
+  rectangle does not cover (the 8 rows of the 1088 high host target below the 1080 row scissor) is transferred as before, so
+  the picture is exact by the same argument as 0450's (the cut region is overwritten by the draw before anything reads it).
+  tonemap_transfer_skip_poison: after the ownership change, the cut rectangle is cleared to magenta (host value 1,0,1,1, the
+  colour render targets of the draw) before the draw, so a pixel the tone map does not write shows in the picture; a picture
+  with the skip and the poison on must equal one with both off.
+  Log (every 10 s while tonemap_transfer_skip acts, and once at the first skip and once per reason a transfer was kept):
+    [tonemap-skip] N transfers skipped, M kept (<reason> xK; ...) in 10.0 s; the tone map marker was seen in F frames, O other
+    rectangle draws after it needed transfers (the first: pixel shader ...)
+  N + M is the number of tone map draws that needed the transfer; F zero says the markers are off ("- no marker: ..."); O > 0
+  with N + M = 0 means the first draw that binds the target is not the tone map (the shader is named).
+  The markers: the game hook writes them only while mcla_render_markers is 1, or -1 (auto) with temporal_aa=fsr; it now also
+  does with tonemap_transfer_skip on (mcla/hooks/mcla_fsr_markers.cpp, game side).
+  Cost with the cvar off: one extra bool store in Update and a cvar read; GetOverwrittenRectangle's other callers are
+  unchanged (whole_out defaults to null). The Vulkan backend gets the same call site, not exercised.
+Bucket: REDO
+
+04e0-tonemap-transfer-skip.patch (mcla-x86 O4; $WORK/scratch/O4)
+
+Check (frozen world, per 0450's protocol: free roam, pause menu, driving; 1080p single tile preset): --tonemap_transfer_skip=
+true --tonemap_transfer_skip_poison=true against both off must show no differing pixel (no magenta anywhere), and the log must
+say N > 0 transfers skipped, 0 kept; GPU timing with the poison off. If it says kept (<reason>), the reason names what the
+analysis could not prove.
+
+---
+diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
+index 48c12fb0..a055e3cc 100644
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -221,6 +221,14 @@
+   // use, are skipped (the skip_overwritten_transfers setting). Needed for every
+   // draw, as the shader is forgotten by the Update.
+   void SetUpdatePixelShader(const Shader* pixel_shader) { update_pixel_shader_ = pixel_shader; }
++
++  // LOCAL PATCH - MCLA (04e0): for host render targets, like SetUpdatePixelShader, for every draw: whether the title's
++  // tone map marker (CommandProcessor::GuestMarkerKind::kTonemapBegin) has been seen in this frame. With the
++  // tonemap_transfer_skip setting, the Update of the first draw after it whose pixel shader is the title's tone map
++  // skips the ownership transfer into the target the tone map rewrites in full (see RenderTargetCache::Update).
++  void SetUpdateAfterTonemapMarker(bool after_tonemap_marker) {
++    update_after_tonemap_marker_ = after_tonemap_marker;
++  }
+ 
+   // Returns bits where 0 is whether a depth render target is currently bound on
+   // the host and 1... are whether the same applies to color render targets, and
+@@ -779,10 +787,14 @@
+   // there. Whether the draw rewrites every sample of a rectangle of its color
+   // render targets, whatever they held before, and the rectangle (in pixels in
+   // the draw's MSAA mode). Only for what can be proven, otherwise false.
++  // whole_out (optional): whether the rectangle starts at 0,0 and covers the whole of the viewport and the scissor
++  // (which tonemap_transfer_skip asks for), not just a part of them.
+   bool GetOverwrittenRectangle(const Shader& vertex_shader, const Shader& pixel_shader,
+                                reg::RB_DEPTHCONTROL normalized_depth_control,
+-                               uint32_t normalized_color_mask, Transfer::Rectangle& rectangle_out);
++                               uint32_t normalized_color_mask, Transfer::Rectangle& rectangle_out,
++                               bool* whole_out = nullptr);
+   const Shader* update_pixel_shader_ = nullptr;
++  bool update_after_tonemap_marker_ = false;
+   Transfer::Rectangle last_update_overwritten_rectangle_ = {};
+   bool last_update_overwritten_rectangle_valid_ = false;
+ 
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index fdda89d4..9765abba 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -3441,6 +3441,8 @@
+       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
+                    : 0;
+   render_target_cache_->SetUpdatePixelShader(pixel_shader);
++  // LOCAL PATCH - MCLA (04e0): the tone map marker (kTonemapBegin) has been seen in this frame: for tonemap_transfer_skip.
++  render_target_cache_->SetUpdateAfterTonemapMarker(hdr_frame_.tonemap);
+   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                     normalized_color_mask, *vertex_shader)) {
+     return false;
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index 0c15bc8b..466286d4 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -14,6 +14,7 @@
+ #include <chrono>
+ #include <cfloat>
+ #include <cmath>
++#include <cstdio>
+ #include <cstring>
+ #include <iterator>
+ #include <map>
+@@ -70,6 +71,23 @@
+                     "Development check of skip_overwritten_transfers: fill what it doesn't transfer with a junk value "
+                     "(0x8040C0208040C020) instead of leaving the old contents, so that a draw that doesn't rewrite "
+                     "all of it shows in the picture")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++// LOCAL PATCH - MCLA (04e0): the targeted form of skip_overwritten_transfers, for the title's tone map only.
++REXCVAR_DEFINE_BOOL(tonemap_transfer_skip, false, "GPU",
++                    "With host render targets, skip the ownership transfer that the title's tone map draw (the one "
++                    "with pixel shader E5EBEFAE4D165CBA, the first draw after the tone map render marker of the frame "
++                    "that finds its 8-bit target on the scene colour's EDRAM tiles, e.g. a 1080p single tile scene) "
++                    "causes: it rewrites every pixel it covers, so a copy of the scene colour into the target is "
++                    "wasted. Only when the draw is proven to rewrite the whole screen from 0,0 (the analysis of "
++                    "skip_overwritten_transfers, which takes precedence when it is on); needs the render markers "
++                    "(mcla_render_markers is auto-on with it). Logs '[tonemap-skip] ...' every 10 s")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(tonemap_transfer_skip_poison, false, "GPU",
++                    "Development check of tonemap_transfer_skip: fill the rectangle whose transfer is skipped with "
++                    "magenta instead of leaving the old contents, so a pixel the tone map does not write shows in the "
++                    "picture")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ REXCVAR_DEFINE_UINT32(edram_tiles, 2048, "GPU",
+@@ -187,6 +205,91 @@
+     window_start = now;
+   }
+ }
++
++// LOCAL PATCH - MCLA (04e0): tonemap_transfer_skip. The pixel shader of the title's tone map (the one the HDR scene check
++// in command_processor.cpp looks for), and the counts behind the log line. The CP thread only.
++constexpr uint64_t kTonemapPixelShaderHash = 0xE5EBEFAE4D165CBA;
++
++class TonemapSkipStats {
++ public:
++  // For every draw while tonemap_transfer_skip is acting: counts the frames the tone map marker was seen in and writes
++  // the summary every 10 seconds. The clock is read at each frame's first draw after the marker and every 8192 draws.
++  void NoteDraw(bool after_marker) {
++    const bool new_frame = after_marker && !marker_active_;
++    marker_active_ = after_marker;
++    if (new_frame) {
++      ++frames_;
++    } else if (++draws_ & 0x1FFF) {
++      return;
++    }
++    const auto now = std::chrono::steady_clock::now();
++    const double seconds = std::chrono::duration<double>(now - window_start_).count();
++    if (seconds >= 10.0) {
++      Report(seconds);
++      window_start_ = now;
++    }
++  }
++
++  void Skipped(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint64_t vertex_shader_hash, bool poison) {
++    ++skipped_;
++    if (!logged_first_skip_) {
++      logged_first_skip_ = true;
++      REXGPU_INFO(
++          "[tonemap-skip] first skipped transfer: the tone map draw (vertex shader {:016X}, pixel shader {:016X}) "
++          "rewrites the whole screen {},{} {}x{} of its target{}",
++          vertex_shader_hash, kTonemapPixelShaderHash, x, y, width, height,
++          poison ? "; the rectangle is filled with magenta (tonemap_transfer_skip_poison)" : "");
++    }
++  }
++
++  // reason: a string literal.
++  void Kept(const char* reason, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint64_t vertex_shader_hash) {
++    ++kept_;
++    if (++kept_reasons_[reason] == 1) {
++      REXGPU_INFO("[tonemap-skip] kept a transfer ({}): vertex shader {:016X}, pixel shader {:016X}, rectangle {},{} {}x{}",
++                  reason, vertex_shader_hash, kTonemapPixelShaderHash, x, y, width, height);
++    }
++  }
++
++  // A rectangle draw after the marker that needed transfers and isn't the tone map.
++  void OtherDraw(uint64_t pixel_shader_hash) {
++    if (!other_++) {
++      other_first_pixel_shader_ = pixel_shader_hash;
++    }
++  }
++
++ private:
++  void Report(double seconds) {
++    std::string reasons;
++    for (const auto& kept : kept_reasons_) {
++      reasons += (reasons.empty() ? "" : "; ") + std::string(kept.first) + " x" + std::to_string(kept.second);
++    }
++    if (reasons.empty()) {
++      reasons = "none";
++    }
++    char first_pixel_shader[64] = "";
++    if (other_) {
++      std::snprintf(first_pixel_shader, sizeof(first_pixel_shader), " (the first: pixel shader %016llX)",
++                    static_cast<unsigned long long>(other_first_pixel_shader_));
++    }
++    REXGPU_INFO(
++        "[tonemap-skip] {} transfers skipped, {} kept ({}) in {:.1f} s; the tone map marker was seen in {} frames, {} "
++        "other rectangle draws after it needed transfers{}{}",
++        skipped_, kept_, reasons, seconds, frames_, other_, first_pixel_shader,
++        frames_ ? "" : " - no marker: the render markers are off (mcla_render_markers)");
++    skipped_ = kept_ = frames_ = other_ = 0;
++    kept_reasons_.clear();
++  }
++
++  uint64_t skipped_ = 0, kept_ = 0, frames_ = 0, other_ = 0, draws_ = 0;
++  uint64_t other_first_pixel_shader_ = 0;
++  std::map<const char*, uint64_t> kept_reasons_;
++  std::chrono::steady_clock::time_point window_start_ = std::chrono::steady_clock::now();
++  bool marker_active_ = false;
++  bool logged_first_skip_ = false;
++};
++
++TonemapSkipStats g_tonemap_skip_stats;
+ 
+ }  // namespace
+ 
+@@ -696,6 +799,18 @@
+   update_pixel_shader_ = nullptr;
+   last_update_overwritten_rectangle_valid_ = false;
+ 
++  // LOCAL PATCH - MCLA (04e0): whether the title's tone map marker has been seen in this frame (the command processor
++  // says so for every draw), for tonemap_transfer_skip. skip_overwritten_transfers, which covers the tone map as well,
++  // takes precedence.
++  const bool after_tonemap_marker = update_after_tonemap_marker_;
++  update_after_tonemap_marker_ = false;
++  const bool skip_overwritten_generic = REXCVAR_GET(skip_overwritten_transfers);
++  const bool tonemap_skip_on = !skip_overwritten_generic && REXCVAR_GET(tonemap_transfer_skip);
++  if (tonemap_skip_on) {
++    g_tonemap_skip_stats.NoteDraw(after_tonemap_marker);
++  }
++  bool tonemap_skip_cut = false;
++
+   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+   xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
+   assert_true(msaa_samples <= xenos::MsaaSamples::k4X);
+@@ -1017,7 +1132,7 @@
+   // transfer would happen (the analysis runs the vertex shader on the CPU).
+   if (!interlock_barrier_only && pixel_shader && is_rasterization_done &&
+       regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type == xenos::PrimitiveType::kRectangleList &&
+-      REXCVAR_GET(skip_overwritten_transfers)) {
++      (skip_overwritten_generic || (tonemap_skip_on && after_tonemap_marker))) {
+     bool transfers_needed = false;
+     for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+       if (WouldOwnershipChangeRequireTransfers(rt_keys[edram_bases_sorted[i].second], 0,
+@@ -1026,7 +1141,7 @@
+         break;
+       }
+     }
+-    if (transfers_needed) {
++    if (transfers_needed && skip_overwritten_generic) {
+       last_update_overwritten_rectangle_valid_ =
+           GetOverwrittenRectangle(vertex_shader, *pixel_shader, normalized_depth_control,
+                                   normalized_color_mask, last_update_overwritten_rectangle_);
+@@ -1037,6 +1152,32 @@
+                             last_update_overwritten_rectangle_.width_pixels,
+                             last_update_overwritten_rectangle_.height_pixels);
+       }
++    } else if (transfers_needed) {
++      // LOCAL PATCH - MCLA (04e0): tonemap_transfer_skip. The first draw after the tone map marker that needs the
++      // ownership of its target changed: the tone map's own, or not.
++      const uint64_t pixel_shader_hash = pixel_shader->ucode_data_hash();
++      if (pixel_shader_hash != kTonemapPixelShaderHash) {
++        g_tonemap_skip_stats.OtherDraw(pixel_shader_hash);
++      } else {
++        bool whole_screen = false;
++        const bool rewritten =
++            GetOverwrittenRectangle(vertex_shader, *pixel_shader, normalized_depth_control,
++                                    normalized_color_mask, last_update_overwritten_rectangle_, &whole_screen);
++        const Transfer::Rectangle& rectangle = last_update_overwritten_rectangle_;
++        if (rewritten && whole_screen) {
++          last_update_overwritten_rectangle_valid_ = true;
++          tonemap_skip_cut = true;
++          g_tonemap_skip_stats.Skipped(rectangle.x_pixels, rectangle.y_pixels, rectangle.width_pixels,
++                                       rectangle.height_pixels, vertex_shader.ucode_data_hash(),
++                                       REXCVAR_GET(tonemap_transfer_skip_poison));
++        } else if (rewritten) {
++          g_tonemap_skip_stats.Kept("the draw doesn't rewrite the whole screen from 0,0", rectangle.x_pixels,
++                                    rectangle.y_pixels, rectangle.width_pixels, rectangle.height_pixels,
++                                    vertex_shader.ucode_data_hash());
++        } else {
++          g_tonemap_skip_stats.Kept(g_overwrite_reject_reason, 0, 0, 0, 0, vertex_shader.ucode_data_hash());
++        }
++      }
+     }
+   }
+ 
+@@ -1054,18 +1195,23 @@
+     return true;
+   }
+ 
+-  // Development check (skip_overwritten_transfers_poison): instead of leaving the old contents where the transfers were
+-  // left out, fill that rectangle with a value that doesn't look like anything, so a draw that doesn't rewrite all of it
+-  // shows up (a stale value that happens to be right would hide that).
+-  if (last_update_overwritten_rectangle_valid_ && REXCVAR_GET(skip_overwritten_transfers_poison)) {
++  // Development check (skip_overwritten_transfers_poison; tonemap_transfer_skip_poison for the tone map's skip, with
++  // magenta): instead of leaving the old contents where the transfers were left out, fill that rectangle with a value
++  // that doesn't look like anything, so a draw that doesn't rewrite all of it shows up (a stale value that happens to be
++  // right would hide that).
++  if (last_update_overwritten_rectangle_valid_ &&
++      (tonemap_skip_cut ? REXCVAR_GET(tonemap_transfer_skip_poison)
++                        : REXCVAR_GET(skip_overwritten_transfers_poison))) {
+     static const std::vector<Transfer> no_transfers;
++    static const float tonemap_poison_host_color[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+     for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+       if (!(depth_and_color_rts_used_bits & (uint32_t(1) << i)) || !rts[i]) {
+         continue;
+       }
+       RenderTarget* poison_render_target = rts[i];
+       const uint64_t poison_value = UINT64_C(0x8040C0208040C020);
+-      TransferAndClearRenderTargets(1, &poison_render_target, &no_transfers, &poison_value, nullptr,
++      TransferAndClearRenderTargets(1, &poison_render_target, &no_transfers, &poison_value,
++                                    tonemap_skip_cut ? tonemap_poison_host_color : nullptr,
+                                     last_update_overwritten_rectangle_);
+     }
+   }
+@@ -1631,7 +1777,11 @@
+                                                 const Shader& pixel_shader,
+                                                 reg::RB_DEPTHCONTROL normalized_depth_control,
+                                                 uint32_t normalized_color_mask,
+-                                                Transfer::Rectangle& rectangle_out) {
++                                                Transfer::Rectangle& rectangle_out,
++                                                bool* whole_out) {
++  if (whole_out) {
++    *whole_out = false;
++  }
+   const RegisterFile& regs = register_file();
+ 
+   // One rectangle (the host draws a rectangle list as two triangles that cover
+@@ -1812,6 +1962,7 @@
+       GetRenderTargetHeight(pitch_tiles_at_32bpp, msaa_samples),
+   };
+   int32_t covered[2][2];
++  bool whole = true;
+   for (uint32_t i = 0; i < 2; ++i) {
+     float scale = float(i ? draw_resolution_scale_y() : draw_resolution_scale_x());
+     float host_low = edges[i][0] * scale;
+@@ -1828,9 +1979,14 @@
+     int32_t low = int32_t(std::max(low_pixel, 0.0f));
+     int32_t high = int32_t(std::min(high_pixel_exclusive, 4096.0f));
+     low = std::max(low, int32_t(std::max(viewport_info.xy_offset[i], scissor.offset[i])));
+-    high = std::min(high, int32_t(std::min(viewport_info.xy_offset[i] + viewport_info.xy_extent[i],
+-                                           scissor.offset[i] + scissor.extent[i])));
+-    high = std::min(high, int32_t(limits[i]));
++    const int32_t bound_high = std::min(
++        int32_t(std::min(viewport_info.xy_offset[i] + viewport_info.xy_extent[i],
++                         scissor.offset[i] + scissor.extent[i])),
++        int32_t(limits[i]));
++    // LOCAL PATCH - MCLA (04e0): the whole screen (whole_out): the rectangle starts at 0 and reaches the far side of
++    // everything it is cut to (the viewport, the scissor, the render target).
++    whole = whole && low == 0 && high >= bound_high;
++    high = std::min(high, bound_high);
+     if (low >= high) {
+       return OverwriteRejected("no pixel is surely covered");
+     }
+@@ -1841,6 +1997,9 @@
+   rectangle_out.y_pixels = uint32_t(covered[1][0]);
+   rectangle_out.width_pixels = uint32_t(covered[0][1] - covered[0][0]);
+   rectangle_out.height_pixels = uint32_t(covered[1][1] - covered[1][0]);
++  if (whole_out) {
++    *whole_out = whole;
++  }
+   return true;
+ }
+ 
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 399b1093..0f53c30d 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -4835,6 +4835,8 @@
+   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
+   // Set up the render targets - this may perform dispatches and draws.
+   render_target_cache_->SetUpdatePixelShader(pixel_shader);
++  // LOCAL PATCH - MCLA (04e0): the tone map marker (kTonemapBegin) has been seen in this frame: for tonemap_transfer_skip.
++  render_target_cache_->SetUpdateAfterTonemapMarker(hdr_frame_.tonemap);
+   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                     normalized_color_mask, *vertex_shader)) {
+     return draw_fail("render_target_update");
