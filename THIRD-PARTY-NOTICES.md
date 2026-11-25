@@ -10,6 +10,8 @@ applies patches from, the projects below. Nothing here is a copy of the game or 
 | mcla-ios (the owner's iOS port) | `e24c575` | Same owner | Game layer (hooks, codegen config, tests, tools) ported from it, and the owner's SDK patches in `patches/sdk/` |
 | [holdmysocks/mcla-recomp](https://github.com/holdmysocks/mcla-recomp) | — | GPL-3.0 | Upstream history of Renan's fork; `runtime_discovered.toml` practice |
 | [AMD FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) signed runtime 2.4.0 (`amd_fidelityfx_loader_dx12.dll`, `amd_fidelityfx_upscaler_dx12.dll`) | v2.4.0, `7539ae8b`, SHA-256 pinned in SDK patch 0470 | MIT (its `docs/license.md`, staged next to the exe as `amd_fidelityfx_signed_LICENSE.md`) | FSR 4.1.2 / 3.1.6 upscaling; fetched at configure time into `$WORK`, never in this repo |
+| [Dear ImGui](https://github.com/ocornut/imgui) | v1.91.9, SHA-256 pinned in `launcher/CMakeLists.txt` | MIT | Launcher UI; fetched at configure time, never vendored |
+| [nlohmann/json](https://github.com/nlohmann/json) | v3.11.3, SHA-256 pinned in `launcher/CMakeLists.txt` | MIT | Launcher settings schema and store; fetched at configure time |
 | [Xenia Canary](https://github.com/xenia-canary/xenia-canary) and [game-patches](https://github.com/xenia-canary/game-patches) | — | BSD-3-Clause | Reference oracle; address confirmation. The XMA cross-buffer packet fix (`patches/sdk/0310-*`) follows Xenia Canary's decoder |
 | [mzzvxm/LARecomp](https://github.com/mzzvxm/larecomp) | — | None (all rights reserved) | **Knowledge only** (addresses, pitfalls), credited where used. No code is copied |
 | [LLVM](https://llvm.org) 20.1.8 | release asset | Apache-2.0 with LLVM exception | Compiler toolchain, installed in `$WORK`; not redistributed |
