@@ -14,7 +14,7 @@ Purpose: Cut GPU time in the D3D12 swap at 1080p (R2: about 0.2-0.35 ms on the 8
   by a direct resolve and nothing has written the memory or the render target since, the swap reads that render target instead
   of the loaded texture (no texture load: the apply-gamma pass reads the render target). Cvar swap_direct_present_fused (default
   true, with swap_direct_present): and when the guest output thread paints the frame right after the refresh as a plain 1:1 copy
-  of an 8-bit image (no scaling, no effects, SDR, no frame generation, no UI overlay painting), the apply-gamma pass is dropped:
+  of an 8-bit image (no scaling, no effects, SDR, no frame generation, no UI overlay shown), the apply-gamma pass is dropped:
   the presenter's paint maps the ramp over the render target while it copies it to the back buffer - one pass. Cvar
   swap_direct_present_check (default 0): every Nth swap that could use it, the picture is made the old way as well, both the
   new ways are drawn next to it, read back and compared, and the largest difference per channel is logged
@@ -61,7 +61,8 @@ Design.
     refresher, before it asks for descriptors). The render target is moved to the read state and recorded as that.
   * Fused paint: D3D12Presenter::FusedGammaState per guest output (mailbox) image. The refresher asks fused_gamma_possible()
     (IsFusedGammaPaintPossible: the guest output thread owns painting and paints right after - Presenter::
-    LockForGuestOutputThreadPaintCheck, which also excludes UI overlay painting - the connection is SDR and paintable, no
+    LockForGuestOutputThreadPaintCheck: with UI overlay painting (present_ui_overlay, which the MCLA profile turns on) while it
+    is not suspended and no overlay is shown - the connection is SDR and paintable, no
     frame generation, and GetGuestOutputPaintFlow for the image says one bilinear pass whose output is the image's size) and, if
     so, gives the render target and the ramp (SRVs) instead of writing the image; both go to the read state for pixel shaders. The
     paint (guest_output_gamma_table_ps, a root signature of its own with the same three parameter indices, a pipeline for the
@@ -75,6 +76,14 @@ Design.
     sample would give (a 10-bit value over 1023, exact), the same alpha 1, to the same B8G8R8A8 render target. The only thing
     the old paint added was the bilinear filter at texel centres, which only hands the texel on (the weights are 0 and 1 on any
     GPU that rounds the fraction to 8 bits). Not proven without a run: swap_direct_present_check says it.
+
+Fused paint with UI overlay painting (V3e-dwsw: the MCLA profile has present_ui_overlay on, the log says "Presenter: UI overlay
+painting", and the first version refused every frame because of it, silently). Allowed now while the overlay isn't suspended and no
+overlay is shown (IsUIOverlayActive). The UI thread paints a guest image only when the guest is silent with a dialog to show or
+the connection changes, so the image it could repaint is never a fused one with a dialog up (the frames are made the usual way
+as soon as one is shown), and every 9th frame is made the usual way (fused_gamma_run_), so the texture of an image that is
+repainted by the UI thread at a connection change holds a frame at most about 3 x 9 frames old, not a stale one from boot.
+Not fused for a paint the guest output thread doesn't make right after the refresh: shows that older frame (logged once).
 
 Diagnostics (added after V3b-dwsw showed 0 of ~600 swaps/10 s qualifying with no "can be shown" line, so no resolve ever
 passed the rules): every picture-sized (640x360 or more) colour resolve that doesn't qualify is noted with a reason, and the
@@ -99,8 +108,10 @@ Checks to run (VER), in this order, each on a frozen frame and on the moving ben
   2. the same with swap_direct_present_fused=true: also "swap_direct_present_check: fused paint #n ... 0/0/0/0".
   3. swap_direct_present=true, check off: GPU time of the swap (PresentMon MsGPUBusy, or P1's timestamps), and the picture
      against the old path on a screenshot of a still scene (identical).
-  The fused paint needs host_present_from_non_ui_thread (guest output thread presenting: no implicit vsync, no UI drawers, no
-  present_ui_overlay, no frame generation) - otherwise the log says "(0 with the gamma ramp applied in the presenter's paint)".
+  The fused paint needs the guest output thread presenting every frame (host_present_from_non_ui_thread, no implicit vsync;
+  with present_ui_overlay: not suspended and no dialog shown), no frame generation, HDR, FXAA or effects at the paint - otherwise
+  the log says why: "swap_direct_present: the gamma ramp is not applied in the presenter's paint: <every failed condition>" (the
+  first 3 times, then every 10 s), and the 10 s line counts them.
 
 Interplay with 0490 (resolve_dual_write): with the swap not loading the front buffer, no texture is ever made for it, so the dual
 write finds none (fallback "no texture") and writes nothing extra; a check swap loads the texture (once in N), after which
@@ -124,10 +135,10 @@ ui/vulkan/vulkan_presenter.cpp: 0 errors. git apply --check --cached of this dif
 
 ---
 diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
-index 43e05a40..92cab70b 100644
+index 43e05a40..1e5381fb 100644
 --- a/include/rex/graphics/d3d12/command_processor.h
 +++ b/include/rex/graphics/d3d12/command_processor.h
-@@ -877,6 +877,52 @@ class D3D12CommandProcessor : public CommandProcessor {
+@@ -877,6 +877,58 @@ class D3D12CommandProcessor : public CommandProcessor {
    Microsoft::WRL::ComPtr<ID3D12Resource> fxaa_source_texture_;
    uint64_t fxaa_source_texture_submission_ = 0;
  
@@ -150,6 +161,9 @@ index 43e05a40..92cab70b 100644
 +  // Counts the swap's outcome: `why_not` (a string literal) if the swap didn't use the render target, and logs the
 +  // counts every 10 seconds.
 +  void NoteSwapDirect(const char* why_not, bool direct, bool fused);
++  // Counts a swap made from the render target whose gamma ramp wasn't applied in the presenter's paint, though
++  // swap_direct_present asked for it; true if a line saying why is due (the first 3, then one every 10 s).
++  bool NoteSwapDirectNotFused();
 +  // swap_direct_present_check: after the apply-gamma pass wrote `mailbox` from the loaded texture, the same pass from
 +  // the render target into a scratch image of the same size, and the copies of both to readback buffers;
 +  // `descriptors` are the scratch image's UAV and the render target's SRV; false if it can't be done.
@@ -165,11 +179,14 @@ index 43e05a40..92cab70b 100644
 +    uint64_t direct = 0;
 +    uint64_t fused = 0;
 +    uint64_t checks = 0;
++    uint64_t not_fused = 0;
 +    // The string literals of the reasons the render target wasn't used, and how many times each.
 +    std::array<std::pair<const char*, uint64_t>, 16> why_not = {};
 +    uint64_t window_start_ms = 0;
 +  } swap_direct_stats_;
 +  uint64_t swap_direct_check_counter_ = 0;
++  uint32_t swap_direct_not_fused_logs_ = 0;
++  uint64_t swap_direct_not_fused_last_ms_ = 0;
 +  Microsoft::WRL::ComPtr<ID3D12Resource> swap_direct_check_texture_;
 +  Microsoft::WRL::ComPtr<ID3D12Resource> swap_direct_check_readback_[2];
 +  D3D12_PLACED_SUBRESOURCE_FOOTPRINT swap_direct_check_footprint_ = {};
@@ -404,10 +421,10 @@ index c0e8d598..d0a0461d 100644
    // allocations of the backends that use them), without uploading anything or
    // changing which pages are valid. RequestRange does this too, but not when
 diff --git a/include/rex/ui/d3d12/d3d12_presenter.h b/include/rex/ui/d3d12/d3d12_presenter.h
-index 190e30ad..a8afc157 100644
+index 190e30ad..ac37ce71 100644
 --- a/include/rex/ui/d3d12/d3d12_presenter.h
 +++ b/include/rex/ui/d3d12/d3d12_presenter.h
-@@ -99,15 +99,47 @@ class D3D12Presenter final : public Presenter {
+@@ -99,15 +99,58 @@ class D3D12Presenter final : public Presenter {
      void* compose_generated_context = nullptr;
    };
  
@@ -439,6 +456,17 @@ index 190e30ad..a8afc157 100644
 +    // References for the GPU use of the paint.
 +    Microsoft::WRL::ComPtr<ID3D12Resource> source_ref;
 +    Microsoft::WRL::ComPtr<ID3D12Resource> ramp_ref;
++    // Why possible is false (string literals), for the refresher's log.
++    const char* why_not[8] = {};
++    uint32_t why_not_count = 0;
++    std::string WhyNotText() const {
++      std::string text;
++      for (uint32_t i = 0; i < why_not_count; ++i) {
++        text += i ? "; " : "";
++        text += why_not[i];
++      }
++      return text.empty() ? std::string("(no reason recorded)") : text;
++    }
 +  };
 +
    // The callback must use the main direct queue of the provider.
@@ -457,13 +485,16 @@ index 190e30ad..a8afc157 100644
  
      // kGuestOutputFormat, supports UAV. The initial state in the callback is
      // kGuestOutputInternalState, and the callback must also transition it back
-@@ -118,9 +150,22 @@ class D3D12Presenter final : public Presenter {
+@@ -118,9 +161,25 @@ class D3D12Presenter final : public Presenter {
      // frames aren't generated now.
      FrameGenerationInputs* frame_generation() const { return frame_generation_; }
  
 +    // swap_direct_present: whether the paint of this image can be given the source and the ramp instead of the
 +    // finished image (see FusedGammaSource).
 +    bool fused_gamma_possible() const { return fused_gamma_ && fused_gamma_->possible; }
++    std::string fused_gamma_why_not() const {
++      return fused_gamma_ ? fused_gamma_->WhyNotText() : std::string("no fused gamma state");
++    }
 +    void SetFusedGammaSource(const FusedGammaSource& source) {
 +      if (fused_gamma_) {
 +        fused_gamma_->source = source;
@@ -480,7 +511,7 @@ index 190e30ad..a8afc157 100644
    };
  
    static std::unique_ptr<D3D12Presenter> Create(HostGpuLossCallback host_gpu_loss_callback,
-@@ -246,6 +291,9 @@ class D3D12Presenter final : public Presenter {
+@@ -246,6 +305,9 @@ class D3D12Presenter final : public Presenter {
        // HDR output: the layer the presenter's own UI is drawn into.
        kRTVIndexHdrUiLayer = kRTVIndexGuestOutputIntermediate0 + kGuestOutputMailboxSize - 1,
  
@@ -490,7 +521,7 @@ index 190e30ad..a8afc157 100644
        kRTVCount,
      };
  
-@@ -266,7 +314,11 @@ class D3D12Presenter final : public Presenter {
+@@ -266,7 +328,11 @@ class D3D12Presenter final : public Presenter {
        kViewIndexUiOverlay0Srv,
        kViewIndexUiOverlay1Srv,
  
@@ -503,7 +534,7 @@ index 190e30ad..a8afc157 100644
      };
  
      void AwaitSwapChainUsageCompletion() {
-@@ -317,6 +369,11 @@ class D3D12Presenter final : public Presenter {
+@@ -317,6 +383,11 @@ class D3D12Presenter final : public Presenter {
          guest_output_intermediate_textures;
      UINT64 guest_output_intermediate_texture_last_usage = 0;
  
@@ -515,7 +546,7 @@ index 190e30ad..a8afc157 100644
      // Connection-specific.
  
      uint32_t swap_chain_width = 0;
-@@ -446,6 +503,41 @@ class D3D12Presenter final : public Presenter {
+@@ -446,6 +517,45 @@ class D3D12Presenter final : public Presenter {
    // UI overlay painting: the UI overlay (premultiplied) over the SDR swap chain.
    Microsoft::WRL::ComPtr<ID3D12PipelineState> ui_overlay_composite_pipeline_;
  
@@ -532,7 +563,11 @@ index 190e30ad..a8afc157 100644
 +  std::array<bool, kGuestOutputMailboxSize> guest_output_written_ = {};
 +  // Whether the refresher may give a fused source for the image being refreshed (the guest output thread owns painting
 +  // and paints it right after, as a 1:1 copy without effects, to an SDR swap chain).
-+  bool IsFusedGammaPaintPossible(uint32_t mailbox_index);
++  bool IsFusedGammaPaintPossible(uint32_t mailbox_index, FusedGammaState& state);
++  // Frames offered for the fused paint since the last one made the usual way: every 9th is made the usual way, so that
++  // the texture of the image the UI thread may have to repaint (a connection change, a dialog while the guest is
++  // silent) never holds a frame more than a few frames old.
++  uint32_t fused_gamma_run_ = 0;
 +  // swap_direct_present_check, in the paint: the scratch image and the readback buffers for comparing the fused paint
 +  // with the usual one, recorded by RecordFusedGammaCheck and compared by CompleteFusedGammaCheck once the paint
 +  // submission has completed.
@@ -558,28 +593,31 @@ index 190e30ad..a8afc157 100644
    // guest output texture was last refreshed, the second is the reference to the
    // texture, which may be null. The indices are the mailbox indices.
 diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
-index 0effdac0..c0312905 100644
+index 0effdac0..a58b2f7f 100644
 --- a/include/rex/ui/presenter.h
 +++ b/include/rex/ui/presenter.h
-@@ -886,6 +886,16 @@ class Presenter {
+@@ -886,6 +886,19 @@ class Presenter {
    const GuestOutputProperties& GetRefreshingGuestOutputProperties(uint32_t mailbox_index) const {
      return guest_output_properties_[mailbox_index];
    }
 +  // LOCAL PATCH - MCLA (04a0): for a refresher that may hand the paint something other than a finished image
 +  // (swap_direct_present's fused paint), which only works if the guest output thread paints right after it. Locks
 +  // the paint mode, like the guest output thread does while it paints, and returns true with the lock held in
-+  // `lock_out` if it is that way now: the guest output thread owns painting (so the paint context can be read),
-+  // the connection is paintable, and the UI overlay doesn't repaint images on its own. The mode can still change
-+  // after the lock is released (before the paint): a paint of the image by the UI thread then has no finished image
-+  // to show, which is the backend's to survive.
-+  bool LockForGuestOutputThreadPaintCheck(std::unique_lock<std::mutex>& lock_out);
++  // `lock_out` if it is that way now: the guest output thread owns painting (so the paint context can be read) and
++  // the connection is paintable. With UI overlay painting (present_ui_overlay, which the MCLA profile has on) that is
++  // so while it isn't suspended; and while no overlay is shown, since the UI thread repaints the last guest frame by
++  // itself only to show a dialog over it when the guest is silent. Otherwise false, with `why_not_out` (a string
++  // literal) saying which. The mode can still change after the lock is released (before the paint): a paint of the
++  // image by the UI thread then has no finished image to show, which is the backend's to survive.
++  bool LockForGuestOutputThreadPaintCheck(std::unique_lock<std::mutex>& lock_out,
++                                          const char** why_not_out = nullptr);
 +  // A copy of the paint configuration, as ConsumeGuestOutput gives it.
 +  void CopyGuestOutputPaintConfig(GuestOutputPaintConfig& config_out);
    // The present log: a real frame composed for a present an implementation's
    // callback makes next (thread c).
    static void LogPresentFromCallback(uint64_t refresh_number);
 diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
-index 4d57be39..ff86be4c 100644
+index 4d57be39..78cd8122 100644
 --- a/src/graphics/d3d12/command_processor.cpp
 +++ b/src/graphics/d3d12/command_processor.cpp
 @@ -94,6 +94,26 @@ REXCVAR_DEFINE_BOOL(d3d12_hoist_shared_memory_uploads_stats, false, "GPU/D3D12",
@@ -658,7 +696,7 @@ index 4d57be39..ff86be4c 100644
         guest_output_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
          const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
          ID3D12Device* device = provider.GetDevice();
-@@ -2814,6 +2854,70 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+@@ -2814,6 +2854,81 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                frame_generation_inputs->generation_width,
                                frame_generation_inputs->generation_height);
  
@@ -682,6 +720,17 @@ index 4d57be39..ff86be4c 100644
 +        const bool swap_direct_read = swap_direct.in_place && swap_direct_usable;
 +        const bool swap_direct_fuse = swap_direct_read && swap_direct.fuse && !use_fxaa &&
 +                                      !use_pwl_gamma_ramp && d3d12_context.fused_gamma_possible();
++        if (swap_direct_read && swap_direct.fuse && !swap_direct_fuse && NoteSwapDirectNotFused()) {
++          // Why the gamma ramp isn't applied in the presenter's paint (the swap is still made from the render target).
++          std::string not_fused_why =
++              use_fxaa ? std::string("FXAA is on (swap_post_effect): its pass needs the gamma-mapped image")
++              : use_pwl_gamma_ramp
++                  ? std::string("the front buffer is 2_10_10_10 (the PWL gamma ramp)")
++                  : d3d12_context.fused_gamma_why_not();
++          REXGPU_INFO(
++              "swap_direct_present: the gamma ramp is not applied in the presenter's paint: {}",
++              not_fused_why);
++        }
 +        // A check swap: also the render target's apply-gamma pass, into a scratch image to compare with.
 +        const bool swap_direct_check =
 +            swap_direct.check && swap_direct_usable && !use_fxaa && !use_pwl_gamma_ramp;
@@ -729,7 +778,7 @@ index 4d57be39..ff86be4c 100644
          // Destination, source, and if bindful, gamma ramp; for HDR, the
          // underlay and the UI layer (adjacent, one table); for frame
          // generation, the HUD-less image.
-@@ -2825,7 +2929,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+@@ -2825,7 +2940,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
              apply_gamma_descriptors + apply_gamma_descriptor_count;
          if (!RequestOneUseSingleViewDescriptors(
                  apply_gamma_descriptor_count + (use_hdr ? 4 : 0) +
@@ -738,7 +787,7 @@ index 4d57be39..ff86be4c 100644
                  apply_gamma_descriptors)) {
            return false;
          }
-@@ -2868,12 +2972,14 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+@@ -2868,12 +2983,14 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
          device->CreateUnorderedAccessView(apply_gamma_dest, nullptr, &apply_gamma_dest_uav_desc,
                                            apply_gamma_descriptors[0].first);
  
@@ -757,7 +806,7 @@ index 4d57be39..ff86be4c 100644
  
          if (use_hdr) {
            // The UI layer and its underlay, if this frame has them at the
-@@ -3104,6 +3210,19 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+@@ -3104,6 +3221,19 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                  apply_gamma_dest_initial_state);
          }
  
@@ -777,7 +826,7 @@ index 4d57be39..ff86be4c 100644
          // Need to submit all the commands before giving the image back to the
          // presenter so it can submit its own commands for displaying it to the
          // queue.
-@@ -3112,6 +3231,16 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+@@ -3112,6 +3242,16 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
          // With threaded submission, they must be in the queue, not only handed
          // over: the presenter signals its fence and paints right after this.
          AwaitSubmissionThread();
@@ -794,7 +843,7 @@ index 4d57be39..ff86be4c 100644
          return true;
        });
  
-@@ -6426,4 +6555,276 @@ void D3D12CommandProcessor::WriteGammaRampSRV(bool is_pwl,
+@@ -6426,4 +6566,288 @@ void D3D12CommandProcessor::WriteGammaRampSRV(bool is_pwl,
    device->CreateShaderResourceView(gamma_ramp_buffer_.Get(), &desc, handle);
  }
  
@@ -903,11 +952,23 @@ index 4d57be39..ff86be4c 100644
 +  }
 +  REXGPU_INFO(
 +      "swap_direct_present: {} swaps in {:.1f} s: {} made from the render target ({} with the gamma ramp "
-+      "applied in the presenter's paint), {} from the loaded texture{}; {} checks",
++      "applied in the presenter's paint, {} without it though swap_direct_present_fused asked for it: see "
++      "the 'not applied' lines), {} from the loaded texture{}; {} checks",
 +      stats.swaps, double(now_ms - stats.window_start_ms) * 0.001, stats.direct, stats.fused,
-+      from_texture, reasons, stats.checks);
++      stats.not_fused, from_texture, reasons, stats.checks);
 +  stats = SwapDirectStats();
 +  stats.window_start_ms = now_ms;
++}
++
++bool D3D12CommandProcessor::NoteSwapDirectNotFused() {
++  ++swap_direct_stats_.not_fused;
++  const uint64_t now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
++  if (swap_direct_not_fused_logs_ < 3 || now_ms - swap_direct_not_fused_last_ms_ >= 10000) {
++    ++swap_direct_not_fused_logs_;
++    swap_direct_not_fused_last_ms_ = now_ms;
++    return true;
++  }
++  return false;
 +}
 +
 +bool D3D12CommandProcessor::RecordSwapDirectCheck(
@@ -1508,7 +1569,7 @@ index f1722de4..df9f5344 100644
                                                      uint32_t length_allocations) {
    assert_always(
 diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
-index 52b43879..aadf9c62 100644
+index 52b43879..719c4eec 100644
 --- a/src/ui/d3d12/d3d12_presenter.cpp
 +++ b/src/ui/d3d12/d3d12_presenter.cpp
 @@ -49,6 +49,7 @@ namespace shaders {
@@ -1553,7 +1614,7 @@ index 52b43879..aadf9c62 100644
 +  // ramp instead of finishing the image (the state is the image's, and stays set until it is refreshed again).
 +  FusedGammaState& fused_gamma = guest_output_fused_[mailbox_index];
 +  fused_gamma = FusedGammaState();
-+  fused_gamma.possible = IsFusedGammaPaintPossible(mailbox_index);
++  fused_gamma.possible = IsFusedGammaPaintPossible(mailbox_index, fused_gamma);
    D3D12GuestOutputRefreshContext context(is_8bpc_out_ref, hdr_out_ref,
                                           guest_output_resource_ref.second.Get(),
                                           GetFrameGenerationInputs(mailbox_index, frontbuffer_width,
@@ -1771,39 +1832,79 @@ index 52b43879..aadf9c62 100644
    // HDR output: bilinear guest output (HDR10 code values, no dithering) and
    // the presenter's UI layer, blended as premultiplied, to the HDR10 swap chain.
    guest_output_paint_pipeline_desc.PS.pShaderBytecode = shaders::guest_output_bilinear_ps;
-@@ -2018,4 +2151,207 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
+@@ -2018,4 +2151,247 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
    return InitializeCommonSurfaceIndependent();
  }
  
 +// LOCAL PATCH - MCLA (04a0): swap_direct_present's fused paint.
 +
-+bool D3D12Presenter::IsFusedGammaPaintPossible(uint32_t mailbox_index) {
-+  if (!guest_output_paint_gamma_pipeline_ || !guest_output_written_[mailbox_index] ||
-+      !guest_output_paint_final_pipelines_[size_t(GuestOutputPaintEffect::kBilinear)] ||
-+      frame_generation_ || frame_generation_wanted() || IsHdrOutputWanted()) {
-+    return false;
++bool D3D12Presenter::IsFusedGammaPaintPossible(uint32_t mailbox_index, FusedGammaState& state) {
++  // Every condition that fails is listed (the refresher logs them, rate-limited, when it wanted the fused paint).
++  auto fail = [&state](const char* why_not) {
++    if (state.why_not_count < std::size(state.why_not)) {
++      state.why_not[state.why_not_count++] = why_not;
++    }
++  };
++  if (!guest_output_paint_gamma_pipeline_) {
++    fail("the fused gamma pipeline couldn't be made");
++  }
++  if (!guest_output_paint_final_pipelines_[size_t(GuestOutputPaintEffect::kBilinear)]) {
++    fail("no bilinear paint pipeline");
++  }
++  if (!guest_output_written_[mailbox_index]) {
++    fail("the image's texture hasn't been written yet (the first frames of each guest output image are usual ones)");
++  }
++  if (frame_generation_ || frame_generation_wanted()) {
++    fail("frame generation");
++  }
++  if (IsHdrOutputWanted()) {
++    fail("HDR output");
 +  }
 +  // Held so the guest output thread keeps owning painting while the paint context is read.
 +  std::unique_lock<std::mutex> paint_lock;
-+  if (!LockForGuestOutputThreadPaintCheck(paint_lock)) {
++  const char* lock_why_not = nullptr;
++  if (!LockForGuestOutputThreadPaintCheck(paint_lock, &lock_why_not)) {
++    fail(lock_why_not);
 +    return false;
 +  }
-+  if (!paint_context_.swap_chain || paint_context_.swap_chain_hdr ||
-+      !paint_context_.swap_chain_width || !paint_context_.swap_chain_height) {
++  if (!paint_context_.swap_chain || !paint_context_.swap_chain_width ||
++      !paint_context_.swap_chain_height) {
++    fail("no swap chain");
++  } else if (paint_context_.swap_chain_hdr) {
++    fail("the swap chain is HDR10");
++  } else {
++    // The paint the image would get: what the refresher writes is 8 bits per channel (SetIs8bpc), HDR off.
++    GuestOutputProperties properties = GetRefreshingGuestOutputProperties(mailbox_index);
++    properties.is_8bpc = true;
++    properties.hdr = GuestOutputHdr();
++    GuestOutputPaintConfig config;
++    CopyGuestOutputPaintConfig(config);
++    GuestOutputPaintFlow flow = GetGuestOutputPaintFlow(
++        properties, paint_context_.swap_chain_width, paint_context_.swap_chain_height,
++        D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, config);
++    if (!flow.effect_count) {
++      fail("the paint draws no guest output (inactive, or the window has no size)");
++    } else if (flow.effect_count != 1) {
++      fail("the paint has more than one effect pass (FSR/CAS upscaling or sharpening: see present_effect)");
++    } else if (flow.effects[0] != GuestOutputPaintEffect::kBilinear) {
++      fail("the paint's one pass isn't a plain bilinear one (dither, CAS or FSR: see present_effect and present_dither)");
++    }
++    if (flow.effect_count &&
++        (flow.effect_output_sizes[flow.effect_count - 1].first != properties.frontbuffer_width ||
++         flow.effect_output_sizes[flow.effect_count - 1].second != properties.frontbuffer_height)) {
++      fail("the guest output isn't painted 1:1 (the window's client area isn't the guest's size, or letterboxing stretches it)");
++    }
++  }
++  if (state.why_not_count) {
 +    return false;
 +  }
-+  // The paint the image would get: what the refresher writes is 8 bits per channel (SetIs8bpc), HDR off.
-+  GuestOutputProperties properties = GetRefreshingGuestOutputProperties(mailbox_index);
-+  properties.is_8bpc = true;
-+  properties.hdr = GuestOutputHdr();
-+  GuestOutputPaintConfig config;
-+  CopyGuestOutputPaintConfig(config);
-+  GuestOutputPaintFlow flow = GetGuestOutputPaintFlow(
-+      properties, paint_context_.swap_chain_width, paint_context_.swap_chain_height,
-+      D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, config);
-+  return flow.effect_count == 1 && flow.effects[0] == GuestOutputPaintEffect::kBilinear &&
-+         flow.effect_output_sizes[0].first == properties.frontbuffer_width &&
-+         flow.effect_output_sizes[0].second == properties.frontbuffer_height;
++  if (fused_gamma_run_ >= 8) {
++    fused_gamma_run_ = 0;
++    fail("every 9th frame is made the usual way, so an image the UI thread repaints is at most a few frames old");
++    return false;
++  }
++  ++fused_gamma_run_;
++  return true;
 +}
 +
 +bool D3D12Presenter::RecordFusedGammaCheck(ID3D12GraphicsCommandList* command_list,
@@ -1980,18 +2081,32 @@ index 52b43879..aadf9c62 100644
 +
  }  // namespace rex::ui::d3d12
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 75d29b10..ae9901d1 100644
+index 75d29b10..2cd2a8bc 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
-@@ -1407,6 +1407,22 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+@@ -1407,6 +1407,36 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
    return std::move(consumer_lock);
  }
  
-+bool Presenter::LockForGuestOutputThreadPaintCheck(std::unique_lock<std::mutex>& lock_out) {
++bool Presenter::LockForGuestOutputThreadPaintCheck(std::unique_lock<std::mutex>& lock_out,
++                                                   const char** why_not_out) {
 +  std::unique_lock<std::mutex> lock(paint_mode_mutex_);
-+  if (paint_mode_ != PaintMode::kGuestOutputThreadImmediately ||
-+      surface_paint_connection_state_ != SurfacePaintConnectionState::kConnectedPaintable ||
-+      ui_overlay_paint_mode_) {
++  const char* why_not = nullptr;
++  if (paint_mode_ != PaintMode::kGuestOutputThreadImmediately) {
++    why_not =
++        "the UI thread paints (UI drawers shown without UI overlay painting, implicit vsync, or "
++        "host_present_from_non_ui_thread off)";
++  } else if (surface_paint_connection_state_ != SurfacePaintConnectionState::kConnectedPaintable) {
++    why_not = "the surface connection isn't paintable";
++  } else if (ui_overlay_paint_mode_ && !IsUIOverlayPaintModeActive()) {
++    why_not = "UI overlay painting is suspended or off";
++  } else if (ui_overlay_paint_mode_ && IsUIOverlayActive()) {
++    why_not = "a UI overlay is shown (the UI thread can repaint the last guest frame while the guest is silent)";
++  }
++  if (why_not) {
++    if (why_not_out) {
++      *why_not_out = why_not;
++    }
 +    return false;
 +  }
 +  lock_out = std::move(lock);
