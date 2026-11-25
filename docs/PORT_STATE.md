@@ -124,3 +124,12 @@ PLAN §7.2. Shared contracts for wave 1:
 - **Default API: D3D12** (beat Vulkan by 20 % at 720p in E2, against PLAN §3.5's Vulkan prior). E3 still runs at M5.
 - **Scripted pad = synthetic `rex::input::InputDriver`** (SDL3 lives statically inside `rexruntime.dll` with no
   exports), not an SDL virtual joystick (PLAN §3.6, §4.1).
+- **Owner decisions (Ali, 2026-11-24):** anti-aliasing = `noaa` (stable frame times over MSAA). M6 = 720p internal
+  upscaled to 1080p with **FSR 3** (the most advanced upscaler available), after one more native-1080p60 check on the
+  new, stronger power adapter (report back if the result changes). Controllers: generic XInput, Xbox, DualShock 4,
+  DualSense.
+- **Present jitter fix (0430) and display-locked vblank (0440)**: the M4 p99 miss was the CP's `Sleep(1)` swap-gate poll.
+- **60 fps lever = present-immediate hook** (`mcla_present_immediate=-1`, 0x82419AC0): the guest D3D's
+  D3DRS_PRESENTIMMEDIATETHRESHOLD is 0, so a late frame was held one whole vblank (33 ms). Raising it to 100 on timed
+  swaps releases late frames at once and keeps the real 60 Hz vblank. Renan's alternative (`vsync=false`, free-running
+  vblank) is not used.
