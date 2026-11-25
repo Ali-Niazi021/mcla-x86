@@ -854,6 +854,15 @@ purpose = "Spin trims (R7 items 1 and 3). Guest vblank (0400): guest_vblank_spin
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "04d0-vs-straight-fetch"
+source = "local"
+path = "patches/sdk/04d0-vs-straight-fetch.patch"
+sha256 = "c68ee8cfa502e500194c62aeb38638c9a5c2ab8b7e42802c942ee8da271af1a4"
+purpose = "D3D12: cvar dxbc_vs_straight_fetch (default false): vertex fetch as straight-line code. The shared memory binding is chosen when the vertex shader is translated (modification bit shared_memory_is_uav = the draw's memexport_used; both bindings still declared) instead of a run-time branch on kSysFlag_SharedMemoryIsUAV, and the vertex fetch and vertex index endian swaps are branch-free (byte-permute idiom + movc on uniform conditions) instead of switches. Two vertex modification bits (vs_straight_fetch, shared_memory_is_uav) keep the translations, pipelines and stored descriptions of each setting apart; kVersion not bumped. Pixel shaders, memexport swaps, Vulkan untouched; off = stock translation byte for byte."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]

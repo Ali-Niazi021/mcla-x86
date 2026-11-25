@@ -1,0 +1,497 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Wed, 25 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 04d0: straight-line vertex fetch (Direct3D 12): the shared memory binding is chosen when the vertex shader is translated, and the endian swap has no branches (dxbc_vs_straight_fetch)
+
+Source: Ours, written for this SDK (O3; changes R8-A and R8-B of $WORK/scratch/R8/REPORT.md and patch_spec.md, whose
+  variants/src is the working prototype; the result is byte-identical to it, see below). The DXBC translator it changes is
+  Xenia's (Triang3l, BSD-3-Clause) in the ReXGlue SDK. Not run in the game: built (SDK build of the series with this
+  patch, scratch tree $WORK/scratch/O3), run offline on the 1,061 translations of the E2 shader storage (the harness below),
+  compiled by RGA for gfx1150, and the swap executed on random words, nothing more
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: R8 found that the cost of a vertex shader on the Radeon 880M is latency, not ALU: every vfetch sits in its own basic
+  blocks (a uniform `if` on the system flag kSysFlag_SharedMemoryIsUAV to read the shared memory from the SRV or from the
+  UAV, then two endian switches), so each vertex load is followed by a full wait before the next one is issued; a shadow
+  vertex shader does about 7 dependent memory round trips, a colour one about 13. Cvar dxbc_vs_straight_fetch (bool, hot
+  reload, default false until a run has validated it; the profile turns it on) makes the vertex fetch straight-line code:
+  * R8-A, the binding: with the cvar on, a vertex shader that fetches vertices is translated for the binding the shared memory
+    has in the draw that asks for it, the one the system flag says now: UAV in a draw that uses memexport (the draw's
+    memexport_used: its vertex or its pixel shader exports), SRV otherwise. The ld_raw is emitted once, from that binding,
+    with no flag test and no if / else. Both bindings are still declared and allocated (as the stock code does after its
+    `if`), so the resources, the root signature and the descriptors are the same. The choice is a bit of the vertex shader
+    modification (Modification::vertex.shared_memory_is_uav, set only with the cvar on and only for a shader with vertex
+    fetches), made in D3D12CommandProcessor::IssueDraw from memexport_used and passed to
+    PipelineCache::GetCurrentVertexShaderModification. Pixel shaders keep the run-time branch (they don't fetch vertices).
+  * R8-B, the swap: the vertex fetch's endian swap (Endian128 from the fetch constant) and the vertex index's (Endian, from
+    the system constant) are the new DxbcShaderTranslator::EmitStraightEndianSwap: the 8-in-16 byte swap
+    ((x << 8) & 0xFF00FF00 | (x >> 8) & 0x00FF00FF) and the 16-in-32 rotation (bfi), always computed and selected with movc
+    on ((e + 1) & 2) and (e & 2), which are uniform in the draw, instead of two switches on e (and the umad x * 256 + y that
+    kept the compiler from forming a v_perm). Exactly the same value for e = 0 ... 3. The memexport's own 64/128-bit swaps are
+    not touched.
+  Each alone changes little (R8: the other leaves block boundaries around every fetch); together the shader is one basic block
+  from the fetch to the first use and the compiler issues all the vertex loads and constant loads before the first wait.
+  R8's numbers (RGA gfx1150, dynamic path): serial memory rounds 6.8 -> 4.2 (shadow VS, -38 %) and 12.8 -> 7.4 (colour VS,
+  -42 %); SALU -19 / -23 %, v_mul_lo_u32 5.3 -> 1.0 (shadow), static branches 8.4 -> 4.0. Expected 0.1-0.3 ms in the
+  shadow pass and 0.1-0.4 ms in the main view at 1080p [INFERENCE, R8], to be benched.
+  What the cvar keys, and kVersion: the option is not read by the translation: it is two bits of the vertex shader
+  modification (vs_straight_fetch and shared_memory_is_uav, in the free upper bits of the second dword, set by
+  DxbcShaderTranslator::ApplyVertexShaderOptimizations from the cvar and the draw when the draw makes its modification). The
+  modification is the key of the translation (Shader::translations_), of the pipeline (PipelineDescription.
+  vertex_shader_modification, hashed) and of the stored pipeline description (.xpso), so a setting of the cvar (and a draw that
+  uses memexport) never reuses the DXBC, the pipeline or the stored description of another one, however and whenever the cvar
+  is changed (a change makes new translations and pipelines, compiled on first use: one stutter). All bits 0 is the stock
+  modification, so Modification::kVersion and the storage versions are NOT bumped (R8's spec bumped kVersion, because it set
+  the binding bit for every vertex shader; with the cvar as the first bit the old stored descriptions are the cvar-off ones and
+  stay valid) and the shader storage (.xsh) is not affected. At the start-up preload, a stored vertex shader description whose
+  vs_straight_fetch differs from the cvar's is not translated and so its pipeline is not made (the stored shared_memory_is_uav
+  is kept: only a draw knows it): the .xpso keeps the entries of both settings and a run builds only its own. A vertex shader
+  used with and without memexport has two translations with the cvar on (none seen in the E2 corpus).
+  This is not the 04b0 pixel shader options (it needs nothing of them). Vertex shaders keep refactoring off (R8-C is not done:
+  it breaks position invariance), the SM3 zero-multiply emulation stays, and the Vulkan translator is untouched.
+Bucket: REDO
+
+04d0-vs-straight-fetch.patch (mcla-x86 O3; R8 of $WORK/scratch/R8/REPORT.md)
+
+Changed files: include/rex/graphics/pipeline/shader/dxbc_translator.h (Modification::vertex bits, ApplyVertexShaderOptimizations,
+EmitStraightEndianSwap, the accessors), include/rex/graphics/d3d12/pipeline_cache.h, src/graphics/pipeline/shader/
+{dxbc_translator.cpp (the cvar, the two functions, the vertex index swap), dxbc_translator_fetch.cpp (the vertex fetch)},
+src/graphics/d3d12/{pipeline_cache.cpp (the modification, the preload skip), command_processor.cpp (memexport_used passed)}. No new
+files; Vulkan untouched. The pixel shaders and everything the cvar leaves off are translated exactly as before.
+
+Checks done (scratch tree $WORK/scratch/O3 = series 92 + this patch):
+  * python tools/prepare_sdk.py --work $WORK/scratch/O3 build (Release): builds and installs.
+  * Harness (scratch/O3/harness/harness_o3.cpp, linked with the objects of that build) over the 1,061 (shader, modification)
+    pairs of the E2 storage, AMD, bindless, RTV: cvar off: 1,061 of 1,061 byte-identical to the stock translation (R1's out/).
+    Cvar on: all 440 vertex shaders change, the 621 pixel shaders don't, and the 201 vertex + 112 pixel translations of R8's
+    ss3 prototype set (R8's R8_VSRV=1 R8_VSWAP=3) are byte-identical to R8's out_ss3. With the draw using memexport (--uav) the same
+    translations read U0 where the others read T0 (both declared in both).
+  * scratch/O3/harness/swaptest.cpp executes the emitted DXBC (a small interpreter of the integer instructions, temporaries,
+    immediates and switch / case that the sequences use) for the endianness 0, 1, 2, 3, for 20,000 random words (and 0, ~0,
+    0x01020304, 0x80000001) per write mask for each of the 15 masks of the fetch (the endianness in the scratch register's unused
+    component, or in another register for 0xF) and 200,000 for the vertex index (r0.x, scratch r0.y), against an independent C
+    reference (8-in-16, 8-in-32 = bswap, 16-in-32 = swap of the halves), also for the stock switch sequence emitted by the same
+    assembler, and checking that nothing else (the other components, the endianness) is touched:
+    4,000,000 executions, 0 failures (12 instructions).
+  * RGA 2.15, DX12 live driver, gfx1150, R8's job lists (81 depth-only vertex shaders with no pixel shader, 54 of them the shadow
+    ones, and 120 colour vertex shaders with their pixel shaders), run under the heavy lock: every job compiled (0 failed of 81 + 120). Mean per shader against the stock translation (R8's rga_base: the same driver and job lists), shadow 54: serial memory rounds 6.8 -> 4.2, SALU 61.4 -> 49.6, VALU 231 -> 223, static branches 8.4 -> 4.0, v_mul_lo_u32 5.3 -> 1.0, VGPR 23.1 -> 22.1; the other 27 depth-only: rounds 6.2 -> 4.1, SALU 57.9 -> 47.7; colour 120: rounds 12.8 -> 7.4, vertex loads
+    waited on in 2.7 -> 0.8 rounds, SALU 105 -> 81, VALU 410 -> 394, branches 15.9 -> 6.9, v_mul_lo_u32 8.2 -> 1.1, VGPR 39.6 -> 39.0 - R8's numbers, and the ISA statistics are identical to those of R8's ss3 (the same DXBC). Five of them translated for a memexport draw (--uav) compile too, with the same rounds.
+  * Not run: the game, a picture, the stored-pipeline preload and the pipeline creation.
+
+Checks to run (VER), in this order (profile cvar: dxbc_vs_straight_fetch=true):
+  1. Cvar false: the pipeline storage and the picture as before.
+  2. Cvar true: no shader or pipeline creation failure in the log; a frozen frame and a moving scene against the stock ones:
+     identical (the same values), including the rain / vinyl / any draw that uses memexport (the UAV translation).
+  3. GPU time of the shadow pass and of the whole frame (n1080 A/B pair, GT build for per-pass deltas; the gain is per draw
+     segment, so larger with clear_memory_page_state=true).
+  4. A toggle between runs on the same cache: "Created N graphics pipelines ... from the storage" counts only the pipelines of that
+     run's setting (the other's entries stay in the .xpso unused); a setting not seen before compiles at first use, and a second
+     run preloads it.
+
+---
+diff --git a/include/rex/graphics/d3d12/pipeline_cache.h b/include/rex/graphics/d3d12/pipeline_cache.h
+index 59c78d56..02fa7553 100644
+--- a/include/rex/graphics/d3d12/pipeline_cache.h
++++ b/include/rex/graphics/d3d12/pipeline_cache.h
+@@ -81,9 +81,11 @@ class PipelineCache {
+ 
+   // Retrieves the shader modification for the current state. The shader must
+   // have microcode analyzed.
++  // shared_memory_is_uav (LOCAL PATCH - MCLA (04d0)): whether the draw binds the shared memory as a UAV (uses
++  // memexport), for dxbc_vs_straight_fetch.
+   DxbcShaderTranslator::Modification GetCurrentVertexShaderModification(
+       const Shader& shader, Shader::HostVertexShaderType host_vertex_shader_type,
+-      uint32_t interpolator_mask) const;
++      uint32_t interpolator_mask, bool shared_memory_is_uav) const;
+   DxbcShaderTranslator::Modification GetCurrentPixelShaderModification(
+       const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
+       reg::RB_DEPTHCONTROL normalized_depth_control) const;
+diff --git a/include/rex/graphics/pipeline/shader/dxbc_translator.h b/include/rex/graphics/pipeline/shader/dxbc_translator.h
+index 85bd7f26..72bc4046 100644
+--- a/include/rex/graphics/pipeline/shader/dxbc_translator.h
++++ b/include/rex/graphics/pipeline/shader/dxbc_translator.h
+@@ -159,6 +159,18 @@ class DxbcShaderTranslator : public ShaderTranslator {
+       // uint32_t 1.
+       // Pipeline stage and input configuration.
+       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
++      // LOCAL PATCH - MCLA (04d0): cvar dxbc_vs_straight_fetch. It changes the DXBC, so it is part of the key of the
++      // translation, of the pipeline and of the stored pipeline description (the cvar is read when the modification is
++      // made, by ApplyVertexShaderOptimizations, never by the translation). All 0 gives the stock translation, so
++      // the stored descriptions of older runs stay valid (the layout, and kVersion, are unchanged).
++      // The vertex fetch and the vertex index endian swap are straight-line code: the shared memory is fetched from
++      // the one binding chosen below instead of from the SRV or the UAV after a run-time branch on a system flag, and
++      // the endian swap is made of selects on conditions that are the same for the whole draw instead of switches.
++      uint32_t vs_straight_fetch : 1;
++      // With vs_straight_fetch: whether the shared memory is bound as a UAV in the draws of this translation (the
++      // value the kSysFlag_SharedMemoryIsUAV system flag has in them, that is whether the draw uses memexport),
++      // otherwise as an SRV. 0 without vs_straight_fetch, and for a shader with no vertex fetch.
++      uint32_t shared_memory_is_uav : 1;
+     } vertex;
+     struct PixelShaderModification {
+       // uint32_t 0.
+@@ -562,6 +574,32 @@ class DxbcShaderTranslator : public ShaderTranslator {
+   // the bits, so toggling a cvar never reuses a translation or a pipeline made without it.
+   static void ApplyPixelShaderOptimizations(Modification& modification, const Shader& shader);
+ 
++  // LOCAL PATCH - MCLA (04d0): sets the vertex shader translation options of the modification (see
++  // Modification::vertex vs_straight_fetch and shared_memory_is_uav) from the cvar dxbc_vs_straight_fetch and the
++  // draw's shared_memory_is_uav (whether it uses memexport: also in its pixel shader), for the shader with its ucode
++  // analyzed; the other bits are not touched. shared_memory_is_uav is only used (and kept in the modification) if
++  // the cvar is on and the shader fetches vertices. The cvar is read here and nowhere else, so toggling it never
++  // reuses a translation or a pipeline made without it.
++  static void ApplyVertexShaderOptimizations(Modification& modification, const Shader& shader,
++                                             bool shared_memory_is_uav);
++
++  // LOCAL PATCH - MCLA (04d0): the 8-in-16 byte swap (when the endianness is 8-in-16 or 8-in-32, that is
++  // ((endian + 1) & 2) != 0) and then the 16-in-32 word rotation (when it's 8-in-32 or 16-in-32, that is
++  // (endian & 2) != 0) of value_dest, as straight-line code: both steps are always computed and selected with movc on
++  // conditions made from the endianness, which is the same for the whole draw (a fetch constant, or the index
++  // endianness of the draw), so the compiler can issue what follows without waiting for a branch. The result is the
++  // same as of the stock switches for the endianness 0 ... 3 (Endian, Endian128: 2 bits). value_src reads the register
++  // of value_dest (with the swizzle that gives each written component, or a broadcast of it for a scalar);
++  // swap_temp_dest / swap_temp_src is a scratch register component per written component, the same way (for the
++  // vertex index in r.x: dest r.y, source r.yyyy); aux_temp is a free register used at the components of value_dest
++  // (read with the swizzle of value_src), cond_temp a free register whose x and y are used. endian_src is a scalar.
++  // Not for the 64-bit and 128-bit swaps of the memexport (Endian128), which are different operations.
++  static void EmitStraightEndianSwap(dxbc::Assembler& a, const dxbc::Src& endian_src,
++                                     const dxbc::Dest& value_dest, const dxbc::Src& value_src,
++                                     const dxbc::Dest& swap_temp_dest,
++                                     const dxbc::Src& swap_temp_src, uint32_t aux_temp,
++                                     uint32_t cond_temp);
++
+   // Common functions useful not only for the translator, but also for render
+   // target reinterpretation.
+ 
+@@ -734,6 +772,14 @@ class DxbcShaderTranslator : public ShaderTranslator {
+     return HasPixelShaderOptimizationBits() && GetDxbcShaderModification().pixel.forward_cf &&
+            current_shader().control_flow_forward_jumps_only();
+   }
++  // LOCAL PATCH - MCLA (04d0): the vertex shader translation options of the modification (see Modification::vertex).
++  // False for pixel shaders (the union members overlap).
++  bool IsVsStraightFetch() const {
++    return is_vertex_shader() && GetDxbcShaderModification().vertex.vs_straight_fetch;
++  }
++  bool IsVsSharedMemoryUAV() const {
++    return is_vertex_shader() && GetDxbcShaderModification().vertex.shared_memory_is_uav;
++  }
+ 
+   // Allocates new consecutive r# registers for internal use and returns the
+   // index of the first.
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index ff86be4c..8699d388 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -3413,9 +3413,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+                                                              regs.Get<reg::SQ_CONTEXT_MISC>(),
+                                                              ps_param_gen_pos))
+                    : 0;
++  // memexport_used is also the value of kSysFlag_SharedMemoryIsUAV in this draw (UpdateSystemConstantValues), which
++  // dxbc_vs_straight_fetch (LOCAL PATCH - MCLA (04d0)) builds the vertex fetch for.
+   DxbcShaderTranslator::Modification vertex_shader_modification =
+       pipeline_cache_->GetCurrentVertexShaderModification(
+-          *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask);
++          *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
++          memexport_used);
+   DxbcShaderTranslator::Modification pixel_shader_modification =
+       pixel_shader
+           ? pipeline_cache_->GetCurrentPixelShaderModification(
+diff --git a/src/graphics/d3d12/pipeline_cache.cpp b/src/graphics/d3d12/pipeline_cache.cpp
+index 25728eb6..fe554b7f 100644
+--- a/src/graphics/d3d12/pipeline_cache.cpp
++++ b/src/graphics/d3d12/pipeline_cache.cpp
+@@ -439,6 +439,19 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
+               continue;
+             }
+           }
++          if (shader_to_translate->type() == xenos::ShaderType::kVertex) {
++            // LOCAL PATCH - MCLA (04d0): the same for the vertex shader translation option (cvar
++            // dxbc_vs_straight_fetch); which binding the shared memory has in the draws of a stored description (its
++            // shared_memory_is_uav, which only the draw knows) is kept.
++            DxbcShaderTranslator::Modification stored_options(modification_it->second);
++            DxbcShaderTranslator::Modification current_options(modification_it->second);
++            DxbcShaderTranslator::ApplyVertexShaderOptimizations(
++                current_options, *shader_to_translate,
++                stored_options.vertex.shared_memory_is_uav != 0);
++            if (current_options.value != modification_it->second) {
++              continue;
++            }
++          }
+           D3D12Shader::D3D12Translation* translation = static_cast<D3D12Shader::D3D12Translation*>(
+               shader_to_translate->GetOrCreateTranslation(modification_it->second));
+           // Only try (and delete in case of failure) if it's a new translation.
+@@ -894,7 +907,7 @@ D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint
+ 
+ DxbcShaderTranslator::Modification PipelineCache::GetCurrentVertexShaderModification(
+     const Shader& shader, Shader::HostVertexShaderType host_vertex_shader_type,
+-    uint32_t interpolator_mask) const {
++    uint32_t interpolator_mask, bool shared_memory_is_uav) const {
+   assert_true(shader.type() == xenos::ShaderType::kVertex);
+   assert_true(shader.is_ucode_analyzed());
+   const auto& regs = register_file_;
+@@ -919,6 +932,10 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentVertexShaderModifica
+       uint32_t((shader.writes_point_size_edge_flag_kill_vertex() & 0b001) &&
+                regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type == xenos::PrimitiveType::kPointList);
+ 
++  // LOCAL PATCH - MCLA (04d0): the vertex shader translation option (cvar dxbc_vs_straight_fetch) is part of the
++  // modification, so each setting has its own translations and pipelines.
++  DxbcShaderTranslator::ApplyVertexShaderOptimizations(modification, shader, shared_memory_is_uav);
++
+   return modification;
+ }
+ 
+diff --git a/src/graphics/pipeline/shader/dxbc_translator.cpp b/src/graphics/pipeline/shader/dxbc_translator.cpp
+index 8709e9ea..d2b67467 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator.cpp
+@@ -71,6 +71,19 @@ REXCVAR_DEFINE_BOOL(dxbc_ps_ieee_mul, false, "GPU/Shader",
+                     "fewer vector ALU instructions on its own. Risky: check a frozen frame")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// LOCAL PATCH - MCLA (04d0): vertex shader translation option, off by default. It changes the DXBC, and is folded into
++// the vertex shader modification (Modification::vertex; DxbcShaderTranslator::ApplyVertexShaderOptimizations) when a
++// draw asks for it, so the translations, the pipelines and the stored pipeline descriptions of each setting are kept
++// apart and a change of the cvar at any time makes (and compiles, on first use) new ones.
++REXCVAR_DEFINE_BOOL(dxbc_vs_straight_fetch, false, "GPU/Shader",
++                    "Direct3D 12: translate the vertex fetch of the vertex shaders as straight-line code: the shared "
++                    "memory is read from the SRV or from the UAV chosen when the shader is translated (UAV in the "
++                    "draws that use memexport) instead of after a run-time branch, and the endian swap of the fetched "
++                    "words and of the vertex index is made with selects instead of switches, so the driver issues all "
++                    "the loads of a vertex shader together instead of one at a time. The same values: no change of "
++                    "the picture. Shaders translated with it are kept apart from the others (toggling is safe)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics {
+ using namespace ucode;
+ 
+@@ -175,6 +188,46 @@ void DxbcShaderTranslator::ApplyPixelShaderOptimizations(Modification& modificat
+   modification.pixel.ps_ieee_mul = uint32_t(REXCVAR_GET(dxbc_ps_ieee_mul));
+ }
+ 
++void DxbcShaderTranslator::ApplyVertexShaderOptimizations(Modification& modification,
++                                                          const Shader& shader,
++                                                          bool shared_memory_is_uav) {
++  assert_true(shader.type() == xenos::ShaderType::kVertex);
++  assert_true(shader.is_ucode_analyzed());
++  bool straight_fetch = REXCVAR_GET(dxbc_vs_straight_fetch);
++  modification.vertex.vs_straight_fetch = uint32_t(straight_fetch);
++  // Only a shader that fetches vertices has a binding to choose.
++  modification.vertex.shared_memory_is_uav =
++      uint32_t(straight_fetch && shared_memory_is_uav && !shader.vertex_bindings().empty());
++}
++
++void DxbcShaderTranslator::EmitStraightEndianSwap(dxbc::Assembler& a, const dxbc::Src& endian_src,
++                                                  const dxbc::Dest& value_dest,
++                                                  const dxbc::Src& value_src,
++                                                  const dxbc::Dest& swap_temp_dest,
++                                                  const dxbc::Src& swap_temp_src,
++                                                  uint32_t aux_temp, uint32_t cond_temp) {
++  // The aux register mirrors the value: the same components, read the same way.
++  dxbc::Dest aux_dest(dxbc::Dest::R(aux_temp, value_dest.GetMask()));
++  dxbc::Src aux_src(dxbc::Src::R(aux_temp, value_src.swizzle_));
++  // Whether to swap the bytes in 16 bits: for 8-in-16 (1) and 8-in-32 (2), x = (endian + 1) & 2.
++  a.OpIAdd(dxbc::Dest::R(cond_temp, 0b0001), endian_src, dxbc::Src::LU(1));
++  a.OpAnd(dxbc::Dest::R(cond_temp, 0b0001), dxbc::Src::R(cond_temp, dxbc::Src::kXXXX),
++          dxbc::Src::LU(2));
++  // Whether to rotate by 16 bits: for 8-in-32 (2) and 16-in-32 (3), y = endian & 2.
++  a.OpAnd(dxbc::Dest::R(cond_temp, 0b0010), endian_src, dxbc::Src::LU(2));
++  // The bytes swapped in each 16 bits: temp = (x << 8) & 0xFF00FF00 | (x >> 8) & 0x00FF00FF (aux is the second part).
++  a.OpIShL(swap_temp_dest, value_src, dxbc::Src::LU(8));
++  a.OpAnd(swap_temp_dest, swap_temp_src, dxbc::Src::LU(0xFF00FF00));
++  a.OpUShR(aux_dest, value_src, dxbc::Src::LU(8));
++  a.OpAnd(aux_dest, aux_src, dxbc::Src::LU(0x00FF00FF));
++  a.OpOr(swap_temp_dest, swap_temp_src, aux_src);
++  a.OpMovC(value_dest, dxbc::Src::R(cond_temp, dxbc::Src::kXXXX), swap_temp_src, value_src);
++  // Temp = ZW00, value = ZWXY.
++  a.OpUShR(swap_temp_dest, value_src, dxbc::Src::LU(16));
++  a.OpBFI(swap_temp_dest, dxbc::Src::LU(16), dxbc::Src::LU(16), value_src, swap_temp_src);
++  a.OpMovC(value_dest, dxbc::Src::R(cond_temp, dxbc::Src::kYYYY), swap_temp_src, value_src);
++}
++
+ void DxbcShaderTranslator::Reset() {
+   ShaderTranslator::Reset();
+ 
+@@ -445,31 +498,40 @@ void DxbcShaderTranslator::StartVertexShader_LoadVertexIndex() {
+     dxbc::Dest swap_temp_dest(dxbc::Dest::R(reg, 0b0010));
+     dxbc::Src swap_temp_src(dxbc::Src::R(reg, dxbc::Src::kYYYY));
+ 
+-    // 8-in-16 or one half of 8-in-32.
+-    a_.OpSwitch(endian_src);
+-    a_.OpCase(dxbc::Src::LU(uint32_t(xenos::Endian::k8in16)));
+-    a_.OpCase(dxbc::Src::LU(uint32_t(xenos::Endian::k8in32)));
+-    // Temp = X0Z0.
+-    a_.OpAnd(swap_temp_dest, index_src, dxbc::Src::LU(0x00FF00FF));
+-    // Index = YZW0.
+-    a_.OpUShR(index_dest, index_src, dxbc::Src::LU(8));
+-    // Index = Y0W0.
+-    a_.OpAnd(index_dest, index_src, dxbc::Src::LU(0x00FF00FF));
+-    // Index = YXWZ.
+-    a_.OpUMAd(index_dest, swap_temp_src, dxbc::Src::LU(256), index_src);
+-    a_.OpBreak();
+-    a_.OpEndSwitch();
+-
+-    // 16-in-32 or another half of 8-in-32.
+-    a_.OpSwitch(endian_src);
+-    a_.OpCase(dxbc::Src::LU(uint32_t(xenos::Endian::k8in32)));
+-    a_.OpCase(dxbc::Src::LU(uint32_t(xenos::Endian::k16in32)));
+-    // Temp = ZW00.
+-    a_.OpUShR(swap_temp_dest, index_src, dxbc::Src::LU(16));
+-    // Index = ZWXY.
+-    a_.OpBFI(index_dest, dxbc::Src::LU(16), dxbc::Src::LU(16), index_src, swap_temp_src);
+-    a_.OpBreak();
+-    a_.OpEndSwitch();
++    if (IsVsStraightFetch()) {
++      uint32_t aux_temp = PushSystemTemp();
++      uint32_t cond_temp = PushSystemTemp();
++      EmitStraightEndianSwap(a_, endian_src, index_dest, index_src, swap_temp_dest, swap_temp_src,
++                             aux_temp, cond_temp);
++      // Release aux_temp and cond_temp.
++      PopSystemTemp(2);
++    } else {
++      // 8-in-16 or one half of 8-in-32.
++      a_.OpSwitch(endian_src);
++      a_.OpCase(dxbc::Src::LU(uint32_t(xenos::Endian::k8in16)));
++      a_.OpCase(dxbc::Src::LU(uint32_t(xenos::Endian::k8in32)));
++      // Temp = X0Z0.
++      a_.OpAnd(swap_temp_dest, index_src, dxbc::Src::LU(0x00FF00FF));
++      // Index = YZW0.
++      a_.OpUShR(index_dest, index_src, dxbc::Src::LU(8));
++      // Index = Y0W0.
++      a_.OpAnd(index_dest, index_src, dxbc::Src::LU(0x00FF00FF));
++      // Index = YXWZ.
++      a_.OpUMAd(index_dest, swap_temp_src, dxbc::Src::LU(256), index_src);
++      a_.OpBreak();
++      a_.OpEndSwitch();
++
++      // 16-in-32 or another half of 8-in-32.
++      a_.OpSwitch(endian_src);
++      a_.OpCase(dxbc::Src::LU(uint32_t(xenos::Endian::k8in32)));
++      a_.OpCase(dxbc::Src::LU(uint32_t(xenos::Endian::k16in32)));
++      // Temp = ZW00.
++      a_.OpUShR(swap_temp_dest, index_src, dxbc::Src::LU(16));
++      // Index = ZWXY.
++      a_.OpBFI(index_dest, dxbc::Src::LU(16), dxbc::Src::LU(16), index_src, swap_temp_src);
++      a_.OpBreak();
++      a_.OpEndSwitch();
++    }
+ 
+     if (!uses_register_dynamic_addressing) {
+       // Break register dependency.
+diff --git a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+index fa803ddd..a66aecf3 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+@@ -156,22 +156,30 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
+   // memexport is used), fetch from the appropriate binding. Extract whether
+   // shared memory is a UAV to system_temp_result_.x and check. In the `if`, put
+   // the more likely case (SRV), in the `else`, the less likely one (UAV).
+-  a_.OpAnd(dxbc::Dest::R(system_temp_result_, 0b0001), LoadFlagsSystemConstant(),
+-           dxbc::Src::LU(kSysFlag_SharedMemoryIsUAV));
+-  a_.OpIf(false, dxbc::Src::R(system_temp_result_, dxbc::Src::kXXXX));
++  // LOCAL PATCH - MCLA (04d0): with vs_straight_fetch, the vertex shader is translated for the one binding it
++  // will have (Modification::vertex.shared_memory_is_uav), so there's no check and no branch (and the loads don't
++  // end a basic block); both bindings are still declared, so the root signature and the resources are the same.
++  const bool straight_fetch = IsVsStraightFetch();
++  if (!straight_fetch) {
++    a_.OpAnd(dxbc::Dest::R(system_temp_result_, 0b0001), LoadFlagsSystemConstant(),
++             dxbc::Src::LU(kSysFlag_SharedMemoryIsUAV));
++    a_.OpIf(false, dxbc::Src::R(system_temp_result_, dxbc::Src::kXXXX));
++  }
+   if (srv_index_shared_memory_ == kBindingIndexUnallocated) {
+     srv_index_shared_memory_ = srv_count_++;
+   }
+   if (uav_index_shared_memory_ == kBindingIndexUnallocated) {
+     uav_index_shared_memory_ = uav_count_++;
+   }
+-  for (uint32_t i = 0; i < 2; ++i) {
++  for (uint32_t i = 0; i < (straight_fetch ? 1u : 2u); ++i) {
+     if (i) {
+       a_.OpElse();
+     }
++    bool shared_memory_is_uav = straight_fetch ? IsVsSharedMemoryUAV() : (i != 0);
+     dxbc::Src shared_memory_src(
+-        i ? dxbc::Src::U(uav_index_shared_memory_, uint32_t(UAVRegister::kSharedMemory))
+-          : dxbc::Src::T(srv_index_shared_memory_, uint32_t(SRVMainRegister::kSharedMemory)));
++        shared_memory_is_uav
++            ? dxbc::Src::U(uav_index_shared_memory_, uint32_t(UAVRegister::kSharedMemory))
++            : dxbc::Src::T(srv_index_shared_memory_, uint32_t(SRVMainRegister::kSharedMemory)));
+     uint32_t needed_words_remaining = needed_words;
+     uint32_t word_index_previous = first_word_index;
+     while (needed_words_remaining) {
+@@ -207,7 +215,9 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
+       }
+     }
+   }
+-  a_.OpEndIf();
++  if (!straight_fetch) {
++    a_.OpEndIf();
++  }
+ 
+   dxbc::Src result_src(dxbc::Src::R(system_temp_result_));
+ 
+@@ -233,31 +243,42 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
+     dxbc::Src swap_temp_src(dxbc::Src::R(swap_temp));
+     dxbc::Dest swap_result_dest(dxbc::Dest::R(system_temp_result_, needed_words));
+ 
+-    // 8-in-16 or one half of 8-in-32.
+-    a_.OpSwitch(endian_src);
+-    a_.OpCase(dxbc::Src::LU(uint32_t(xenos::Endian128::k8in16)));
+-    a_.OpCase(dxbc::Src::LU(uint32_t(xenos::Endian128::k8in32)));
+-    // Temp = X0Z0.
+-    a_.OpAnd(swap_temp_dest, result_src, dxbc::Src::LU(0x00FF00FF));
+-    // Result = YZW0.
+-    a_.OpUShR(swap_result_dest, result_src, dxbc::Src::LU(8));
+-    // Result = Y0W0.
+-    a_.OpAnd(swap_result_dest, result_src, dxbc::Src::LU(0x00FF00FF));
+-    // Result = YXWZ.
+-    a_.OpUMAd(swap_result_dest, swap_temp_src, dxbc::Src::LU(256), result_src);
+-    a_.OpBreak();
+-    a_.OpEndSwitch();
+-
+-    // 16-in-32 or another half of 8-in-32.
+-    a_.OpSwitch(endian_src);
+-    a_.OpCase(dxbc::Src::LU(uint32_t(xenos::Endian128::k8in32)));
+-    a_.OpCase(dxbc::Src::LU(uint32_t(xenos::Endian128::k16in32)));
+-    // Temp = ZW00.
+-    a_.OpUShR(swap_temp_dest, result_src, dxbc::Src::LU(16));
+-    // Result = ZWXY.
+-    a_.OpBFI(swap_result_dest, dxbc::Src::LU(16), dxbc::Src::LU(16), result_src, swap_temp_src);
+-    a_.OpBreak();
+-    a_.OpEndSwitch();
++    if (straight_fetch) {
++      // LOCAL PATCH - MCLA (04d0): without the switches, from selects on conditions made of the endianness.
++      uint32_t aux_temp = PushSystemTemp();
++      uint32_t cond_temp = PushSystemTemp();
++      EmitStraightEndianSwap(a_, endian_src, swap_result_dest, result_src, swap_temp_dest,
++                             swap_temp_src, aux_temp, cond_temp);
++      // Release aux_temp and cond_temp.
++      PopSystemTemp(2);
++    } else {
++      // 8-in-16 or one half of 8-in-32.
++      a_.OpSwitch(endian_src);
++      a_.OpCase(dxbc::Src::LU(uint32_t(xenos::Endian128::k8in16)));
++      a_.OpCase(dxbc::Src::LU(uint32_t(xenos::Endian128::k8in32)));
++      // Temp = X0Z0.
++      a_.OpAnd(swap_temp_dest, result_src, dxbc::Src::LU(0x00FF00FF));
++      // Result = YZW0.
++      a_.OpUShR(swap_result_dest, result_src, dxbc::Src::LU(8));
++      // Result = Y0W0.
++      a_.OpAnd(swap_result_dest, result_src, dxbc::Src::LU(0x00FF00FF));
++      // Result = YXWZ.
++      a_.OpUMAd(swap_result_dest, swap_temp_src, dxbc::Src::LU(256), result_src);
++      a_.OpBreak();
++      a_.OpEndSwitch();
++
++      // 16-in-32 or another half of 8-in-32.
++      a_.OpSwitch(endian_src);
++      a_.OpCase(dxbc::Src::LU(uint32_t(xenos::Endian128::k8in32)));
++      a_.OpCase(dxbc::Src::LU(uint32_t(xenos::Endian128::k16in32)));
++      // Temp = ZW00.
++      a_.OpUShR(swap_temp_dest, result_src, dxbc::Src::LU(16));
++      // Result = ZWXY.
++      a_.OpBFI(swap_result_dest, dxbc::Src::LU(16), dxbc::Src::LU(16), result_src,
++               swap_temp_src);
++      a_.OpBreak();
++      a_.OpEndSwitch();
++    }
+ 
+     // Release endian_temp (if allocated) and swap_temp.
+     PopSystemTemp((endian_temp != swap_temp) ? 2 : 1);
