@@ -10,7 +10,8 @@
 // (the 1080p preset plus the FSR temporal upscaler; a preset may name a parent whose entries it builds on) and
 // `720p-fsr1` (the shipped 1280x720 render upscaled by the presenter's FSR 1). S6 adds `1080p-fsr4p` / `1080p-fsr4q` (the
 // same with AMD's FSR 4 machine-learning upscaler, SDK patch 0470) and the 16:10 sizes `800p`, `900p16`, `1200p`, with
-// `1200p-fsr` and `1200p-fsr4p` (the 1200p render with FSR 3.1/4 at 1.5x / FSR 4 at 2x).
+// `1200p-fsr` and `1200p-fsr4p` (the 1200p render with FSR 3.1/4 at 1.5x / FSR 4 at 2x). `1000p` (1600x1000) and `2000p`
+// (the same drawn at 2x2 on the host: 3200x2000, a 16:10 laptop panel's native size) came with the owner's native request.
 //
 // Frame-rate target (W4.1): `--mcla_fps_target=60` (cvar below; 0 = the shipped timing, nothing is set) is the whole 60 fps
 // profile in one switch. It is a separate axis from the resolution presets: `--mcla_profile=1080p --mcla_fps_target=60`
@@ -42,7 +43,9 @@ REXCVAR_DEFINE_STRING(mcla_profile, "", "MCLA",
                       "temporal_aa_upscaler=fsr4; FSR 3.1.6 where the device lacks it) from 960x540 (Performance, "
                       "2x) / 1280x720 (Quality, 1.5x). 16:10 (Vert+ camera, the Flash UI in a 16:9 band): '800p' = "
                       "1280x800, '900p16' = 1440x900, '1200p' = 1920x1200, '1200p-fsr' = 1200p with the scene at "
-                      "1280x800 upscaled by FSR (1.5x), '1200p-fsr4p' = 1200p from 960x600 by FSR 4 (2x). "
+                      "1280x800 upscaled by FSR (1.5x), '1200p-fsr4p' = 1200p from 960x600 by FSR 4 (2x), '1000p' = "
+                      "1600x1000, '2000p' = 3200x2000 on the host (1000p with every render target drawn at 2x2: "
+                      "about 4x the GPU load). "
                       "Read once, in OnPreSetup")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -278,6 +281,33 @@ constexpr CvarDefault k1200pDefaults[] = {
     {"mcla_ws_ui_probe", "false"},
 };
 
+// 1000p / 2000p (owner request: the laptop's native 3200x2000 panel). A 3200x2000 guest back buffer cannot exist (5,000
+// EDRAM tiles per surface against a reach of 2,048: S4 report), so the game renders 1600x1000 and the SDK draws every
+// render target at 2x2 on the host (draw_resolution_scale_x/y; `resolution_scale` is only honoured when set by hand, so
+// the two axes are named). The front buffer is then 3200x2000 and a borderless window of the desktop's size shows it 1:1.
+// Measured on the Radeon 880M (parked scene, orc-native-n2000): 23 fps, the picture correct.
+static_assert(AcceptedAs(1600, 1000) && sizing::RenderTargetMaxHeight(1000) == 1008 &&
+              sizing::SingleTileFits(1600, 1000, 1, 4096));
+constexpr CvarDefault k1000pDefaults[] = {
+    {"mcla_widescreen_width", "1600"},
+    {"mcla_scene_height", "1000"},
+    {"video_mode_width", "1600"},
+    {"video_mode_height", "1000"},
+    {"window_width", "1600"},
+    {"window_height", "1000"},
+    {"render_target_max_height", "1008"},  // 1000 rows aligned to the 16-row tile
+    {"mcla_noaa", "true"},
+    {"mcla_ws_single_tile", "true"},
+    {"mcla_ws_ui_squeeze", "268"},
+    {"mcla_ws_ui_probe", "false"},
+};
+constexpr CvarDefault k2000pDefaults[] = {
+    {"draw_resolution_scale_x", "2"},
+    {"draw_resolution_scale_y", "2"},
+    {"window_width", "3200"},
+    {"window_height", "2000"},
+};
+
 // 1200p-fsr / 1200p-fsr4p: the 1200p render with the scene drawn at 1280x800 (1.5x) or 960x600 (2x) and upscaled to
 // 1920x1200, FSR as in the 1080p-fsr family below (1.5x with RCAS 0.3; the FSR 4 Performance preset with RCAS 0.2).
 static_assert(1920 * 2 / 3 == 1280 && 1200 * 2 / 3 == 800 && 1920 / 2 == 960 && 1200 / 2 == 600,
@@ -390,6 +420,12 @@ constexpr Preset kPresets[] = {
      "the 1200p render with the scene drawn at 960x600 (Performance, 2x) and upscaled to 1920x1200 by AMD's FSR 4 "
      "(temporal_aa_upscaler=fsr4, RCAS 0.2; FSR 3.1.6 where the device lacks it)",
      k1200pFsr4pDefaults, sizeof(k1200pFsr4pDefaults) / sizeof(k1200pFsr4pDefaults[0]), "1200p-fsr"},
+    {"1000p", "16:10 1600x1000 internal render, 1x (noaa), single-tile scene, Vert+ camera, the Flash UI in a 16:9 band",
+     k1000pDefaults, sizeof(k1000pDefaults) / sizeof(k1000pDefaults[0]), nullptr},
+    {"2000p",
+     "16:10 3200x2000 on the host: the 1000p render with every render target drawn at 2x2 (draw_resolution_scale_x/y=2); "
+     "the game still sees 1600x1000",
+     k2000pDefaults, sizeof(k2000pDefaults) / sizeof(k2000pDefaults[0]), "1000p"},
 };
 
 // ---- frame-rate targets (W4.1) --------------------------------------------------------------------------------

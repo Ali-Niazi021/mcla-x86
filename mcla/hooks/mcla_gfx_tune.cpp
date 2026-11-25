@@ -31,7 +31,7 @@
 //                              reads [renderer+448] & [renderer+364]; the override in mcla_fsr_markers.cpp clears the bits in
 //                              [renderer+448] around the loop on the frames that are left out (PhasesToSkip())
 //   mcla_gfx_reflection_interval  the same for the reflection view phase (0x2); at 2 it falls on the frames the env map is left out
-//   mcla_gfx_far_cascades_interval  N = 2: the far shadow cascades 2 / 3 (phases 0x80 / 0x100) on alternate frames, the skipped
+//   mcla_gfx_far_cascades_interval  N = 2: the far shadow cascade 2 (phase 0x80; cascade 3 is never skipped) on alternate frames, the skipped
 //                              cascade's light matrices held (sub_825F61F0 override) and the shadow atlas in memory of its own
 //                              (mcla_gfx_shadow_private; sub_825F4EF8 override): mcla_gfx_far_cascades.cpp
 //   mcla_gfx_impostor_interval  N >= 2: a tree-impostor type is regenerated at most every N-th frame (mid-asm hook 0x8230DE50)
@@ -139,9 +139,10 @@ REXCVAR_DEFINE_BOOL(mcla_gfx_impostors, true, "MCLA",
                     "loop would never end, so mcla_gfx_impostors.cpp guards it). Applies to impostors created after the change. "
                     "true = as shipped");
 REXCVAR_DEFINE_INT32(mcla_gfx_far_cascades_interval, 1, "MCLA",
-                     "MCLA quality knob: the two far sun-shadow cascades, 2 and 3 (phases 0x80 / 0x100), are drawn on "
-                     "alternate frames (N = 2: cascade 2 on odd frames, cascade 3 on even ones; every N-th frame each), their light "
-                     "matrices held for the receivers so the static far shadows do not slide. 1 = every frame, as shipped; "
+                     "MCLA quality knob: the far sun-shadow cascade 2 (phase 0x80) is drawn only every N-th frame (N = 2: odd "
+                     "frames), its light matrices held for the receivers and its slice of the shadow atlas kept, so the static far "
+                     "shadows do not slide. Cascade 3 is never skipped (zeroing its phase object breaks the next phases: the car "
+                     "body vanished). 1 = every frame, as shipped; "
                      "0 = as shipped plus a one-time log of the four cascade light matrices (index order check). "
                      "Live (phase loop override + the sub_825F61F0 setter override, mcla_gfx_far_cascades.cpp, build flag "
                      "MCLA_HOOK_GFX_FAR_CASCADES). The shadow atlas needs memory of its own for this (mcla_gfx_shadow_private)")
@@ -161,10 +162,10 @@ REXCVAR_DEFINE_INT32(mcla_gfx_impostor_interval, 1, "MCLA",
     .range(0, 8);
 REXCVAR_DEFINE_STRING(mcla_gfx_preset, "", "MCLA",
                       "MCLA quality preset for a weak GPU, a bundle of the mcla_gfx_* knobs, applied once at first use as app "
-                      "defaults (a knob set by hand wins): '' = as shipped; perf = env_interval 2, far_cascades_interval 2, "
-                      "impostor_interval 2, shadow_dist 0.6, traffic_lod 0.7, city_lod 0.67, shadow_res 512 (the reflection "
-                      "view stays every frame); perf+ (perfplus) = perf + dl_disable 256 (no far cascade) + impostors off; "
-                      "lowest = perf + shadow_mode 1 (no sun shadows). Logs '[mcla-gfx] preset <name>: ...' once");
+                      "defaults (a knob set by hand wins): '' = as shipped; perf = shadow_dist 0.6, "
+                      "traffic_lod 0.7, city_lod 0.67, shadow_res 512; perf+ (perfplus) = perf + dl_disable 256 (no far "
+                      "cascade) + impostors off; lowest = perf + shadow_mode 1 (no sun shadows). Logs '[mcla-gfx] preset "
+                      "<name>: ...' once");
 REXCVAR_DEFINE_STRING(mcla_gfx_dump, "none", "MCLA",
                       "MCLA debug: log guest words once per change of this string, 'ADDR/COUNT+...' "
                       "(ADDR as in mcla_gfx_poke). Live");
@@ -500,9 +501,12 @@ void Dump() {
 // The phase loop sub_822E6408 (one call per frame, from sub_822C0980 at 0x822C0B08, on the render thread) walks r30 = 1, 2, 4
 // ... 0x20000000 and runs a phase only when its bit is set in r21 = [renderer+364] & [renderer+448]: `lwz r11,448(r27)` at
 // 0x822E6608, `lwz r17,364(r27)` at 0x822E6624, `and r21,r17,r11` at 0x822E6630, r21 stored to [renderer+360] at 0x822E66D8, and
-// the 13 phase objects at renderer+128.. (render target set, clear, draws, resolve) are called only for a phase in r21
-// (`and r10,r30,r21; beq` at 0x822E6844). A phase left out of the mask costs nothing and keeps the textures it resolved
-// the last time it ran (the guest memory is not cleared).
+// the 13 draw-list objects at renderer+128.. are called only for a phase in r21 (`and r10,r30,r21; beq` at 0x822E6844). That is
+// NOT the whole phase: the per-phase object renderer[k] (k = the bit's index; sub_822E50D8 registers them from 0x823048D0) gets
+// its virtual +4 (begin: render target, clear) and +8 (end: resolve) called in every iteration whatever r21 says, so clearing
+// the mask bit alone leaves a phase that clears its target and resolves it EMPTY over the texture it should keep (the env map,
+// the shadow atlas quarter: the flicker of the first version). mcla_fsr_markers.cpp therefore also zeroes renderer[k] of a
+// skipped phase around the call. A phase left out that way costs nothing and keeps the textures it resolved the last time it ran.
 //   +364 is the draw-type enable mask the game and mcla_gfx_dl_disable change every frame; +448 is not: it is -1 from the
 //   renderer constructor (0x822E4838, sub_822E47E0), cut by dev options in the constructor, and otherwise written only by
 //   sub_822E51F8 (no direct caller). It is read by nothing but the phase loop (scan of the generated code: the only function that
@@ -560,7 +564,7 @@ void PublishPhaseIntervals() {
   g_far_interval.store(far_interval, std::memory_order_relaxed);
   REXLOG_INFO(
       "[mcla-gfx] phases: environment map (0x{:X}) drawn every {} frame(s), reflection view (0x{:X}) every {} frame(s), "
-      "far shadow cascades 2 / 3 (0x{:X} / 0x{:X}) every {} frame(s), alternating (cascade 2 on frames = 1 mod N, 3 on 0 mod N), "
+      "far shadow cascade 2 (0x{:X}, cascade 3 / 0x{:X} is never left out) every {} frame(s), on frames = 1 mod N, "
       "light matrices held (1 = as shipped; the skipped frames keep the last picture)",
       kPhaseEnvMaps, env, kPhaseReflection, reflection, kPhaseFarCascade2, kPhaseFarCascade3, far_interval);
 }
@@ -576,13 +580,12 @@ struct PresetKnob {
   const char* value;
 };
 
-// perf: near-identical picture, about 1.2-1.8 ms of GPU at 1080p on the 880M [INFERENCE from scratch/S3/REPORT.md], plus the
-// R4 levers: the far cascades on alternate frames and the tree-impostor regeneration at most every 2nd frame (R4 #2 and #5,
-// not measured yet). The reflection view stays every frame (R4: the mirror shows near cars, 30 Hz would show).
+// perf: near-identical picture: shorter shadow and LOD distances and a smaller shadow map. Nothing temporal:
+//   - mcla_gfx_env_interval=2 / mcla_gfx_far_cascades_interval=2 were here and flickered (owner report): the skipped phase
+//     still cleared and resolved its empty target. Fixed since (the phase's own object is taken out too, mcla_fsr_markers.cpp),
+//     but they come back only with a measured gain and a look at a moving picture.
+//   - mcla_gfx_impostor_interval=2 held nothing back (1800 requests per 300 frames, all let through): a no-op.
 constexpr PresetKnob kPresetPerf[] = {
-    {"mcla_gfx_env_interval", "2"},               // car paint / speedometer reflection at 30 Hz
-    {"mcla_gfx_far_cascades_interval", "2"},      // cascades 2 / 3 on alternate frames, matrices held; the atlas goes private
-    {"mcla_gfx_impostor_interval", "2"},          // a tree-impostor type regenerated at most every 2nd frame
     {"mcla_gfx_shadow_dist", "0.6"},              // sections past 120 m cast no cascade shadows
     {"mcla_gfx_traffic_lod", "0.7"},
     {"mcla_gfx_city_lod", "0.67"},
@@ -685,12 +688,19 @@ uint32_t PhasesToSkip(uint32_t active_phases) {
     skip |= kPhaseReflection;
   }
 #if MCLA_HOOK_GFX_FAR_CASCADES
-  // The far shadow cascades (see the block above kPhaseFarCascade2): cascade 2 is drawn on frames = 1 mod N and cascade 3 on
-  // frames = 0 mod N, so at N = 2 they take turns. A cascade is always drawn on the first frame it is active after being
-  // inactive (start of the world, day after night, the preset switched on): its matrices and its slice of the atlas
-  // do not exist before that.
+  // The far shadow cascade 2 (see the block above kPhaseFarCascade2) is drawn on frames = 1 mod N, so at N = 2 on every second
+  // frame. A cascade is always drawn on the first frame it is active after being inactive (start of the world, day after night,
+  // the preset switched on): its matrices and its slice of the atlas do not exist before that.
+  // CASCADE 3 IS NEVER SKIPPED (kFarCascadesSkipped = 1): zeroing its per-phase object (the shadow system, registered for the
+  // phases of the mask 0x7DE0) also drops its virtual +8, the end of the last cascade, which sub_823115E8 uses to set up the
+  // phases after it (the `cmpwi r30,3` branch: sub_825F5850 at 0x82311A9C, sub_82177B40 at 0x82311AB0, then the setter 0x82311AF4): with it left out on alternate
+  // frames the player's car body was not drawn at all on those frames (scratch/ORC flicker run orc-flk-bothfix, b072_b.png).
+  // Cascade 2 has no such special case. Verified in the parked scene (24-frame bursts, std of luma over the burst, b072): at 60 fps
+  // perf-without-intervals 0.15 / 0.3 % of pixels over 6 / consecutive diff 0.07, with env 2 + cascade 2 on alternate frames
+  // 0.11 / 0.3 % / 0.04 (runs orc-flk-base60, orc-flk-both60); before the fix env 2 alone was 0.31 / 1.0 % / 0.28.
+  constexpr int kFarCascadesSkipped = 1;
   uint32_t far_skip = 0;
-  for (int k = 0; k < 2; ++k) {
+  for (int k = 0; k < kFarCascadesSkipped; ++k) {
     FarState& state = g_far[k];
     const uint32_t bit = k == 0 ? kPhaseFarCascade2 : kPhaseFarCascade3;
     if (far_interval <= 1 || !(active_phases & bit)) {

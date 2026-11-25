@@ -2,8 +2,9 @@
 // (docs/PLAN.md W5.4, scratch/R4 change 2; the correct form of scratch/S3 lever 4 and of Renan's mcla_far_shadow_interval).
 // Cvar mcla_gfx_far_cascades_interval (1 = as shipped, 2 = alternate; 0 = as shipped plus a one-time dump of the matrices),
 // defined in mcla_gfx_tune.cpp together with the schedule (PhasesToSkip(): cascade 2 = phase 0x80 on frames = 1 mod N,
-// cascade 3 = phase 0x100 on frames = 0 mod N, applied through [renderer+448] by the phase loop override in
-// mcla_fsr_markers.cpp). This file holds the two function overrides that make a skipped cascade consistent.
+// cascade 3 = phase 0x100 on frames = 0 mod N, applied by the phase loop override in mcla_fsr_markers.cpp: the bit is cleared
+// in [renderer+448] AND the per-phase object renderer[k] is zeroed around the loop, see there). This file holds the two function
+// overrides that make a skipped cascade consistent.
 //
 // What a skipped cascade is. The shadow phase handler sub_823120C8 runs once per cascade phase; for cascade i it calls
 //   sub_825F5B18(shadow map)               per-frame parameter blend, writes into cascade 0's object only
@@ -11,9 +12,13 @@
 //   (i == 3) sub_825F4188(global, shadow map)  copies the four cascades' viewport matrices into [0x829019E4]+336, which the
 //                                          CPU culling (sub_822DF960 -> sub_825F3F90) reads to put boxes into cascade lists
 //   sub_825F5C48(shadow map, i, ..)        render target set, per-cascade constants (CShadowMap +0x160..0x24F), clear
-// then the phase object draws and resolves into the cascade's quarter of the shadow atlas. A phase left out of
-// [renderer+448] runs none of it: no draws, no clear, no resolve, and every per-cascade value computed in it keeps what the last
-// run wrote (the objects are persistent). Nothing else is recomputed per frame in a skipped cascade's slot.
+// then the phase object draws and resolves into the cascade's quarter of the shadow atlas. All of this is a virtual call of the
+// per-phase object renderer[k] (k = 7 and 8 for the cascades 2 and 3: the shadow system registered for the mask 0x7DE0), made at
+// the start of every phase whatever the mask says; clearing the mask bit only stopped the draw-list objects. That was the first
+// version's bug: the skipped cascade still set its target, CLEARED it and RESOLVED THE EMPTY DEPTH into its atlas quarter, so
+// the far shadows alternated with no shadow at all (scratch/ORC flicker runs). The loop override now zeroes renderer[k] for a
+// skipped phase too: none of it runs, no draws, no clear, no resolve, and every per-cascade value computed in it keeps what the
+// last run wrote (the objects are persistent). Nothing else is recomputed per frame in a skipped cascade's slot.
 //
 // 1. sub_825F61F0 (override; callers 0x82311AF4 in sub_823115E8 and 0x82312D54 / 0x82312FC4 in sub_823120C8; r3 = the CShadowMap, BE32[0x8288D2B4],
 //    the singleton the shadow collector phases pass) uploads the receivers' shader constants: 1/w, 1/h from +0x250/+0x254,

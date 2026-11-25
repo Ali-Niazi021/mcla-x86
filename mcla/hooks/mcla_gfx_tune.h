@@ -26,7 +26,7 @@ void OnFrame();
 
 // The phase bits the renderer's phase loop (sub_822E6408) leaves out of THIS frame: the environment-map phases
 // (0x4 | 0x8) on the frames mcla_gfx_env_interval skips, the reflection phase (0x2) on the frames
-// mcla_gfx_reflection_interval skips, and the far shadow cascades 2 and 3 (0x80 / 0x100) on alternate frames with
+// mcla_gfx_reflection_interval skips, and the far shadow cascade 2 (0x80; cascade 3 is never skipped) on alternate frames with
 // mcla_gfx_far_cascades_interval. `active_phases` = [renderer+364] & [renderer+448], the phases that would run (a far cascade
 // is only left out after a frame it was drawn in). 0 when every interval is 1 (as shipped). Called once per frame on the
 // render thread at the start of the phase loop (mcla_fsr_markers.cpp); only relaxed atomics are read.
@@ -39,7 +39,7 @@ bool PhasesActive();
 // (mcla_gfx_far_cascades.cpp) holds those cascades' light matrices. 0 as shipped.
 uint32_t FarCascadePhasesSkipped();
 
-// mcla_gfx_far_cascades_interval (1 = as shipped, 2 = cascades 2 and 3 drawn on alternate frames), clamped to 1..8.
+// mcla_gfx_far_cascades_interval (1 = as shipped, 2 = cascade 2 drawn on alternate frames), clamped to 1..8.
 uint32_t FarCascadesInterval();
 
 // True with mcla_gfx_far_cascades_interval=0: as shipped, plus a one-time log of the four cascade light matrices (to check

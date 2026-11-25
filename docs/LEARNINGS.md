@@ -9,6 +9,22 @@ Owner: ORC (merges what tasks report). One entry per non-obvious finding, newest
 
 ---
 
+### Owner-report Skipping a render phase by its draw-list mask still clears and resolves its target
+**Symptom** With `mcla_gfx_preset=perf` the car paint alternated bright/dark and far shadows flickered every other frame.
+**Cause** `mcla_gfx_env_interval=2` / `mcla_gfx_far_cascades_interval=2` clear bits in `[renderer+448]`, which only gates
+the 13 draw-list objects. The phase loop `sub_822E6408` still calls each phase's own object (`renderer[k]`, vtable +4 begin
+at `0x822E6800`, +8 end at `0x822E68E4`): it sets the target, clears it, draws nothing and resolves, so the env map / atlas
+quarter is overwritten with an empty target on every "skipped" frame (resolve log: env resolves in 726 of 731 frames).
+**Fix** Both knobs removed from `perf`; a still picture is not a flicker test. **Evidence** `$WORK/scratch/ORC/burst.py`
+(24 window captures in 1 s of the parked scene: 2.6 % of pixels with a temporal std > 6 with perf, 0.3 % without),
+`$WORK/runs/s7-env2-rlog`.
+
+### Owner-request Native 3200x2000 = a 1600x1000 guest drawn at 2x2
+**Symptom** A 3200x2000 guest back buffer cannot exist (5,000 EDRAM tiles per surface, reach 2,048). **Fix** Profile
+`2000p`: the `1000p` guest with `draw_resolution_scale_x/y=2` (`resolution_scale` is ignored as a default: it is only read
+when set by hand). The picture is correct (HUD, Vert+); 23–26 fps on the 880M, GPU 100 % busy; dual-write resolves and
+the direct present fall back at a scale above 1. **Evidence** runs `orc-native-n2000`, `orc-native2-*`, `orc-flk-n2000`.
+
 ### Sprint P1/R6 Where the 880M's time goes
 **Symptom** 1080p single tile ~17.8 ms GPU; game-side detail cuts barely moved it. **Cause** (1) the package is capped at
 ~35 W, so the GPU runs ~1.25–1.6 GHz of 2.9 and loses more when any other CPU work runs (agent builds, rga, VS Code,
