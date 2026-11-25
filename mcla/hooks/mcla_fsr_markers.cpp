@@ -7,7 +7,8 @@
 // Ported from RenanQueiroz/mcla-recomp src/render_markers.cpp (GPL-3, with credit): the call sites, the packet and
 // the make-room rule are his findings from launcher/dev/frame-structure-2026-10-16.md, which are his own analysis
 // (not LARecomp's). The code here is re-written for this layout; every address below was re-read in our generated code.
-// His other duties in the same file (the ultrawide aspect phase, the shadow-phase skip) are not ours and are left out.
+// His ultrawide aspect phase is not ours and is left out; his shadow-phase skip is the phase loop override below
+// (mcla_gfx_env_interval / mcla_gfx_reflection_interval, written for this layout from the findings of scratch/S3).
 //
 // What is written, and where. The frame is drawn by sub_822C0980 (called by the game loop sub_82131008), whose phase loop
 // sub_822E6408 walks the renderer's phase bits and calls sub_822E55D0(r3 = renderer, r4 = the phase bit) at the start
@@ -56,8 +57,12 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
+#include "mcla_gfx_tune.h"
 #include "mcla_hooks.h"
 
+#ifndef MCLA_HOOK_GFX_PHASES
+#define MCLA_HOOK_GFX_PHASES 0
+#endif
 #ifndef MCLA_HOOK_FSR_MARKERS
 #define MCLA_HOOK_FSR_MARKERS 0
 #endif
@@ -90,6 +95,9 @@ constexpr uint32_t kPhaseComposite = 0x04000000;
 constexpr uint32_t kPhasePost = 0x08000000;
 constexpr uint32_t kPhaseTonemap = 0x10000000;
 constexpr uint32_t kPhaseUI = 0x20000000;
+
+// The renderer's phase enable mask: the word the phase loop ANDs with [renderer+364] (0x822E6608); see the sub_822E6408 override.
+constexpr uint32_t kRendererPhaseEnableMask = 448;
 
 constexpr uint32_t kD3DDevicePointer = 0x82839254;
 constexpr uint32_t kDeviceWritePointer = 48;
@@ -198,8 +206,33 @@ extern "C" REX_FUNC(sub_822C0980) {
 }
 
 // The render phase loop: what is drawn after it in the frame (Bink movies) is over the finished picture.
+//
+// With MCLA_HOOK_GFX_PHASES the same override also lets the loop leave phases out of a frame (mcla_gfx_env_interval,
+// mcla_gfx_reflection_interval: mcla_gfx_tune.cpp, PhasesToSkip(), which also explains the phase bits). The loop runs a phase
+// only when its bit is set in [renderer+364] & [renderer+448] (reads at 0x822E6624 / 0x822E6608, once, before the first
+// phase); [renderer+448] is the phase enable mask (-1 from the constructor) and nothing else reads or writes it while a frame
+// is drawn, so the bits of the phases left out are cleared here, before the original runs, and OR-ed back after it: the game
+// never sees a changed mask outside this call. Only the bits that were set and that this call cleared are put back. The call is
+// made on the render thread; with every interval at 1 PhasesToSkip() is 0 and nothing is read or written.
 extern "C" REX_FUNC(sub_822E6408) {
+#if MCLA_HOOK_GFX_PHASES
+  const uint32_t renderer = ctx.r3.u32;  // the original takes the renderer in r3 and uses the register
+  const uint32_t skip = mcla::gfxtune::PhasesToSkip();
+  uint32_t left_out = 0;
+  if (skip && renderer >= 0x10000) {
+    const uint32_t mask = REX_LOAD_U32(renderer + kRendererPhaseEnableMask);
+    left_out = mask & skip;
+    if (left_out) {
+      REX_STORE_U32(renderer + kRendererPhaseEnableMask, mask & ~left_out);
+    }
+  }
+#endif
   __imp__sub_822E6408(ctx, base);
+#if MCLA_HOOK_GFX_PHASES
+  if (left_out) {
+    REX_STORE_U32(renderer + kRendererPhaseEnableMask, REX_LOAD_U32(renderer + kRendererPhaseEnableMask) | left_out);
+  }
+#endif
   EmitMarker(ctx, base, kRenderEnd, g_frame.load(std::memory_order_relaxed));
 }
 

@@ -31,7 +31,12 @@
 #             SIM_PRESENT_IMMEDIATE 0x82419AC0 + census 0x82419920 (W4.5): the guest's present-immediate threshold
 #             on timed swaps, cvar mcla_present_immediate (0 = as shipped, -1 = auto; mcla_sim60 on)
 #   cpu       CPU_POLL_WAIT 0x82148AB0, CPU_POLL_RELEASE 0x82160140, CPU_PUMP 0x821449C8
-#   gfx       GFX_CULL_MASK, GFX_SHADOW_MODE, GFX_DL_ENABLE, GFX_TRAFFIC_LOD, GFX_AMBIENT_ZONE (the mcla_gfx_* knobs)
+#   gfx       GFX_CULL_MASK, GFX_SHADOW_MODE, GFX_DL_ENABLE, GFX_TRAFFIC_LOD, GFX_AMBIENT_ZONE (the mcla_gfx_* knobs), plus
+#             GFX_PHASES (the phase skip inside the sub_822E6408 override of mcla_fsr_markers.cpp, so it needs FSR_MARKERS
+#             too: mcla_gfx_env_interval / mcla_gfx_reflection_interval), GFX_SHADOW_RES (mid-asm hook 0x825F69A0, cvar
+#             mcla_gfx_shadow_res; its codegen entry goes in hooks_gfx.toml) and GFX_IMPOSTORS (function overrides of
+#             sub_8230B778 / sub_8230D988, cvar mcla_gfx_impostors, no codegen entry); mcla_gfx_preset (perf, perf+, lowest)
+#             is a bundle of these and the older knobs
 #   fsr       FSR_MARKERS (W5.6): function overrides of sub_822C0980 / sub_822E6408 / sub_822E55D0 that write the guest
 #             render markers (PM4 NOP 'REXM') the SDK's FSR 3.1 temporal AA / upscaling needs; no codegen entry (link-time
 #             override of the generated weak functions); cvar mcla_render_markers (-1 = auto: on while temporal_aa=fsr)
@@ -84,6 +89,9 @@ set(MCLA_HOOK_DEFINITIONS
     MCLA_HOOK_GFX_DL_ENABLE=1
     MCLA_HOOK_GFX_TRAFFIC_LOD=1
     MCLA_HOOK_GFX_AMBIENT_ZONE=1
+    MCLA_HOOK_GFX_PHASES=1
+    MCLA_HOOK_GFX_SHADOW_RES=1
+    MCLA_HOOK_GFX_IMPOSTORS=1
     # FSR render markers, 60 fps input fixes (W5.6)
     MCLA_HOOK_FSR_MARKERS=1
     MCLA_HOOK_INPUT_TITLE_LATCH=1

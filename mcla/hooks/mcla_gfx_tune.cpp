@@ -26,10 +26,22 @@
 //   mcla_gfx_dl_clear         draw-list bits removed from every object's mask (mid-asm hook at 0x822E0180), see below
 //   mcla_gfx_traffic_lod      x the vehicle LOD thresholds (mid-asm hook at 0x827903E0)
 //   mcla_gfx_ambient_density  x pedestrian density and parked-car fraction of NEW ambient zones (hook 0x826F5CA0)
+//   mcla_gfx_env_interval     N = draw the environment-map phases (0x4 | 0x8: the cars' paint and speedometer reflection, 512x256 4x
+//                              and its mips) only every N-th frame (1 / 0 = every frame, as shipped). The phase loop sub_822E6408
+//                              reads [renderer+448] & [renderer+364]; the override in mcla_fsr_markers.cpp clears the bits in
+//                              [renderer+448] around the loop on the frames that are left out (PhasesToSkip())
+//   mcla_gfx_reflection_interval  the same for the reflection view phase (0x2); at 2 it falls on the frames the env map is left out
+//   mcla_gfx_shadow_res       0 = shipped 640; 512 or 384 = the edge of the sun-shadow map (mid-asm hook 0x825F69A0 in the CShadowMap
+//                              constructor, mcla_gfx_shadow_res.cpp). Read when the shadow map is created: a world load
+//   mcla_gfx_impostors        false = no tree impostors (the game's own `noimpostors` switch, plus the guard of the refresh loop
+//                              the switch alone would hang in: mcla_gfx_impostors.cpp). Applies to impostors created after the change
+//   mcla_gfx_preset           "" = as shipped, perf, perf+, lowest: bundles of the knobs above and below, applied once at first use
+//                              as app defaults; a knob set by hand wins (see ApplyPreset)
 // mcla_gfx_dump logs words: 'SPEC/COUNT' joined by '+' (same SPEC), once per change of the string
 // (add '+0/0' to dump again); each line is the address, then 8 words as hex with the float reading.
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -64,6 +76,12 @@
 #ifndef MCLA_HOOK_GFX_AMBIENT_ZONE
 #define MCLA_HOOK_GFX_AMBIENT_ZONE 0
 #endif
+#ifndef MCLA_HOOK_GFX_PHASES
+#define MCLA_HOOK_GFX_PHASES 0
+#endif
+#ifndef MCLA_HOOK_FSR_MARKERS
+#define MCLA_HOOK_FSR_MARKERS 0
+#endif
 
 REXCVAR_DEFINE_STRING(mcla_gfx_poke, "none", "MCLA",
                       "MCLA quality knobs, generic: guest memory writes applied every engine frame, "
@@ -94,6 +112,31 @@ REXCVAR_DEFINE_DOUBLE(mcla_gfx_traffic_lod, 1.0, "MCLA",
 REXCVAR_DEFINE_DOUBLE(mcla_gfx_ambient_density, 1.0, "MCLA",
                       "MCLA quality knob: scale of pedestrian density and the parked-car fraction of ambient zones "
                       "built after the change (hook 0x826F5CA0: at the next load). 1 = as shipped");
+REXCVAR_DEFINE_INT32(mcla_gfx_env_interval, 1, "MCLA",
+                     "MCLA quality knob: the environment-map phases of the renderer (0x4 | 0x8: the cars' paint and speedometer "
+                     "reflection) are drawn only every N-th frame; the frames in between keep the last picture. 1 (or 0) = every "
+                     "frame, as shipped. Live (the phase loop override of mcla_fsr_markers.cpp, build flag MCLA_HOOK_GFX_PHASES)")
+    .range(0, 8);
+REXCVAR_DEFINE_INT32(mcla_gfx_reflection_interval, 1, "MCLA",
+                     "MCLA quality knob: the reflection view phase (0x2) is drawn only every N-th frame (at 2, on the frames the "
+                     "environment map is not). 1 (or 0) = every frame, as shipped. Live (same override as "
+                     "mcla_gfx_env_interval)")
+    .range(0, 8);
+REXCVAR_DEFINE_INT32(mcla_gfx_shadow_res, 0, "MCLA",
+                     "MCLA quality knob: the edge of the sun-shadow map in texels (the game's 640; the cascades are drawn into one "
+                     "square render target and resolved from it): 0 or 640 = as shipped, 512 or 384. Read when the shadow map is "
+                     "created (a world load; mid-asm hook 0x825F69A0, mcla_gfx_shadow_res.cpp)")
+    .allowed({"0", "384", "512", "640"});
+REXCVAR_DEFINE_BOOL(mcla_gfx_impostors, true, "MCLA",
+                    "MCLA quality knob: false = no tree impostors (the game's own noimpostors switch; with it the game's refresh "
+                    "loop would never end, so mcla_gfx_impostors.cpp guards it). Applies to impostors created after the change. "
+                    "true = as shipped");
+REXCVAR_DEFINE_STRING(mcla_gfx_preset, "", "MCLA",
+                      "MCLA quality preset for a weak GPU, a bundle of the mcla_gfx_* knobs, applied once at first use as app "
+                      "defaults (a knob set by hand wins): '' = as shipped; perf = env_interval 2, reflection_interval 2, "
+                      "shadow_dist 0.6, traffic_lod 0.7, city_lod 0.67, shadow_res 512; perf+ (perfplus) = perf + dl_disable 256 "
+                      "(no far cascade) + impostors off; lowest = perf + shadow_mode 1 (no sun shadows). Logs "
+                      "'[mcla-gfx] preset <name>: ...' once");
 REXCVAR_DEFINE_STRING(mcla_gfx_dump, "none", "MCLA",
                       "MCLA debug: log guest words once per change of this string, 'ADDR/COUNT+...' "
                       "(ADDR as in mcla_gfx_poke). Live");
@@ -424,9 +467,184 @@ void Dump() {
   }
 }
 
+// ---- the environment-map and reflection phases at a lower rate (PhasesToSkip) -------------------------------------
+//
+// The phase loop sub_822E6408 (one call per frame, from sub_822C0980 at 0x822C0B08, on the render thread) walks r30 = 1, 2, 4
+// ... 0x20000000 and runs a phase only when its bit is set in r21 = [renderer+364] & [renderer+448]: `lwz r11,448(r27)` at
+// 0x822E6608, `lwz r17,364(r27)` at 0x822E6624, `and r21,r17,r11` at 0x822E6630, r21 stored to [renderer+360] at 0x822E66D8, and
+// the 13 phase objects at renderer+128.. (render target set, clear, draws, resolve) are called only for a phase in r21
+// (`and r10,r30,r21; beq` at 0x822E6844). A phase left out of the mask costs nothing and keeps the textures it resolved
+// the last time it ran (the guest memory is not cleared).
+//   +364 is the draw-type enable mask the game and mcla_gfx_dl_disable change every frame; +448 is not: it is -1 from the
+//   renderer constructor (0x822E4838, sub_822E47E0), cut by dev options in the constructor, and otherwise written only by
+//   sub_822E51F8 (no direct caller). It is read by nothing but the phase loop (scan of the generated code: the only function that
+//   loads the renderer global 0x8287E064 and reads +448). So +448 is the word to clear, on the render thread, around the call.
+//
+// The bits. Phase k is the k-th entry of the draw-type name table at 0x827E19E4 (dtRENDERTARGETS, dtREFLECTIONMAP, dtENVMAP0,
+// dtENVMAP1, dtPARTICLECOLLISIONMAP, dtSHADOWMAP0..3, dtCULLING, dtSHADOWCOLLECTORFAST, dtSHADOWPREPASS ... dtUI; the table's own
+// second column holds 1 << (k + 1), one bit up, so the bit is the entry's index, not that column): 0x1 render targets,
+// 0x2 reflection map, 0x4 env map 0, 0x8 env map 1, 0x10 particle collision map, 0x20 / 0x40 / 0x80 / 0x100 shadow cascades 0..3,
+// 0x200 culling, 0x400 fast shadow collector, 0x800 shadow prepass = the start of the main view (the FSR scene marker). Checked
+// against code: the shadow phase handler sub_823120C8 (r18 = the phase bit) does `addi r11,r18,-32; cmplwi r11,224` + a jump
+// table that gives 0x20 / 0x40 / 0x80 / 0x100 the cascade index 0..3, `cmpwi r18,1024` gives 0x400 index 4, and 0x1000 / 0x2000 /
+// 0x4000 / 0x800 get 5 / 6 / 7 / 8 (0x82312220-0x823122C4); the fast shadow path of sub_822F3BD8 removes 0x71E0 (the four cascades
+// + collectors 0x1000 / 0x2000 / 0x4000) from +364. So entry 5 = 0x20 and the entries before it (render targets, reflection, env 0,
+// env 1, particle collision) are 0x1, 0x2, 0x4, 0x8, 0x10. The same bits as RenanQueiroz/mcla-recomp's frame-structure notes
+// (cascades 0x20..0x100, env map 0x4 | 0x8, reflection 0x2) and the iOS port's mcla_gfx_dl_clear (2 / 4 / 8).
+constexpr uint32_t kPhaseReflection = 0x2;
+constexpr uint32_t kPhaseEnvMaps = 0x4 | 0x8;
+constexpr uint32_t kMaxInterval = 8;
+
+std::atomic<uint32_t> g_env_interval{1};
+std::atomic<uint32_t> g_reflection_interval{1};
+std::atomic<uint32_t> g_phase_frame{0};
+
+uint32_t ClampInterval(int32_t value) {
+  return value <= 1 ? 1u : (uint32_t(value) > kMaxInterval ? kMaxInterval : uint32_t(value));
+}
+
+// Game thread, from OnFrame: the cvars into the atomics the render thread reads, with a log line per change.
+void PublishPhaseIntervals() {
+  const uint32_t env = ClampInterval(REXCVAR_GET(mcla_gfx_env_interval));
+  const uint32_t reflection = ClampInterval(REXCVAR_GET(mcla_gfx_reflection_interval));
+  if (env == g_env_interval.load(std::memory_order_relaxed) &&
+      reflection == g_reflection_interval.load(std::memory_order_relaxed)) {
+    return;
+  }
+  g_env_interval.store(env, std::memory_order_relaxed);
+  g_reflection_interval.store(reflection, std::memory_order_relaxed);
+  REXLOG_INFO(
+      "[mcla-gfx] phases: environment map (0x{:X}) drawn every {} frame(s), reflection view (0x{:X}) every {} frame(s) "
+      "(1 = as shipped; the skipped frames keep the last picture)",
+      kPhaseEnvMaps, env, kPhaseReflection, reflection);
+}
+
+// ---- mcla_gfx_preset ----------------------------------------------------------------------------------------------
+//
+// A bundle of knobs applied with rex::cvar::SetDefaultValue (the way the profile's tables are, mcla/profile/pc_profile.cpp):
+// the value becomes the cvar's own default while nothing else sets it, so a knob set by hand (command line, config file,
+// environment, console) keeps its value, and nothing is written to the config file. Applied once, at first use: OnFrame, a
+// hook registration's announce line, or a hook that reads a knob at its own time (shadow map size, impostors).
+struct PresetKnob {
+  const char* cvar;
+  const char* value;
+};
+
+// perf: near-identical picture, about 1.2-1.8 ms of GPU at 1080p on the 880M [INFERENCE from scratch/S3/REPORT.md].
+constexpr PresetKnob kPresetPerf[] = {
+    {"mcla_gfx_env_interval", "2"},        // car paint / speedometer reflection at 30 Hz
+    {"mcla_gfx_reflection_interval", "2"},  // reflection view at 30 Hz, on the other frames than the env map
+    {"mcla_gfx_shadow_dist", "0.6"},        // sections past 120 m cast no cascade shadows
+    {"mcla_gfx_traffic_lod", "0.7"},
+    {"mcla_gfx_city_lod", "0.67"},
+    {"mcla_gfx_shadow_res", "512"},  // 640 -> 512: ~36 % less cascade fill; read when the shadow map is created
+};
+// perf+: perf and no far shadow cascade (stale far shadows in motion), no tree impostors.
+constexpr PresetKnob kPresetPerfPlus[] = {
+    {"mcla_gfx_dl_disable", "256"},
+    {"mcla_gfx_impostors", "false"},
+};
+// lowest: perf and no sun shadows (the game's own night path).
+constexpr PresetKnob kPresetLowest[] = {
+    {"mcla_gfx_shadow_mode", "1"},
+};
+
+std::string Lower(const std::string& text) {
+  size_t b = 0, e = text.size();
+  while (b < e && std::isspace(static_cast<unsigned char>(text[b]))) ++b;
+  while (e > b && std::isspace(static_cast<unsigned char>(text[e - 1]))) --e;
+  std::string out = text.substr(b, e - b);
+  for (char& c : out) c = char(std::tolower(static_cast<unsigned char>(c)));
+  return out;
+}
+
+// "0.600000" -> "0.6", "2" -> "2".
+std::string Pretty(std::string value) {
+  if (value.find('.') != std::string::npos) {
+    while (!value.empty() && value.back() == '0') value.pop_back();
+    if (!value.empty() && value.back() == '.') value.pop_back();
+  }
+  return value;
+}
+
+void ApplyPreset() {
+  const std::string requested = REXCVAR_GET(mcla_gfx_preset);
+  std::string name = Lower(requested);
+  if (name.empty() || name == "default" || name == "none" || name == "shipped") {
+    return;
+  }
+  if (name == "perfplus" || name == "perf_plus" || name == "perf-plus") {
+    name = "perf+";  // '+' in a value is awkward in some shells and bench variants
+  }
+  std::vector<PresetKnob> knobs(std::begin(kPresetPerf), std::end(kPresetPerf));
+  if (name == "perf+") {
+    knobs.insert(knobs.end(), std::begin(kPresetPerfPlus), std::end(kPresetPerfPlus));
+  } else if (name == "lowest") {
+    knobs.insert(knobs.end(), std::begin(kPresetLowest), std::end(kPresetLowest));
+  } else if (name != "perf") {
+    REXLOG_WARN("[mcla-gfx] preset '{}': unknown (perf, perf+, lowest, or empty for as shipped): nothing applied", requested);
+    return;
+  }
+  const size_t prefix = std::strlen("mcla_gfx_");
+  std::string line;
+  for (const PresetKnob& knob : knobs) {
+    // Set by hand (anything but the compiled-in default, an app default of the profile included) = the user's value stays.
+    const bool by_hand = rex::cvar::GetFlagSource(knob.cvar) != rex::cvar::Source::kDefault;
+    const bool ok = rex::cvar::SetDefaultValue(knob.cvar, knob.value);
+    line += ' ';
+    line += knob.cvar + prefix;
+    line += '=';
+    line += Pretty(rex::cvar::GetFlagByName(knob.cvar));
+    if (by_hand) {
+      line += "(yours)";
+    }
+    if (!ok) {
+      line += "(REJECTED)";
+    }
+  }
+  REXLOG_INFO("[mcla-gfx] preset {}:{}", name, line);
+}
+
 }  // namespace
 
+void EnsurePreset() {
+  static std::once_flag once;
+  std::call_once(once, ApplyPreset);
+}
+
+uint32_t PhasesToSkip() {
+  const uint32_t env = g_env_interval.load(std::memory_order_relaxed);
+  const uint32_t reflection = g_reflection_interval.load(std::memory_order_relaxed);
+  if (env <= 1 && reflection <= 1) {
+    return 0;  // as shipped: nothing written, nothing counted
+  }
+  // The frames are the phase loop's own calls. The first `interval` frames draw everything (the textures exist before they
+  // are reused); after that the env map is drawn on frames = 0 mod N and the reflection view on frames = 1 mod N, so at N = 2
+  // the two take turns and the frame cost stays even.
+  const uint32_t frame = g_phase_frame.fetch_add(1, std::memory_order_relaxed);
+  uint32_t skip = 0;
+  if (env > 1 && frame >= env && frame % env != 0) {
+    skip |= kPhaseEnvMaps;
+  }
+  if (reflection > 1 && frame >= reflection && frame % reflection != 1) {
+    skip |= kPhaseReflection;
+  }
+  return skip;
+}
+
+uint32_t ShadowMapSize() {
+  EnsurePreset();
+  const int32_t size = REXCVAR_GET(mcla_gfx_shadow_res);
+  return (size == 384 || size == 512) ? uint32_t(size) : 640u;
+}
+
+bool ImpostorsEnabled() {
+  EnsurePreset();
+  return REXCVAR_GET(mcla_gfx_impostors);
+}
+
 void OnFrame() {
+  EnsurePreset();
   std::lock_guard<std::mutex> lock(g_mutex);
   // The per-call hooks read these relaxed atomics, not the cvars.
   g_dl_clear.store(uint32_t(REXCVAR_GET(mcla_gfx_dl_clear)), std::memory_order_relaxed);
@@ -443,6 +661,7 @@ void OnFrame() {
   g_shadow_mode.store(g_eff.shadow_mode, std::memory_order_relaxed);
   g_traffic_lod.store(float(g_eff.traffic_lod), std::memory_order_relaxed);
   g_ambient_density.store(float(REXCVAR_GET(mcla_gfx_ambient_density)), std::memory_order_relaxed);
+  PublishPhaseIntervals();
   std::map<std::string, Entry> want;
   GatherPokes(&want);
   GatherKnobs(&want);
@@ -462,20 +681,38 @@ mcla::hooks::Registration g_reg_cull("gfx-cull", "mcla_gfx_dl_clear", MCLA_HOOK_
                                      /*default_on=*/false);
 mcla::hooks::Registration g_reg_shadow_mode("gfx-shadow-mode", "mcla_gfx_shadow_mode",
                                             MCLA_HOOK_GFX_SHADOW_MODE != 0,
-                                            [] { return REXCVAR_GET(mcla_gfx_shadow_mode) != 0; },
+                                            [] {
+                                              mcla::gfxtune::EnsurePreset();
+                                              return REXCVAR_GET(mcla_gfx_shadow_mode) != 0;
+                                            },
                                             /*default_on=*/false);
 mcla::hooks::Registration g_reg_dl_enable("gfx-dl-disable", "mcla_gfx_dl_disable",
                                           MCLA_HOOK_GFX_DL_ENABLE != 0,
-                                          [] { return REXCVAR_GET(mcla_gfx_dl_disable) != 0; },
+                                          [] {
+                                            mcla::gfxtune::EnsurePreset();
+                                            return REXCVAR_GET(mcla_gfx_dl_disable) != 0;
+                                          },
                                           /*default_on=*/false);
 mcla::hooks::Registration g_reg_traffic("gfx-traffic-lod", "mcla_gfx_traffic_lod",
                                         MCLA_HOOK_GFX_TRAFFIC_LOD != 0,
-                                        [] { return REXCVAR_GET(mcla_gfx_traffic_lod) != 1.0; },
+                                        [] {
+                                          mcla::gfxtune::EnsurePreset();
+                                          return REXCVAR_GET(mcla_gfx_traffic_lod) != 1.0;
+                                        },
                                         /*default_on=*/false);
 mcla::hooks::Registration g_reg_ambient("gfx-ambient", "mcla_gfx_ambient_density",
                                         MCLA_HOOK_GFX_AMBIENT_ZONE != 0,
                                         [] { return REXCVAR_GET(mcla_gfx_ambient_density) != 1.0; },
                                         /*default_on=*/false);
+// The phase skip is an override of sub_822E6408 in mcla_fsr_markers.cpp: it needs both build flags.
+mcla::hooks::Registration g_reg_phases("gfx-phases", "mcla_gfx_env_interval",
+                                       MCLA_HOOK_GFX_PHASES != 0 && MCLA_HOOK_FSR_MARKERS != 0,
+                                       [] {
+                                         mcla::gfxtune::EnsurePreset();
+                                         return REXCVAR_GET(mcla_gfx_env_interval) > 1 ||
+                                                REXCVAR_GET(mcla_gfx_reflection_interval) > 1;
+                                       },
+                                       /*default_on=*/false);
 }  // namespace
 
 #if MCLA_HOOK_GFX_CULL_MASK
