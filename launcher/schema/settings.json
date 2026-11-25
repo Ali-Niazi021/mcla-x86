@@ -14,7 +14,7 @@
     {
       "id": "recommended",
       "label": "Recommended (1080p)",
-      "help": "True 1920x1080, single-tile scene, MSAA off, the 60 fps profile with late-frame release and the Performance scene-detail preset. Whether it holds 60 fps depends on the GPU (about 55 fps measured on a Radeon 880M); pick Balanced or Performance if it does not.",
+      "help": "True 1920x1080, single-tile scene, MSAA off, the 60 fps profile with late-frame release and the Performance scene-detail preset. About 60 fps on the Radeon 880M in Performance mode, with occasional dips; pick Balanced or Performance if your GPU is slower.",
       "set": {
         "mcla_profile": "1080p",
         "mcla_noaa": true,
@@ -33,7 +33,7 @@
     {
       "id": "balanced_900",
       "label": "Balanced (900p 60)",
-      "help": "1600x900 at the 60 fps profile, no upscaler, scaled to the screen by the presenter (about 59 fps measured on a Radeon 880M).",
+      "help": "1600x900 at the 60 fps profile, no upscaler, scaled to the screen by the presenter: a lighter load than 1080p.",
       "set": {
         "mcla_profile": "900p",
         "mcla_noaa": true,
@@ -52,7 +52,7 @@
     {
       "id": "performance_720",
       "label": "Performance (720p 60)",
-      "help": "The shipped 1280x720 at the 60 fps profile with MSAA off and the Performance scene-detail preset: the lightest 60 fps setup (held 60 fps on a Radeon 880M).",
+      "help": "The shipped 1280x720 at the 60 fps profile with MSAA off and the Performance scene-detail preset: the lightest 60 fps setup (60.00 fps, 99th percentile 17.4 ms on a Radeon 880M in Performance mode).",
       "set": {
         "mcla_profile": "default",
         "mcla_noaa": true,
@@ -71,7 +71,7 @@
     {
       "id": "fsr4_1080",
       "label": "FSR 4 (1080p from 540p, experimental)",
-      "help": "A 1920x1080 picture with the 3D scene drawn at 960x540 and upscaled by AMD FSR 4 (the 1080p-fsr4p profile: 2x, sharpness 0.2). Needs AMD's signed runtime DLLs next to mcla.exe and a Radeon RDNA 2 or newer / 800M series GPU; otherwise it runs FSR 3.1.6. Experimental.",
+      "help": "A 1920x1080 picture with the 3D scene drawn at 960x540 and upscaled by AMD FSR 4 (the 1080p-fsr4p profile: 2x, sharpness 0.2). Needs AMD's signed runtime DLLs next to mcla.exe and a Radeon RDNA 2 or newer / 800M series GPU; otherwise it runs FSR 3.1.6. Experimental: 37 fps measured on a Radeon 880M, slower than native 1080p.",
       "set": {
         "mcla_profile": "1080p",
         "mcla_noaa": true,
@@ -140,8 +140,8 @@
         {"value": "default", "label": "1280x720 (shipped, 16:9)", "help": "The console's own size. With MSAA off it is the cheapest setting."},
         {"value": "800p", "label": "1280x800 (16:10)", "help": "Matches a 16:10 laptop panel. Vert+ camera, HUD in a 16:9 band."},
         {"value": "900p16", "label": "1440x900 (16:10)", "help": "16:10 at 900 rows. Vert+ camera, HUD in a 16:9 band."},
-        {"value": "900p", "label": "1600x900 (16:9)", "help": "A step below 1080p; about 59 fps measured on a Radeon 880M (native 1080p: about 55)."},
-        {"value": "1080p", "label": "1920x1080 (16:9)", "help": "True 1920x1080 render, MSAA off. Heavy on integrated GPUs (about 55 fps measured on a Radeon 880M)."},
+        {"value": "900p", "label": "1600x900 (16:9)", "help": "A step below 1080p: a lighter load than 1920x1080, scaled to the screen by the presenter."},
+        {"value": "1080p", "label": "1920x1080 (16:9)", "help": "True 1920x1080 render, MSAA off. About 60 fps with occasional dips on a Radeon 880M in Performance mode, with the Performance scene-detail preset."},
         {"value": "1200p", "label": "1920x1200 (16:10)", "help": "16:10 at 1200 rows. Vert+ camera, HUD in a 16:9 band. The heaviest size."}
       ],
       "advanced": false,
@@ -288,7 +288,7 @@
     {
       "id": "temporal_aa",
       "label": "Upscaler (AMD FSR)",
-      "help": "AMD FSR temporal upscaling: the 3D scene is drawn smaller and upscaled to the output size, with temporal anti-aliasing. HUD and post-processing stay at full size. Needs: MSAA disabled, Single-tile scene on, Direct3D 12. The FSR pass costs about 4 ms on a Radeon 880M, so it is slower than native 1080p there; it pays off only where shading dominates.",
+      "help": "AMD FSR temporal upscaling: the 3D scene is drawn smaller and upscaled to the output size, with temporal anti-aliasing. HUD and post-processing stay at full size. Needs: MSAA disabled, Single-tile scene on, Direct3D 12. On a Radeon 880M it measured slower than native 1080p (FSR 3: 49 fps, FSR 4: 37 fps against 60), so it only pays off where shading dominates.",
       "category": "graphics",
       "type": "enum",
       "cvar": "temporal_aa",
@@ -310,8 +310,8 @@
       "cvar": "temporal_aa_upscaler",
       "default": "fsr3",
       "options": [
-        {"value": "fsr3", "label": "FSR 3.1", "help": "AMD FSR 3.1 (the temporal upscaler built into the game; FSR 3.1.6 with AMD's runtime)."},
-        {"value": "fsr4", "label": "FSR 4 (ML)", "help": "AMD's machine-learning upscaler (experimental here); the game falls back to FSR 3.1.6 where the GPU or the runtime does not offer it."},
+        {"value": "fsr3", "label": "FSR 3.1", "help": "AMD FSR 3.1 (the temporal upscaler built into the game; FSR 3.1.6 with AMD's runtime). 49 fps measured on a Radeon 880M."},
+        {"value": "fsr4", "label": "FSR 4 (ML)", "help": "AMD's machine-learning upscaler (experimental here; 37 fps measured on a Radeon 880M); the game falls back to FSR 3.1.6 where the GPU or the runtime does not offer it."},
         {"value": "auto", "label": "Auto (FSR 4 if available, else FSR 3.1)", "help": "FSR 4.1 on RDNA 2 and newer and the Radeon 800M series when AMD's signed runtime is next to mcla.exe, else FSR 3.1."}
       ],
       "advanced": false,
@@ -414,7 +414,7 @@
       "default": "perf",
       "options": [
         {"value": "default", "label": "Full (as shipped)", "help": "No change to the game's own detail levels."},
-        {"value": "perf", "label": "Performance", "help": "Car paint and reflection views drawn every 2nd frame, shadow distance 0.6, vehicle LOD 0.7, city LOD 0.67, sun-shadow map 512. Near-identical picture; an estimated 1-2 ms of GPU time saved at 1080p."},
+        {"value": "perf", "label": "Performance", "help": "Car paint and reflection views drawn every 2nd frame, shadow distance 0.6, vehicle LOD 0.7, city LOD 0.67, sun-shadow map 512. Near-identical picture; at 1080p on a Radeon 880M it brought the 99th-percentile frame time from about 24.5 ms to 20-23 ms."},
         {"value": "perfplus", "label": "Performance+", "help": "Performance plus no far shadow cascade and no tree impostors."},
         {"value": "lowest", "label": "Lowest", "help": "Performance plus no sun shadows (the game's own night path): the largest saving, at the price of every sun shadow."}
       ],
@@ -1299,6 +1299,123 @@
       "type": "bool",
       "cvar": "mcla_watchdog",
       "default": true,
+      "advanced": true,
+      "emit": "nondefault"
+    },
+    {
+      "id": "resolve_dual_write",
+      "label": "Optimization: dual-write resolve",
+      "help": "Direct3D 12: a resolve also writes the host texture directly, so the texture cache does not load it back from shared memory. Exact in the check (15,691 resolved textures, 0 differing); about 0.6 ms less GPU time at 1080p. Turn off to compare or if textures look wrong.",
+      "category": "advanced",
+      "type": "bool",
+      "cvar": "resolve_dual_write",
+      "default": true,
+      "advanced": true,
+      "requires": {"mcla_gpu_backend": "d3d12"},
+      "emit": "nondefault"
+    },
+    {
+      "id": "swap_direct_present",
+      "label": "Optimization: direct present",
+      "help": "Direct3D 12: the finished frame goes to the swap chain straight from its render target instead of through an extra full-screen copy. Exact in 155 swap checks; about 0.35 ms less GPU time at 1080p.",
+      "category": "advanced",
+      "type": "bool",
+      "cvar": "swap_direct_present",
+      "default": true,
+      "advanced": true,
+      "requires": {"mcla_gpu_backend": "d3d12"},
+      "emit": "nondefault"
+    },
+    {
+      "id": "force_convert_quad_lists_to_triangle_lists",
+      "label": "Optimization: quad lists as triangles",
+      "help": "Converts the game's quad lists to triangle lists up front: the same triangles on a cheaper path (the picture was identical in the check).",
+      "category": "advanced",
+      "type": "bool",
+      "cvar": "force_convert_quad_lists_to_triangle_lists",
+      "default": true,
+      "advanced": true,
+      "emit": "nondefault"
+    },
+    {
+      "id": "clear_memory_page_state",
+      "label": "Optimization: clear memory page state (off = faster)",
+      "help": "Off (the default here) keeps uploaded vertex and index memory valid between frames. On is the SDK's old behaviour: it drops every page the GPU did not write at the end of each frame, so 25-30 MB are re-uploaded each frame (about 0.45 CPU core, 0.7 ms GPU). Turn on only if geometry or textures look stale.",
+      "category": "advanced",
+      "type": "bool",
+      "cvar": "clear_memory_page_state",
+      "default": false,
+      "advanced": true,
+      "emit": "nondefault"
+    },
+    {
+      "id": "dxbc_ps_refactoring_allowed",
+      "label": "Optimization: fast-math pixel shaders",
+      "help": "Direct3D 12: pixel shaders compile in the driver's fast-math mode (fused multiply-add, reassociation): about 20-30 % fewer vector ALU instructions. Last-ulp colour differences only.",
+      "category": "advanced",
+      "type": "bool",
+      "cvar": "dxbc_ps_refactoring_allowed",
+      "default": true,
+      "advanced": true,
+      "requires": {"mcla_gpu_backend": "d3d12"},
+      "emit": "nondefault"
+    },
+    {
+      "id": "dxbc_ps_mad",
+      "label": "Optimization: multiply-add in pixel shaders",
+      "help": "With fast-math pixel shaders: a Xenos mad becomes one multiply-add. The 0 x anything = 0 check is dropped for those terms, so 0 x infinity is NaN there.",
+      "category": "advanced",
+      "type": "bool",
+      "cvar": "dxbc_ps_mad",
+      "default": true,
+      "advanced": true,
+      "requires": {"dxbc_ps_refactoring_allowed": true},
+      "emit": "nondefault"
+    },
+    {
+      "id": "dxbc_sample_bias",
+      "label": "Optimization: texture sample with LOD bias",
+      "help": "Direct3D 12: where the hardware computes the texture LOD, pixel shaders sample with sample_b instead of sample_d with scaled derivatives: the same LOD with fewer instructions.",
+      "category": "advanced",
+      "type": "bool",
+      "cvar": "dxbc_sample_bias",
+      "default": true,
+      "advanced": true,
+      "requires": {"mcla_gpu_backend": "d3d12"},
+      "emit": "nondefault"
+    },
+    {
+      "id": "dxbc_forward_cf",
+      "label": "Optimization: forward-jump shaders without a loop",
+      "help": "Direct3D 12: pixel shaders whose control flow is only forward jumps are translated without the main loop used for jumping back, so the compiler need not keep a loop back-edge.",
+      "category": "advanced",
+      "type": "bool",
+      "cvar": "dxbc_forward_cf",
+      "default": true,
+      "advanced": true,
+      "requires": {"mcla_gpu_backend": "d3d12"},
+      "emit": "nondefault"
+    },
+    {
+      "id": "dxbc_vs_straight_fetch",
+      "label": "Optimization: straight-line vertex fetch",
+      "help": "Direct3D 12: the vertex fetch is straight-line code (static shared-memory binding, branch-free endian swap), so the driver issues a vertex shader's loads together. The same values.",
+      "category": "advanced",
+      "type": "bool",
+      "cvar": "dxbc_vs_straight_fetch",
+      "default": true,
+      "advanced": true,
+      "requires": {"mcla_gpu_backend": "d3d12"},
+      "emit": "nondefault"
+    },
+    {
+      "id": "tonemap_transfer_skip",
+      "label": "Optimization: skip tone-map transfer (experimental)",
+      "help": "Experimental, off in the profile: skips the full-screen copy of the scene colour into the tone map's render target where the tone map is proven to rewrite the whole screen. Needs the render markers (switched on automatically). Check the picture.",
+      "category": "advanced",
+      "type": "bool",
+      "cvar": "tonemap_transfer_skip",
+      "default": false,
       "advanced": true,
       "emit": "nondefault"
     },
