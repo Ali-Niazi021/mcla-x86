@@ -1,0 +1,688 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Wed, 25 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 04b0: pixel shader DXBC translation options: refactoringAllowed, fused mad, sample_b, loop-free forward control flow, IEEE multiplication (Direct3D 12; dxbc_ps_refactoring_allowed, dxbc_ps_mad, dxbc_sample_bias, dxbc_forward_cf, dxbc_ps_ieee_mul)
+
+Source: Ours, written for this SDK (O3; changes R1-A, B, C, D and F of $WORK/scratch/R1/REPORT.md, whose variants/src is the working
+  code of each). The DXBC translator they change is Xenia's (Triang3l, BSD-3-Clause) in the ReXGlue SDK. Not run in the game:
+  built (SDK build of the series with this patch, scratch tree $WORK/scratch/O3) and run offline on the 1,061 translations of the
+  E2 shader storage (the harness below), compiled by RGA for gfx1150, nothing more
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: R1 measured that a median MCLA pixel shader costs about 25 vector ALU instructions per Xenos instruction slot on the
+  Radeon 880M (about 5 would do), from the way the DXBC translator emits it: the precise-mode flags, the SM3 "0 * anything = 0"
+  check after every multiplication, no fused multiply-add, gradient-scaled sample_d where only the LOD bias is wanted, and a
+  loop around the whole shader that survives in the biggest (forward-jump) ones. Five cvars, each its own option, all default
+  false until a run has validated them (the profile turns them on). All of them are for pixel shaders only (vertex shaders are
+  translated exactly as before: position invariance), and only on host render targets (the RTV path, not ROV); with all of them
+  off the translation is byte-identical to the stock one (1,061 of 1,061 translations of the E2 corpus, 621 pixel and 440 vertex).
+  * dxbc_ps_refactoring_allowed (R1-A): sets the refactoringAllowed global flag (dcl_globalFlags) in a pixel shader that writes
+    neither oDepth nor, through depth_stencil_mode, the float24 conversion of the depth, so the driver compiles it in fast math
+    mode (fused multiply-add, reassociation, uniform integer work of the fetch constants on the scalar unit). Last-ulp colour
+    differences only. RGA, 126 pixel shaders (R1's subset: all 52 jmp ones, every 8th other, the tone map): vector ALU -20.2% (280,161 -> 223,551),
+    VGPRs mean 78.4 -> 62.3.
+  * dxbc_ps_mad (R1-B, only together with dxbc_ps_refactoring_allowed): the Xenos mad, and the dp2add/dp3/dp4 terms after the
+    first, are the DXBC mad (one fused multiply-add) instead of mul + the SM3 zero check + add. THIS DROPS THE SM3 CHECK FOR THESE
+    (0 * infinity and 0 * NaN in them are NaN, not 0): the same risk as dxbc_ps_ieee_mul, only for these instructions. RGA, on top
+    of A: -29.7% in total (196,880), mean VGPRs 61.2.
+  * dxbc_sample_bias (R1-D): where the LOD is computed by the hardware (no gradients from registers, mip filtering on) the texture
+    is sampled with sample_b, the bias (fetch constant + register LOD + instruction bias, as before) being its operand, instead of
+    sample_d with the coarse derivatives made by hand and multiplied by 2^bias: the same LOD (the gradients times 2^b are the LOD
+    plus b, also with the anisotropic filter, whose ratio the scale leaves alone), no derivative instructions, 4 address
+    registers fewer per sample. Not for 3D / stacked fetches (the second layer of a stacked texture is sampled under a per-pixel
+    `if`, which implicit derivatives would be taken in; the stock translation takes the derivatives before it). New opcode
+    sample_b (74) in format/dxbc.h. RGA alone: -6.6% (261,798), mean VGPRs 77.3.
+  * dxbc_forward_cf (R1-F): a pixel shader whose control flow is execs and forward jumps only (at least one jmp; no loop, call or
+    return; the new Shader::control_flow_forward_jumps_only, found in AnalyzeUcode, which for MCLA are 23 shaders, 52 pixel
+    translations, the biggest ones) is translated without the `loop` around everything: the code of a label is the if (pc <= label)
+    region of the stock non-switch flow, and a jmp or an end sets pc (the end to the maximum) and closes the region, opening the
+    rest of it for the lanes that haven't jumped or ended (pc <= the region's label), so nothing needs to jump back and the
+    compiler keeps no loop back-edge. Same per-lane semantics as the stock translation. RGA alone: on the 52 jmp translations vector ALU -1.2%, mean VGPRs 121.9 -> 106.1 (-13%), the backward branches of the ISA 60 -> 0.
+  * dxbc_ps_ieee_mul (R1-C, risky): no SM3 "+-0 or denormal times anything is +0" in mul, mad, dp#, dst, muls, mulsc and mulsprev
+    (the min/eq/movc after each multiplication): plain IEEE multiplication, so 0 * infinity and 0 * NaN are NaN, which can leave
+    NaN pixels (bloom, TAA smears) where the game relies on the zero. RGA alone: -27.0% (204,489), mean VGPRs 64.5. Needs a frozen-frame picture diff
+    before the profile turns it on.
+  All five together: RGA vector ALU -48.3% (280,161 -> 144,969), VGPRs mean 78.4 -> 56.7 (the 52 jmp translations 121.9 -> 82.5, vector ALU -47.0%) (the same 126).
+  What the cvars key: the options are not read by the translation but are bits of the pixel shader modification
+  (DxbcShaderTranslator::Modification::pixel: ps_refactoring_allowed, ps_mad, sample_bias, forward_cf, ps_ieee_mul, in the free
+  upper half of the second dword), set by DxbcShaderTranslator::ApplyPixelShaderOptimizations from the cvars when a draw makes
+  its modification (PipelineCache::GetCurrentPixelShaderModification, host render targets only) and only where the option has an
+  effect on the shader (not for one writing depth; sample_bias with a texture; forward_cf with forward jumps). The modification
+  is the key of the translation (Shader::translations_), of the pipeline (PipelineDescription.pixel_shader_modification, hashed)
+  and of the stored pipeline description (.xpso), so a combination of the cvars never reuses the DXBC, the pipeline or the stored
+  description of another one, however and whenever a cvar is changed (they are hot-reloadable: a change makes new translations and
+  pipelines, compiled on first use). All bits 0 is the stock modification, so the stored descriptions of older runs stay valid
+  (the Modification::kVersion and the storage versions are unchanged) and the shader storage (.xsh, ucode only) is not affected.
+  At the start-up preload, a stored pixel shader description whose options differ from the current cvars' (computed per shader after
+  its ucode analysis, the same function) is not translated and so its pipeline is not made: the file keeps the entries of every
+  combination, and a run builds only its own. A new combination compiles its pipelines on first use (like any new shader), so the
+  first run after a toggle stutters once.
+Bucket: REDO
+
+04b0-dxbc-ps-optimizations.patch (mcla-x86 O3; R1 of $WORK/scratch/R1/REPORT.md)
+
+Changed files: include/rex/graphics/format/dxbc.h (sample_b), include/rex/graphics/pipeline/shader/{dxbc_translator.h
+(Modification::pixel bits, ApplyPixelShaderOptimizations, the option accessors, SplitForwardControlFlowRegion,
+cf_forward_region_start_), shader.h (control_flow_forward_jumps_only)}, src/graphics/pipeline/shader/{dxbc_translator.cpp (the cvars,
+ApplyPixelShaderOptimizations, the global flag, the forward control flow), dxbc_translator_alu.cpp (mad, ieee mul),
+dxbc_translator_fetch.cpp (sample_b), translator.cpp (the control flow analysis)}, src/graphics/d3d12/pipeline_cache.cpp (the
+modification and the preload skip). No new files; Vulkan untouched.
+
+Checks done (scratch tree $WORK/scratch/O3 = series 90 + this patch):
+  * python tools/prepare_sdk.py --work $WORK/scratch/O3 build (Release): builds and installs; clang++ 20.1.8, no new warning in the
+    changed files.
+  * Harness (scratch/O3/harness/harness_o3.cpp: R1's harness, with the cvars from its command line applied by
+    ApplyPixelShaderOptimizations, linked with the objects of that build) over the 1,061 (shader, modification) pairs of the E2
+    storage, AMD, bindless, RTV: all cvars off: 1,061 of 1,061 byte-identical to the stock translation (R1's out/). Each option on
+    alone against R1's variant of it (harness_v2 with R1_REFACT, R1_REFACT + R1_MAD, R1_TEXBIAS, R1_NOZM): pixel shaders
+    byte-identical except two translations (the one shader that writes oDepth, which A leaves alone). The forward flow differs from
+    R1's `f` as intended (R1's removed the loop from every loop-free shader, this one only from the 52 jmp translations, and
+    splits the region after an end too); vertex shaders differ from R1's variants as intended (R1's applied to them).
+  * RGA 2.15, DX12 live driver, gfx1150, 126 pixel shaders each with its vertex shader, run under the heavy lock: every variant
+    compiled (0 failed); the numbers above (vector ALU = the ISA
+    instructions v_*, VGPRs from the RGA statistics); A and A+B have the same ISA totals as R1's variants r and rm, all five within 0.02% of
+    R1's fa (A + mad + sample_b + C + loop-free flow), D alone -6.6% where R1 measured -8.4% on top of the others.
+  * Not run: the game, a picture, the stored-pipeline preload and the pipeline creation (they need the SDK in the game: next
+    paragraph).
+
+Checks to run (VER), in this order (each is a profile cvar: dxbc_ps_refactoring_allowed=true dxbc_ps_mad=true dxbc_sample_bias=true
+dxbc_forward_cf=true, dxbc_ps_ieee_mul=true last):
+  1. All five false: the pipeline storage and the picture as before (nothing in the log about the options).
+  2. dxbc_ps_refactoring_allowed=true: no shader or pipeline creation failures in the log; a frozen frame against the stock one (last-ulp
+     differences only: a difference image of a few levels at most); GPU time of the draws (n1080 A/B pair).
+  3. + dxbc_ps_mad, + dxbc_sample_bias, + dxbc_forward_cf: the same, one at a time. dxbc_sample_bias: textures at oblique angles
+     and bias (the fetch constants with LOD bias) look the same (mip transitions identical to a stock frame); dxbc_forward_cf: the
+     52 forward-jump pixel shaders (the world and car materials) give the same picture.
+  4. dxbc_ps_ieee_mul=true: frozen frame diff for NaN / black or white pixels, bloom, TAA, rain and reflections.
+  5. A toggle between runs on the same cache: "Created N graphics pipelines ... from the storage" counts only the pipelines of the
+     combination of that run (the other combinations' entries stay in the .xpso unused), and a combination never seen before
+     compiles its pipelines at first use (one stutter), a second run with it preloads them all.
+
+---
+diff --git a/include/rex/graphics/format/dxbc.h b/include/rex/graphics/format/dxbc.h
+index a5eaa8fe..016723e6 100644
+--- a/include/rex/graphics/format/dxbc.h
++++ b/include/rex/graphics/format/dxbc.h
+@@ -1383,6 +1383,7 @@ enum class Opcode : uint32_t {
+   kRSq = 68,
+   kSampleL = 72,
+   kSampleD = 73,
++  kSampleB = 74,
+   kSqRt = 75,
+   kSwitch = 76,
+   kSinCos = 77,
+@@ -1819,6 +1820,25 @@ class Assembler {
+     ++stat_.instruction_count;
+     ++stat_.texture_normal_instructions;
+   }
++  // LOCAL PATCH - MCLA (04b0): sample_b - the same operand layout as sample_l, with the LOD bias in place of the
++  // LOD (added to the implicitly calculated LOD, after the sampler's own LOD bias).
++  void OpSampleB(const Dest& dest, const Src& address, uint32_t address_components,
++                 const Src& resource, const Src& sampler, const Src& bias) {
++    uint32_t dest_write_mask = dest.GetMask();
++    uint32_t address_mask = (1 << address_components) - 1;
++    uint32_t operands_length = dest.GetLength() + address.GetLength(address_mask) +
++                               resource.GetLength(dest_write_mask, true) +
++                               sampler.GetLength(0b0000) + bias.GetLength(0b0000);
++    code_.reserve(code_.size() + 1 + operands_length);
++    code_.push_back(OpcodeToken(Opcode::kSampleB, operands_length, false, 0));
++    dest.Write(code_);
++    address.Write(code_, false, address_mask);
++    resource.Write(code_, false, dest_write_mask, true);
++    sampler.Write(code_, false, 0b0000);
++    bias.Write(code_, false, 0b0000);
++    ++stat_.instruction_count;
++    ++stat_.texture_normal_instructions;
++  }
+   void OpSampleD(const Dest& dest, const Src& address, uint32_t address_components,
+                  const Src& resource, const Src& sampler, const Src& x_derivatives,
+                  const Src& y_derivatives, uint32_t derivatives_components, int32_t aoffimmi_u = 0,
+diff --git a/include/rex/graphics/pipeline/shader/dxbc_translator.h b/include/rex/graphics/pipeline/shader/dxbc_translator.h
+index 8d3ea5d5..85bd7f26 100644
+--- a/include/rex/graphics/pipeline/shader/dxbc_translator.h
++++ b/include/rex/graphics/pipeline/shader/dxbc_translator.h
+@@ -177,6 +177,25 @@ class DxbcShaderTranslator : public ShaderTranslator {
+       uint32_t dynamic_addressable_register_count : 8;
+       // Non-ROV - depth / stencil output mode.
+       DepthStencilMode depth_stencil_mode : 2;
++      // LOCAL PATCH - MCLA (04b0): pixel shader translation options (cvars dxbc_ps_refactoring_allowed,
++      // dxbc_ps_mad, dxbc_sample_bias, dxbc_forward_cf, dxbc_ps_ieee_mul). They change the DXBC, so they are part of
++      // the key of the translation, of the pipeline and of the stored pipeline description (the cvars are read when the
++      // modification is made, never by the translation). All 0 gives the stock translation, so the stored
++      // descriptions of older runs stay valid. Set only for host render targets (not ROV), and only where they have
++      // an effect, by ApplyPixelShaderOptimizations; vertex shaders have none of these.
++      // Set the refactoringAllowed global flag (stock: none, so the driver compiles in precise mode). Not set for
++      // shaders writing oDepth, or converting the depth to float24 in the epilogue (position / depth invariance).
++      uint32_t ps_refactoring_allowed : 1;
++      // Emit DXBC mad for the Xenos mad, and for the dp# terms after the first (instead of mul + SM3 zero check +
++      // add). Drops the SM3 0 * anything = 0 emulation for these. Only together with ps_refactoring_allowed.
++      uint32_t ps_mad : 1;
++      // sample_b (bias operand) instead of sample_d with the coarse gradients multiplied by 2^bias, where the LOD is
++      // computed implicitly and there are no register gradients.
++      uint32_t sample_bias : 1;
++      // For a shader with forward jumps only (Shader::control_flow_forward_jumps_only): no main loop.
++      uint32_t forward_cf : 1;
++      // No SM3 0 * anything = 0 emulation in mul, mad, dp#, muls and mulsc (IEEE multiplication).
++      uint32_t ps_ieee_mul : 1;
+     } pixel;
+ 
+     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {
+@@ -536,6 +555,13 @@ class DxbcShaderTranslator : public ShaderTranslator {
+   // state of the translator.
+   std::vector<uint8_t> CreateDepthOnlyPixelShader();
+ 
++  // LOCAL PATCH - MCLA (04b0): sets the pixel shader translation options of the modification (see
++  // Modification::pixel) from the cvars dxbc_ps_refactoring_allowed, dxbc_ps_mad, dxbc_sample_bias, dxbc_forward_cf and
++  // dxbc_ps_ieee_mul, for the shader with its ucode analyzed, where they apply to it; the other bits are not touched.
++  // The cvars are read here (every time a draw makes the modification) and nowhere else, the translation only follows
++  // the bits, so toggling a cvar never reuses a translation or a pipeline made without it.
++  static void ApplyPixelShaderOptimizations(Modification& modification, const Shader& shader);
++
+   // Common functions useful not only for the translator, but also for render
+   // target reinterpretation.
+ 
+@@ -684,6 +710,31 @@ class DxbcShaderTranslator : public ShaderTranslator {
+   // Whether to use switch-case rather than if (pc >= label) for control flow.
+   bool UseSwitchForControlFlow() const;
+ 
++  // LOCAL PATCH - MCLA (04b0): the pixel shader translation options of the modification (see Modification::pixel). All
++  // false for vertex shaders (the union members overlap) and for the depth-only pixel shader.
++  bool HasPixelShaderOptimizationBits() const {
++    return is_pixel_shader() && !is_depth_only_pixel_shader_;
++  }
++  bool IsPsRefactoringAllowed() const {
++    return HasPixelShaderOptimizationBits() &&
++           GetDxbcShaderModification().pixel.ps_refactoring_allowed;
++  }
++  bool IsPsMad() const {
++    return HasPixelShaderOptimizationBits() && GetDxbcShaderModification().pixel.ps_mad;
++  }
++  bool IsSampleBias() const {
++    return HasPixelShaderOptimizationBits() && GetDxbcShaderModification().pixel.sample_bias;
++  }
++  bool IsPsIeeeMul() const {
++    return HasPixelShaderOptimizationBits() && GetDxbcShaderModification().pixel.ps_ieee_mul;
++  }
++  // Whether the shader is translated without the main loop: forward jumps are ifs on pc, and jumping and ending skip
++  // the rest of the region (up to the next label) of the lanes that jumped or ended.
++  bool UseForwardControlFlow() const {
++    return HasPixelShaderOptimizationBits() && GetDxbcShaderModification().pixel.forward_cf &&
++           current_shader().control_flow_forward_jumps_only();
++  }
++
+   // Allocates new consecutive r# registers for internal use and returns the
+   // index of the first.
+   uint32_t PushSystemTemp(uint32_t zero_mask = 0, uint32_t count = 1);
+@@ -867,6 +918,10 @@ class DxbcShaderTranslator : public ShaderTranslator {
+   // conditional, but can't itself be predicated.
+   void CloseInstructionPredication();
+   void JumpToLabel(uint32_t address);
++  // UseForwardControlFlow: after a jump or the end, closes the exec and the label region, and opens the rest of the
++  // region for the lanes that have neither jumped nor ended (pc is still at or below the label of the region; the
++  // end sets it to the maximum value).
++  void SplitForwardControlFlowRegion();
+ 
+   uint32_t FindOrAddTextureBinding(uint32_t fetch_constant, xenos::FetchOpDimension dimension,
+                                    bool is_signed);
+@@ -1157,6 +1212,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
+   // the exec-level predicate value, and can't merge two execs with the same
+   // predicate condition anymore.
+   bool cf_exec_predicate_written_;
++  // UseForwardControlFlow: the address of the label that opened the current region (0 for the first one).
++  uint32_t cf_forward_region_start_;
+ 
+   // Number of SRV resources used in this shader - also used for generation of
+   // indices of SRV resources that are optional.
+diff --git a/include/rex/graphics/pipeline/shader/shader.h b/include/rex/graphics/pipeline/shader/shader.h
+index 4cf38547..216d7ae4 100644
+--- a/include/rex/graphics/pipeline/shader/shader.h
++++ b/include/rex/graphics/pipeline/shader/shader.h
+@@ -874,6 +874,11 @@ class Shader {
+   // Labels that jumps (explicit or from loops) can be done to.
+   const std::set<uint32_t>& label_addresses() const { return label_addresses_; }
+ 
++  // LOCAL PATCH - MCLA (04b0): whether the control flow has at least one `jmp` and nothing but execs and forward
++  // jumps (the target label is after the jump; no loop, call or return), so the shader can be translated without the
++  // main loop (dxbc_forward_cf).
++  bool control_flow_forward_jumps_only() const { return control_flow_forward_jumps_only_; }
++
+   // Exclusive upper bound of the indexes of paired control flow instructions
+   // (each corresponds to 3 dwords).
+   uint32_t cf_pair_index_bound() const { return cf_pair_index_bound_; }
+@@ -1007,6 +1012,7 @@ class Shader {
+   std::vector<TextureBinding> texture_bindings_;
+   ConstantRegisterMap constant_register_map_ = {};
+   std::set<uint32_t> label_addresses_;
++  bool control_flow_forward_jumps_only_ = false;
+   uint32_t cf_pair_index_bound_ = 0;
+   uint32_t register_static_address_bound_ = 0;
+   uint32_t writes_interpolators_ = 0;
+diff --git a/src/graphics/d3d12/pipeline_cache.cpp b/src/graphics/d3d12/pipeline_cache.cpp
+index a1ee77d3..25728eb6 100644
+--- a/src/graphics/d3d12/pipeline_cache.cpp
++++ b/src/graphics/d3d12/pipeline_cache.cpp
+@@ -427,6 +427,18 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
+              modification_it != shader_translations_needed.end() &&
+              modification_it->first == ucode_data_hash;
+              ++modification_it) {
++          if (!edram_rov_used && shader_to_translate->type() == xenos::ShaderType::kPixel) {
++            // LOCAL PATCH - MCLA (04b0): a stored description made with other pixel shader translation options
++            // (cvars dxbc_ps_*, dxbc_sample_bias, dxbc_forward_cf) than the current ones is not translated (and
++            // so its pipeline isn't made) - it would never be used by a draw, which asks for the current ones, and
++            // is only an entry for another combination of the cvars in the same file.
++            DxbcShaderTranslator::Modification current_options(modification_it->second);
++            DxbcShaderTranslator::ApplyPixelShaderOptimizations(current_options,
++                                                                *shader_to_translate);
++            if (current_options.value != modification_it->second) {
++              continue;
++            }
++          }
+           D3D12Shader::D3D12Translation* translation = static_cast<D3D12Shader::D3D12Translation*>(
+               shader_to_translate->GetOrCreateTranslation(modification_it->second));
+           // Only try (and delete in case of failure) if it's a new translation.
+@@ -956,6 +968,9 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModificat
+         modification.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;
+       }
+     }
++    // LOCAL PATCH - MCLA (04b0): the pixel shader translation options (cvars dxbc_ps_*, dxbc_sample_bias,
++    // dxbc_forward_cf) are part of the modification, so each combination has its own translations and pipelines.
++    DxbcShaderTranslator::ApplyPixelShaderOptimizations(modification, shader);
+   }
+ 
+   return modification;
+diff --git a/src/graphics/pipeline/shader/dxbc_translator.cpp b/src/graphics/pipeline/shader/dxbc_translator.cpp
+index e75f85e2..8709e9ea 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator.cpp
+@@ -28,6 +28,49 @@ REXCVAR_DEFINE_BOOL(dxbc_switch, true, "GPU/Shader", "Use switch statements in D
+ 
+ REXCVAR_DEFINE_BOOL(dxbc_source_map, false, "GPU/Shader", "Generate source maps for DXBC");
+ 
++// LOCAL PATCH - MCLA (04b0): pixel shader translation options, all off by default. They change the DXBC, and are folded
++// into the pixel shader modification (Modification::pixel; DxbcShaderTranslator::ApplyPixelShaderOptimizations) when
++// a draw asks for it, so the translations, the pipelines and the stored pipeline descriptions of each combination are
++// kept apart and a change of a cvar at any time makes (and compiles, on first use) new ones.
++REXCVAR_DEFINE_BOOL(dxbc_ps_refactoring_allowed, false, "GPU/Shader",
++                    "Direct3D 12 (host render targets): set the refactoringAllowed global flag in the pixel shaders "
++                    "that don't write depth (neither oDepth nor the conversion of the depth to float24 in the pixel "
++                    "shader), so the driver compiles them in fast math mode (fused multiply-add, reassociation, "
++                    "uniform integer work on the scalar unit) instead of precise mode. Last-ulp differences in "
++                    "colours only. Static analysis: about 20% fewer vector ALU instructions")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(dxbc_ps_mad, false, "GPU/Shader",
++                    "Direct3D 12 (host render targets): with dxbc_ps_refactoring_allowed, translate the Xenos mad, and "
++                    "the terms of dp2add/dp3/dp4 after the first, to the DXBC mad (one fused multiply-add) instead of a "
++                    "multiplication, the Shader Model 3 0 * anything = 0 check and an addition. The check is dropped "
++                    "for these, so 0 * infinity or 0 * NaN in them is NaN, not 0")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(dxbc_sample_bias, false, "GPU/Shader",
++                    "Direct3D 12 (host render targets): in pixel shaders, where the texture LOD is computed by the "
++                    "hardware (no gradients from registers, mip filtering on), sample with the DXBC sample_b "
++                    "(LOD bias from the fetch constant and the instruction) instead of sample_d with the coarse "
++                    "derivatives multiplied by 2^bias, which is the same LOD with fewer instructions and address "
++                    "registers")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(dxbc_forward_cf, false, "GPU/Shader",
++                    "Direct3D 12 (host render targets): translate pixel shaders whose control flow is execs and "
++                    "forward jumps only (jmp, no loop, call or return) without the main loop that is emitted for "
++                    "jumping back (the code of a label is an if on the program counter, and a jump or the end "
++                    "skips the rest of the region for the lanes that took it), so the compiler doesn't have to "
++                    "keep a loop back-edge")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(dxbc_ps_ieee_mul, false, "GPU/Shader",
++                    "Direct3D 12 (host render targets): in pixel shaders, don't emulate the Shader Model 3 rule that "
++                    "+-0 or a denormal times anything is +0 in mul, mad, dp2add/dp3/dp4, dst, muls, mulsc and mulsprev "
++                    "(the min/eq/movc after each multiplication), use plain IEEE multiplication: 0 * infinity and "
++                    "0 * NaN become NaN instead of 0, which can leave NaN pixels (bloom, TAA smears). About 27% "
++                    "fewer vector ALU instructions on its own. Risky: check a frozen frame")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics {
+ using namespace ucode;
+ 
+@@ -112,6 +155,26 @@ uint64_t DxbcShaderTranslator::GetDefaultPixelShaderModification(
+   return shader_modification.value;
+ }
+ 
++void DxbcShaderTranslator::ApplyPixelShaderOptimizations(Modification& modification,
++                                                         const Shader& shader) {
++  assert_true(shader.type() == xenos::ShaderType::kPixel);
++  assert_true(shader.is_ucode_analyzed());
++  // Position and depth invariance: nothing is changed in a shader that writes depth, be it oDepth of the shader or the
++  // conversion of the depth to float24 in the epilogue (depth_stencil_mode).
++  using DepthStencilMode = Modification::DepthStencilMode;
++  bool writes_depth = shader.writes_depth() ||
++                      modification.pixel.depth_stencil_mode == DepthStencilMode::kFloat24Truncating ||
++                      modification.pixel.depth_stencil_mode == DepthStencilMode::kFloat24Rounding;
++  bool refactoring_allowed = REXCVAR_GET(dxbc_ps_refactoring_allowed) && !writes_depth;
++  modification.pixel.ps_refactoring_allowed = uint32_t(refactoring_allowed);
++  modification.pixel.ps_mad = uint32_t(refactoring_allowed && REXCVAR_GET(dxbc_ps_mad));
++  modification.pixel.sample_bias =
++      uint32_t(REXCVAR_GET(dxbc_sample_bias) && !shader.texture_bindings().empty());
++  modification.pixel.forward_cf =
++      uint32_t(REXCVAR_GET(dxbc_forward_cf) && shader.control_flow_forward_jumps_only());
++  modification.pixel.ps_ieee_mul = uint32_t(REXCVAR_GET(dxbc_ps_ieee_mul));
++}
++
+ void DxbcShaderTranslator::Reset() {
+   ShaderTranslator::Reset();
+ 
+@@ -148,6 +211,7 @@ void DxbcShaderTranslator::Reset() {
+   cf_exec_predicated_ = false;
+   cf_instruction_predicate_if_open_ = false;
+   cf_exec_predicate_written_ = false;
++  cf_forward_region_start_ = 0;
+ 
+   srv_count_ = 0;
+   srv_index_shared_memory_ = kBindingIndexUnallocated;
+@@ -175,6 +239,11 @@ uint32_t DxbcShaderTranslator::GetModificationRegisterCount() const {
+ }
+ 
+ bool DxbcShaderTranslator::UseSwitchForControlFlow() const {
++  // The forward control flow has no loop to continue in, and a switch can't be left in the middle with the rest of
++  // the code skipped by anything but a continue.
++  if (UseForwardControlFlow()) {
++    return false;
++  }
+   // Xenia crashes on Intel HD Graphics 4000 with switch.
+   return REXCVAR_GET(dxbc_switch) && vendor_id_ != ui::GraphicsProvider::GpuVendorID::kIntel;
+ }
+@@ -909,8 +978,11 @@ void DxbcShaderTranslator::StartTranslation() {
+     return;
+   }
+ 
+-  // Start the main loop (for jumping to labels by setting pc and continuing).
+-  a_.OpLoop();
++  // Start the main loop (for jumping to labels by setting pc and continuing). Not in the forward control flow, where
++  // nothing jumps back and a jump or the end skips the rest of the region instead of continuing.
++  if (!UseForwardControlFlow()) {
++    a_.OpLoop();
++  }
+   // Switch and the first label (pc == 0).
+   if (UseSwitchForControlFlow()) {
+     a_.OpSwitch(dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kYYYY));
+@@ -1040,8 +1112,10 @@ void DxbcShaderTranslator::CompleteShaderCode() {
+       a_.OpEndIf();
+     }
+     // End the main loop.
+-    a_.OpBreak();
+-    a_.OpEndLoop();
++    if (!UseForwardControlFlow()) {
++      a_.OpBreak();
++      a_.OpEndLoop();
++    }
+ 
+     // Release the following system temporary values so epilogue can reuse them:
+     // - system_temp_result_.
+@@ -1664,7 +1738,23 @@ void DxbcShaderTranslator::CloseInstructionPredication() {
+ 
+ void DxbcShaderTranslator::JumpToLabel(uint32_t address) {
+   a_.OpMov(dxbc::Dest::R(system_temp_ps_pc_p0_a0_, 0b0010), dxbc::Src::LU(address));
+-  a_.OpContinue();
++  if (!UseForwardControlFlow()) {
++    a_.OpContinue();
++  }
++}
++
++void DxbcShaderTranslator::SplitForwardControlFlowRegion() {
++  assert_true(UseForwardControlFlow());
++  // Close the exec (and the instruction predication) - the rest of the region is not part of it - and the region.
++  CloseExecConditionals();
++  a_.OpEndIf();
++  // if (pc <= region label), for the first region (label 0) it's the same as pc == 0 of its beginning.
++  uint32_t test_temp = PushSystemTemp();
++  a_.OpUGE(dxbc::Dest::R(test_temp, 0b0001), dxbc::Src::LU(cf_forward_region_start_),
++           dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kYYYY));
++  a_.OpIf(true, dxbc::Src::R(test_temp, dxbc::Src::kXXXX));
++  // Release test_temp.
++  PopSystemTemp();
+ }
+ 
+ void DxbcShaderTranslator::ProcessLabel(uint32_t cf_index) {
+@@ -1687,6 +1777,7 @@ void DxbcShaderTranslator::ProcessLabel(uint32_t cf_index) {
+   } else {
+     // Close the previous label.
+     a_.OpEndIf();
++    cf_forward_region_start_ = cf_index;
+     // if (pc <= cf_index)
+     uint32_t test_temp = PushSystemTemp();
+     a_.OpUGE(dxbc::Dest::R(test_temp, 0b0001), dxbc::Src::LU(cf_index),
+@@ -1709,7 +1800,12 @@ void DxbcShaderTranslator::ProcessExecInstructionEnd(const ParsedExecInstruction
+   if (instr.is_end) {
+     // Break out of the main loop.
+     CloseInstructionPredication();
+-    if (UseSwitchForControlFlow()) {
++    if (UseForwardControlFlow()) {
++      // Write an invalid value to pc - no label region will be entered after this - and skip the rest of the
++      // current region (it's still reachable by the lanes that didn't execute this exec).
++      a_.OpMov(dxbc::Dest::R(system_temp_ps_pc_p0_a0_, 0b0010), dxbc::Src::LU(UINT32_MAX));
++      SplitForwardControlFlowRegion();
++    } else if (UseSwitchForControlFlow()) {
+       // Write an invalid value to pc.
+       a_.OpMov(dxbc::Dest::R(system_temp_ps_pc_p0_a0_, 0b0010), dxbc::Src::LU(UINT32_MAX));
+       // Go to the next iteration, where switch cases won't be reached.
+@@ -1872,6 +1968,10 @@ void DxbcShaderTranslator::ProcessJumpInstruction(const ParsedJumpInstruction& i
+   CloseInstructionPredication();
+ 
+   JumpToLabel(instr.target_address);
++  if (UseForwardControlFlow()) {
++    // The code after the jump must not run for the lanes that have jumped.
++    SplitForwardControlFlowRegion();
++  }
+ }
+ 
+ void DxbcShaderTranslator::ProcessAllocInstruction(const ParsedAllocInstruction& instr,
+@@ -3138,10 +3238,12 @@ void DxbcShaderTranslator::WriteShaderCode() {
+   }
+ 
+   // Don't allow refactoring when converting to native code to maintain position
+-  // invariance (needed even in pixel shaders for oDepth invariance).
++  // invariance (needed even in pixel shaders for oDepth invariance), except in the pixel shaders that don't write
++  // depth, if asked for (Modification::pixel.ps_refactoring_allowed).
+   bool global_flag_force_early_depth_stencil = IsForceEarlyDepthStencilGlobalFlagEnabled();
+   ao_.OpDclGlobalFlags(
+-      global_flag_force_early_depth_stencil ? dxbc::kGlobalFlagForceEarlyDepthStencil : 0);
++      (global_flag_force_early_depth_stencil ? dxbc::kGlobalFlagForceEarlyDepthStencil : 0) |
++      (IsPsRefactoringAllowed() ? dxbc::kGlobalFlagRefactoringAllowed : 0));
+ 
+   // Constant buffers, from most frequenly accessed to least frequently accessed
+   // (the order is a hint to the driver according to the DXBC header).
+diff --git a/src/graphics/pipeline/shader/dxbc_translator_alu.cpp b/src/graphics/pipeline/shader/dxbc_translator_alu.cpp
+index 66834e51..e4326699 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator_alu.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator_alu.cpp
+@@ -84,6 +84,12 @@ void DxbcShaderTranslator::ProcessVectorAluOperation(
+       break;
+     case AluVectorOpcode::kMul:
+     case AluVectorOpcode::kMad: {
++      if (instr.vector_opcode == AluVectorOpcode::kMad && IsPsMad()) {
++        // LOCAL PATCH - MCLA (04b0): Modification::pixel.ps_mad - one DXBC mad (with ps_refactoring_allowed, the driver
++        // is free to fuse it; without the Shader Model 3 0 * anything = 0 check of the multiplication).
++        a_.OpMAd(per_component_dest, operands[0], operands[1], operands[2]);
++        break;
++      }
+       // Not using DXBC mad to prevent fused multiply-add (mul followed by add
+       // may be optimized into non-fused mad by the driver in the identical
+       // operands case also).
+@@ -91,7 +97,7 @@ void DxbcShaderTranslator::ProcessVectorAluOperation(
+       uint32_t multiplicands_different =
+           used_result_components &
+           ~instr.vector_operands[0].GetIdenticalComponents(instr.vector_operands[1]);
+-      if (multiplicands_different) {
++      if (multiplicands_different && !IsPsIeeeMul()) {
+         // Shader Model 3: +-0 or denormal * anything = +0.
+         uint32_t is_zero_temp = PushSystemTemp();
+         a_.OpMin(dxbc::Dest::R(is_zero_temp, multiplicands_different), operands[0].Abs(),
+@@ -190,9 +196,16 @@ void DxbcShaderTranslator::ProcessVectorAluOperation(
+           uint32_t((1 << component_count) - 1) &
+           ~instr.vector_operands[0].GetIdenticalComponents(instr.vector_operands[1]);
+       for (uint32_t i = 0; i < component_count; ++i) {
++        if (i && IsPsMad()) {
++          // LOCAL PATCH - MCLA (04b0): Modification::pixel.ps_mad - the next term in one mad, without the check.
++          a_.OpMAd(dxbc::Dest::R(system_temp_result_, 0b0001), operands[0].SelectFromSwizzled(i),
++                   operands[1].SelectFromSwizzled(i),
++                   dxbc::Src::R(system_temp_result_, dxbc::Src::kXXXX));
++          continue;
++        }
+         a_.OpMul(dxbc::Dest::R(system_temp_result_, i ? 0b0010 : 0b0001),
+                  operands[0].SelectFromSwizzled(i), operands[1].SelectFromSwizzled(i));
+-        if ((different & (1 << i)) != 0) {
++        if ((different & (1 << i)) != 0 && !IsPsIeeeMul()) {
+           // Shader Model 3: +-0 or denormal * anything = +0 (also not replacing
+           // true `0 + term` with movc of the term because +0 + -0 should result
+           // in +0, not -0).
+@@ -528,7 +541,8 @@ void DxbcShaderTranslator::ProcessVectorAluOperation(
+       if (used_result_components & 0b0010) {
+         a_.OpMul(dxbc::Dest::R(system_temp_result_, 0b0010), operands[0].SelectFromSwizzled(1),
+                  operands[1].SelectFromSwizzled(1));
+-        if (!(instr.vector_operands[0].GetIdenticalComponents(instr.vector_operands[1]) & 0b0010)) {
++        if (!(instr.vector_operands[0].GetIdenticalComponents(instr.vector_operands[1]) & 0b0010) &&
++            !IsPsIeeeMul()) {
+           // Shader Model 3: +-0 or denormal * anything = +0.
+           a_.OpMin(dxbc::Dest::R(system_temp_result_, 0b0100),
+                    operands[0].SelectFromSwizzled(1).Abs(),
+@@ -621,7 +635,8 @@ void DxbcShaderTranslator::ProcessScalarAluOperation(
+       break;
+     case AluScalarOpcode::kMuls:
+       a_.OpMul(ps_dest, operand_0_a, operand_0_b);
+-      if (instr.scalar_operands[0].components[0] != instr.scalar_operands[0].components[1]) {
++      if (instr.scalar_operands[0].components[0] != instr.scalar_operands[0].components[1] &&
++          !IsPsIeeeMul()) {
+         // Shader Model 3: +-0 or denormal * anything = +0.
+         uint32_t is_zero_temp = PushSystemTemp();
+         a_.OpMin(dxbc::Dest::R(is_zero_temp, 0b0001), operand_0_a.Abs(), operand_0_b.Abs());
+@@ -658,13 +673,17 @@ void DxbcShaderTranslator::ProcessScalarAluOperation(
+                  dxbc::Src::R(test_temp, dxbc::Src::kYYYY));
+         a_.OpIf(true, dxbc::Src::R(test_temp, dxbc::Src::kXXXX));
+       }
+-      // Shader Model 3: +-0 or denormal * anything = +0.
+-      a_.OpMin(dxbc::Dest::R(test_temp, 0b0001), operand_0_a.Abs(), ps_src.Abs());
+-      // min isn't required to flush denormals, eq is.
+-      a_.OpEq(dxbc::Dest::R(test_temp, 0b0001), dxbc::Src::R(test_temp, dxbc::Src::kXXXX),
+-              dxbc::Src::LF(0.0f));
++      // Shader Model 3: +-0 or denormal * anything = +0 (not with Modification::pixel.ps_ieee_mul).
++      if (!IsPsIeeeMul()) {
++        a_.OpMin(dxbc::Dest::R(test_temp, 0b0001), operand_0_a.Abs(), ps_src.Abs());
++        // min isn't required to flush denormals, eq is.
++        a_.OpEq(dxbc::Dest::R(test_temp, 0b0001), dxbc::Src::R(test_temp, dxbc::Src::kXXXX),
++                dxbc::Src::LF(0.0f));
++      }
+       a_.OpMul(ps_dest, operand_0_a, ps_src);
+-      a_.OpMovC(ps_dest, dxbc::Src::R(test_temp, dxbc::Src::kXXXX), dxbc::Src::LF(0.0f), ps_src);
++      if (!IsPsIeeeMul()) {
++        a_.OpMovC(ps_dest, dxbc::Src::R(test_temp, dxbc::Src::kXXXX), dxbc::Src::LF(0.0f), ps_src);
++      }
+       if (instr.scalar_opcode == AluScalarOpcode::kMulsPrev2) {
+         a_.OpElse();
+         a_.OpMov(ps_dest, dxbc::Src::LF(-FLT_MAX));
+@@ -890,7 +909,8 @@ void DxbcShaderTranslator::ProcessScalarAluOperation(
+     case AluScalarOpcode::kMulsc0:
+     case AluScalarOpcode::kMulsc1:
+       a_.OpMul(ps_dest, operand_0_a, operand_1);
+-      if (!(instr.scalar_operands[0].GetIdenticalComponents(instr.scalar_operands[1]) & 0b0001)) {
++      if (!(instr.scalar_operands[0].GetIdenticalComponents(instr.scalar_operands[1]) & 0b0001) &&
++          !IsPsIeeeMul()) {
+         // Shader Model 3: +-0 or denormal * anything = +0.
+         uint32_t is_zero_temp = PushSystemTemp();
+         a_.OpMin(dxbc::Dest::R(is_zero_temp, 0b0001), operand_0_a.Abs(), operand_1.Abs());
+diff --git a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+index 8ef8f9a4..fa803ddd 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+@@ -1397,6 +1397,17 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+       // - Gradients or LOD to be passed to the sample_d/sample_l.
+ 
+       dxbc::Src lod_src(dxbc::Src::LF(0.0f));
++      // LOCAL PATCH - MCLA (04b0): Modification::pixel.sample_bias - the LOD is computed by the hardware, so the bias
++      // (fetch constant + register + instruction, 2^bias times the gradients in the stock translation, with the same
++      // result for the isotropic and the anisotropic LOD) goes as the sample_b operand, and no gradients are made.
++      // Only with mip filtering (without it the LOD is 0 and there's no bias), not with the gradients from registers,
++      // and not for 3D / stacked textures, where the second layer of a stacked texture is sampled under a per-pixel
++      // `if` (implicit derivatives would be taken in divergent control flow, while the stock translation takes them
++      // before it).
++      const bool use_sample_bias = IsSampleBias() && use_computed_lod &&
++                                   !instr.attributes.use_register_gradients &&
++                                   instr.attributes.mip_filter != xenos::TextureFilter::kBaseMap &&
++                                   instr.dimension != xenos::FetchOpDimension::k3DOrStacked;
+       uint32_t grad_component_count = 0;
+       // Will be allocated for both explicit and computed LOD.
+       uint32_t grad_h_lod_temp = UINT32_MAX;
+@@ -1431,7 +1442,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+             a_.OpMul(lod_dest, lod_src, dxbc::Src::LF(1.0f / 32.0f));
+           }
+         }
+-        if (use_computed_lod) {
++        if (use_computed_lod && !use_sample_bias) {
+           grad_v_temp = PushSystemTemp();
+           switch (instr.dimension) {
+             case xenos::FetchOpDimension::k1D:
+@@ -1842,6 +1853,9 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+                            dxbc::Src::R(coord_and_sampler_temp), 3, srv_unsigned, sampler,
+                            dxbc::Src::R(grad_h_lod_temp), dxbc::Src::R(grad_v_temp),
+                            srv_grad_component_count);
++            } else if (use_sample_bias) {
++              a_.OpSampleB(dxbc::Dest::R(layer_value_temp, used_result_nonzero_components),
++                           dxbc::Src::R(coord_and_sampler_temp), 3, srv_unsigned, sampler, lod_src);
+             } else {
+               a_.OpSampleL(dxbc::Dest::R(layer_value_temp, used_result_nonzero_components),
+                            dxbc::Src::R(coord_and_sampler_temp), 3, srv_unsigned, sampler, lod_src);
+@@ -1872,6 +1886,9 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+                            dxbc::Src::R(coord_and_sampler_temp), 3, srv_signed, sampler,
+                            dxbc::Src::R(grad_h_lod_temp), dxbc::Src::R(grad_v_temp),
+                            srv_grad_component_count);
++            } else if (use_sample_bias) {
++              a_.OpSampleB(dxbc::Dest::R(signed_temp, used_result_nonzero_components),
++                           dxbc::Src::R(coord_and_sampler_temp), 3, srv_signed, sampler, lod_src);
+             } else {
+               a_.OpSampleL(dxbc::Dest::R(signed_temp, used_result_nonzero_components),
+                            dxbc::Src::R(coord_and_sampler_temp), 3, srv_signed, sampler, lod_src);
+diff --git a/src/graphics/pipeline/shader/translator.cpp b/src/graphics/pipeline/shader/translator.cpp
+index e472251f..3b5ba925 100644
+--- a/src/graphics/pipeline/shader/translator.cpp
++++ b/src/graphics/pipeline/shader/translator.cpp
+@@ -58,6 +58,9 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
+   // Gather the upper bound of the control flow instructions, and label
+   // addresses, which are needed for disassembly.
+   cf_pair_index_bound_ = uint32_t(ucode_data_.size() / 3);
++  // LOCAL PATCH - MCLA (04b0): control_flow_forward_jumps_only().
++  bool cf_has_jump = false;
++  bool cf_backward_or_structured = false;
+   for (uint32_t i = 0; i < cf_pair_index_bound_; ++i) {
+     ControlFlowInstruction cf_ab[2];
+     UnpackControlFlowInstructions(ucode_data_.data() + i * 3, cf_ab);
+@@ -72,21 +75,32 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
+       switch (cf.opcode()) {
+         case ControlFlowOpcode::kCondCall:
+           label_addresses_.insert(cf.cond_call.address());
++          cf_backward_or_structured = true;
+           break;
+         case ControlFlowOpcode::kCondJmp:
+           label_addresses_.insert(cf.cond_jmp.address());
++          cf_has_jump = true;
++          if (cf.cond_jmp.address() <= i * 2 + j) {
++            cf_backward_or_structured = true;
++          }
+           break;
+         case ControlFlowOpcode::kLoopStart:
+           label_addresses_.insert(cf.loop_start.address());
++          cf_backward_or_structured = true;
+           break;
+         case ControlFlowOpcode::kLoopEnd:
+           label_addresses_.insert(cf.loop_end.address());
++          cf_backward_or_structured = true;
++          break;
++        case ControlFlowOpcode::kReturn:
++          cf_backward_or_structured = true;
+           break;
+         default:
+           break;
+       }
+     }
+   }
++  control_flow_forward_jumps_only_ = cf_has_jump && !cf_backward_or_structured;
+ 
+   // Disassemble and gather information.
+   ucode_disasm_buffer.Reset();

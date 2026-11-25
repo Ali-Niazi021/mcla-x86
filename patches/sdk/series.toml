@@ -836,6 +836,15 @@ purpose = "D3D12: cvar swap_direct_present (default false): when the front buffe
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "04b0-dxbc-ps-optimizations"
+source = "local"
+path = "patches/sdk/04b0-dxbc-ps-optimizations.patch"
+sha256 = "2cc8c40edd45cb105168b4974af8dfa542709c12ba0b90128ef941fcb5b935f5"
+purpose = "D3D12 pixel shader DXBC translation options, each a cvar (default false), each a bit of the pixel shader modification (so the translations, pipelines and stored pipeline descriptions of each combination are kept apart): dxbc_ps_refactoring_allowed (refactoringAllowed global flag, not for shaders writing depth), dxbc_ps_mad (DXBC mad for Xenos mad / dp terms; needs the former; drops the SM3 zero check there), dxbc_sample_bias (sample_b instead of gradient-scaled sample_d), dxbc_forward_cf (no main loop for forward-jump shaders), dxbc_ps_ieee_mul (no SM3 0*x=0 emulation; risky). Vertex shaders and ROV untouched; all off = stock translation byte for byte."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]
