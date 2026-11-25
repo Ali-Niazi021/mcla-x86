@@ -1,0 +1,35 @@
+// Resources of mcla_launcher: the application icon (resource id 1, loaded by main.cpp) and version info. The manifest
+// (per-monitor v2 DPI awareness, UTF-8 code page, themed common controls) is launcher.manifest, passed to the linker as
+// a source file (/MANIFESTINPUT): the linker already embeds a manifest, so it must not be a resource here too.
+// Numeric ids and values on purpose: no SDK headers needed.
+
+1 ICON "launcher.ico"
+
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L      // VOS_NT_WINDOWS32
+FILETYPE 0x1L        // VFT_APP
+FILESUBTYPE 0x0L
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "CompanyName", "mcla-x86 contributors"
+      VALUE "FileDescription", "Midnight Club: Los Angeles x86 Launcher"
+      VALUE "FileVersion", "1.0.0.0"
+      VALUE "InternalName", "mcla_launcher"
+      VALUE "LegalCopyright", "GPL-3.0-or-later"
+      VALUE "OriginalFilename", "mcla_launcher.exe"
+      VALUE "ProductName", "Midnight Club: Los Angeles x86"
+      VALUE "ProductVersion", "1.0.0.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
