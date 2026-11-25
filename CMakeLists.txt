@@ -115,3 +115,9 @@ endif()
 
 # --- Unit tests -------------------------------------------------------------------------------------------------------
 add_subdirectory(mcla/tests)
+
+# --- Launcher (launcher/: settings UI + Launch button; fetches ImGui and nlohmann/json at configure time) -------------
+option(MCLA_BUILD_LAUNCHER "Build mcla_launcher.exe next to mcla.exe" ON)
+if(MCLA_BUILD_LAUNCHER)
+  add_subdirectory(launcher)
+endif()
