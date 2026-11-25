@@ -248,7 +248,7 @@ constexpr CvarDefault k1200pFsrDefaults[] = {
     {"temporal_aa", "fsr"},
     {"temporal_aa_upscale", "1.5"},
     {"temporal_aa_sharpness", "0.3"},
-    {"temporal_aa_upscaler", "auto"},
+    {"temporal_aa_upscaler", "fsr3"},
 };
 constexpr CvarDefault k1200pFsr4pDefaults[] = {
     {"temporal_aa_upscaler", "fsr4"},
@@ -275,11 +275,10 @@ constexpr CvarDefault k1080pFsrDefaults[] = {
     {"temporal_aa_upscale", "1.5"},
     {"temporal_aa_sharpness", "0.3"},
     {"mcla_ws_single_tile", "true"},
-    // Which FSR the SDK's signed runtime runs (SDK patch 0470; D3D12): auto = the newest the device offers, FSR 4.1
-    // (the machine-learning upscaler) on the 880M when amd_fidelityfx_loader_dx12.dll and amd_fidelityfx_upscaler_dx12.dll
-    // are next to mcla.exe, else FSR 3.1; fsr3 pins FSR 3.1.6 for a comparison. Without those two DLLs the FSR 3.1.4 built
-    // with the SDK runs whatever this says.
-    {"temporal_aa_upscaler", "auto"},
+    // Which FSR the SDK runs (SDK patch 0470; D3D12): fsr3 pins FSR 3.1 (3.1.6 from the signed runtime, else the 3.1.4
+    // built with the SDK) so this preset means the same with or without AMD's signed DLLs next to mcla.exe. FSR 4.1 is
+    // the 1080p-fsr4p / 1080p-fsr4q presets below (G-S9 review B1).
+    {"temporal_aa_upscaler", "fsr3"},
 };
 
 // 1080p-fsr4p / 1080p-fsr4q (S6, SDK patch 0470): AMD's FSR 4.1 (the machine-learning upscaler; the Radeon 800M series has
@@ -324,8 +323,8 @@ constexpr Preset kPresets[] = {
      sizeof(k900pDefaults) / sizeof(k900pDefaults[0]), nullptr},
     {"1080p-fsr",
      "the 1080p render with the scene drawn at 1280x720 and upscaled to 1920x1080 by FSR (temporal_aa=fsr, 1.5x, "
-     "RCAS 0.3, single-tile scene; temporal_aa_upscaler=auto: FSR 4.1 where AMD's signed runtime is next to the "
-     "executable and the device offers it, else FSR 3.1; the render markers are written while temporal_aa=fsr)",
+     "RCAS 0.3, single-tile scene; temporal_aa_upscaler=fsr3: FSR 3.1, see 1080p-fsr4p/q for FSR 4; the render "
+     "markers are written while temporal_aa=fsr)",
      k1080pFsrDefaults, sizeof(k1080pFsrDefaults) / sizeof(k1080pFsrDefaults[0]), "1080p"},
     {"1080p-fsr4p",
      "the 1080p render with the scene drawn at 960x540 (Performance, 2x) and upscaled to 1920x1080 by AMD's FSR 4 "
@@ -347,7 +346,7 @@ constexpr Preset kPresets[] = {
      k1200pDefaults, sizeof(k1200pDefaults) / sizeof(k1200pDefaults[0]), nullptr},
     {"1200p-fsr",
      "the 1200p render with the scene drawn at 1280x800 and upscaled to 1920x1200 by FSR (temporal_aa=fsr, 1.5x, RCAS "
-     "0.3, temporal_aa_upscaler=auto: FSR 4.1 where AMD's signed runtime is there, else FSR 3.1)",
+     "0.3, temporal_aa_upscaler=fsr3: FSR 3.1)",
      k1200pFsrDefaults, sizeof(k1200pFsrDefaults) / sizeof(k1200pFsrDefaults[0]), "1200p"},
     {"1200p-fsr4p",
      "the 1200p render with the scene drawn at 960x600 (Performance, 2x) and upscaled to 1920x1200 by AMD's FSR 4 "

@@ -15,7 +15,7 @@
 //    own, shipped path for the switch.
 //
 // 2. sub_8230D988 (0x8230D988), the per-frame refresh of the impostor views, called from the shadow phase handler
-//    sub_823120C8 (0x82312320, with [0x8288D0A0] the manager) when the cascade-0 phase (0x20) runs. After the setup it either
+//    sub_823120C8 (call at 0x823126A4, with [0x8288D0A0] the manager) when the cascade-0 phase (0x20) runs. After the setup it either
 //    refreshes every entry that has a +168 (|time delta| >= the threshold, bounded), or searches round-robin for ONE entry
 //    (0x8230DA08..0x8230DA64):
 //        idx = (cursor + 1) % count; cursor = idx; entry = array + idx * 224;
