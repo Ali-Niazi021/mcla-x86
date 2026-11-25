@@ -14,7 +14,7 @@
     {
       "id": "recommended",
       "label": "Recommended (1080p)",
-      "help": "True 1920x1080, single-tile scene, MSAA off, the 60 fps profile with late-frame release and the Performance scene-detail preset. About 60 fps on the Radeon 880M in Performance mode, with occasional dips; pick Balanced or Performance if your GPU is slower.",
+      "help": "True 1920x1080, single-tile scene, MSAA off, the 60 fps profile with late-frame release and the Performance scene-detail preset. 60.0 fps, 99th percentile 17.7 ms on a Radeon 880M in Performance mode (5 min drive); pick Balanced or Performance if your GPU is slower.",
       "set": {
         "mcla_profile": "1080p",
         "mcla_noaa": true,
@@ -22,12 +22,34 @@
         "mcla_fps_target": 60,
         "mcla_present_immediate": -1,
         "mcla_gfx_preset": "perf",
+        "mcla_gfx_shadow_res": 0,
         "present_effect": "bilinear",
         "fullscreen_mode": "desktop",
         "temporal_aa": "off",
         "temporal_aa_upscaler": "fsr3",
         "temporal_aa_upscale": 1.5,
         "temporal_aa_sharpness": 0.3
+      }
+    },
+    {
+      "id": "panel_1200",
+      "label": "16:10 panel 60 (1920x1200)",
+      "help": "A 1920x1200 (16:10) render at the 60 fps profile with the Performance scene-detail preset: fills a 16:10 panel with no black bars. Measured 60.0 fps, 99th percentile 17.3 ms on a Radeon 880M in Performance mode (5 min drive).",
+      "set": {
+        "mcla_profile": "1200p",
+        "mcla_noaa": true,
+        "mcla_ws_single_tile": true,
+        "mcla_fps_target": 60,
+        "mcla_present_immediate": -1,
+        "mcla_gfx_preset": "perf",
+        "mcla_gfx_shadow_res": 0,
+        "present_effect": "bilinear",
+        "fullscreen_mode": "desktop",
+        "temporal_aa": "off",
+        "temporal_aa_upscaler": "fsr3",
+        "temporal_aa_upscale": 1.5,
+        "temporal_aa_sharpness": 0.3,
+        "fullscreen": true
       }
     },
     {
@@ -41,6 +63,7 @@
         "mcla_fps_target": 60,
         "mcla_present_immediate": -1,
         "mcla_gfx_preset": "perf",
+        "mcla_gfx_shadow_res": 0,
         "present_effect": "bilinear",
         "fullscreen_mode": "desktop",
         "temporal_aa": "off",
@@ -60,6 +83,7 @@
         "mcla_fps_target": 60,
         "mcla_present_immediate": -1,
         "mcla_gfx_preset": "perf",
+        "mcla_gfx_shadow_res": 0,
         "present_effect": "bilinear",
         "fullscreen_mode": "desktop",
         "temporal_aa": "off",
@@ -79,6 +103,7 @@
         "mcla_fps_target": 60,
         "mcla_present_immediate": -1,
         "mcla_gfx_preset": "perf",
+        "mcla_gfx_shadow_res": 0,
         "present_effect": "bilinear",
         "fullscreen_mode": "desktop",
         "temporal_aa": "fsr",
@@ -88,8 +113,8 @@
       }
     },
     {
-      "id": "native_panel_800",
-      "label": "Native panel 16:10 (1280x800, exclusive fullscreen)",
+      "id": "panel_800",
+      "label": "16:10 panel, fastest (1280x800, display mode switch)",
       "help": "A 1280x800 (16:10) render at the 60 fps profile for a 16:10 laptop panel. Fullscreen switches the display to the game's mode (the highest multiple of 60 Hz, 120 preferred) so the panel's scaler fills the screen with no black bars; falls back to desktop scaling if the display has no such mode.",
       "set": {
         "mcla_profile": "800p",
@@ -98,8 +123,30 @@
         "mcla_fps_target": 60,
         "mcla_present_immediate": -1,
         "mcla_gfx_preset": "default",
+        "mcla_gfx_shadow_res": 0,
         "present_effect": "bilinear",
         "fullscreen_mode": "guest",
+        "temporal_aa": "off",
+        "temporal_aa_upscaler": "fsr3",
+        "temporal_aa_upscale": 1.5,
+        "temporal_aa_sharpness": 0.3,
+        "fullscreen": true
+      }
+    },
+    {
+      "id": "panel_2000",
+      "label": "Native panel 3200x2000 (about 25 fps)",
+      "help": "A true 3200x2000 picture for the 3200x2000 laptop panel: the game renders 1600x1000 and draws every render target at 2x2, about 4x the GPU load (23-26 fps measured on a Radeon 880M, parked scene). The 60 fps profile runs unlocked below 60 with a variable simulation step, so the game's speed stays right (world/real 1.000). Sun-shadow map 384 (768 host texels, close to the shipped 640). Fullscreen uses the desktop size (borderless); do not switch the display mode, it would go to 1600x1000.",
+      "set": {
+        "mcla_profile": "2000p",
+        "mcla_noaa": true,
+        "mcla_ws_single_tile": true,
+        "mcla_fps_target": 60,
+        "mcla_present_immediate": -1,
+        "mcla_gfx_preset": "perf",
+        "mcla_gfx_shadow_res": 384,
+        "present_effect": "bilinear",
+        "fullscreen_mode": "desktop",
         "temporal_aa": "off",
         "temporal_aa_upscaler": "fsr3",
         "temporal_aa_upscale": 1.5,
@@ -118,6 +165,7 @@
         "mcla_fps_target": 30,
         "mcla_present_immediate": 0,
         "mcla_gfx_preset": "default",
+        "mcla_gfx_shadow_res": 0,
         "present_effect": "bilinear",
         "fullscreen_mode": "desktop",
         "temporal_aa": "off",
@@ -141,8 +189,10 @@
         {"value": "800p", "label": "1280x800 (16:10)", "help": "Matches a 16:10 laptop panel. Vert+ camera, HUD in a 16:9 band."},
         {"value": "900p16", "label": "1440x900 (16:10)", "help": "16:10 at 900 rows. Vert+ camera, HUD in a 16:9 band."},
         {"value": "900p", "label": "1600x900 (16:9)", "help": "A step below 1080p: a lighter load than 1920x1080, scaled to the screen by the presenter."},
-        {"value": "1080p", "label": "1920x1080 (16:9)", "help": "True 1920x1080 render, MSAA off. About 60 fps with occasional dips on a Radeon 880M in Performance mode, with the Performance scene-detail preset."},
-        {"value": "1200p", "label": "1920x1200 (16:10)", "help": "16:10 at 1200 rows. Vert+ camera, HUD in a 16:9 band. The heaviest size."}
+        {"value": "1000p", "label": "1600x1000 (16:10)", "help": "16:10 at 1000 rows. Vert+ camera, HUD in a 16:9 band."},
+        {"value": "1080p", "label": "1920x1080 (16:9)", "help": "True 1920x1080 render, MSAA off. 60.0 fps, 99th percentile 17.7 ms on a Radeon 880M in Performance mode (5 min drive), with the Performance scene-detail preset."},
+        {"value": "1200p", "label": "1920x1200 (16:10)", "help": "16:10 at 1200 rows. Vert+ camera, HUD in a 16:9 band. Fills a 16:10 panel with no black bars; measured 60.0 fps, 99th percentile 17.3 ms on a Radeon 880M in Performance mode (5 min drive)."},
+        {"value": "2000p", "label": "3200x2000 (16:10, native laptop panel)", "help": "The game renders 1600x1000 and every render target is drawn at 2x2, so the picture is a true 3200x2000 (Vert+ camera, HUD in a 16:9 band); about 4x the GPU load of 1600x1000, measured 23-26 fps on a Radeon 880M (parked scene). Use Fullscreen mode \"Desktop size (borderless)\": with \"Switch the display to the game's mode\" the display would go to 1600x1000."}
       ],
       "advanced": false,
       "emit": "always"
@@ -168,7 +218,7 @@
       "default": "desktop",
       "options": [
         {"value": "desktop", "label": "Desktop size (borderless)", "help": "Borderless window at the desktop's size; the game scales (and letterboxes) the picture itself. Safe everywhere."},
-        {"value": "guest", "label": "Switch the display to the game's mode", "help": "Changes the display mode to the game's video mode (e.g. 1280x800 or 1920x1080) at the highest refresh rate that is a multiple of 60 Hz (120 preferred), so the monitor's own scaler fills the panel. Falls back to the desktop size (see the log) if the display has no such mode."},
+        {"value": "guest", "label": "Switch the display to the game's mode", "help": "Changes the display mode to the game's video mode (e.g. 1280x800 or 1920x1080) at the highest refresh rate that is a multiple of 60 Hz (120 preferred), so the monitor's own scaler fills the panel. Falls back to the desktop size (see the log) if the display has no such mode. Do not use it with the 3200x2000 resolution: the display would go to the game's 1600x1000."},
         {"value": "1280x800@120", "label": "1280x800 @ 120 Hz (display mode)", "help": "Switches the display to exactly 1280x800 at 120 Hz (a 16:10 laptop panel mode); the panel's scaler fills the screen. Falls back to the desktop size if the display has no such mode."},
         {"value": "1600x1000@120", "label": "1600x1000 @ 120 Hz (display mode)", "help": "Switches the display to exactly 1600x1000 at 120 Hz (16:10); the panel's scaler fills the screen. Falls back to the desktop size if the display has no such mode."},
         {"value": "1920x1200@120", "label": "1920x1200 @ 120 Hz (display mode)", "help": "Switches the display to exactly 1920x1200 at 120 Hz (16:10); the panel's scaler fills the screen. Falls back to the desktop size if the display has no such mode."}
@@ -235,7 +285,7 @@
     {
       "id": "mcla_ws_tall_fov",
       "label": "16:10 camera",
-      "help": "Camera on a back buffer taller than 16:9 (the 1280x800, 1440x900 and 1920x1200 sizes). Has no effect at 16:9 sizes.",
+      "help": "Camera on a back buffer taller than 16:9 (the 16:10 sizes: 1280x800, 1440x900, 1600x1000, 1920x1200 and 3200x2000). Has no effect at 16:9 sizes.",
       "category": "display",
       "type": "enum",
       "cvar": "mcla_ws_tall_fov",
@@ -414,7 +464,7 @@
       "default": "perf",
       "options": [
         {"value": "default", "label": "Full (as shipped)", "help": "No change to the game's own detail levels."},
-        {"value": "perf", "label": "Performance", "help": "Car paint and reflection views drawn every 2nd frame, shadow distance 0.6, vehicle LOD 0.7, city LOD 0.67, sun-shadow map 512. Near-identical picture; at 1080p on a Radeon 880M it brought the 99th-percentile frame time from about 24.5 ms to 20-23 ms."},
+        {"value": "perf", "label": "Performance", "help": "Shadow distance 0.6, vehicle LOD 0.7, city LOD 0.67, sun-shadow map 512: a near-identical picture at a lower cost."},
         {"value": "perfplus", "label": "Performance+", "help": "Performance plus no far shadow cascade and no tree impostors."},
         {"value": "lowest", "label": "Lowest", "help": "Performance plus no sun shadows (the game's own night path): the largest saving, at the price of every sun shadow."}
       ],
@@ -432,7 +482,7 @@
       "options": [
         {"value": 0, "label": "640 (as shipped)", "help": "The game's own size."},
         {"value": 512, "label": "512", "help": "About a third less shadow fill."},
-        {"value": 384, "label": "384", "help": "Cheapest; visibly softer shadows."}
+        {"value": 384, "label": "384", "help": "Cheapest; softer shadows (at 2x2 resolution, the 3200x2000 size, it is drawn as 768 texels, close to the shipped 640)."}
       ],
       "advanced": true,
       "emit": "nondefault"
@@ -497,7 +547,7 @@
     {
       "id": "mcla_gfx_env_interval",
       "label": "Car reflection update interval",
-      "help": "The cars' paint and speedometer environment maps are redrawn every N-th frame; frames in between keep the last picture. 1 = every frame (as shipped).",
+      "help": "1 = the cars' paint and speedometer reflections are redrawn every frame (the default). 2 = they update at 30 Hz, the frames in between keep the last picture, for a little less GPU load (about 5 points of GPU load at 1080p together with the far-shadow knob). Not part of any preset.",
       "category": "graphics",
       "type": "int",
       "cvar": "mcla_gfx_env_interval",
@@ -510,8 +560,8 @@
     },
     {
       "id": "mcla_gfx_reflection_interval",
-      "label": "Reflection view update interval",
-      "help": "The reflection view is redrawn every N-th frame (at 2, on the frames the environment map is not). 1 = every frame (as shipped).",
+      "label": "Reflection view update interval (experimental)",
+      "help": "The reflection view is redrawn every N-th frame (at 2, on the frames the car-paint reflections are not); the frames in between keep the last picture. Experimental: it uses the same mechanism as the car reflection interval but has not been checked on its own. 1 = every frame (as shipped).",
       "category": "graphics",
       "type": "int",
       "cvar": "mcla_gfx_reflection_interval",
