@@ -818,6 +818,15 @@ purpose = "Windows D3D12: AMD's signed FidelityFX 2.4.0 runtime (loader + upscal
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0490-dual-write-resolve"
+source = "local"
+path = "patches/sdk/0490-dual-write-resolve.patch"
+sha256 = "02aa503cbdc46bebdfec57481f7d1ee8a7762454c8fb1ebe1ebd1a225a1d3cb3"
+purpose = "D3D12: cvar resolve_dual_write (default false): a direct resolve (batched, 1x source, unscaled, 32/64 bpp) that fully covers a resolved, tiled, single-level, direct-loadable texture of the texture cache also writes that texture from the resolve shader and marks it up to date, so its load is skipped; the shared memory is written as before. resolve_dual_write_verify (default 0): every Nth dual-written texture is also loaded the usual way and compared. Log: [resolve-dual-write] ... every 10 s. 4 new DXBC (fxc, xenia 0b2ffa3 tree). Vulkan untouched."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]
