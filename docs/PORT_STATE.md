@@ -24,8 +24,8 @@ Owner: ORC. The plan is [PLAN.md](PLAN.md); this file tracks where execution sta
 
 ## Current phase
 
-**PAUSED by the owner (2026-11-25).** Waves 3–5 in progress. Resume from "Next actions" below. No job is running and
-the heavy lock is free.
+**1080p60 sprint + launcher (2026-11-25).** Swarm: VER S1 benching, P1 GPU profiling (RGP + GPU timestamps), R1 shader
+translator study, O2 swap-path patch, TOOLS bench telemetry. Launcher (`launcher/`) built and reviewed.
 
 ## Milestones
 
@@ -38,14 +38,14 @@ the heavy lock is free.
 | M3 | Free-roam driving, 10 min soak | **pass** (b2.1): new profile → `cutscene -> free-roam` 136.9 s, save-backup lines ×2, drove 52 mph, pause open/close; fixture `after_intro`; 600 s soak `fatal=0` (run w2.1-m3c); parity with E2: cars coloured, no missing geometry/flashes. Owner check (radio balance) pending | 2026-11-24 |
 | M4 | Locked 30 fps at 720p | **open**: run w3.4-m4 met avg 30.00 and world/real 1.0004 but p99 was 35.1–35.2 ms (limit 35.0). Root cause: the CP's `Sleep(1)` swap-gate poll. Fixed by SDK patch 0430 (series 84), not yet re-gated | |
 | M5 | 60 fps at 720p | **close, not met**: `mcla_fps_target=60,mcla_present_immediate=-1,mcla_ws_single_tile=true` gives a stable run (w4.2-m5g-immst-stable) of avg 59.42, p99 25.25, world/real 0.9998 (bar: ≥59.5, ≤20). The run without the hold (w4.2-m5m2-immst) gets 60.00 / p99 22.66 | |
-| M6 | 60 fps at 1080p on the 880M | **open**: native 1080p now boots to free roam (w4.2-smoke1080, `fatal=0`) after the physical-pool fix; not benched yet. The owner's target is 720p + FSR 3 → 1080p | |
+| M6 | 60 fps at 1080p on the 880M | **open**: native 1080p single tile 55.3–56.7 fps (GPU ms p50 17.1–17.8); 900p single tile 59.4; FSR 3 (720p→1080p) 49.3 (pass 4.1 ms), FSR 4 (540p→1080p) 37.5 (pass 6.4 ms): **upscaling is slower than native on the 880M**. 16:10 1280x800 exclusive 57.2. Package power-capped at ~35 W, GPU at ~1.4 GHz of 2.9 GHz; ~8–13 ms of the GPU frame doesn't scale with clock (R6) | |
 | M7 | Polish | todo | |
 
 ## Task board
 
 ### Doing
 
-(nothing: paused)
+- Optimization round (see "Sprint findings" below): S1 VER benches, P1 profile, R1 shaders, O2 swap path.
 
 ### Todo (next actions, in order)
 
@@ -114,6 +114,22 @@ PLAN §7.2. Shared contracts for wave 1:
 See "Todo (next actions, in order)" in the task board. Note for resuming: the SDK install at `$WORK/sdk/install` is
 series 84 (`5e4b01ee959eb13a`); since the last codegen, new hooks were added (input fixes, physical pool), so run
 `python tools/codegen.py` before the next build. The role files are in `.omp/agents/` (local, gitignored).
+
+## Sprint findings (2026-11-25)
+
+Reports in `$WORK/scratch/{S2,S3,S4,S5,R2,R3,R4,R5,R6}/REPORT.md`.
+- **Upscaling loses on the 880M.** The FSR 3.1 pass costs 4.1 ms, FSR 4.1 6.4 ms, against ~3 ms saved by drawing the scene
+  smaller. Native 1080p single tile is the fastest 1080p.
+- **Power, not compute, is the wall.** The package sits at ~35 W; the GPU runs ~1.25–1.6 GHz (2.9 GHz boost) and drops
+  further when other CPU work runs (agent builds, Defender). Benches need a quiet machine (heavy lock for every
+  CPU-heavy job; `prepare_sdk.py build` now always takes the global lock) and telemetry in each row.
+- **8–13 ms of the GPU frame doesn't scale with the shader clock** (R6): bandwidth- or serialization-bound emulation work
+  (resolves + texture reloads ~140 MB/frame, EDRAM transfers, swap path). Levers in flight: 0490 dual-write resolve
+  (−0.8–1.1 ms est.), swap-direct-present (−0.2–0.35), quad lists without the GS, `clear_memory_page_state=false`.
+- **Game-side detail cuts barely move it** (`mcla_gfx_preset=perf` −0.3 ms, inside noise); `perf+` (impostors off) is
+  slower; `skip_overwritten_transfers=true` costs +6 ms (do not ship).
+- **Exclusive fullscreen stays "Composed: Flip"** with the SuperDisplay virtual second display attached; owner check:
+  detach DISPLAY2 for one run.
 
 ## Decisions changed since PLAN
 
