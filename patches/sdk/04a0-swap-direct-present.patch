@@ -1,0 +1,1965 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Wed, 25 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 04a0: swap_direct_present: the swap shows the front buffer's host render target without loading it, and the gamma ramp goes into the presenter's paint
+
+Source: Ours, written for this SDK (O2; R2 lever 4 and S2 lever 8: $WORK/scratch/R2/REPORT.md, $WORK/scratch/S2/REPORT.md). The
+  SDK's swap, direct resolve, shared memory watch and presenter code are used as they are. The pixel shader is a port of the
+  SDK's apply_gamma_table (the same table lookup) with the paint's pixel index; compiled with fxc from the HLSL in this patch
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: Cut GPU time in the D3D12 swap at 1080p (R2: about 0.2-0.35 ms on the 880M). A swap was: the game's front buffer resolve
+  (render target -> shared memory) -> texture load (shared memory -> texture) -> apply-gamma compute (texture -> guest output image)
+  -> presenter paint (guest output image -> back buffer): 2 full-screen passes more than the picture needs. Cvar
+  swap_direct_present (default FALSE, hot reload): when the front buffer was resolved, whole, from ONE host 8_8_8_8 render target
+  by a direct resolve and nothing has written the memory or the render target since, the swap reads that render target instead
+  of the loaded texture (no texture load: the apply-gamma pass reads the render target). Cvar swap_direct_present_fused (default
+  true, with swap_direct_present): and when the guest output thread paints the frame right after the refresh as a plain 1:1 copy
+  of an 8-bit image (no scaling, no effects, SDR, no frame generation, no UI overlay painting), the apply-gamma pass is dropped:
+  the presenter's paint maps the ramp over the render target while it copies it to the back buffer - one pass. Cvar
+  swap_direct_present_check (default 0): every Nth swap that could use it, the picture is made the old way as well, both the
+  new ways are drawn next to it, read back and compared, and the largest difference per channel is logged
+  ("swap_direct_present_check: ... 0/0/0/0" is exact). The resolve still writes the front buffer to shared memory. Not built or run
+  (every changed file passes clang++ -fsyntax-only with the SDK's Release flags, except the PCH; see Checks).
+Bucket: REDO
+
+04a0-swap-direct-present.patch (mcla-x86 O2)
+
+Depends on 0490 (it patches the same Resolve and texture cache header lines). Series entry, after 0490-dual-write-resolve:
+  name = "04a0-swap-direct-present", source = "local", path = "patches/sdk/04a0-swap-direct-present.patch", subdir = "", bucket = "REDO".
+
+What reads the front buffer's guest memory (the question: is the memory write still needed?). Found: nothing in this SDK or in this
+repo's host code. The swap itself (the texture load, which this removes for the swap), the CPU readbacks (d3d12_readback_resolve,
+readback_resolve rules: none for the front buffer, only the vinyl editor's 512x512), and Presenter::CaptureGuestOutput, which has
+no caller in the SDK or in mcla-x86 and reads the guest output IMAGE, not the guest memory (tools/run_game.py takes screenshots of
+the window with CopyFromScreen, which sees the presented picture). The game's own CPU code could read the memory: unknown, so the
+resolve is NOT skipped (the 16.8 MB texture load and a pass are what is saved). A front buffer resolve that is skipped altogether
+when nothing reads it would save a third pass; it needs an owner decision.
+
+Design.
+  * Recording (d3d12/render_target_cache.cpp NoteSwapDirectResolve, called for every resolve that copied): a resolve qualifies when it
+    was direct, read one single-sampled k_8_8_8_8 colour render target at the resolve's own base (no offset in the render target
+    or the EDRAM, at the texture's origin), at 1x, not stretched by the FSR upscaling (TaaSqueezingScene), to a k_8_8_8_8
+    destination with no red/blue swap, no exponent bias, not an array slice. Then the destination texel (x, y) is the render
+    target's texel (x, y) and the bytes are the same up to the endian swap that the swap's fetch constant undoes (compared at
+    the swap: base address, pitch, endianness; the texture may not be larger than the resolved area). One record per destination
+    address (4, the least recent replaced), so another small 8_8_8_8 resolve does not evict the front buffer's.
+    The recorded memory range must be GPU-written valid data when it is recorded (SharedMemory::AreAllPagesValidAndGpuWritten,
+    asked under the global critical region that a write to the memory also takes).
+  * Staleness: (1) the shared memory's global watch (any CPU write, any other GPU write, a ClearCache) bumps a per-record counter
+    when it overlaps the recorded range - the next resolve of the same memory included; (2) a D3D12RenderTarget counts the times
+    it is put in a state it can be written in (render target, depth write, UAV, copy / resolve destination: every draw, clear,
+    ownership transfer and HDR copy does, SetResourceState), and has a serial that a trimmed and made-again render target does not
+    keep (the record keeps keys, FindRenderTargetByKey, no pointers). A resolve that clears the render target after copying
+    bumps it, so it never counts. The direct resolve leaves the render target in the non-pixel read state, so every later write
+    must go through SetResourceState.
+  * The swap (D3D12CommandProcessor::IssueSwap): PrepareSwapDirect reads the fetch constant 0 (D3D12TextureCache::GetSwapTextureInfo:
+    2D, k_8_8_8_8, tiled, one level, not scaled; the SRV swizzle of RequestSwapTexture is kept) and asks the cache. If it matches,
+    the render target's SRV stands in for the swap texture (its size is the fetch constant's: the picture is the top-left corner)
+    and the texture isn't loaded. HDR output and frame generation read the swap texture too: they get it loaded (inside the
+    refresher, before it asks for descriptors). The render target is moved to the read state and recorded as that.
+  * Fused paint: D3D12Presenter::FusedGammaState per guest output (mailbox) image. The refresher asks fused_gamma_possible()
+    (IsFusedGammaPaintPossible: the guest output thread owns painting and paints right after - Presenter::
+    LockForGuestOutputThreadPaintCheck, which also excludes UI overlay painting - the connection is SDR and paintable, no
+    frame generation, and GetGuestOutputPaintFlow for the image says one bilinear pass whose output is the image's size) and, if
+    so, gives the render target and the ramp (SRVs) instead of writing the image; both go to the read state for pixel shaders. The
+    paint (guest_output_gamma_table_ps, a root signature of its own with the same three parameter indices, a pipeline for the
+    swap chain format) draws the same rectangle with the output's offset: for a pixel the texel under it, its ramp value, which
+    is what the apply-gamma pass wrote and the 1:1 bilinear paint of that image would hand on. The paint makes a descriptor pair
+    in its own heap per command allocator and keeps references to the resources for the GPU until the allocator is reused.
+    Only a paint in the guest output thread right after the refresh may use the image (the source is a live render target);
+    any other paint of such an image (the mode changed in between, a window repaint) shows the older frame still in its texture
+    (a texture is offered for this only after it was written once), and CaptureGuestOutput of one says no.
+  * Fused paint exactness: the same table lookup on the same 8-bit value, the same float from the ramp as the UNORM10 texture
+    sample would give (a 10-bit value over 1023, exact), the same alpha 1, to the same B8G8R8A8 render target. The only thing
+    the old paint added was the bilinear filter at texel centres, which only hands the texel on (the weights are 0 and 1 on any
+    GPU that rounds the fraction to 8 bits). Not proven without a run: swap_direct_present_check says it.
+
+Checks to run (VER), in this order, each on a frozen frame and on the moving bench:
+  1. swap_direct_present=true swap_direct_present_fused=false swap_direct_present_check=60: the log has
+     "swap_direct_present: a resolve of the host render target ... can be shown without loading it" once, a line every 10 s
+     "swap_direct_present: N swaps in 10.0 s: N made from the render target (0 with the gamma ramp applied in the presenter's paint),
+     0 from the loaded texture; K checks", and "swap_direct_present_check: apply-gamma image #n ... 0/0/0/0, 0 pixels differ".
+     A non-zero difference or a reason list ("the render target was written since the resolve" ...) is the finding.
+  2. the same with swap_direct_present_fused=true: also "swap_direct_present_check: fused paint #n ... 0/0/0/0".
+  3. swap_direct_present=true, check off: GPU time of the swap (PresentMon MsGPUBusy, or P1's timestamps), and the picture
+     against the old path on a screenshot of a still scene (identical).
+  The fused paint needs host_present_from_non_ui_thread (guest output thread presenting: no implicit vsync, no UI drawers, no
+  present_ui_overlay, no frame generation) - otherwise the log says "(0 with the gamma ramp applied in the presenter's paint)".
+
+Interplay with 0490 (resolve_dual_write): with the swap not loading the front buffer, no texture is ever made for it, so the dual
+write finds none (fallback "no texture") and writes nothing extra; a check swap loads the texture (once in N), after which
+the dual write for it starts and its "dual writes unused" counter counts the front buffer, which is cosmetic.
+
+Not done / limits: only the table gamma path (k_8_8_8_8 front buffer); k_2_10_10_10 (PWL ramp), FXAA (the pass still reads the
+render target, but isn't fused), HDR, frame generation, FSR/CAS effects and scaled output use the old paint; resolution_scale > 1 and
+the squeezed FSR scene (TaaSqueezingScene) are never recorded; a front buffer in several tile resolves (one record per tile
+address, the swap's texture must match one) falls back. The front buffer resolve is not skipped (see above).
+
+Changed files: include/rex/graphics/{shared_memory.h, pipeline/render_target/cache.h, d3d12/render_target_cache.h,
+d3d12/texture_cache.h, d3d12/command_processor.h}, include/rex/ui/{presenter.h, d3d12/d3d12_presenter.h},
+src/graphics/{shared_memory.cpp, d3d12/render_target_cache.cpp, d3d12/texture_cache.cpp, d3d12/command_processor.cpp},
+src/ui/{presenter.cpp, d3d12/d3d12_presenter.cpp}, and new src/ui/shaders/guest_output_gamma_table.ps.hlsl and
+src/ui/shaders/bytecode/d3d12_5_1/guest_output_gamma_table_ps.h (fxc 10.0.26100.0, ps_5_1 /O3 /Qstrip_reflect /Qstrip_debug
+/Qstrip_priv, 632 bytes, the command is in the HLSL file).
+
+Checks done: clang++ 20.1.8 -fsyntax-only (Release flags and defines of the SDK build, no PCH, -w) of the 6 changed .cpp files and
+of d3d12_presenter_frame_generation.cpp, d3d12/{frame_generation,temporal_aa,pipeline_cache,graphics_system}.cpp,
+ui/vulkan/vulkan_presenter.cpp: 0 errors. git apply --check --cached of this diff on series 88 + 0490: clean. Not built, not run.
+
+---
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 43e05a40..92cab70b 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -877,6 +877,52 @@ class D3D12CommandProcessor : public CommandProcessor {
+   Microsoft::WRL::ComPtr<ID3D12Resource> fxaa_source_texture_;
+   uint64_t fxaa_source_texture_submission_ = 0;
+ 
++  // LOCAL PATCH - MCLA (04a0): swap_direct_present (D3D12CommandProcessor::IssueSwap).
++  struct SwapDirect {
++    // A recorded resolve of the front buffer matches the swap's texture, and the render target can stand in for it.
++    bool possible = false;
++    // The swap's texture isn't loaded: the apply-gamma pass (or the presenter's paint) reads the render target.
++    bool in_place = false;
++    // A check swap (swap_direct_present_check): the picture is made from the loaded texture as before, and the render
++    // target's is compared with it.
++    bool check = false;
++    // swap_direct_present_fused.
++    bool fuse = false;
++    D3D12TextureCache::SwapTextureInfo texture_info;
++    D3D12RenderTargetCache::SwapDirectSource source;
++    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
++  };
++  void PrepareSwapDirect(SwapDirect& direct);
++  // Counts the swap's outcome: `why_not` (a string literal) if the swap didn't use the render target, and logs the
++  // counts every 10 seconds.
++  void NoteSwapDirect(const char* why_not, bool direct, bool fused);
++  // swap_direct_present_check: after the apply-gamma pass wrote `mailbox` from the loaded texture, the same pass from
++  // the render target into a scratch image of the same size, and the copies of both to readback buffers;
++  // `descriptors` are the scratch image's UAV and the render target's SRV; false if it can't be done.
++  bool RecordSwapDirectCheck(const SwapDirect& direct, ID3D12Resource* mailbox, uint32_t width,
++                             uint32_t height,
++                             const ui::d3d12::util::DescriptorCpuGpuHandlePair* descriptors,
++                             const ui::d3d12::util::DescriptorCpuGpuHandlePair& ramp,
++                             D3D12_RESOURCE_STATES read_state);
++  // After the check's submission completed: compares the two images and logs the largest difference.
++  void CompleteSwapDirectCheck(uint32_t width, uint32_t height);
++  struct SwapDirectStats {
++    uint64_t swaps = 0;
++    uint64_t direct = 0;
++    uint64_t fused = 0;
++    uint64_t checks = 0;
++    // The string literals of the reasons the render target wasn't used, and how many times each.
++    std::array<std::pair<const char*, uint64_t>, 16> why_not = {};
++    uint64_t window_start_ms = 0;
++  } swap_direct_stats_;
++  uint64_t swap_direct_check_counter_ = 0;
++  Microsoft::WRL::ComPtr<ID3D12Resource> swap_direct_check_texture_;
++  Microsoft::WRL::ComPtr<ID3D12Resource> swap_direct_check_readback_[2];
++  D3D12_PLACED_SUBRESOURCE_FOOTPRINT swap_direct_check_footprint_ = {};
++  uint32_t swap_direct_check_width_ = 0;
++  uint32_t swap_direct_check_height_ = 0;
++  uint64_t swap_direct_check_number_ = 0;
++
+   // Unsubmitted barrier batch.
+   std::vector<D3D12_RESOURCE_BARRIER> barriers_;
+ 
+diff --git a/include/rex/graphics/d3d12/render_target_cache.h b/include/rex/graphics/d3d12/render_target_cache.h
+index 0716fd5d..6eb40383 100644
+--- a/include/rex/graphics/d3d12/render_target_cache.h
++++ b/include/rex/graphics/d3d12/render_target_cache.h
+@@ -13,6 +13,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <cstddef>
+ #include <cstdint>
+ #include <deque>
+@@ -38,6 +39,12 @@ namespace rex::graphics::d3d12 {
+ 
+ class D3D12CommandProcessor;
+ 
++// LOCAL PATCH - MCLA (04a0): numbers the D3D12 render target objects (swap_direct_present).
++inline uint64_t NextSwapDirectRenderTargetSerial() {
++  static std::atomic<uint64_t> serial{0};
++  return ++serial;
++}
++
+ class D3D12RenderTargetCache final : public RenderTargetCache {
+  public:
+   D3D12RenderTargetCache(const RegisterFile& register_file, const memory::Memory& memory,
+@@ -98,6 +105,35 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+   bool HdrRestoreColorTarget(uint32_t key, D3D12_GPU_DESCRIPTOR_HANDLE underlay_srv,
+                              D3D12_RECT rect);
+ 
++  // LOCAL PATCH - MCLA (04a0): swap_direct_present. The host render target that the last resolve of a whole front buffer
++  // read, which the swap can show the picture from instead of from the resolved copy in memory (loaded to a texture
++  // and gamma-mapped): while the resolve is the only writer of that memory and nothing has drawn to, cleared or
++  // transferred into the render target since, its texels are the resolve's texels (see NoteSwapDirectResolve for what
++  // a resolve must be to count).
++  struct SwapDirectTexture {
++    // The texture the swap would load (the fetch constant of the swap packet): the resolve destination's address in
++    // bytes, its pitch in 32-texel units, its size, and its endianness (xenos::Endian).
++    uint32_t base_address = 0;
++    uint32_t pitch_div_32 = 0;
++    uint32_t width = 0;
++    uint32_t height = 0;
++    uint32_t endianness = 0;
++  };
++  struct SwapDirectSource {
++    ID3D12Resource* resource = nullptr;
++    // R8G8B8A8_UNORM, the host format of the k_8_8_8_8 render target.
++    DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN;
++    // Opaque, for UseSwapDirectSource.
++    void* render_target = nullptr;
++  };
++  // Whether the swap's texture can be shown from the render target (true), or why not (a string literal). Changes
++  // nothing.
++  bool FindSwapDirectSource(const SwapDirectTexture& texture, SwapDirectSource& source_out,
++                            const char*& why_not_out);
++  // Pushes the transition of the render target to `state` (a state it is read in) and records it as the state, for a
++  // pass of the swap that reads it; the next draw into it transitions it back.
++  void UseSwapDirectSource(const SwapDirectSource& source, D3D12_RESOURCE_STATES state);
++
+   // For host render targets.
+ 
+   bool gamma_render_target_as_unorm16() const { return gamma_render_target_as_unorm16_; }
+@@ -285,8 +321,19 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+     D3D12_RESOURCE_STATES SetResourceState(D3D12_RESOURCE_STATES new_state) {
+       D3D12_RESOURCE_STATES old_state = resource_state_;
+       resource_state_ = new_state;
++      // LOCAL PATCH - MCLA (04a0): swap_direct_present's "written since" (draws, clears, ownership transfers, the
++      // HDR copies all go through a state it can be written in).
++      if (new_state & (D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_DEPTH_WRITE |
++                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_COPY_DEST |
++                       D3D12_RESOURCE_STATE_RESOLVE_DEST)) {
++        ++write_generation_;
++      }
+       return old_state;
+     }
++    // LOCAL PATCH - MCLA (04a0): which object this is (a trimmed render target made again for the same key is another),
++    // and how many times it was put in a state it can be written in.
++    uint64_t serial() const { return serial_; }
++    uint64_t write_generation() const { return write_generation_; }
+ 
+     uint32_t temporary_srv_descriptor_index() const { return temporary_srv_descriptor_index_; }
+     void SetTemporarySRVDescriptorIndex(uint32_t index) { temporary_srv_descriptor_index_ = index; }
+@@ -314,6 +361,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+     uint32_t temporary_srv_descriptor_index_ = UINT32_MAX;
+     uint32_t temporary_srv_descriptor_index_stencil_ = UINT32_MAX;
+     uint32_t temporary_sort_index_ = 0;
++    uint64_t serial_ = NextSwapDirectRenderTargetSerial();
++    uint64_t write_generation_ = 0;
+   };
+ 
+   enum TransferCBVRegister : uint32_t {
+@@ -828,6 +877,54 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+   ID3D12PipelineState* resolve_rov_clear_32bpp_pipeline_ = nullptr;
+   // Clearing 64bpp color.
+   ID3D12PipelineState* resolve_rov_clear_64bpp_pipeline_ = nullptr;
++
++  // LOCAL PATCH - MCLA (04a0): swap_direct_present. The last resolves to whole pictures that qualified (a whole 8_8_8_8
++  // picture, one render target the source, no scaling, stretching or conversion), one record for each destination
++  // address (another small 8_8_8_8 resolve doesn't make the front buffer's forgotten), the least recent replaced.
++  static constexpr size_t kSwapDirectRecordCount = 4;
++  struct SwapDirectRecord {
++    bool valid = false;
++    RenderTargetKey render_target_key;
++    uint64_t render_target_serial = 0;
++    uint64_t render_target_write_generation = 0;
++    // The resolve destination and what it wrote (the texture's top-left corner is the render target's).
++    uint32_t dest_base = 0;
++    uint32_t dest_pitch_div_32 = 0;
++    uint32_t endianness = 0;
++    uint32_t width = 0;
++    uint32_t height = 0;
++    // The invalidation count of the memory range written, when it was written.
++    uint64_t invalidations = 0;
++    // When it was made, for replacing the least recent.
++    uint64_t sequence = 0;
++  };
++  SwapDirectRecord swap_direct_records_[kSwapDirectRecordCount];
++  uint64_t swap_direct_sequence_ = 0;
++  // For each record, what the shared memory's global watch needs (any thread, within the global critical region): the
++  // memory range written, inclusive (start > end: none), and how many times it was invalidated (CPU writes, other
++  // GPU writes).
++  struct SwapDirectWatch {
++    std::atomic<uint32_t> start{UINT32_MAX};
++    std::atomic<uint32_t> end{0};
++    std::atomic<uint64_t> invalidations{0};
++  };
++  SwapDirectWatch swap_direct_watches_[kSwapDirectRecordCount];
++  SharedMemory* swap_direct_shared_memory_ = nullptr;
++  SharedMemory::GlobalWatchHandle swap_direct_watch_handle_ = nullptr;
++  static void SwapDirectWatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
++                                      void* context, uint32_t address_first, uint32_t address_last,
++                                      bool invalidated_by_gpu);
++  // Called by Resolve for every resolve that copied to memory: records it if it is a whole picture's resolve from one
++  // render target the way swap_direct_present can use (anything it overwrites is forgotten by the watch).
++  void NoteSwapDirectResolve(D3D12SharedMemory& shared_memory,
++                             const draw_util::ResolveInfo& resolve_info,
++                             D3D12RenderTarget* direct_source,
++                             const DirectResolveSourceConstants& direct_source_constants);
++  void ClearSwapDirectRecords() {
++    for (SwapDirectRecord& record : swap_direct_records_) {
++      record.valid = false;
++    }
++  }
+ };
+ 
+ }  // namespace rex::graphics::d3d12
+diff --git a/include/rex/graphics/d3d12/texture_cache.h b/include/rex/graphics/d3d12/texture_cache.h
+index 94ac3460..d9183437 100644
+--- a/include/rex/graphics/d3d12/texture_cache.h
++++ b/include/rex/graphics/d3d12/texture_cache.h
+@@ -254,6 +254,22 @@ class D3D12TextureCache final : public TextureCache {
+   // Every 10 s logs the counts since the last line, if there were any.
+   void LogResolveDualWriteIfDue();
+ 
++  // LOCAL PATCH - MCLA (04a0): what RequestSwapTexture would use, read from the swap's fetch constant without creating
++  // or loading the texture (swap_direct_present). False, with why_not_out (a string literal), if it isn't a tiled
++  // single-level 2D k_8_8_8_8 texture at native resolution.
++  struct SwapTextureInfo {
++    uint32_t base_address = 0;  // bytes
++    uint32_t pitch_div_32 = 0;
++    uint32_t width = 0;
++    uint32_t height = 0;
++    uint32_t endianness = 0;  // xenos::Endian
++    xenos::TextureFormat format = xenos::TextureFormat::k_8_8_8_8;
++    DXGI_FORMAT dxgi_format = DXGI_FORMAT_UNKNOWN;
++    // The SRV's component mapping: the fetch constant's swizzle on the host format's.
++    uint32_t shader_4_component_mapping = 0;
++  };
++  bool GetSwapTextureInfo(SwapTextureInfo& info_out, const char*& why_not_out);
++
+  protected:
+   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
+   bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
+diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
+index 429d65a4..48c12fb0 100644
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -616,6 +616,12 @@ class RenderTargetCache {
+     auto it = render_targets_.find(rt_key);
+     return it != render_targets_.end() ? it->second : nullptr;
+   }
++  // LOCAL PATCH - MCLA (04a0): the host render target made for `key`, if it still exists (swap_direct_present
++  // keeps keys, not pointers, across frames).
++  RenderTarget* FindRenderTargetByKey(const RenderTargetKey& key) const {
++    auto it = render_targets_.find(key);
++    return it != render_targets_.end() ? it->second : nullptr;
++  }
+   RenderTarget* const* last_update_accumulated_render_targets() const {
+     assert_true(GetPath() == Path::kHostRenderTargets);
+     return last_update_accumulated_render_targets_;
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index c0e8d598..d0a0461d 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -95,6 +95,12 @@ class SharedMemory {
+   // regions in those pages.
+   void RangeWrittenByGpu(uint32_t start, uint32_t length);
+ 
++  // LOCAL PATCH - MCLA (04a0): whether every page of the range holds data the GPU wrote (RangeWrittenByGpu) that nothing
++  // has invalidated since: not written by the CPU, not by a later upload, not made hot (swap_direct_present asks, under
++  // the global critical region it takes itself, right after a resolve wrote the range, so a write that came between
++  // the resolve and the question is seen).
++  bool AreAllPagesValidAndGpuWritten(uint32_t start, uint32_t length);
++
+   // Makes sure the host GPU memory behind the range exists (the sparse
+   // allocations of the backends that use them), without uploading anything or
+   // changing which pages are valid. RequestRange does this too, but not when
+diff --git a/include/rex/ui/d3d12/d3d12_presenter.h b/include/rex/ui/d3d12/d3d12_presenter.h
+index 190e30ad..a8afc157 100644
+--- a/include/rex/ui/d3d12/d3d12_presenter.h
++++ b/include/rex/ui/d3d12/d3d12_presenter.h
+@@ -99,15 +99,47 @@ class D3D12Presenter final : public Presenter {
+     void* compose_generated_context = nullptr;
+   };
+ 
++  // LOCAL PATCH - MCLA (04a0): swap_direct_present. A guest output refresher that has an 8-bit image and the ramp of
++  // the 256-entry table gamma path can, instead of writing the gamma-mapped image to the guest output texture, give
++  // the presenter the image (an SRV of it) and the ramp, for its paint to map the ramp over while it copies the
++  // image 1:1 to the back buffer: one pass instead of two. Only for a paint that comes right after the refresher in the
++  // same thread (the guest output thread paints immediately, with the image's size as the output size, no
++  // effects): the image is a live host render target that the next guest draw will change. Whether that is the case
++  // is fused_gamma_possible(), asked by the refresher before it commits.
++  struct FusedGammaSource {
++    // Both in D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, alone or with other read states, when the refresher returns.
++    ID3D12Resource* source = nullptr;
++    D3D12_SHADER_RESOURCE_VIEW_DESC source_srv = {};
++    ID3D12Resource* ramp = nullptr;
++    D3D12_SHADER_RESOURCE_VIEW_DESC ramp_srv = {};
++    // The refresher also wrote the guest output texture as usual (swap_direct_present_check): the paint is the usual
++    // one, and the presenter draws the fused one next to it, compares the two back buffer images and logs the largest
++    // difference.
++    bool check_only = false;
++  };
++  // Per guest output (mailbox) image.
++  struct FusedGammaState {
++    // Set by the presenter before the refresher runs.
++    bool possible = false;
++    // Set by the refresher: the guest output texture was not written (or, with check_only, was and is also checked).
++    bool set = false;
++    FusedGammaSource source;
++    // References for the GPU use of the paint.
++    Microsoft::WRL::ComPtr<ID3D12Resource> source_ref;
++    Microsoft::WRL::ComPtr<ID3D12Resource> ramp_ref;
++  };
++
+   // The callback must use the main direct queue of the provider.
+   class D3D12GuestOutputRefreshContext final : public GuestOutputRefreshContext {
+    public:
+     D3D12GuestOutputRefreshContext(bool& is_8bpc_out_ref, GuestOutputHdr& hdr_out_ref,
+                                    ID3D12Resource* resource,
+-                                   FrameGenerationInputs* frame_generation = nullptr)
++                                   FrameGenerationInputs* frame_generation = nullptr,
++                                   FusedGammaState* fused_gamma = nullptr)
+         : GuestOutputRefreshContext(is_8bpc_out_ref, hdr_out_ref),
+           resource_(resource),
+-          frame_generation_(frame_generation) {}
++          frame_generation_(frame_generation),
++          fused_gamma_(fused_gamma) {}
+ 
+     // kGuestOutputFormat, supports UAV. The initial state in the callback is
+     // kGuestOutputInternalState, and the callback must also transition it back
+@@ -118,9 +150,22 @@ class D3D12Presenter final : public Presenter {
+     // frames aren't generated now.
+     FrameGenerationInputs* frame_generation() const { return frame_generation_; }
+ 
++    // swap_direct_present: whether the paint of this image can be given the source and the ramp instead of the
++    // finished image (see FusedGammaSource).
++    bool fused_gamma_possible() const { return fused_gamma_ && fused_gamma_->possible; }
++    void SetFusedGammaSource(const FusedGammaSource& source) {
++      if (fused_gamma_) {
++        fused_gamma_->source = source;
++        fused_gamma_->source_ref = source.source;
++        fused_gamma_->ramp_ref = source.ramp;
++        fused_gamma_->set = true;
++      }
++    }
++
+    private:
+     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
+     FrameGenerationInputs* frame_generation_;
++    FusedGammaState* fused_gamma_;
+   };
+ 
+   static std::unique_ptr<D3D12Presenter> Create(HostGpuLossCallback host_gpu_loss_callback,
+@@ -246,6 +291,9 @@ class D3D12Presenter final : public Presenter {
+       // HDR output: the layer the presenter's own UI is drawn into.
+       kRTVIndexHdrUiLayer = kRTVIndexGuestOutputIntermediate0 + kGuestOutputMailboxSize - 1,
+ 
++      // swap_direct_present_check: the scratch image the fused paint is drawn into, to compare it with the back buffer.
++      kRTVIndexFusedGammaCheck,
++
+       kRTVCount,
+     };
+ 
+@@ -266,7 +314,11 @@ class D3D12Presenter final : public Presenter {
+       kViewIndexUiOverlay0Srv,
+       kViewIndexUiOverlay1Srv,
+ 
+-      kViewCount,
++      // swap_direct_present: the ramp (t0) and the source (t1) of the fused paint, a pair for each of the command
++      // allocators (the pair of paint submission N is overwritten once the paint of N - 3 has completed).
++      kViewIndexFusedGamma0,
++
++      kViewCount = kViewIndexFusedGamma0 + 2 * kSwapChainBufferCount,
+     };
+ 
+     void AwaitSwapChainUsageCompletion() {
+@@ -317,6 +369,11 @@ class D3D12Presenter final : public Presenter {
+         guest_output_intermediate_textures;
+     UINT64 guest_output_intermediate_texture_last_usage = 0;
+ 
++    // swap_direct_present: the resources the fused paint of a paint submission reads (the source, the ramp), indexed
++    // like its command allocator, so they live until that allocator is reused.
++    std::array<std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2>, kSwapChainBufferCount>
++        fused_gamma_refs;
++
+     // Connection-specific.
+ 
+     uint32_t swap_chain_width = 0;
+@@ -446,6 +503,41 @@ class D3D12Presenter final : public Presenter {
+   // UI overlay painting: the UI overlay (premultiplied) over the SDR swap chain.
+   Microsoft::WRL::ComPtr<ID3D12PipelineState> ui_overlay_composite_pipeline_;
+ 
++  // LOCAL PATCH - MCLA (04a0): swap_direct_present's fused paint: the bilinear paint of a 1:1 image with the table
++  // gamma ramp (guest_output_gamma_table_ps) applied to the 8-bit source on the way. Root parameters as
++  // GuestOutputPaintRootParameter: 0 - the ramp (t0) and source (t1) SRVs, 1 - the rectangle (vertex shader),
++  // 2 - the output's offset in the back buffer (2 int32, pixel shader).
++  Microsoft::WRL::ComPtr<ID3D12RootSignature> guest_output_paint_gamma_root_signature_;
++  Microsoft::WRL::ComPtr<ID3D12PipelineState> guest_output_paint_gamma_pipeline_;
++  // Per mailbox image: what the refresher gave for the fused paint, and whether the image's texture has ever been
++  // written (a paint of an image that wasn't, other than the fused one, would show uninitialized memory; one that
++  // was shows an older frame).
++  std::array<FusedGammaState, kGuestOutputMailboxSize> guest_output_fused_;
++  std::array<bool, kGuestOutputMailboxSize> guest_output_written_ = {};
++  // Whether the refresher may give a fused source for the image being refreshed (the guest output thread owns painting
++  // and paints it right after, as a 1:1 copy without effects, to an SDR swap chain).
++  bool IsFusedGammaPaintPossible(uint32_t mailbox_index);
++  // swap_direct_present_check, in the paint: the scratch image and the readback buffers for comparing the fused paint
++  // with the usual one, recorded by RecordFusedGammaCheck and compared by CompleteFusedGammaCheck once the paint
++  // submission has completed.
++  struct FusedGammaCheck {
++    Microsoft::WRL::ComPtr<ID3D12Resource> texture;
++    Microsoft::WRL::ComPtr<ID3D12Resource> readback[2];
++    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
++    uint32_t width = 0;
++    uint32_t height = 0;
++    uint64_t number = 0;
++    uint64_t refresh_number = 0;
++    bool recorded = false;
++    UINT64 submission = 0;
++  } fused_gamma_check_;
++  bool RecordFusedGammaCheck(ID3D12GraphicsCommandList* command_list, ID3D12Resource* back_buffer,
++                             D3D12_CPU_DESCRIPTOR_HANDLE rtv_heap_start,
++                             D3D12_CPU_DESCRIPTOR_HANDLE back_buffer_rtv,
++                             D3D12_GPU_DESCRIPTOR_HANDLE fused_view_gpu,
++                             const GuestOutputPaintFlow& flow, uint64_t refresh_number);
++  void CompleteFusedGammaCheck();
++
+   // The first is the refresher submission tracker fence value at which the
+   // guest output texture was last refreshed, the second is the reference to the
+   // texture, which may be null. The indices are the mailbox indices.
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index 0effdac0..c0312905 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -886,6 +886,16 @@ class Presenter {
+   const GuestOutputProperties& GetRefreshingGuestOutputProperties(uint32_t mailbox_index) const {
+     return guest_output_properties_[mailbox_index];
+   }
++  // LOCAL PATCH - MCLA (04a0): for a refresher that may hand the paint something other than a finished image
++  // (swap_direct_present's fused paint), which only works if the guest output thread paints right after it. Locks
++  // the paint mode, like the guest output thread does while it paints, and returns true with the lock held in
++  // `lock_out` if it is that way now: the guest output thread owns painting (so the paint context can be read),
++  // the connection is paintable, and the UI overlay doesn't repaint images on its own. The mode can still change
++  // after the lock is released (before the paint): a paint of the image by the UI thread then has no finished image
++  // to show, which is the backend's to survive.
++  bool LockForGuestOutputThreadPaintCheck(std::unique_lock<std::mutex>& lock_out);
++  // A copy of the paint configuration, as ConsumeGuestOutput gives it.
++  void CopyGuestOutputPaintConfig(GuestOutputPaintConfig& config_out);
+   // The present log: a real frame composed for a present an implementation's
+   // callback makes next (thread c).
+   static void LogPresentFromCallback(uint64_t refresh_number);
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 4d57be39..0fea5f41 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -94,6 +94,26 @@ REXCVAR_DEFINE_BOOL(d3d12_hoist_shared_memory_uploads_stats, false, "GPU/D3D12",
+ REXCVAR_DECLARE(bool, gpu_regwrite_bulk);
+ REXCVAR_DECLARE(bool, gpu_batch_perf_counters);
+ 
++// LOCAL PATCH - MCLA (04a0): swap_direct_present (defined in d3d12/render_target_cache.cpp) and its sub-switches.
++REXCVAR_DECLARE(bool, swap_direct_present);
++REXCVAR_DEFINE_BOOL(swap_direct_present_fused, true, "GPU/D3D12",
++                    "With swap_direct_present, when the guest output thread paints the swap right after "
++                    "the guest frame as a plain 1:1 copy of an 8-bit image (no scaling, no effects, SDR; "
++                    "see the presenter), apply the gamma ramp in that paint instead of in a pass of "
++                    "its own: the swap is one pass from the host render target to the back buffer. "
++                    "Otherwise the apply-gamma pass reads the render target and writes the guest "
++                    "output image, as it read the loaded texture before")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_UINT32(swap_direct_present_check, 0, "GPU/D3D12",
++                      "Development check of swap_direct_present: every this many swaps (0: never) in which "
++                      "it could be used, make the picture the old way (loaded texture, apply-gamma, bilinear "
++                      "paint) and make it the new way next to it (from the render target) as well, "
++                      "compare the two images read back (stalls the frame) and log the largest difference "
++                      "of each channel: 'swap_direct_present_check: ... 0/0/0/0' for exact. The picture "
++                      "shown is the old one")
++    .range(0, 100000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics::d3d12 {
+ 
+ // Generated with `xb buildshaders`.
+@@ -2602,9 +2622,23 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   D3D12_SHADER_RESOURCE_VIEW_DESC swap_texture_srv_desc;
+   xenos::TextureFormat frontbuffer_format;
+   uint32_t frontbuffer_width_unscaled = 0, frontbuffer_height_unscaled = 0;
+-  ID3D12Resource* swap_texture_resource =
+-      texture_cache_->RequestSwapTexture(swap_texture_srv_desc, frontbuffer_format,
+-                                         &frontbuffer_width_unscaled, &frontbuffer_height_unscaled);
++  // LOCAL PATCH - MCLA (04a0): swap_direct_present: when the front buffer's resolve was a whole 8_8_8_8 picture from one
++  // host render target that nothing has written since, the render target stands in for the texture that would be
++  // loaded from the resolved memory (see D3D12RenderTargetCache::NoteSwapDirectResolve).
++  SwapDirect swap_direct;
++  PrepareSwapDirect(swap_direct);
++  ID3D12Resource* swap_texture_resource;
++  if (swap_direct.in_place) {
++    swap_texture_srv_desc = swap_direct.srv_desc;
++    frontbuffer_format = swap_direct.texture_info.format;
++    frontbuffer_width_unscaled = swap_direct.texture_info.width;
++    frontbuffer_height_unscaled = swap_direct.texture_info.height;
++    swap_texture_resource = swap_direct.source.resource;
++  } else {
++    swap_texture_resource =
++        texture_cache_->RequestSwapTexture(swap_texture_srv_desc, frontbuffer_format,
++                                           &frontbuffer_width_unscaled, &frontbuffer_height_unscaled);
++  }
+   if (!swap_texture_resource) {
+     // Dump texture fetch constant 0 for debugging
+     const auto& regs = *register_file_;
+@@ -2615,6 +2649,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+     return;
+   }
+   D3D12_RESOURCE_DESC swap_texture_desc = swap_texture_resource->GetDesc();
++  if (swap_direct.in_place) {
++    // The render target is bigger than the picture: the picture is its top-left corner.
++    swap_texture_desc.Width = swap_direct.texture_info.width;
++    swap_texture_desc.Height = swap_direct.texture_info.height;
++  }
+   // The swap gamma / FXAA pass samples source texels by pixel index, but swap
+   // textures may be allocation-padded. Prefer the active frontbuffer region
+   // from the swap packet, scaled proportionally to the actual source texture.
+@@ -2676,7 +2715,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+ 
+   presenter->RefreshGuestOutput(
+       guest_output_width, guest_output_height, display_width, display_height,
+-      [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
++      [this, &swap_texture_srv_desc, &swap_direct, frontbuffer_format, swap_texture_resource,
++       guest_output_width,
+        guest_output_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+         const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+         ID3D12Device* device = provider.GetDevice();
+@@ -2814,6 +2854,70 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+                               frame_generation_inputs->generation_width,
+                               frame_generation_inputs->generation_height);
+ 
++        // LOCAL PATCH - MCLA (04a0): swap_direct_present: where the apply-gamma pass (or the presenter's paint) reads the
++        // picture from. HDR output and frame generation read the swap texture too, so they need it loaded.
++        auto& d3d12_context =
++            static_cast<ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context);
++        const bool swap_direct_usable = swap_direct.possible && !use_hdr && !use_frame_generation;
++        ID3D12Resource* swap_source_resource = swap_texture_resource;
++        if (swap_direct.in_place && !swap_direct_usable) {
++          D3D12_SHADER_RESOURCE_VIEW_DESC swap_texture_load_srv_desc;
++          xenos::TextureFormat swap_texture_load_format;
++          swap_source_resource = texture_cache_->RequestSwapTexture(swap_texture_load_srv_desc,
++                                                                    swap_texture_load_format);
++          if (!swap_source_resource) {
++            return false;
++          }
++          swap_texture_srv_desc = swap_texture_load_srv_desc;
++        }
++        // The pass reads the render target (not a check swap, which makes the picture the old way).
++        const bool swap_direct_read = swap_direct.in_place && swap_direct_usable;
++        const bool swap_direct_fuse = swap_direct_read && swap_direct.fuse && !use_fxaa &&
++                                      !use_pwl_gamma_ramp && d3d12_context.fused_gamma_possible();
++        // A check swap: also the render target's apply-gamma pass, into a scratch image to compare with.
++        const bool swap_direct_check =
++            swap_direct.check && swap_direct_usable && !use_fxaa && !use_pwl_gamma_ramp;
++        const bool swap_check_fused =
++            swap_direct_check && swap_direct.fuse && d3d12_context.fused_gamma_possible();
++        // A fused paint is made by a pixel shader of the presenter.
++        const D3D12_RESOURCE_STATES swap_read_state =
++            (swap_direct_fuse || swap_check_fused)
++                ? D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
++                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
++                : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++        bool swap_check_recorded = false;
++        auto make_fused_gamma_source = [&](bool check_only) {
++          ui::d3d12::D3D12Presenter::FusedGammaSource fused;
++          fused.source = swap_direct.source.resource;
++          fused.source_srv = swap_direct.srv_desc;
++          fused.ramp = gamma_ramp_buffer_.Get();
++          // The 256-entry table (WriteGammaRampSRV).
++          fused.ramp_srv.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
++          fused.ramp_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
++          fused.ramp_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++          fused.ramp_srv.Buffer.FirstElement = 0;
++          fused.ramp_srv.Buffer.NumElements = 256;
++          fused.ramp_srv.Buffer.StructureByteStride = 0;
++          fused.ramp_srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
++          fused.check_only = check_only;
++          return fused;
++        };
++        if (swap_direct_fuse) {
++          // One pass: the presenter's paint maps the ramp over the render target while it copies it to the back buffer,
++          // and the guest output image isn't written. Both are only read, by a pixel shader, until the next
++          // draw into the render target and the next ramp upload (the next guest frame's work, after the paint).
++          render_target_cache_->UseSwapDirectSource(swap_direct.source, swap_read_state);
++          PushTransitionBarrier(gamma_ramp_buffer_.Get(), gamma_ramp_buffer_state_,
++                                swap_read_state);
++          gamma_ramp_buffer_state_ = swap_read_state;
++          SubmitBarriers();
++          d3d12_context.SetFusedGammaSource(make_fused_gamma_source(false));
++          EndSubmission(true);
++          AwaitSubmissionThread();
++          NoteSwapDirect(nullptr, true, true);
++          return true;
++        }
++
+         // Destination, source, and if bindful, gamma ramp; for HDR, the
+         // underlay and the UI layer (adjacent, one table); for frame
+         // generation, the HUD-less image.
+@@ -2825,7 +2929,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+             apply_gamma_descriptors + apply_gamma_descriptor_count;
+         if (!RequestOneUseSingleViewDescriptors(
+                 apply_gamma_descriptor_count + (use_hdr ? 4 : 0) +
+-                    (use_frame_generation ? (use_hdr ? 1 : 5) : 0),
++                    (use_frame_generation ? (use_hdr ? 1 : 5) : 0) + (swap_direct_check ? 2 : 0),
+                 apply_gamma_descriptors)) {
+           return false;
+         }
+@@ -2868,12 +2972,14 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+         device->CreateUnorderedAccessView(apply_gamma_dest, nullptr, &apply_gamma_dest_uav_desc,
+                                           apply_gamma_descriptors[0].first);
+ 
+-        device->CreateShaderResourceView(swap_texture_resource, &swap_texture_srv_desc,
++        device->CreateShaderResourceView(swap_source_resource, &swap_texture_srv_desc,
+                                          apply_gamma_descriptors[1].first);
+ 
+-        PushTransitionBarrier(gamma_ramp_buffer_.Get(), gamma_ramp_buffer_state_,
+-                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+-        gamma_ramp_buffer_state_ = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++        if (swap_direct_read) {
++          render_target_cache_->UseSwapDirectSource(swap_direct.source, swap_read_state);
++        }
++        PushTransitionBarrier(gamma_ramp_buffer_.Get(), gamma_ramp_buffer_state_, swap_read_state);
++        gamma_ramp_buffer_state_ = swap_read_state;
+ 
+         if (use_hdr) {
+           // The UI layer and its underlay, if this frame has them at the
+@@ -3104,6 +3210,19 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+                                 apply_gamma_dest_initial_state);
+         }
+ 
++        // LOCAL PATCH - MCLA (04a0): a check swap (swap_direct_present_check): the same pass from the render target
++        // into a scratch image, with the copies of both to readback buffers; the presenter's fused paint too, if
++        // it can be made.
++        if (swap_direct_check) {
++          swap_check_recorded = RecordSwapDirectCheck(
++              swap_direct, guest_output_resource, guest_output_width, guest_output_height,
++              apply_gamma_descriptors + apply_gamma_descriptor_count,
++              apply_gamma_descriptor_gamma_ramp, swap_read_state);
++          if (swap_check_recorded && swap_check_fused) {
++            d3d12_context.SetFusedGammaSource(make_fused_gamma_source(true));
++          }
++        }
++
+         // Need to submit all the commands before giving the image back to the
+         // presenter so it can submit its own commands for displaying it to the
+         // queue.
+@@ -3112,6 +3231,16 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+         // With threaded submission, they must be in the queue, not only handed
+         // over: the presenter signals its fence and paints right after this.
+         AwaitSubmissionThread();
++        if (swap_check_recorded) {
++          CompleteSwapDirectCheck(guest_output_width, guest_output_height);
++        }
++        if (swap_direct_read) {
++          NoteSwapDirect(nullptr, true, false);
++        } else if (swap_direct.possible) {
++          NoteSwapDirect(swap_direct.check ? "a check swap, made from the loaded texture"
++                                           : "HDR output or frame generation reads the texture",
++                         false, false);
++        }
+         return true;
+       });
+ 
+@@ -6426,4 +6555,257 @@ void D3D12CommandProcessor::WriteGammaRampSRV(bool is_pwl,
+   device->CreateShaderResourceView(gamma_ramp_buffer_.Get(), &desc, handle);
+ }
+ 
++// LOCAL PATCH - MCLA (04a0): swap_direct_present (see IssueSwap and D3D12RenderTargetCache::NoteSwapDirectResolve).
++
++void D3D12CommandProcessor::PrepareSwapDirect(SwapDirect& direct) {
++  if (!REXCVAR_GET(swap_direct_present)) {
++    return;
++  }
++  ++swap_direct_stats_.swaps;
++  const char* why_not = nullptr;
++  if (render_target_cache_->GetPath() != RenderTargetCache::Path::kHostRenderTargets) {
++    why_not = "not the host render target path";
++  } else if (texture_cache_->GetSwapTextureInfo(direct.texture_info, why_not)) {
++    D3D12RenderTargetCache::SwapDirectTexture texture;
++    texture.base_address = direct.texture_info.base_address;
++    texture.pitch_div_32 = direct.texture_info.pitch_div_32;
++    texture.width = direct.texture_info.width;
++    texture.height = direct.texture_info.height;
++    texture.endianness = direct.texture_info.endianness;
++    if (render_target_cache_->FindSwapDirectSource(texture, direct.source, why_not)) {
++      if (direct.source.srv_format != direct.texture_info.dxgi_format) {
++        why_not = "the render target's format isn't the swap texture's";
++      } else {
++        direct.possible = true;
++      }
++    }
++  }
++  if (!direct.possible) {
++    NoteSwapDirect(why_not, false, false);
++    return;
++  }
++  const uint32_t check_interval = REXCVAR_GET(swap_direct_present_check);
++  direct.check = check_interval && (++swap_direct_check_counter_ % check_interval) == 0;
++  direct.in_place = !direct.check;
++  direct.fuse = REXCVAR_GET(swap_direct_present_fused);
++  // The swap texture's SRV, on the render target: the fetch constant's swizzle on the same host format.
++  direct.srv_desc.Format = direct.source.srv_format;
++  direct.srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++  direct.srv_desc.Shader4ComponentMapping = direct.texture_info.shader_4_component_mapping;
++  direct.srv_desc.Texture2D.MostDetailedMip = 0;
++  direct.srv_desc.Texture2D.MipLevels = 1;
++  direct.srv_desc.Texture2D.PlaneSlice = 0;
++  direct.srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
++}
++
++void D3D12CommandProcessor::NoteSwapDirect(const char* why_not, bool direct, bool fused) {
++  SwapDirectStats& stats = swap_direct_stats_;
++  if (direct) {
++    ++stats.direct;
++    if (fused) {
++      ++stats.fused;
++    }
++  } else if (why_not) {
++    bool counted = false;
++    for (std::pair<const char*, uint64_t>& entry : stats.why_not) {
++      if (entry.first && !std::strcmp(entry.first, why_not)) {
++        ++entry.second;
++        counted = true;
++        break;
++      }
++    }
++    if (!counted) {
++      for (std::pair<const char*, uint64_t>& entry : stats.why_not) {
++        if (!entry.first) {
++          entry = {why_not, 1};
++          break;
++        }
++      }
++    }
++  }
++  const uint64_t now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
++  if (!stats.window_start_ms) {
++    stats.window_start_ms = now_ms;
++    return;
++  }
++  if (now_ms - stats.window_start_ms < 10000) {
++    return;
++  }
++  std::string reasons;
++  uint64_t from_texture = 0;
++  for (const std::pair<const char*, uint64_t>& entry : stats.why_not) {
++    if (entry.first) {
++      reasons += fmt::format("{}{} x{}", reasons.empty() ? ": " : "; ", entry.first, entry.second);
++      from_texture += entry.second;
++    }
++  }
++  REXGPU_INFO(
++      "swap_direct_present: {} swaps in {:.1f} s: {} made from the render target ({} with the gamma ramp "
++      "applied in the presenter's paint), {} from the loaded texture{}; {} checks",
++      stats.swaps, double(now_ms - stats.window_start_ms) * 0.001, stats.direct, stats.fused,
++      from_texture, reasons, stats.checks);
++  stats = SwapDirectStats();
++  stats.window_start_ms = now_ms;
++}
++
++bool D3D12CommandProcessor::RecordSwapDirectCheck(
++    const SwapDirect& direct, ID3D12Resource* mailbox, uint32_t width, uint32_t height,
++    const ui::d3d12::util::DescriptorCpuGpuHandlePair* descriptors,
++    const ui::d3d12::util::DescriptorCpuGpuHandlePair& ramp, D3D12_RESOURCE_STATES read_state) {
++  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
++  ID3D12Device* device = provider.GetDevice();
++  if (!swap_direct_check_texture_ || swap_direct_check_width_ != width ||
++      swap_direct_check_height_ != height) {
++    // The previous check's submission has completed (CompleteSwapDirectCheck waited for it).
++    swap_direct_check_texture_.Reset();
++    swap_direct_check_readback_[0].Reset();
++    swap_direct_check_readback_[1].Reset();
++    D3D12_RESOURCE_DESC texture_desc;
++    texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    texture_desc.Alignment = 0;
++    texture_desc.Width = width;
++    texture_desc.Height = height;
++    texture_desc.DepthOrArraySize = 1;
++    texture_desc.MipLevels = 1;
++    texture_desc.Format = ui::d3d12::D3D12Presenter::kGuestOutputFormat;
++    texture_desc.SampleDesc.Count = 1;
++    texture_desc.SampleDesc.Quality = 0;
++    texture_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++    texture_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++    UINT64 readback_size;
++    device->GetCopyableFootprints(&texture_desc, 0, 1, 0, &swap_direct_check_footprint_, nullptr,
++                                  nullptr, &readback_size);
++    D3D12_RESOURCE_DESC readback_desc;
++    ui::d3d12::util::FillBufferResourceDesc(readback_desc, readback_size,
++                                            D3D12_RESOURCE_FLAG_NONE);
++    if (FAILED(device->CreateCommittedResource(
++            &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(),
++            &texture_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
++            IID_PPV_ARGS(&swap_direct_check_texture_))) ||
++        FAILED(device->CreateCommittedResource(
++            &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &readback_desc,
++            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++            IID_PPV_ARGS(&swap_direct_check_readback_[0]))) ||
++        FAILED(device->CreateCommittedResource(
++            &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &readback_desc,
++            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++            IID_PPV_ARGS(&swap_direct_check_readback_[1])))) {
++      REXGPU_ERROR("swap_direct_present_check: failed to create the check images");
++      swap_direct_check_texture_.Reset();
++      swap_direct_check_readback_[0].Reset();
++      swap_direct_check_readback_[1].Reset();
++      return false;
++    }
++    swap_direct_check_width_ = width;
++    swap_direct_check_height_ = height;
++  }
++
++  // What the batch holds (the usual pass's transition of the guest output image back) goes first.
++  SubmitBarriers();
++  // The same pass, from the render target to the scratch image.
++  D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc;
++  uav_desc.Format = ui::d3d12::D3D12Presenter::kGuestOutputFormat;
++  uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++  uav_desc.Texture2D.MipSlice = 0;
++  uav_desc.Texture2D.PlaneSlice = 0;
++  device->CreateUnorderedAccessView(swap_direct_check_texture_.Get(), nullptr, &uav_desc,
++                                    descriptors[0].first);
++  device->CreateShaderResourceView(direct.source.resource, &direct.srv_desc, descriptors[1].first);
++  render_target_cache_->UseSwapDirectSource(direct.source, read_state);
++  deferred_command_list_.D3DSetComputeRootSignature(apply_gamma_root_signature_.Get());
++  ApplyGammaConstants apply_gamma_constants;
++  apply_gamma_constants.size[0] = width;
++  apply_gamma_constants.size[1] = height;
++  deferred_command_list_.D3DSetComputeRoot32BitConstants(
++      UINT(ApplyGammaRootParameter::kConstants), sizeof(apply_gamma_constants) / sizeof(uint32_t),
++      &apply_gamma_constants, 0);
++  deferred_command_list_.D3DSetComputeRootDescriptorTable(
++      UINT(ApplyGammaRootParameter::kDestination), descriptors[0].second);
++  deferred_command_list_.D3DSetComputeRootDescriptorTable(
++      UINT(ApplyGammaRootParameter::kSource), descriptors[1].second);
++  deferred_command_list_.D3DSetComputeRootDescriptorTable(UINT(ApplyGammaRootParameter::kRamp),
++                                                          ramp.second);
++  SetExternalPipeline(apply_gamma_table_pipeline_.Get());
++  SubmitBarriers();
++  deferred_command_list_.D3DDispatch((width + 15) / 16, (height + 7) / 8, 1);
++
++  // Both images to the readback buffers.
++  ID3D12Resource* images[2] = {mailbox, swap_direct_check_texture_.Get()};
++  const D3D12_RESOURCE_STATES image_states[2] = {
++      ui::d3d12::D3D12Presenter::kGuestOutputInternalState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
++  for (uint32_t i = 0; i < 2; ++i) {
++    PushTransitionBarrier(images[i], image_states[i], D3D12_RESOURCE_STATE_COPY_SOURCE);
++  }
++  SubmitBarriers();
++  for (uint32_t i = 0; i < 2; ++i) {
++    D3D12_TEXTURE_COPY_LOCATION copy_dest = {};
++    copy_dest.pResource = swap_direct_check_readback_[i].Get();
++    copy_dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++    copy_dest.PlacedFootprint = swap_direct_check_footprint_;
++    D3D12_TEXTURE_COPY_LOCATION copy_source = {};
++    copy_source.pResource = images[i];
++    copy_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++    copy_source.SubresourceIndex = 0;
++    deferred_command_list_.D3DCopyTextureRegion(&copy_dest, 0, 0, 0, &copy_source, nullptr);
++    PushTransitionBarrier(images[i], D3D12_RESOURCE_STATE_COPY_SOURCE, image_states[i]);
++  }
++  return true;
++}
++
++void D3D12CommandProcessor::CompleteSwapDirectCheck(uint32_t width, uint32_t height) {
++  if (!AwaitAllQueueOperationsCompletion()) {
++    REXGPU_ERROR("swap_direct_present_check: the check submission did not complete");
++    return;
++  }
++  const D3D12_RANGE read_range = {0, SIZE_T(swap_direct_check_footprint_.Footprint.RowPitch) * height};
++  void* mappings[2] = {};
++  for (uint32_t i = 0; i < 2; ++i) {
++    if (FAILED(swap_direct_check_readback_[i]->Map(0, &read_range, &mappings[i]))) {
++      REXGPU_ERROR("swap_direct_present_check: failed to map a readback buffer");
++      if (i) {
++        swap_direct_check_readback_[0]->Unmap(0, nullptr);
++      }
++      return;
++    }
++  }
++  // R10G10B10A2: red in bits 0 to 9, green 10 to 19, blue 20 to 29, alpha 30 and 31.
++  uint32_t max_difference[4] = {};
++  uint64_t differing_pixels = 0;
++  uint32_t first_x = 0, first_y = 0;
++  const uint32_t row_pitch = swap_direct_check_footprint_.Footprint.RowPitch;
++  for (uint32_t y = 0; y < height; ++y) {
++    const uint32_t* usual =
++        reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(mappings[0]) + size_t(y) * row_pitch);
++    const uint32_t* direct =
++        reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(mappings[1]) + size_t(y) * row_pitch);
++    for (uint32_t x = 0; x < width; ++x) {
++      if (usual[x] == direct[x]) {
++        continue;
++      }
++      for (uint32_t c = 0; c < 4; ++c) {
++        const uint32_t shift = c < 3 ? c * 10 : 30;
++        const uint32_t mask = c < 3 ? 0x3FF : 0x3;
++        const uint32_t a = (usual[x] >> shift) & mask, b = (direct[x] >> shift) & mask;
++        max_difference[c] = std::max(max_difference[c], a > b ? a - b : b - a);
++      }
++      if (!differing_pixels) {
++        first_x = x;
++        first_y = y;
++      }
++      ++differing_pixels;
++    }
++  }
++  const D3D12_RANGE written_range = {0, 0};
++  swap_direct_check_readback_[0]->Unmap(0, &written_range);
++  swap_direct_check_readback_[1]->Unmap(0, &written_range);
++  ++swap_direct_check_number_;
++  ++swap_direct_stats_.checks;
++  REXGPU_INFO(
++      "swap_direct_present_check: apply-gamma image #{} {}x{}: largest difference of the render "
++      "target's from the loaded texture's (R/G/B/A, 10-bit units) {}/{}/{}/{}, {} pixels differ{}",
++      swap_direct_check_number_, width, height, max_difference[0], max_difference[1],
++      max_difference[2], max_difference[3], differing_pixels,
++      differing_pixels ? fmt::format(", the first at {},{}", first_x, first_y) : std::string());
++}
++
+ }  // namespace rex::graphics::d3d12
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index e31ee04e..90271f2c 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -49,6 +49,18 @@ REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native ste
+ 
+ REXCVAR_DECLARE(bool, resolve_dual_write);
+ 
++// LOCAL PATCH - MCLA (04a0): the master switch of the direct swap (see NoteSwapDirectResolve, command_processor.cpp
++// IssueSwap and d3d12_presenter.cpp). Read by every resolve and every swap.
++REXCVAR_DEFINE_BOOL(swap_direct_present, false, "GPU/D3D12",
++                    "With host render targets, make the swap's picture from the host render target the "
++                    "front buffer was resolved from, when it is exactly what the resolved copy in memory "
++                    "holds (an 8_8_8_8 front buffer from one render target, nothing written to it or the "
++                    "memory since), instead of loading the resolved copy to a texture first; and, when the "
++                    "guest output thread paints it 1:1, apply the gamma ramp in the presenter's paint "
++                    "(swap_direct_present_fused). The resolve itself still writes the front buffer to "
++                    "memory. Off until validated: see swap_direct_present_check")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics::d3d12 {
+ 
+ // Generated with `xb buildshaders`.
+@@ -1414,6 +1426,14 @@ bool D3D12RenderTargetCache::Initialize() {
+ }
+ 
+ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
++  // LOCAL PATCH - MCLA (04a0): the global watch of swap_direct_present goes before the shared memory does.
++  if (swap_direct_watch_handle_) {
++    swap_direct_shared_memory_->UnregisterGlobalWatch(swap_direct_watch_handle_);
++    swap_direct_watch_handle_ = nullptr;
++  }
++  swap_direct_shared_memory_ = nullptr;
++  ClearSwapDirectRecords();
++
+   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_64bpp_pipeline_);
+   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_32bpp_pipeline_);
+   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_root_signature_);
+@@ -2106,6 +2126,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+           written_address_out = resolve_info.copy_dest_extent_start;
+           written_length_out = resolve_info.copy_dest_extent_length;
+           copied = true;
++          NoteSwapDirectResolve(shared_memory, resolve_info, direct_source, direct_source_constants);
+         }
+       } else {
+         REXGPU_ERROR(
+@@ -6795,4 +6816,196 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
+   return all_pipelines_available;
+ }
+ 
++// LOCAL PATCH - MCLA (04a0): swap_direct_present.
++//
++// The swap shows the guest's front buffer: a texture the game's last resolve wrote to memory and the swap loads
++// (RequestSwapTexture), then applies the gamma ramp to. When that resolve was a direct one that copied a whole
++// 8_8_8_8 picture straight from the one host render target that owned it, the render target holds exactly the
++// texels the load would produce, for as long as nothing has written either, and the load can be left out.
++//
++// What a resolve must be to be recorded (anything else leaves the swap as before):
++//  - direct: one single-sampled k_8_8_8_8 colour render target of the resolve's pitch owned the whole area, at the
++//    resolve's own base (no offset into the render target, no EDRAM offset, so the destination's texel (x, y) is the
++//    render target's), at 1x resolution and not stretched by the FSR upscaling;
++//  - to a k_8_8_8_8 destination with no red/blue swap, no exponent bias, not an array slice, at the texture's
++//    origin (no offset into its tiles), so the bytes the copy writes are the render target's bytes, endian
++//    swapped the way the texture's fetch constant undoes (checked at the swap against the fetch constant);
++//  - its memory range is still valid GPU-written data when it is recorded (no CPU write has come between).
++// It stops being usable when the shared memory reports a write to the range (a global watch, which also sees the next
++// resolve of the same memory), when the render target object is gone or replaced, or when it was put in a state it
++// can be written in (D3D12RenderTarget::SetResourceState: every draw, clear, ownership transfer and HDR copy does).
++
++void D3D12RenderTargetCache::SwapDirectWatchCallback(
++    const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
++    uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu) {
++  auto* cache = static_cast<D3D12RenderTargetCache*>(context);
++  for (SwapDirectWatch& watch : cache->swap_direct_watches_) {
++    if (address_first <= watch.end.load(std::memory_order_relaxed) &&
++        address_last >= watch.start.load(std::memory_order_relaxed)) {
++      watch.invalidations.fetch_add(1, std::memory_order_release);
++    }
++  }
++}
++
++void D3D12RenderTargetCache::NoteSwapDirectResolve(
++    D3D12SharedMemory& shared_memory, const draw_util::ResolveInfo& resolve_info,
++    D3D12RenderTarget* direct_source, const DirectResolveSourceConstants& direct_source_constants) {
++  if (!REXCVAR_GET(swap_direct_present)) {
++    ClearSwapDirectRecords();
++    return;
++  }
++  if (!direct_source || IsDrawResolutionScaled() || command_processor_.TaaSqueezingScene() ||
++      resolve_info.IsCopyingDepth()) {
++    return;
++  }
++  const RenderTargetKey key = direct_source->key();
++  DirectResolveSourceConversion conversion;
++  if (key.is_depth || key.msaa_samples != xenos::MsaaSamples::k1X ||
++      key.GetColorFormat() != xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
++      !GetDirectResolveSourceConversion(key, conversion) ||
++      conversion != DirectResolveSourceConversion::k_8_8_8_8) {
++    return;
++  }
++  const reg::RB_COPY_DEST_INFO& dest_info = resolve_info.copy_dest_info;
++  const draw_util::ResolveCopyDestCoordinateInfo& dest_coordinate =
++      resolve_info.copy_dest_coordinate_info;
++  if (direct_source_constants.offset != 0 ||
++      resolve_info.coordinate_info.edram_offset_x_div_8 != 0 ||
++      resolve_info.coordinate_info.edram_offset_y_div_8 != 0 ||
++      resolve_info.color_edram_info.GetBaseTiles() !=
++          (resolve_info.color_original_base & (edram_tile_count() - 1)) ||
++      dest_info.copy_dest_format != xenos::ColorFormat::k_8_8_8_8 || dest_info.copy_dest_array ||
++      dest_info.copy_dest_swap || dest_info.copy_dest_exp_bias != 0 ||
++      dest_coordinate.offset_x_div_8 != 0 || dest_coordinate.offset_y_div_8 != 0) {
++    return;
++  }
++  const uint32_t width = resolve_info.coordinate_info.width_div_8 * 8;
++  const uint32_t height = resolve_info.height_div_8 * 8;
++  const uint32_t range_start = resolve_info.copy_dest_extent_start & 0x1FFFFFFF;
++  const uint32_t range_length = resolve_info.copy_dest_extent_length;
++  if (!width || !height || !range_length || range_length > 0x20000000 - range_start) {
++    return;
++  }
++
++  // From here on a write by the CPU or the GPU to the range can't be missed: the global critical region is held, so
++  // nothing invalidates while the range is checked, the watch's range is set and the count is read.
++  auto global_lock = rex::thread::global_critical_region::AcquireDirect();
++  if (!shared_memory.AreAllPagesValidAndGpuWritten(range_start, range_length)) {
++    return;
++  }
++  if (!swap_direct_watch_handle_) {
++    swap_direct_shared_memory_ = &shared_memory;
++    swap_direct_watch_handle_ = shared_memory.RegisterGlobalWatch(SwapDirectWatchCallback, this);
++  }
++  // The record of this destination, else a free one, else the least recent.
++  size_t index = SIZE_MAX;
++  bool replaced = false;
++  for (size_t i = 0; i < kSwapDirectRecordCount; ++i) {
++    if (swap_direct_records_[i].valid &&
++        swap_direct_records_[i].dest_base == resolve_info.copy_dest_base) {
++      index = i;
++      replaced = true;
++      break;
++    }
++  }
++  for (size_t i = 0; index == SIZE_MAX && i < kSwapDirectRecordCount; ++i) {
++    if (!swap_direct_records_[i].valid) {
++      index = i;
++    }
++  }
++  if (index == SIZE_MAX) {
++    index = 0;
++    for (size_t i = 1; i < kSwapDirectRecordCount; ++i) {
++      if (swap_direct_records_[i].sequence < swap_direct_records_[index].sequence) {
++        index = i;
++      }
++    }
++  }
++  SwapDirectWatch& watch = swap_direct_watches_[index];
++  watch.start.store(range_start, std::memory_order_relaxed);
++  watch.end.store(range_start + (range_length - 1), std::memory_order_relaxed);
++  SwapDirectRecord& record = swap_direct_records_[index];
++  record.valid = true;
++  record.render_target_key = key;
++  record.render_target_serial = direct_source->serial();
++  record.render_target_write_generation = direct_source->write_generation();
++  record.dest_base = resolve_info.copy_dest_base;
++  record.dest_pitch_div_32 = dest_coordinate.pitch_aligned_div_32;
++  record.endianness = uint32_t(dest_info.copy_dest_endian);
++  record.width = width;
++  record.height = height;
++  record.invalidations = watch.invalidations.load(std::memory_order_acquire);
++  record.sequence = ++swap_direct_sequence_;
++  static std::atomic<uint32_t> logged{0};
++  if (!replaced && logged.fetch_add(1, std::memory_order_relaxed) < 8) {
++    REXGPU_INFO(
++        "swap_direct_present: a resolve of the host render target {} to 0x{:08X} ({}x{}, pitch {}, "
++        "endian {}) can be shown without loading it",
++        key.GetDebugName(), record.dest_base, width, height, record.dest_pitch_div_32 * 32,
++        record.endianness);
++  }
++}
++
++bool D3D12RenderTargetCache::FindSwapDirectSource(const SwapDirectTexture& texture,
++                                                  SwapDirectSource& source_out,
++                                                  const char*& why_not_out) {
++  size_t index = SIZE_MAX;
++  for (size_t i = 0; i < kSwapDirectRecordCount; ++i) {
++    if (swap_direct_records_[i].valid && swap_direct_records_[i].dest_base == texture.base_address) {
++      index = i;
++      break;
++    }
++  }
++  if (index == SIZE_MAX) {
++    why_not_out =
++        "no qualifying resolve (8_8_8_8, direct, one render target) to the swap texture's address";
++    return false;
++  }
++  const SwapDirectRecord& record = swap_direct_records_[index];
++  if (texture.pitch_div_32 != record.dest_pitch_div_32 || texture.endianness != record.endianness) {
++    why_not_out = "the swap's texture has another pitch or endianness than the recorded resolve";
++    return false;
++  }
++  if (texture.width > record.width || texture.height > record.height) {
++    why_not_out = "the swap's texture is larger than the area resolved";
++    return false;
++  }
++  if (swap_direct_watches_[index].invalidations.load(std::memory_order_acquire) !=
++      record.invalidations) {
++    why_not_out = "the front buffer's memory was written since the resolve";
++    return false;
++  }
++  RenderTarget* found_render_target = FindRenderTargetByKey(record.render_target_key);
++  if (!found_render_target) {
++    why_not_out = "the render target is gone";
++    return false;
++  }
++  auto* render_target = static_cast<D3D12RenderTarget*>(found_render_target);
++  if (render_target->serial() != record.render_target_serial) {
++    why_not_out = "the render target was replaced";
++    return false;
++  }
++  if (render_target->write_generation() != record.render_target_write_generation) {
++    why_not_out = "the render target was written since the resolve";
++    return false;
++  }
++  D3D12_RESOURCE_DESC resource_desc = render_target->resource()->GetDesc();
++  if (texture.width > resource_desc.Width || texture.height > resource_desc.Height) {
++    why_not_out = "the swap's texture is larger than the render target";
++    return false;
++  }
++  source_out.resource = render_target->resource();
++  source_out.srv_format =
++      GetColorOwnershipTransferDXGIFormat(xenos::ColorRenderTargetFormat::k_8_8_8_8);
++  source_out.render_target = render_target;
++  return true;
++}
++
++void D3D12RenderTargetCache::UseSwapDirectSource(const SwapDirectSource& source,
++                                                 D3D12_RESOURCE_STATES state) {
++  auto* render_target = static_cast<D3D12RenderTarget*>(source.render_target);
++  command_processor_.PushTransitionBarrier(
++      render_target->resource(), render_target->SetResourceState(state), state);
++}
++
+ }  // namespace rex::graphics::d3d12
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index be703a95..e3865c8f 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -1534,6 +1534,41 @@ ID3D12Resource* D3D12TextureCache::RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW
+   return texture_resource;
+ }
+ 
++bool D3D12TextureCache::GetSwapTextureInfo(SwapTextureInfo& info_out, const char*& why_not_out) {
++  const auto& regs = register_file();
++  xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(0);
++  TextureKey key;
++  BindingInfoFromFetchConstant(fetch, key, nullptr);
++  if (!key.is_valid || key.base_page == 0 || key.dimension != xenos::DataDimension::k2DOrStacked) {
++    why_not_out = "the swap's fetch constant is no 2D texture";
++    return false;
++  }
++  if (IsDrawResolutionScaled()) {
++    why_not_out = "resolution scaling";
++    return false;
++  }
++  if (key.format != xenos::TextureFormat::k_8_8_8_8) {
++    why_not_out = "the swap's texture isn't k_8_8_8_8";
++    return false;
++  }
++  if (!key.tiled || key.GetDepthOrArraySize() != 1 || key.mip_max_level != 0 ||
++      key.signed_separate) {
++    why_not_out = "the swap's texture isn't a tiled single-level one";
++    return false;
++  }
++  info_out.base_address = key.base_page << 12;
++  info_out.pitch_div_32 = key.pitch;
++  info_out.width = key.GetWidth();
++  info_out.height = key.GetHeight();
++  info_out.endianness = uint32_t(key.endianness);
++  info_out.format = key.format;
++  info_out.dxgi_format = GetDXGIUnormFormat(key);
++  info_out.shader_4_component_mapping =
++      GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(key)) |
++      D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
++  return true;
++}
++
+ D3D12TextureCache::D3D12Texture::D3D12Texture(D3D12TextureCache& texture_cache,
+                                               const TextureKey& key, ID3D12Resource* resource,
+                                               D3D12_RESOURCE_STATES resource_state,
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index f1722de4..df9f5344 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -365,6 +365,27 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
+   MakeRangeValid(start, length, true);
+ }
+ 
++bool SharedMemory::AreAllPagesValidAndGpuWritten(uint32_t start, uint32_t length) {
++  if (length == 0 || start >= kBufferSize) {
++    return false;
++  }
++  length = std::min(length, kBufferSize - start);
++  const uint32_t page_first = start >> page_size_log2_;
++  const uint32_t page_last = (start + (length - 1)) >> page_size_log2_;
++  const uint32_t now_ms = uint32_t(rex::chrono::Clock::QueryHostUptimeMillis());
++  auto global_lock = global_critical_region_.Acquire();
++  const bool any_hot = AnyPageHot(now_ms);
++  for (uint32_t page = page_first; page <= page_last; ++page) {
++    const uint64_t bit = uint64_t(1) << (page & 63);
++    if (!(system_page_flags_valid_[page >> 6] & bit) ||
++        !(system_page_flags_valid_and_gpu_written_[page >> 6] & bit) ||
++        (any_hot && IsPageHot(page, now_ms))) {
++      return false;
++    }
++  }
++  return true;
++}
++
+ bool SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
+                                                     uint32_t length_allocations) {
+   assert_always(
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 52b43879..aadf9c62 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -49,6 +49,7 @@ namespace shaders {
+ #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_fsr_rcas_dither_ps.h"
+ #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_fsr_rcas_ps.h"
+ #endif
++#include "ui/shaders/bytecode/d3d12_5_1/guest_output_gamma_table_ps.h"
+ #include "ui/shaders/bytecode/d3d12_5_1/guest_output_triangle_strip_rect_vs.h"
+ #include "ui/shaders/bytecode/d3d12_5_1/hdr_ui_composite_ps.h"
+ #include "ui/shaders/bytecode/d3d12_5_1/ui_overlay_composite_ps.h"
+@@ -220,17 +221,22 @@ Surface::TypeFlags D3D12Presenter::GetSupportedSurfaceTypes() const {
+ bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
+   Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
+   GuestOutputProperties guest_output_properties;
++  // LOCAL PATCH - MCLA (04a0): an image the refresher gave to the fused paint (swap_direct_present) was never
++  // written to its texture, which has an older frame in it: there is nothing to capture.
++  bool guest_output_fused_only = false;
+   {
+     uint32_t guest_output_mailbox_index;
+     std::unique_lock<std::mutex> guest_output_consumer_lock(
+         ConsumeGuestOutput(guest_output_mailbox_index, &guest_output_properties, nullptr));
+     if (guest_output_mailbox_index != UINT32_MAX) {
+       guest_output_resource = guest_output_resources_[guest_output_mailbox_index].second;
++      guest_output_fused_only = guest_output_fused_[guest_output_mailbox_index].set &&
++                                !guest_output_fused_[guest_output_mailbox_index].source.check_only;
+     }
+     // Incremented the reference count of the guest output resource - safe to
+     // leave the consumer critical section now.
+   }
+-  if (!guest_output_resource) {
++  if (!guest_output_resource || guest_output_fused_only) {
+     return false;
+   }
+ 
+@@ -809,12 +815,24 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
+                    frontbuffer_width, frontbuffer_height);
+       return false;
+     }
++    guest_output_written_[mailbox_index] = false;
+   }
++  // LOCAL PATCH - MCLA (04a0): swap_direct_present's fused paint: whether the refresher may give a source and a
++  // ramp instead of finishing the image (the state is the image's, and stays set until it is refreshed again).
++  FusedGammaState& fused_gamma = guest_output_fused_[mailbox_index];
++  fused_gamma = FusedGammaState();
++  fused_gamma.possible = IsFusedGammaPaintPossible(mailbox_index);
+   D3D12GuestOutputRefreshContext context(is_8bpc_out_ref, hdr_out_ref,
+                                          guest_output_resource_ref.second.Get(),
+                                          GetFrameGenerationInputs(mailbox_index, frontbuffer_width,
+-                                                                  frontbuffer_height));
++                                                                  frontbuffer_height),
++                                         &fused_gamma);
+   bool refresher_succeeded = refresher(context);
++  if (!refresher_succeeded) {
++    fused_gamma = FusedGammaState();
++  } else if (!fused_gamma.set || fused_gamma.source.check_only) {
++    guest_output_written_[mailbox_index] = true;
++  }
+   // Even if the refresher has returned false, it still might have submitted
+   // some commands referencing the resource. It's better to put an excessive
+   // signal and wait slightly longer, for nothing important, while shutting down
+@@ -920,12 +938,15 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   GuestOutputProperties guest_output_properties;
+   GuestOutputPaintConfig guest_output_paint_config;
+   Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
++  // LOCAL PATCH - MCLA (04a0): what the refresher gave the fused paint for the image (copied under the consumer lock).
++  FusedGammaState fused_paint;
+   {
+     uint32_t guest_output_mailbox_index;
+     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
+         guest_output_mailbox_index, &guest_output_properties, &guest_output_paint_config));
+     if (guest_output_mailbox_index != UINT32_MAX) {
+       guest_output_resource = guest_output_resources_[guest_output_mailbox_index].second;
++      fused_paint = guest_output_fused_[guest_output_mailbox_index];
+     }
+     // Incremented the reference count of the guest output resource - safe to
+     // leave the consumer critical section now as everything here either will be
+@@ -1132,6 +1153,46 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+       // involved are consistent.
+       D3D12_GPU_DESCRIPTOR_HANDLE view_heap_gpu_start =
+           view_heap->GetGPUDescriptorHandleForHeapStart();
++
++      // LOCAL PATCH - MCLA (04a0): swap_direct_present's fused paint. An image the refresher gave as a source and a
++      // ramp (never written to its texture) is painted by the table gamma pass (guest_output_gamma_table_ps) in place
++      // of the bilinear one, which for a 1:1 copy of an 8-bit image only hands the texel on. The source is a live
++      // host render target, so only the paint that comes right after the refresher, in its thread, may use it. With
++      // check_only the texture was written as usual and the usual paint is made; the fused one is drawn next to it,
++      // for the comparison.
++      bool paint_fused = false;
++      bool paint_fused_check = false;
++      UINT fused_view_index = 0;
++      if (fused_paint.set) {
++        const bool fused_viable =
++            InGuestOutputThreadPaint() && guest_output_paint_gamma_pipeline_ &&
++            !paint_context_.swap_chain_hdr && guest_output_flow.effect_count == 1 &&
++            guest_output_flow.effects[0] == GuestOutputPaintEffect::kBilinear &&
++            guest_output_flow.effect_output_sizes[0].first == guest_output_properties.frontbuffer_width &&
++            guest_output_flow.effect_output_sizes[0].second == guest_output_properties.frontbuffer_height;
++        if (fused_viable) {
++          const uint32_t fused_slot = uint32_t(current_paint_submission % command_allocator_count);
++          fused_view_index = UINT(PaintContext::kViewIndexFusedGamma0) + 2 * fused_slot;
++          device->CreateShaderResourceView(
++              fused_paint.source.ramp, &fused_paint.source.ramp_srv,
++              provider_.OffsetViewDescriptor(view_heap_cpu_start, fused_view_index));
++          device->CreateShaderResourceView(
++              fused_paint.source.source, &fused_paint.source.source_srv,
++              provider_.OffsetViewDescriptor(view_heap_cpu_start, fused_view_index + 1));
++          paint_context_.fused_gamma_refs[fused_slot][0] = fused_paint.ramp_ref;
++          paint_context_.fused_gamma_refs[fused_slot][1] = fused_paint.source_ref;
++          (fused_paint.source.check_only ? paint_fused_check : paint_fused) = true;
++        } else if (!fused_paint.source.check_only) {
++          static std::atomic<bool> fused_not_painted_logged{false};
++          if (!fused_not_painted_logged.exchange(true)) {
++            REXLOG_WARN(
++                "D3D12Presenter: an image given to the fused gamma paint (swap_direct_present) wasn't painted "
++                "by it (the paint isn't the guest output thread's right after the refresh, or it isn't a "
++                "1:1 bilinear copy any more); the image's texture has an older frame, which is shown "
++                "(logged once)");
++          }
++        }
++      }
+       bool temporal_effect_selected = false;
+ #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+       temporal_effect_selected =
+@@ -1258,21 +1319,26 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+           command_list->RSSetScissorRects(1, &scissor);
+ 
+           command_list->SetPipelineState(
+-              is_final_effect
+-                  ? (paint_context_.swap_chain_hdr
+-                         ? guest_output_paint_final_hdr10_pipeline_.Get()
+-                         : guest_output_paint_final_pipelines_[size_t(effect)].Get())
+-                  : guest_output_paint_intermediate_pipelines_[size_t(effect)].Get());
++              paint_fused
++                  ? guest_output_paint_gamma_pipeline_.Get()
++                  : (is_final_effect
++                         ? (paint_context_.swap_chain_hdr
++                                ? guest_output_paint_final_hdr10_pipeline_.Get()
++                                : guest_output_paint_final_pipelines_[size_t(effect)].Get())
++                         : guest_output_paint_intermediate_pipelines_[size_t(effect)].Get()));
+           GuestOutputPaintRootSignatureIndex guest_output_paint_root_signature_index =
+               GetGuestOutputPaintRootSignatureIndex(effect);
+           command_list->SetGraphicsRootSignature(
+-              guest_output_paint_root_signatures_[size_t(guest_output_paint_root_signature_index)]
+-                  .Get());
++              paint_fused ? guest_output_paint_gamma_root_signature_.Get()
++                          : guest_output_paint_root_signatures_
++                                [size_t(guest_output_paint_root_signature_index)]
++                                    .Get());
+ 
+           UINT effect_src_view_index =
+-              UINT(i ? (PaintContext::kViewIndexGuestOutputIntermediate0Srv + (i - 1))
+-                     : (PaintContext::kViewIndexGuestOutput0Srv +
+-                        guest_output_resource_paint_ref_index));
++              paint_fused ? fused_view_index
++                          : UINT(i ? (PaintContext::kViewIndexGuestOutputIntermediate0Srv + (i - 1))
++                                   : (PaintContext::kViewIndexGuestOutput0Srv +
++                                      guest_output_resource_paint_ref_index));
+           command_list->SetGraphicsRootDescriptorTable(
+               UINT(GuestOutputPaintRootParameter::kSource),
+               provider_.OffsetViewDescriptor(view_heap_gpu_start, effect_src_view_index));
+@@ -1293,6 +1359,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+ 
+           UINT effect_constants_size = 0;
+           union {
++            int32_t fused_gamma_output_offset[2];
+             BilinearConstants bilinear;
+ #if defined(REX_HAS_FIDELITYFX_SDK)
+             CasSharpenConstants cas_sharpen;
+@@ -1329,6 +1396,12 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+             default:
+               break;
+           }
++          if (paint_fused) {
++            // The fused pass's own constants: where the image sits in the back buffer.
++            effect_constants_size = sizeof(effect_constants.fused_gamma_output_offset);
++            effect_constants.fused_gamma_output_offset[0] = effect_rect_x;
++            effect_constants.fused_gamma_output_offset[1] = effect_rect_y;
++          }
+           if (effect_constants_size) {
+             command_list->SetGraphicsRoot32BitConstants(
+                 UINT(GuestOutputPaintRootParameter::kEffectConstants),
+@@ -1422,6 +1495,13 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+           }
+         }
+       }
++      if (paint_fused_check) {
++        // swap_direct_present_check: the fused paint drawn next to the usual one, for the comparison.
++        fused_gamma_check_.recorded = RecordFusedGammaCheck(
++            command_list, back_buffer, rtv_heap_start, back_buffer_rtv,
++            provider_.OffsetViewDescriptor(view_heap_gpu_start, fused_view_index),
++            guest_output_flow, guest_output_properties.refresh_number);
++      }
+     }
+   }
+ 
+@@ -1610,6 +1690,10 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   // internally before the failure according to Jesse Natalie from the DirectX
+   // Discord server.
+   paint_context_.present_submission_tracker.NextSubmission();
++  // LOCAL PATCH - MCLA (04a0): swap_direct_present_check: the paint submission has to be done to read what it copied.
++  if (fused_gamma_check_.recorded) {
++    CompleteFusedGammaCheck();
++  }
+   switch (present_result) {
+     case DXGI_ERROR_DEVICE_REMOVED:
+       return PaintResult::kGpuLostExternally;
+@@ -1902,6 +1986,55 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
+     }
+   }
+ 
++  // LOCAL PATCH - MCLA (04a0): the fused gamma paint (swap_direct_present): guest_output_gamma_table_ps over the same
++  // rectangle vertex shader, writing the swap chain, without blending. If it can't be made, only the fused paint is
++  // lost (the refresher is never offered it, see IsFusedGammaPaintPossible).
++  {
++    D3D12_DESCRIPTOR_RANGE gamma_range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0};
++    D3D12_ROOT_PARAMETER gamma_root_parameters[UINT(GuestOutputPaintRootParameter::kCount)] = {};
++    gamma_root_parameters[UINT(GuestOutputPaintRootParameter::kSource)].ParameterType =
++        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    gamma_root_parameters[UINT(GuestOutputPaintRootParameter::kSource)]
++        .DescriptorTable.NumDescriptorRanges = 1;
++    gamma_root_parameters[UINT(GuestOutputPaintRootParameter::kSource)]
++        .DescriptorTable.pDescriptorRanges = &gamma_range;
++    gamma_root_parameters[UINT(GuestOutputPaintRootParameter::kSource)].ShaderVisibility =
++        D3D12_SHADER_VISIBILITY_PIXEL;
++    gamma_root_parameters[UINT(GuestOutputPaintRootParameter::kRectangle)].ParameterType =
++        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    gamma_root_parameters[UINT(GuestOutputPaintRootParameter::kRectangle)]
++        .Constants.Num32BitValues = sizeof(GuestOutputPaintRectangleConstants) / sizeof(uint32_t);
++    gamma_root_parameters[UINT(GuestOutputPaintRootParameter::kRectangle)].ShaderVisibility =
++        D3D12_SHADER_VISIBILITY_VERTEX;
++    gamma_root_parameters[UINT(GuestOutputPaintRootParameter::kEffectConstants)].ParameterType =
++        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    gamma_root_parameters[UINT(GuestOutputPaintRootParameter::kEffectConstants)]
++        .Constants.Num32BitValues = 2;
++    gamma_root_parameters[UINT(GuestOutputPaintRootParameter::kEffectConstants)].ShaderVisibility =
++        D3D12_SHADER_VISIBILITY_PIXEL;
++    D3D12_ROOT_SIGNATURE_DESC gamma_root_signature_desc = {};
++    gamma_root_signature_desc.NumParameters = UINT(GuestOutputPaintRootParameter::kCount);
++    gamma_root_signature_desc.pParameters = gamma_root_parameters;
++    gamma_root_signature_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
++    *(guest_output_paint_gamma_root_signature_.ReleaseAndGetAddressOf()) =
++        util::CreateRootSignature(provider_, gamma_root_signature_desc);
++    bool gamma_pipeline_made = false;
++    if (guest_output_paint_gamma_root_signature_) {
++      D3D12_GRAPHICS_PIPELINE_STATE_DESC gamma_pipeline_desc = guest_output_paint_pipeline_desc;
++      gamma_pipeline_desc.pRootSignature = guest_output_paint_gamma_root_signature_.Get();
++      gamma_pipeline_desc.PS.pShaderBytecode = shaders::guest_output_gamma_table_ps;
++      gamma_pipeline_desc.PS.BytecodeLength = sizeof(shaders::guest_output_gamma_table_ps);
++      gamma_pipeline_desc.RTVFormats[0] = kSwapChainFormat;
++      gamma_pipeline_made = SUCCEEDED(device->CreateGraphicsPipelineState(
++          &gamma_pipeline_desc, IID_PPV_ARGS(&guest_output_paint_gamma_pipeline_)));
++    }
++    if (!gamma_pipeline_made) {
++      REXLOG_WARN("D3D12Presenter: Failed to create the fused gamma paint pipeline (swap_direct_present)");
++      guest_output_paint_gamma_pipeline_.Reset();
++      guest_output_paint_gamma_root_signature_.Reset();
++    }
++  }
++
+   // HDR output: bilinear guest output (HDR10 code values, no dithering) and
+   // the presenter's UI layer, blended as premultiplied, to the HDR10 swap chain.
+   guest_output_paint_pipeline_desc.PS.pShaderBytecode = shaders::guest_output_bilinear_ps;
+@@ -2018,4 +2151,207 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
+   return InitializeCommonSurfaceIndependent();
+ }
+ 
++// LOCAL PATCH - MCLA (04a0): swap_direct_present's fused paint.
++
++bool D3D12Presenter::IsFusedGammaPaintPossible(uint32_t mailbox_index) {
++  if (!guest_output_paint_gamma_pipeline_ || !guest_output_written_[mailbox_index] ||
++      !guest_output_paint_final_pipelines_[size_t(GuestOutputPaintEffect::kBilinear)] ||
++      frame_generation_ || frame_generation_wanted() || IsHdrOutputWanted()) {
++    return false;
++  }
++  // Held so the guest output thread keeps owning painting while the paint context is read.
++  std::unique_lock<std::mutex> paint_lock;
++  if (!LockForGuestOutputThreadPaintCheck(paint_lock)) {
++    return false;
++  }
++  if (!paint_context_.swap_chain || paint_context_.swap_chain_hdr ||
++      !paint_context_.swap_chain_width || !paint_context_.swap_chain_height) {
++    return false;
++  }
++  // The paint the image would get: what the refresher writes is 8 bits per channel (SetIs8bpc), HDR off.
++  GuestOutputProperties properties = GetRefreshingGuestOutputProperties(mailbox_index);
++  properties.is_8bpc = true;
++  properties.hdr = GuestOutputHdr();
++  GuestOutputPaintConfig config;
++  CopyGuestOutputPaintConfig(config);
++  GuestOutputPaintFlow flow = GetGuestOutputPaintFlow(
++      properties, paint_context_.swap_chain_width, paint_context_.swap_chain_height,
++      D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, config);
++  return flow.effect_count == 1 && flow.effects[0] == GuestOutputPaintEffect::kBilinear &&
++         flow.effect_output_sizes[0].first == properties.frontbuffer_width &&
++         flow.effect_output_sizes[0].second == properties.frontbuffer_height;
++}
++
++bool D3D12Presenter::RecordFusedGammaCheck(ID3D12GraphicsCommandList* command_list,
++                                           ID3D12Resource* back_buffer,
++                                           D3D12_CPU_DESCRIPTOR_HANDLE rtv_heap_start,
++                                           D3D12_CPU_DESCRIPTOR_HANDLE back_buffer_rtv,
++                                           D3D12_GPU_DESCRIPTOR_HANDLE fused_view_gpu,
++                                           const GuestOutputPaintFlow& flow,
++                                           uint64_t refresh_number) {
++  ID3D12Device* device = provider_.GetDevice();
++  FusedGammaCheck& check = fused_gamma_check_;
++  const uint32_t width = paint_context_.swap_chain_width;
++  const uint32_t height = paint_context_.swap_chain_height;
++  if (!check.texture || check.width != width || check.height != height) {
++    // The previous check's paint has completed (CompleteFusedGammaCheck waits for it).
++    check.texture.Reset();
++    check.readback[0].Reset();
++    check.readback[1].Reset();
++    D3D12_RESOURCE_DESC texture_desc;
++    texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    texture_desc.Alignment = 0;
++    texture_desc.Width = width;
++    texture_desc.Height = height;
++    texture_desc.DepthOrArraySize = 1;
++    texture_desc.MipLevels = 1;
++    texture_desc.Format = kSwapChainFormat;
++    texture_desc.SampleDesc.Count = 1;
++    texture_desc.SampleDesc.Quality = 0;
++    texture_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++    texture_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
++    UINT64 readback_size;
++    device->GetCopyableFootprints(&texture_desc, 0, 1, 0, &check.footprint, nullptr, nullptr,
++                                  &readback_size);
++    D3D12_RESOURCE_DESC readback_desc;
++    util::FillBufferResourceDesc(readback_desc, readback_size, D3D12_RESOURCE_FLAG_NONE);
++    if (FAILED(device->CreateCommittedResource(
++            &util::kHeapPropertiesDefault, provider_.GetHeapFlagCreateNotZeroed(), &texture_desc,
++            D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&check.texture))) ||
++        FAILED(device->CreateCommittedResource(
++            &util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &readback_desc,
++            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&check.readback[0]))) ||
++        FAILED(device->CreateCommittedResource(
++            &util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &readback_desc,
++            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&check.readback[1])))) {
++      REXLOG_ERROR("D3D12Presenter: swap_direct_present_check: failed to create the check images");
++      check.texture.Reset();
++      check.readback[0].Reset();
++      check.readback[1].Reset();
++      return false;
++    }
++    check.width = width;
++    check.height = height;
++    device->CreateRenderTargetView(
++        check.texture.Get(), nullptr,
++        provider_.OffsetRTVDescriptor(rtv_heap_start, PaintContext::kRTVIndexFusedGammaCheck));
++  }
++
++  // The fused paint, the way it is drawn to the back buffer, into the scratch image (cleared like the back
++  // buffer's letterbox).
++  D3D12_CPU_DESCRIPTOR_HANDLE scratch_rtv =
++      provider_.OffsetRTVDescriptor(rtv_heap_start, PaintContext::kRTVIndexFusedGammaCheck);
++  const float kClearColor[] = {0.0f, 0.0f, 0.0f, 1.0f};
++  command_list->ClearRenderTargetView(scratch_rtv, kClearColor, 0, nullptr);
++  command_list->OMSetRenderTargets(1, &scratch_rtv, TRUE, nullptr);
++  command_list->SetPipelineState(guest_output_paint_gamma_pipeline_.Get());
++  command_list->SetGraphicsRootSignature(guest_output_paint_gamma_root_signature_.Get());
++  command_list->SetGraphicsRootDescriptorTable(UINT(GuestOutputPaintRootParameter::kSource),
++                                               fused_view_gpu);
++  GuestOutputPaintRectangleConstants rect_constants;
++  const float x_to_ndc = 2.0f / float(width);
++  const float y_to_ndc = 2.0f / float(height);
++  rect_constants.x = -1.0f + float(flow.output_x) * x_to_ndc;
++  rect_constants.y = 1.0f - float(flow.output_y) * y_to_ndc;
++  rect_constants.width = float(flow.effect_output_sizes[0].first) * x_to_ndc;
++  rect_constants.height = -float(flow.effect_output_sizes[0].second) * y_to_ndc;
++  command_list->SetGraphicsRoot32BitConstants(UINT(GuestOutputPaintRootParameter::kRectangle),
++                                              sizeof(rect_constants) / sizeof(uint32_t),
++                                              &rect_constants, 0);
++  const int32_t output_offset[2] = {flow.output_x, flow.output_y};
++  command_list->SetGraphicsRoot32BitConstants(
++      UINT(GuestOutputPaintRootParameter::kEffectConstants), 2, output_offset, 0);
++  command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
++  command_list->DrawInstanced(4, 1, 0, 0);
++  // Back to the back buffer for what follows.
++  command_list->OMSetRenderTargets(1, &back_buffer_rtv, TRUE, nullptr);
++
++  // The usual paint (the back buffer) and the fused one (the scratch image) to the readback buffers.
++  ID3D12Resource* images[2] = {back_buffer, check.texture.Get()};
++  D3D12_RESOURCE_BARRIER barriers[2];
++  for (uint32_t i = 0; i < 2; ++i) {
++    barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    barriers[i].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
++    barriers[i].Transition.pResource = images[i];
++    barriers[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    barriers[i].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++  }
++  command_list->ResourceBarrier(2, barriers);
++  for (uint32_t i = 0; i < 2; ++i) {
++    D3D12_TEXTURE_COPY_LOCATION copy_dest = {};
++    copy_dest.pResource = check.readback[i].Get();
++    copy_dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++    copy_dest.PlacedFootprint = check.footprint;
++    D3D12_TEXTURE_COPY_LOCATION copy_source = {};
++    copy_source.pResource = images[i];
++    copy_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++    copy_source.SubresourceIndex = 0;
++    command_list->CopyTextureRegion(&copy_dest, 0, 0, 0, &copy_source, nullptr);
++    std::swap(barriers[i].Transition.StateBefore, barriers[i].Transition.StateAfter);
++  }
++  command_list->ResourceBarrier(2, barriers);
++  check.submission = paint_context_.paint_submission_tracker.GetCurrentSubmission();
++  check.refresh_number = refresh_number;
++  return true;
++}
++
++void D3D12Presenter::CompleteFusedGammaCheck() {
++  FusedGammaCheck& check = fused_gamma_check_;
++  check.recorded = false;
++  if (!check.readback[0] || !check.readback[1] ||
++      !paint_context_.paint_submission_tracker.AwaitSubmissionCompletion(check.submission)) {
++    REXLOG_ERROR("D3D12Presenter: swap_direct_present_check: the check paint did not complete");
++    return;
++  }
++  const D3D12_RANGE read_range = {0, SIZE_T(check.footprint.Footprint.RowPitch) * check.height};
++  void* mappings[2] = {};
++  for (uint32_t i = 0; i < 2; ++i) {
++    if (FAILED(check.readback[i]->Map(0, &read_range, &mappings[i]))) {
++      REXLOG_ERROR("D3D12Presenter: swap_direct_present_check: failed to map a readback buffer");
++      if (i) {
++        check.readback[0]->Unmap(0, nullptr);
++      }
++      return;
++    }
++  }
++  // B8G8R8A8: the bytes of a pixel are blue, green, red, alpha.
++  uint32_t max_difference[4] = {};
++  uint64_t differing_pixels = 0;
++  uint32_t first_x = 0, first_y = 0;
++  const uint32_t row_pitch = check.footprint.Footprint.RowPitch;
++  for (uint32_t y = 0; y < check.height; ++y) {
++    const uint8_t* usual = static_cast<const uint8_t*>(mappings[0]) + size_t(y) * row_pitch;
++    const uint8_t* fused = static_cast<const uint8_t*>(mappings[1]) + size_t(y) * row_pitch;
++    for (uint32_t x = 0; x < check.width; ++x) {
++      bool differs = false;
++      for (uint32_t c = 0; c < 4; ++c) {
++        const uint32_t a = usual[x * 4 + c], b = fused[x * 4 + c];
++        const uint32_t difference = a > b ? a - b : b - a;
++        if (difference) {
++          differs = true;
++          max_difference[c] = std::max(max_difference[c], difference);
++        }
++      }
++      if (differs) {
++        if (!differing_pixels) {
++          first_x = x;
++          first_y = y;
++        }
++        ++differing_pixels;
++      }
++    }
++  }
++  const D3D12_RANGE written_range = {0, 0};
++  check.readback[0]->Unmap(0, &written_range);
++  check.readback[1]->Unmap(0, &written_range);
++  ++check.number;
++  REXLOG_INFO(
++      "swap_direct_present_check: fused paint #{} (guest frame {}), {}x{}: largest difference from "
++      "the usual paint (B/G/R/A, 8 bits) {}/{}/{}/{}, {} pixels differ{}",
++      check.number, check.refresh_number, check.width, check.height, max_difference[0],
++      max_difference[1], max_difference[2], max_difference[3], differing_pixels,
++      differing_pixels ? fmt::format(", the first at {},{}", first_x, first_y) : std::string());
++}
++
+ }  // namespace rex::ui::d3d12
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 75d29b10..ae9901d1 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -1407,6 +1407,22 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+   return std::move(consumer_lock);
+ }
+ 
++bool Presenter::LockForGuestOutputThreadPaintCheck(std::unique_lock<std::mutex>& lock_out) {
++  std::unique_lock<std::mutex> lock(paint_mode_mutex_);
++  if (paint_mode_ != PaintMode::kGuestOutputThreadImmediately ||
++      surface_paint_connection_state_ != SurfacePaintConnectionState::kConnectedPaintable ||
++      ui_overlay_paint_mode_) {
++    return false;
++  }
++  lock_out = std::move(lock);
++  return true;
++}
++
++void Presenter::CopyGuestOutputPaintConfig(GuestOutputPaintConfig& config_out) {
++  std::lock_guard<std::mutex> config_lock(guest_output_paint_config_mutex_);
++  config_out = guest_output_paint_config_;
++}
++
+ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+     const GuestOutputProperties& properties, uint32_t host_rt_width, uint32_t host_rt_height,
+     uint32_t max_rt_width, uint32_t max_rt_height, const GuestOutputPaintConfig& config) const {
+diff --git a/src/ui/shaders/bytecode/d3d12_5_1/guest_output_gamma_table_ps.h b/src/ui/shaders/bytecode/d3d12_5_1/guest_output_gamma_table_ps.h
+new file mode 100644
+index 00000000..584336ba
+--- /dev/null
++++ b/src/ui/shaders/bytecode/d3d12_5_1/guest_output_gamma_table_ps.h
+@@ -0,0 +1,76 @@
++#if 0
++//
++// Generated by Microsoft (R) D3D Shader Disassembler
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// SV_Position              0   xyzw        0      POS   float   xy  
++//
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// SV_Target                0   xyzw        0   TARGET   float   xyzw
++//
++ps_5_1
++dcl_globalFlags refactoringAllowed
++dcl_constantbuffer CB0[0:0][1], immediateIndexed, space=0
++dcl_resource_buffer (float,float,float,float) T0[0:0], space=0
++dcl_resource_texture2d (float,float,float,float) T1[1:1], space=0
++dcl_input_ps_siv linear noperspective v0.xy, position
++dcl_output o0.xyzw
++dcl_temps 1
++ftoi r0.xy, v0.xyxx
++iadd r0.xy, r0.xyxx, -CB0[0][0].xyxx
++mov r0.zw, l(0,0,0,0)
++ld r0.xyz, r0.xyzw, T1[1].xyzw
++mad r0.xyz, r0.xyzx, l(255.000000, 255.000000, 255.000000, 0.000000), l(0.500000, 0.500000, 0.500000, 0.000000)
++ftou r0.xyz, r0.xyzx
++ld r0.x, r0.xxxx, T0[0].zxyw
++ld r0.y, r0.yyyy, T0[0].xyzw
++ld r0.z, r0.zzzz, T0[0].yzxw
++mov o0.xyz, r0.xyzx
++mov o0.w, l(1.000000)
++ret 
++// Approximately 11 instruction slots used
++#endif
++
++const BYTE guest_output_gamma_table_ps[] = {
++    68,  88,  66,  67,  54,  148, 171, 10,  241, 209, 125, 167, 29,  192, 5,   2,   79,  133, 220,
++    162, 1,   0,   0,   0,   120, 2,   0,   0,   3,   0,   0,   0,   44,  0,   0,   0,   96,  0,
++    0,   0,   148, 0,   0,   0,   73,  83,  71,  78,  44,  0,   0,   0,   1,   0,   0,   0,   8,
++    0,   0,   0,   32,  0,   0,   0,   0,   0,   0,   0,   1,   0,   0,   0,   3,   0,   0,   0,
++    0,   0,   0,   0,   15,  3,   0,   0,   83,  86,  95,  80,  111, 115, 105, 116, 105, 111, 110,
++    0,   79,  83,  71,  78,  44,  0,   0,   0,   1,   0,   0,   0,   8,   0,   0,   0,   32,  0,
++    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   3,   0,   0,   0,   0,   0,   0,   0,   15,
++    0,   0,   0,   83,  86,  95,  84,  97,  114, 103, 101, 116, 0,   171, 171, 83,  72,  69,  88,
++    220, 1,   0,   0,   81,  0,   0,   0,   119, 0,   0,   0,   106, 8,   0,   1,   89,  0,   0,
++    7,   70,  142, 48,  0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   1,   0,
++    0,   0,   0,   0,   0,   0,   88,  8,   0,   7,   70,  126, 48,  0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   0,   85,  85,  0,   0,   0,   0,   0,   0,   88,  24,  0,   7,
++    70,  126, 48,  0,   1,   0,   0,   0,   1,   0,   0,   0,   1,   0,   0,   0,   85,  85,  0,
++    0,   0,   0,   0,   0,   100, 32,  0,   4,   50,  16,  16,  0,   0,   0,   0,   0,   1,   0,
++    0,   0,   101, 0,   0,   3,   242, 32,  16,  0,   0,   0,   0,   0,   104, 0,   0,   2,   1,
++    0,   0,   0,   27,  0,   0,   5,   50,  0,   16,  0,   0,   0,   0,   0,   70,  16,  16,  0,
++    0,   0,   0,   0,   30,  0,   0,   10,  50,  0,   16,  0,   0,   0,   0,   0,   70,  0,   16,
++    0,   0,   0,   0,   0,   70,  128, 48,  128, 65,  0,   0,   0,   0,   0,   0,   0,   0,   0,
++    0,   0,   0,   0,   0,   0,   54,  0,   0,   8,   194, 0,   16,  0,   0,   0,   0,   0,   2,
++    64,  0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
++    45,  0,   0,   8,   114, 0,   16,  0,   0,   0,   0,   0,   70,  14,  16,  0,   0,   0,   0,
++    0,   70,  126, 32,  0,   1,   0,   0,   0,   1,   0,   0,   0,   50,  0,   0,   15,  114, 0,
++    16,  0,   0,   0,   0,   0,   70,  2,   16,  0,   0,   0,   0,   0,   2,   64,  0,   0,   0,
++    0,   127, 67,  0,   0,   127, 67,  0,   0,   127, 67,  0,   0,   0,   0,   2,   64,  0,   0,
++    0,   0,   0,   63,  0,   0,   0,   63,  0,   0,   0,   63,  0,   0,   0,   0,   28,  0,   0,
++    5,   114, 0,   16,  0,   0,   0,   0,   0,   70,  2,   16,  0,   0,   0,   0,   0,   45,  0,
++    0,   8,   18,  0,   16,  0,   0,   0,   0,   0,   6,   0,   16,  0,   0,   0,   0,   0,   38,
++    125, 32,  0,   0,   0,   0,   0,   0,   0,   0,   0,   45,  0,   0,   8,   34,  0,   16,  0,
++    0,   0,   0,   0,   86,  5,   16,  0,   0,   0,   0,   0,   70,  126, 32,  0,   0,   0,   0,
++    0,   0,   0,   0,   0,   45,  0,   0,   8,   66,  0,   16,  0,   0,   0,   0,   0,   166, 10,
++    16,  0,   0,   0,   0,   0,   150, 124, 32,  0,   0,   0,   0,   0,   0,   0,   0,   0,   54,
++    0,   0,   5,   114, 32,  16,  0,   0,   0,   0,   0,   70,  2,   16,  0,   0,   0,   0,   0,
++    54,  0,   0,   5,   130, 32,  16,  0,   0,   0,   0,   0,   1,   64,  0,   0,   0,   0,   128,
++    63,  62,  0,   0,   1};
+diff --git a/src/ui/shaders/guest_output_gamma_table.ps.hlsl b/src/ui/shaders/guest_output_gamma_table.ps.hlsl
+new file mode 100644
+index 00000000..efd73b94
+--- /dev/null
++++ b/src/ui/shaders/guest_output_gamma_table.ps.hlsl
+@@ -0,0 +1,36 @@
++// guest_output_gamma_table.ps.hlsl - mcla-x86 patch 04a0 (swap_direct_present), written for this SDK.
++//
++// The guest output paint pass of the presenter with the swap's gamma ramp folded in: the 256-entry table path of
++// apply_gamma_table_cs (the ramp looked up by the source's 8-bit value of each channel, the result in the ramp's
++// 10 bits) in a pixel shader that writes the swap chain, instead of the compute pass that writes the guest output image
++// followed by the bilinear paint of that image. Used only where the bilinear paint is a plain 1:1 copy of an 8 bpc
++// image (the guest output's size, no scaling), so the filter would only have returned the texel it was given:
++// the output is the ramp's value of the source texel under the pixel, exactly, with the (xe_gamma_output_offset)
++// shift of the guest output's rectangle in the back buffer.
++//
++// The ramp is the SDK's R10G10B10X2 typed buffer of the gamma ramp (bytes 0x0...0x3FF of gamma_ramp_buffer_, B10G10R10X2
++// data read as R10G10B10X2 with a swizzle): red takes the entry's blue, green its green, blue its red, as apply_gamma_table
++// does.
++//
++// fxc /T ps_5_1 /E main /O3 /Qstrip_reflect /Qstrip_debug /Qstrip_priv /Vn guest_output_gamma_table_ps
++//     /Fh guest_output_gamma_table_ps.h guest_output_gamma_table.ps.hlsl
++
++Buffer<float4> xe_gamma_ramp : register(t0);
++Texture2D<float4> xe_gamma_source : register(t1);
++
++cbuffer push_consts_xe : register(b0) {
++  int2 xe_gamma_output_offset;
++};
++
++float4 main(float4 xe_position : SV_Position) : SV_Target {
++  // Truncated like the bilinear pass's own pixel index (ftoi), so a pixel centre maps to its own texel.
++  int2 pixel_index = int2(xe_position.xy) - xe_gamma_output_offset;
++  float3 source = xe_gamma_source.Load(int3(pixel_index, 0)).rgb;
++  // The same rounding as apply_gamma_table_cs: the 8-bit value of the channel.
++  uint3 table_indices = uint3(source * 255.0 + 0.5);
++  float3 result;
++  result.r = xe_gamma_ramp[table_indices.r].b;
++  result.g = xe_gamma_ramp[table_indices.g].g;
++  result.b = xe_gamma_ramp[table_indices.b].r;
++  return float4(result, 1.0);
++}

@@ -827,6 +827,15 @@ purpose = "D3D12: cvar resolve_dual_write (default false): a direct resolve (bat
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "04a0-swap-direct-present"
+source = "local"
+path = "patches/sdk/04a0-swap-direct-present.patch"
+sha256 = "9be0bbd5c072e7a2be5bedb1c988ffe43e9350d9e181624882b81dd475afbf4d"
+purpose = "D3D12: cvar swap_direct_present (default false): when the front buffer was resolved whole from one host 8888 render target (1x, no offsets, not FSR-stretched) and nothing wrote that guest range since, the swap samples the render target directly (no front-buffer texture load); swap_direct_present_fused (default true) applies the gamma ramp in the presenter paint instead of a separate apply-gamma pass when the paint is a plain 1:1 copy. swap_direct_present_check=N compares against the old path every Nth swap. Needs 0490 first."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]

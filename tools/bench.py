@@ -84,10 +84,26 @@ docs/METRICS.md rows (never hand-edited; `--no-metrics` skips, `--metrics-file F
   GetSystemPowerStatus, battery %, power scheme and the Windows power-mode overlay via powrprof), warm-up run id, repetition, fixture,
   `sim on` and the sim frame-time summary, --note.
 
+Telemetry (R6: the package is capped at ~35 W and the GPU clock swings 1.25-1.9 GHz with background CPU load)
+  If $WORK/toolchain/telemetry/sampler.exe exists (built from tools/telemetry, see its README; `--sampler PATH` names another,
+  `--no-telemetry` skips everything in this paragraph), `sampler.exe <run>/adlx.csv <seconds-4> 100 <exe name>` runs next to
+  PresentMon (ADLX: GPU clock, package power, temperature; 1 Hz real resolution; it ends by itself before the kill), and bench.py
+  itself samples the machine's CPU load every 0.5 s into <run>/cpu.csv (busy cores of the whole system by GetSystemTimes minus
+  the game's cores by GetProcessTimes = non-game cores). Alignment: the sampler's t_s clock has no epoch, so sampler_meta.json
+  records start_epoch = the CSV's mtime minus its last t_s (the CSV is flushed every second and closed when sampler.exe ends or
+  is killed); cpu.csv carries epochs. Over the measured window the notes get
+  `gpuclk=<p50>/<p10>MHz pkg=<W>W nongame_cpu=<cores> tmax=<C>C` (medians; tmax is the maximum).
+  TAINTED, leading the notes as `TAINTED (...)`: the non-game CPU median is above 1.5 cores (flagged at once); or, when the bench
+  is done, the variants of one kind of run differ by more than 10 % of the lower in median GPU clock (the median of their runs'
+  p50; every row of that kind is rewritten in place). A `TAINTED <id>: ...` line closes the output and bench.json has the flags;
+  the exit code and --gate do not change. Telemetry never makes a run INVALID; without sampler.exe the notes lack gpuclk/pkg/tmax.
+
 --dry-metrics PM_CSV LOG   recompute the metrics of existing files (no game, no lock); prints the `bench` line, exits 3 when INVALID.
   Options: --pm-meta F (default: pm_meta.json beside the CSV, for the QPC offset), --qpc-offset S, --pm-t0 S, --window-skip, --window-seconds,
   --pid N (only that process), --id, --variant name:cvars (labels the line, cap/resolution), --api, --build-id, --note, --gate,
-  --append (append the row; off by default), --metrics-file.
+  --append (append the row; off by default), --metrics-file. Telemetry files beside the CSV are used when present: --adlx F
+  (adlx.csv), --adlx-meta F (sampler_meta.json: start_epoch), --adlx-t0 S (seconds after the first log line at which the sampler's
+  t_s is 0; wins over the meta; with neither, t_s 0 is assumed at the window start), --cpu-csv F (cpu.csv).
 
 Exit codes: 0 done (valid runs); 2 setup problem (bad option, flow, PresentMon missing; nothing ran); 3 a measured run INVALID;
   4 --gate failed on a valid run; 75 heavy-lock wait expired; 130 interrupted. Stdlib only.
@@ -130,6 +146,11 @@ PM_TIMED_MARGIN_S = 2.0        # PresentMon stops this long before run_game kill
 PM_FINISH_GRACE_S = 10.0
 SIM_TOLERANCE_S = 0.6          # a [mcla-sim] interval may start this much before the window and still count
 MIN_WINDOW_FRACTION = 0.5
+SAMPLER_EXE = "toolchain/telemetry/sampler.exe"   # under $WORK (tools/telemetry/README.md)
+SAMPLER_MARGIN_S = 4.0         # sampler.exe is told to run this much shorter than the run, so it ends by itself
+CPU_SAMPLE_S = 0.5
+TAINT_CPU_CORES = 1.5          # median non-game CPU load (cores) above which a run is TAINTED
+TAINT_CLOCK_FRAC = 0.10        # variants whose median GPU clock differs by more than this (of the lower) are TAINTED
 
 EXIT_SETUP = run_game.EXIT_SETUP
 EXIT_INVALID = 3
@@ -513,6 +534,7 @@ def analyse_run(csv_path, log_path, *, skip: float = WINDOW_SKIP_S, window_s: Op
     res["stats"] = frame_stats(ft, gpu)
     res["chain"] = best_key
     res["chains"] = len(pm.series)
+    res["window"].update(captured_end=min(w1, last_in), log_first=base)
     # world/real over the part of the window that was captured (the log goes on a moment after the capture ended)
     wr, world_s, real_s, n_sim = world_real(log["sim"], w0, min(w1, last_in))
     res.update(world_real=wr, world_s=world_s, real_s=real_s, sim_lines=n_sim,
@@ -745,6 +767,285 @@ class FreeRoamGuard(threading.Thread):
 
 
 # ================================================================================================================
+# Telemetry: GPU clock, package power, temperature (tools/telemetry/sampler.exe, ADLX) and the machine's CPU load
+# ================================================================================================================
+
+def _adlx_val(cells: List[str], idx: Dict[str, int], name: str) -> Optional[float]:
+    i = idx.get(name)
+    v = _float_or_none(cells[i]) if i is not None else None
+    return v if v is not None and v > 0 else None       # -1 = not supported
+
+
+def load_adlx_csv(path) -> List[Tuple[float, Optional[float], Optional[float], Optional[float]]]:
+    """(t_s, gfx_mhz, gpu_w, temp_c) rows of a sampler.exe CSV: `#` lines and a cut last row skipped, unsupported (-1) = None.
+    Raises ValueError for a file without the sampler's header."""
+    rows: List[Tuple[float, Optional[float], Optional[float], Optional[float]]] = []
+    header: Optional[List[str]] = None
+    idx: Dict[str, int] = {}
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+        for line in fh:
+            line = line.rstrip("\r\n")
+            if not line or line.startswith("#"):
+                continue
+            cells = line.split(",")
+            if header is None:
+                header = [c.strip().lower() for c in cells]
+                idx = {name: i for i, name in enumerate(header)}
+                if "t_s" not in idx or "gfx_mhz" not in idx:
+                    raise ValueError("%s is not a sampler.exe CSV (header: %s)" % (path, line[:120]))
+                continue
+            if len(cells) != len(header):
+                continue
+            t = _float_or_none(cells[idx["t_s"]])
+            if t is not None:
+                rows.append((t, _adlx_val(cells, idx, "gfx_mhz"), _adlx_val(cells, idx, "gpu_w"), _adlx_val(cells, idx, "temp_c")))
+    if header is None:
+        raise ValueError("%s is empty" % path)
+    return rows
+
+
+def load_cpu_csv(path) -> List[Tuple[float, float, float]]:
+    """(epoch_s, sys_cores, game_cores) rows of a bench.py cpu.csv."""
+    rows: List[Tuple[float, float, float]] = []
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+        rd = csv.reader(fh)
+        header = next(rd, None)
+        if not header or [h.strip().lower() for h in header[:3]] != ["epoch_s", "sys_cores", "game_cores"]:
+            raise ValueError("%s is not a bench.py cpu.csv" % path)
+        for row in rd:
+            vals = [_float_or_none(x) for x in row[:3]]
+            if len(row) >= 3 and all(v is not None for v in vals):
+                rows.append((vals[0], vals[1], vals[2]))
+    return rows
+
+
+def telemetry_summary(adlx, adlx_shift: Optional[float], cpu, w0: float, w1: float) -> Optional[Dict]:
+    """Medians over the window [w0, w1) of the sampler rows (epoch = t_s + adlx_shift) and the CPU rows; None without data files."""
+    if adlx is None and cpu is None:
+        return None
+    out: Dict = {"taint": []}
+    if adlx is not None:
+        sel = [r for r in adlx if w0 <= r[0] + adlx_shift < w1]
+        out["adlx_rows"] = len(sel)
+        out["adlx_span_s"] = (max(r[0] for r in sel) - min(r[0] for r in sel)) if sel else 0.0
+        clk = sorted(r[1] for r in sel if r[1] is not None)
+        if clk:
+            out["gpuclk_p50"], out["gpuclk_p10"] = statistics.median(clk), percentile(clk, 10)
+        pw = [r[2] for r in sel if r[2] is not None]
+        if pw:
+            out["pkg_w"] = statistics.median(pw)
+        tc = [r[3] for r in sel if r[3] is not None]
+        if tc:
+            out["temp_max"] = max(tc)
+    if cpu is not None:
+        sel2 = [(s, g) for e, s, g in cpu if w0 <= e < w1]
+        out["cpu_rows"] = len(sel2)
+        if sel2:
+            out["nongame_cpu"] = statistics.median(max(0.0, s - g) for s, g in sel2)
+            out["sys_cores"] = statistics.median(s for s, _ in sel2)
+            out["game_cores"] = statistics.median(g for _, g in sel2)
+    if out.get("nongame_cpu", 0.0) > TAINT_CPU_CORES:
+        out["taint"].append("non-game CPU %.1f cores > %g" % (out["nongame_cpu"], TAINT_CPU_CORES))
+    return out
+
+
+def attach_telemetry(res: Dict, *, adlx_path=None, adlx_start_epoch: Optional[float] = None, adlx_t0: Optional[float] = None,
+                     cpu_path=None) -> None:
+    """Adds res["telemetry"] (summary over the captured window) to an analysis with a window. Telemetry is advisory: a missing or
+    unreadable file only sets res["telemetry_error"], it never makes the run INVALID."""
+    win = res.get("window") or {}
+    w0, w1 = win.get("start_epoch"), win.get("captured_end")
+    if w0 is None or w1 is None:
+        return
+    adlx = cpu = None
+    shift: Optional[float] = None
+    errors: List[str] = []
+    if adlx_path is not None and Path(adlx_path).is_file():
+        try:
+            adlx = load_adlx_csv(adlx_path)
+            if adlx_start_epoch is not None:
+                shift = float(adlx_start_epoch)
+            elif adlx_t0 is not None and win.get("log_first") is not None:
+                shift = win["log_first"] + adlx_t0
+            else:
+                shift = w0       # nothing says when the sampler started: t_s 0 is assumed at the window start
+                res["adlx_t0_assumed"] = True
+        except (OSError, ValueError) as e:
+            errors.append("sampler CSV unusable: %s" % e)
+            adlx = None
+    if cpu_path is not None and Path(cpu_path).is_file():
+        try:
+            cpu = load_cpu_csv(cpu_path)
+        except (OSError, ValueError) as e:
+            errors.append("cpu.csv unusable: %s" % e)
+    tel = telemetry_summary(adlx, shift, cpu, w0, w1)
+    if tel is not None:
+        if adlx is not None and not tel.get("adlx_rows"):
+            errors.append("no sampler rows in the window (check the sampler's start time)")
+        if adlx is not None and tel.get("adlx_rows") and tel.get("adlx_span_s", 0.0) < 0.5 * (w1 - w0):
+            errors.append("the sampler covers only %.0f s of the %.0f s window" % (tel["adlx_span_s"], w1 - w0))
+        if cpu is not None and not tel.get("cpu_rows"):
+            errors.append("no CPU-load rows in the window")
+    res["telemetry"] = tel
+    if errors:
+        res["telemetry_error"] = "; ".join(errors)
+
+
+def telemetry_token(tel: Optional[Dict]) -> str:
+    """`gpuclk=<p50>/<p10>MHz pkg=<W>W nongame_cpu=<cores> tmax=<C>C`, the parts that were measured."""
+    if not tel:
+        return ""
+    parts = []
+    if tel.get("gpuclk_p50") is not None:
+        parts.append("gpuclk=%.0f/%.0fMHz" % (tel["gpuclk_p50"], tel["gpuclk_p10"]))
+    if tel.get("pkg_w") is not None:
+        parts.append("pkg=%.1fW" % tel["pkg_w"])
+    if tel.get("nongame_cpu") is not None:
+        parts.append("nongame_cpu=%.1f" % tel["nongame_cpu"])
+    if tel.get("temp_max") is not None:
+        parts.append("tmax=%.0fC" % tel["temp_max"])
+    return " ".join(parts)
+
+
+def find_sampler(args: argparse.Namespace, work: Path) -> Optional[Path]:
+    """sampler.exe: --sampler (must exist), else $WORK/toolchain/telemetry/sampler.exe if built, else None. None with --no-telemetry."""
+    if args.no_telemetry:
+        return None
+    if args.sampler:
+        p = Path(args.sampler)
+        if not p.is_file():
+            raise SetupError("sampler not found at %s" % p)
+        return p
+    p = work / SAMPLER_EXE
+    return p if p.is_file() else None
+
+
+class Sampler:
+    """tools/telemetry/sampler.exe beside the game: ADLX GPU clock / power / temperature into <run>/adlx.csv."""
+
+    def __init__(self, exe: Path, seconds: float, proc_name: str) -> None:
+        self.exe, self.proc_name = exe, proc_name
+        self.secs = max(1, int(seconds - SAMPLER_MARGIN_S))
+        self.proc: Optional[subprocess.Popen] = None
+        self.log = None
+        self.run_dir: Optional[Path] = None
+        self.meta: Dict = {}
+        self.error: Optional[str] = None
+
+    def start(self, run_dir: Path) -> None:
+        self.run_dir = run_dir
+        cmd = [str(self.exe), str(run_dir / "adlx.csv"), str(self.secs), "100", self.proc_name]
+        self.meta = {"cmd": cmd, "launched_epoch": time.time()}
+        try:
+            self.log = open(run_dir / "sampler.log", "wb")
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=self.log, stderr=subprocess.STDOUT,
+                                         creationflags=0x08000000)  # CREATE_NO_WINDOW
+        except OSError as e:
+            self.error = "could not start sampler.exe: %s" % e
+            say(self.error)
+
+    def finish(self) -> None:
+        """Wait for sampler.exe to end by itself, else kill it; record sampler_meta.json (start_epoch = mtime - last t_s)."""
+        killed = False
+        rc = None
+        if self.proc is not None:
+            deadline = time.monotonic() + PM_FINISH_GRACE_S
+            while self.proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.2)
+            if self.proc.poll() is None:
+                killed = True
+                self.proc.kill()
+                try:
+                    self.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+            rc = self.proc.poll()
+        if self.log is not None:
+            self.log.close()
+        if self.run_dir is None:
+            return
+        csv_path = self.run_dir / "adlx.csv"
+        try:
+            rows = load_adlx_csv(csv_path)
+            if rows:
+                self.meta["start_epoch"] = csv_path.stat().st_mtime - rows[-1][0]
+        except (OSError, ValueError):
+            pass
+        self.meta.update({"rc": rc, "killed": killed, "error": self.error})
+        run_game.write_json(self.run_dir / "sampler_meta.json", self.meta)
+
+
+class CpuLoad(threading.Thread):
+    """The machine's CPU load beside the game, every CPU_SAMPLE_S into <run>/cpu.csv (epoch_s,sys_cores,game_cores): busy cores of
+    the whole system (GetSystemTimes) and of the game process (GetProcessTimes); their difference is the non-game load."""
+
+    def __init__(self, pid: int, csv_path: Path) -> None:
+        super().__init__(daemon=True)
+        self.pid, self.csv_path = pid, csv_path
+        self.error: Optional[str] = None
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self.join(timeout=5)
+
+    def run(self) -> None:
+        try:
+            self._loop()
+        except Exception as e:  # noqa: BLE001 - telemetry must never break a run
+            self.error = repr(e)
+
+    def _loop(self) -> None:
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32")
+        pft = ctypes.POINTER(wintypes.FILETIME)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.GetProcessTimes.argtypes = [wintypes.HANDLE, pft, pft, pft, pft]
+        k32.GetSystemTimes.argtypes = [pft, pft, pft]
+        k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = k32.OpenProcess(0x1000, False, self.pid)       # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            self.error = "OpenProcess(%d) failed" % self.pid
+            return
+        ncpu = os.cpu_count() or 1
+
+        def ticks(ft) -> int:
+            return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+        def read():
+            idle, kern, user, c, e, pk, pu = (wintypes.FILETIME() for _ in range(7))
+            code = wintypes.DWORD()
+            if not k32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user)):
+                return None
+            if not k32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:     # STILL_ACTIVE
+                return None
+            if not k32.GetProcessTimes(handle, ctypes.byref(c), ctypes.byref(e), ctypes.byref(pk), ctypes.byref(pu)):
+                return None
+            return (time.perf_counter(), time.time(), ticks(kern) + ticks(user), ticks(kern) - ticks(idle) + ticks(user),
+                    ticks(pk) + ticks(pu))
+
+        try:
+            prev = read()
+            if prev is None:
+                return
+            with open(self.csv_path, "w", newline="") as fh:
+                fh.write("epoch_s,sys_cores,game_cores\n")
+                while not self._stop_event.wait(CPU_SAMPLE_S):
+                    cur = read()
+                    if cur is None:
+                        break
+                    dt, dsys = cur[0] - prev[0], cur[2] - prev[2]
+                    if dt > 0 and dsys > 0:
+                        fh.write("%.3f,%.3f,%.3f\n" % (cur[1], ncpu * (cur[3] - prev[3]) / dsys, (cur[4] - prev[4]) / 1e7 / dt))
+                        fh.flush()
+                    prev = cur
+        finally:
+            k32.CloseHandle(handle)
+
+
+# ================================================================================================================
 # METRICS.md
 # ================================================================================================================
 
@@ -812,6 +1113,42 @@ def append_metrics(path: Path, rows: List[Dict]) -> None:
     tmp = path.with_name(path.name + ".part")
     tmp.write_text(nl.join(lines) + nl, encoding="utf-8", newline="")
     os.replace(tmp, path)
+
+
+def retag_metrics(path: Path, tags: Dict[str, str]) -> int:
+    """Prefix `TAINTED (<text>)` to the notes of the rows with these run ids in the `## Runs` table; returns the rows changed."""
+    if not tags or not path.exists():
+        return 0
+    text = path.read_text(encoding="utf-8", newline="")
+    nl = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines()
+    head = next((i for i, l in enumerate(lines) if re.fullmatch(r"##\s+Runs\s*", l)), None)
+    if head is None:
+        return 0
+    j = head + 1
+    while j < len(lines) and not lines[j].strip():
+        j += 1
+    if j >= len(lines) or not lines[j].lstrip().startswith("|"):
+        return 0
+    cols = [_norm_col(c) for c in _split_row(lines[j])]
+    if "notes" not in cols:
+        return 0
+    ni = cols.index("notes")
+    changed = 0
+    k = j + 1
+    while k < len(lines) and lines[k].lstrip().startswith("|"):
+        cells = _split_row(lines[k])
+        if len(cells) == len(cols) and cells[0] in tags:
+            tag = "TAINTED (%s)" % md_cell(tags[cells[0]])
+            cells[ni] = tag + ("; " + cells[ni] if cells[ni] else "")
+            lines[k] = "| " + " | ".join(cells) + " |"
+            changed += 1
+        k += 1
+    if changed:
+        tmp = path.with_name(path.name + ".part")
+        tmp.write_text(nl.join(lines) + nl, encoding="utf-8", newline="")
+        os.replace(tmp, path)
+    return changed
 
 
 def internal_resolution(cvars: Sequence[Tuple[str, str]], wide: Optional[Dict]) -> str:
@@ -924,6 +1261,19 @@ def detail_lines(res: Result) -> List[str]:
             "on" if a.get("sim_on") else "no `on:` line",
             "" if not ft else "; sim frame times p50 %.0f p99 %.0f worst %.1f ms (%d lines)" % (ft["p50"], ft["p99"],
                                                                                                ft["worst"], ft["lines"])))
+    tel = a.get("telemetry")
+    if tel:
+        cpu_part = ""
+        if tel.get("sys_cores") is not None:
+            cpu_part = " (CPU: system %.1f cores, game %.1f; %d samples)" % (tel["sys_cores"], tel["game_cores"], tel.get("cpu_rows", 0))
+        adlx_part = "; %d sampler rows" % tel["adlx_rows"] if "adlx_rows" in tel else ""
+        out.append("  telemetry: %s%s%s" % (telemetry_token(tel) or "no samples", cpu_part, adlx_part))
+        for t in tel.get("taint", []):
+            out.append("  TAINTED: " + t)
+    if a.get("adlx_t0_assumed"):
+        out.append("  note: no sampler start time (--adlx-t0 / sampler_meta.json): the sampler CSV is assumed to start at the window start")
+    if a.get("telemetry_error"):
+        out.append("  telemetry: " + a["telemetry_error"])
     if res.pm_note:
         out.append("  presentmon: " + res.pm_note)
     return out
@@ -957,6 +1307,11 @@ def make_row(res: Result, build_id: str, api: str, fixture: Optional[str], note:
             notes.append("relative-time CSV: capture assumed to start at the window start")
     if res.power:
         notes.append(res.power)
+    token = telemetry_token(a.get("telemetry"))
+    if token:
+        notes.append(token)
+    if a.get("telemetry_error"):
+        notes.append("telemetry: " + a["telemetry_error"])
     if res.warmup:
         notes.append(res.warmup)
     if res.rep:
@@ -965,6 +1320,8 @@ def make_row(res: Result, build_id: str, api: str, fixture: Optional[str], note:
         notes.append("fixture %s" % fixture)
     if res.pm_note:
         notes.append("PresentMon: " + res.pm_note)
+    for taint in (a.get("telemetry") or {}).get("taint", []):
+        notes.insert(0, "TAINTED (%s)" % taint)
     if note:
         notes.append(note)
 
@@ -1026,10 +1383,12 @@ def pooled(results: Sequence[Result], run_id: str, kind: str, flow: str, variant
         real += r.analysis["real_s"]
         sim_lines += r.analysis["sim_lines"]
     first = results[0].analysis
+    taints = list(dict.fromkeys(t for r in results for t in (r.analysis.get("telemetry") or {}).get("taint", [])))
     analysis = {"valid": True, "reasons": [], "stats": frame_stats(ft, gpu), "world_real": world / real if real > 0 else None,
                 "world_s": world, "real_s": real, "sim_lines": sim_lines, "sim_ft": None, "sim_on": first.get("sim_on"),
                 "sim_cap": first.get("sim_cap"), "wide": first.get("wide"), "built": first.get("built"), "ft": ft, "gpu": gpu,
                 "window": first.get("window"), "pm_clock": first.get("pm_clock"), "pm_rows": 0, "pm_skipped": 0, "fr_rel": None}
+    analysis["telemetry"] = {"taint": taints} if taints else None
     return Result(run_id, kind, variant, flow, rep, results[0].cvars, True, [], analysis, results[0].power, results[0].warmup)
 
 
@@ -1051,7 +1410,7 @@ def result_json(res: Result) -> Dict:
             "metrics": metrics_of(a), "world_s": a.get("world_s"), "real_s": a.get("real_s"), "sim_lines": a.get("sim_lines"),
             "sim_frame_times": a.get("sim_ft"), "sim_on": a.get("sim_on"), "wide": a.get("wide"), "built": a.get("built"),
             "window": a.get("window"), "free_roam_log_s": a.get("fr_rel"), "pm_clock": a.get("pm_clock"),
-            "pm_rows": a.get("pm_rows"), "power": res.power, "warmup": res.warmup}
+            "pm_rows": a.get("pm_rows"), "power": res.power, "warmup": res.warmup, "telemetry": a.get("telemetry")}
 
 
 # ================================================================================================================
@@ -1069,6 +1428,7 @@ class Ctx:
     holding_lock: bool
     metrics_file: Optional[Path]
     warmup_ids: List[str] = field(default_factory=list)
+    sampler_exe: Optional[Path] = None
 
 
 def run_one(ctx: Ctx, spec: RunSpec) -> Result:
@@ -1081,7 +1441,9 @@ def run_one(ctx: Ctx, spec: RunSpec) -> Result:
         run_id=spec.run_id, config=args.config, exe=args.exe, lock=False, expect="free-roam", work=str(ctx.work),
         game=args.game)
     pm = PresentMon(ctx.pm_exe, spec.seconds)
-    holder: Dict[str, FreeRoamGuard] = {}
+    exe_name = Path(args.exe).name if args.exe else "mcla.exe"
+    sampler = Sampler(ctx.sampler_exe, spec.seconds, exe_name) if ctx.sampler_exe is not None else None
+    holder: Dict[str, threading.Thread] = {}
 
     def on_start(pid: int, run_dir: Path) -> None:
         try:
@@ -1093,6 +1455,16 @@ def run_one(ctx: Ctx, spec: RunSpec) -> Result:
             g = FreeRoamGuard(pid, run_dir / "mcla.log", args.guard_at)
             g.start()
             holder["guard"] = g
+        if not args.no_telemetry:
+            if sampler is not None:
+                try:
+                    sampler.start(run_dir)
+                except Exception as e:  # noqa: BLE001
+                    sampler.error = "sampler.exe start failed: %r" % (e,)
+                    say(sampler.error)
+            load = CpuLoad(pid, run_dir / "cpu.csv")
+            load.start()
+            holder["cpu"] = load
 
     power0 = power_state()
     try:
@@ -1101,7 +1473,12 @@ def run_one(ctx: Ctx, spec: RunSpec) -> Result:
         guard = holder.get("guard")
         if guard is not None:
             guard.stop()
+        load = holder.get("cpu")
+        if load is not None:
+            load.stop()
         pm.finish()
+        if sampler is not None:
+            sampler.finish()
     power1 = power_state()
     if summary.get("ended_by") == "interrupted":
         raise KeyboardInterrupt()
@@ -1120,6 +1497,12 @@ def run_one(ctx: Ctx, spec: RunSpec) -> Result:
                                pm_meta=pm.meta, pid=summary.get("pid"), expected_s=expected)
     except SetupError as e:
         analysis = {"valid": False, "reasons": [str(e)], "stats": None, "ft": [], "gpu": []}
+    if analysis.get("window"):
+        attach_telemetry(analysis, adlx_path=run_dir / "adlx.csv" if sampler is not None else None,
+                         adlx_start_epoch=sampler.meta.get("start_epoch") if sampler is not None else None,
+                         cpu_path=run_dir / "cpu.csv" if holder.get("cpu") is not None else None)
+        if sampler is not None and sampler.error and not analysis.get("telemetry_error"):
+            analysis["telemetry_error"] = sampler.error
     guard = holder.get("guard")
     if guard is not None and guard.fired:
         reasons.append("the guard killed the game: no `-> free-roam` line %.0f s after the launch" % args.guard_at)
@@ -1209,6 +1592,56 @@ def run_all(ctx: Ctx, plan: List[RunSpec]) -> Tuple[List[Result], List[Dict]]:
     return results, rows
 
 
+def cross_variant_taint(results: List[Result]) -> Dict[str, str]:
+    """TAINTED across variants: for each kind of run (drive, parked), when the variants' median GPU clock (the median of their
+    runs' p50) differs by more than TAINT_CLOCK_FRAC of the lower one, every run of that kind with telemetry is tainted, and so is
+    a pooled `-stable` result whose drive or parked run is. Adds the text to the results' telemetry; returns {run id: text}."""
+    tags: Dict[str, str] = {}
+    for kind in ("drive", "parked"):
+        per: Dict[str, List[float]] = {}
+        for r in results:
+            tel = r.analysis.get("telemetry") if r.valid else None
+            if r.kind == kind and tel and tel.get("gpuclk_p50"):
+                per.setdefault(r.variant.name, []).append(tel["gpuclk_p50"])
+        if len(per) < 2:
+            continue
+        med = {v: statistics.median(x) for v, x in per.items()}
+        lo, hi = min(med.values()), max(med.values())
+        if (hi - lo) / lo <= TAINT_CLOCK_FRAC:
+            continue
+        text = "median GPU clock differs %.0f %% between variants (%s)" % (
+            100.0 * (hi - lo) / lo, ", ".join("%s %.0f MHz" % kv for kv in sorted(med.items())))
+        for r in results:
+            if r.kind == kind and r.valid and r.analysis.get("telemetry"):
+                tags[r.run_id] = text
+    for r in results:
+        if r.kind == "stable":
+            drive_id = r.run_id[:-len("-stable")]
+            text = tags.get(drive_id) or tags.get(drive_id + "-parked")
+            if text:
+                tags[r.run_id] = text
+    for r in results:
+        if r.run_id in tags:
+            tel = r.analysis.get("telemetry") or {"taint": []}
+            tel.setdefault("taint", []).append(tags[r.run_id])
+            r.analysis["telemetry"] = tel
+    return tags
+
+
+def apply_taint(ctx: Ctx, results: List[Result], rows: List[Dict], tags: Dict[str, str]) -> None:
+    """The rows are already appended: flag them in the METRICS file, in `rows` and in the runs' metrics.json."""
+    if ctx.metrics_file is not None:
+        n = retag_metrics(ctx.metrics_file, tags)
+        say("TAINTED: %d METRICS row(s) flagged in %s" % (n, run_game.posix(ctx.metrics_file)))
+    for row in rows:
+        if row["run_id"] in tags:
+            row["notes"] = "TAINTED (%s); %s" % (tags[row["run_id"]], row["notes"])
+    for r in results:
+        run_dir = ctx.work / "runs" / r.run_id
+        if r.run_id in tags and r.kind != "stable" and run_dir.is_dir():
+            run_game.write_json(run_dir / "metrics.json", result_json(r))
+
+
 def is_gated(args: argparse.Namespace, res: Result) -> bool:
     """--gate judges the drive runs, or with --parked the pooled drive + parked result (PLAN 6's definition)."""
     return bool(args.gate) and res.kind == ("stable" if args.parked else "drive")
@@ -1231,6 +1664,9 @@ def summarize(ctx: Ctx, results: List[Result]) -> int:
     say("%d measured result(s), %d INVALID%s" % (len(results), len(invalid), ", gate %s FAILED" % ctx.args.gate if gate_failed else ""))
     for r in invalid:
         print("INVALID %s: %s" % (r.run_id, "; ".join(r.reasons)), flush=True)
+    for r in results:
+        for t in (r.analysis.get("telemetry") or {}).get("taint", []):
+            print("TAINTED %s: %s" % (r.run_id, t), flush=True)
     return EXIT_INVALID if invalid else (EXIT_GATE if gate_failed else 0)
 
 
@@ -1297,6 +1733,13 @@ def make_parser() -> argparse.ArgumentParser:
     ap.add_argument("--pm-t0", type=float, metavar="S",
                     help="--dry-metrics, relative-time CSV: seconds after the first log line at which the CSV clock is 0")
     ap.add_argument("--pid", type=int, metavar="N", help="--dry-metrics: only the rows of this process id")
+    ap.add_argument("--no-telemetry", action="store_true", help="no sampler.exe and no CPU-load sampling (GPU clock, power, non-game CPU)")
+    ap.add_argument("--sampler", metavar="EXE", help="sampler.exe (default: $WORK/%s when built; tools/telemetry/README.md)" % SAMPLER_EXE)
+    ap.add_argument("--adlx", metavar="F", help="--dry-metrics: sampler CSV (default: adlx.csv beside the PresentMon CSV)")
+    ap.add_argument("--adlx-meta", metavar="F", help="--dry-metrics: sampler_meta.json (start_epoch; default: beside the CSV)")
+    ap.add_argument("--adlx-t0", type=float, metavar="S",
+                    help="--dry-metrics: seconds after the first log line at which the sampler's t_s is 0 (default: its meta, else the window start)")
+    ap.add_argument("--cpu-csv", metavar="F", help="--dry-metrics: cpu.csv (default: beside the PresentMon CSV)")
     return ap
 
 
@@ -1337,6 +1780,23 @@ def cmd_dry(args: argparse.Namespace) -> int:
         raise SetupError("no pm_meta.json at %s" % meta_path)
     analysis = analyse_run(csv_path, log_path, skip=args.window_skip, window_s=args.window_seconds, pm_meta=meta,
                            pm_t0=args.pm_t0, qpc_offset=args.qpc_offset, pid=args.pid)
+    adlx = Path(args.adlx) if args.adlx else csv_path.with_name("adlx.csv")
+    if args.adlx and not adlx.is_file():
+        raise SetupError("no sampler CSV at %s" % adlx)
+    cpu = Path(args.cpu_csv) if args.cpu_csv else csv_path.with_name("cpu.csv")
+    if args.cpu_csv and not cpu.is_file():
+        raise SetupError("no CPU-load CSV at %s" % cpu)
+    smeta = Path(args.adlx_meta) if args.adlx_meta else csv_path.with_name("sampler_meta.json")
+    if args.adlx_meta and not smeta.is_file():
+        raise SetupError("no sampler meta at %s" % smeta)
+    start_epoch = None
+    if args.adlx_t0 is None and smeta.is_file():
+        try:
+            start_epoch = json.loads(smeta.read_text(encoding="utf-8")).get("start_epoch")
+        except (OSError, ValueError) as e:
+            raise SetupError("cannot read %s: %s" % (smeta, e))
+    attach_telemetry(analysis, adlx_path=adlx if adlx.is_file() else None, adlx_start_epoch=start_epoch, adlx_t0=args.adlx_t0,
+                     cpu_path=cpu if cpu.is_file() else None)
     facts = run_game.evaluate(run_game.parse_log(log_path), "free-roam")
     reasons = list(analysis["reasons"])
     if facts["fatal_log"]:
@@ -1386,6 +1846,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
     metrics_file = None if args.no_metrics else metrics_path(args)
     pm_exe = find_presentmon(args.presentmon, work)
     ctx = Ctx(args, work, pm_exe, common, fixture, bench_id, not args.no_lock, metrics_file)
+    ctx.sampler_exe = find_sampler(args, work)
     plan = build_plan(ctx, variants, drive_seconds)
     taken = [s.run_id for s in plan if (work / "runs" / s.run_id).exists()]
     if taken:
@@ -1393,6 +1854,9 @@ def cmd_bench(args: argparse.Namespace) -> int:
     print("plan %s: %d run(s), %d measured; api %s, fixture %s, window = free roam + %g s to %s" % (
         bench_id, len(plan), sum(1 for s in plan if s.kind != "warmup"), args.api, fixture or "none", args.window_skip,
         "the end" if not args.window_seconds else "+%g s" % args.window_seconds), flush=True)
+    print("telemetry: %s" % ("off (--no-telemetry)" if args.no_telemetry else (
+        "sampler %s + CPU load" % run_game.posix(ctx.sampler_exe) if ctx.sampler_exe is not None else
+        "CPU load only (no sampler.exe at %s: build tools/telemetry)" % run_game.posix(work / SAMPLER_EXE))), flush=True)
     for i, s in enumerate(plan, 1):
         print("  %d. %-6s %-24s %-14s %5g s  variant %s %s" % (i, s.kind, s.run_id, s.flow, s.seconds, s.variant.name,
                                                            format_cvars(merged_cvars(common, s.variant))), flush=True)
@@ -1408,6 +1872,9 @@ def cmd_bench(args: argparse.Namespace) -> int:
     finally:
         if lease is not None:
             lease.release()
+    tags = cross_variant_taint(results)
+    if tags:
+        apply_taint(ctx, results, rows, tags)
     code = summarize(ctx, results)
     out = work / "runs" / (bench_id + ".bench.json")
     try:
