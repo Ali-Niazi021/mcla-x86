@@ -2,7 +2,7 @@
 // comes from. "W0.4" = the research report $WORK/scratch/W0.4/REPORT.md section 1 (the patch lines there are
 // the REXCVAR_DEFINE of the cvar). Left at the SDK default on purpose, so nobody ports them by mistake:
 // vsync (false makes the guest vblank fire at ~1 kHz), readback_resolve (stays `none`: the vinyl rule below is
-// the only readback), clear_memory_page_state, resolution_scale, hdr.
+// the only readback), resolution_scale, hdr. (clear_memory_page_state was on this list; it is set below since V3.)
 //
 // Named presets (W5.1): `--mcla_profile=1080p` or `900p` (cvar below; "" / "default" = the table below, unchanged)
 // adds a second table on top of the first. Same mechanism, so the command line, the environment and the TOML file
@@ -108,6 +108,24 @@ constexpr CvarDefault kProfileDefaults[] = {
     // -2.4 % frame time on a Radeon iGPU. Pictures are not proved identical: the first suspect in any parity
     // diff. Source: Renan :1105, KNOWN-ISSUES.md:695; rexglue-d3d12-hoist-shared-memory-uploads.patch:243 (false).
     {"d3d12_hoist_shared_memory_uploads", "true"},
+    // The resolve writes its result into the host texture directly and to shared memory too ("dual write"), so the texture
+    // cache does not load it back (SDK patch 0490, D3D12). Exact: the cvar's own verify mode compared 15,691 resolved
+    // textures with 0 differing; -0.6 ms GPU at 1080p. Defined in texture_cache.cpp (false); V3d-dw, docs/METRICS.md.
+    {"resolve_dual_write", "true"},
+    // The finished frame goes to the swap chain straight from its render target instead of through the extra full-screen
+    // copy of the guest's front buffer (SDK patch 04a0, D3D12). Exact: 155 swap checks, 0 / 0 / 0 / 0 mismatches;
+    // -0.35 ms GPU at 1080p. Defined in render_target_cache.cpp (false); V3d-dwsw, docs/METRICS.md.
+    {"swap_direct_present", "true"},
+    // The game's quad lists are expanded by the SDK into triangles with its own step; converting them to triangle lists up
+    // front gives the same triangles on a cheaper path. R5: the picture is identical (S1 group F `s1f-quad`, V3d). Defined in
+    // primitive_processor.cpp (false).
+    {"force_convert_quad_lists_to_triangle_lists", "true"},
+    // The SDK drops the valid bit of every shared-memory page the GPU did not write at the end of each frame, so the next
+    // frame re-uploads each vertex / index range it uses: 25-30 MB a frame, about 0.45 core of CPU and 0.7 ms of GPU
+    // (R3 / R5 / R7; P1's A/B p1-gt2). false keeps the pages valid. Checked identical in V3's picture check: the minimap,
+    // the GPS, the menus and the car paint (where LARecomp and the iOS Carbon renderer saw stale data). Defined in
+    // command_processor.cpp (true); `--clear_memory_page_state=true` brings the old behaviour back.
+    {"clear_memory_page_state", "false"},
     // Custom vinyls are the only readback the game needs: a 1 MiB, 512x512, format-6 resolve into the
     // vinyl editor's range (readback_resolve itself stays `none`). The owner's and Renan's strings are
     // identical. Source: iOS games/mcla/game_profile.cpp:40; Renan perf_options.cpp:619,652;
