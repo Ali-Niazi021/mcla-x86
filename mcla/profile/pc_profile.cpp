@@ -7,8 +7,10 @@
 // Named presets (W5.1): `--mcla_profile=1080p` or `900p` (cvar below; "" / "default" = the table below, unchanged)
 // adds a second table on top of the first. Same mechanism, so the command line, the environment and the TOML file
 // still win over every entry, and an entry that names a cvar of the base table replaces its value. W5.6 adds `1080p-fsr`
-// (the 1080p preset plus the FSR 3.1 temporal upscaler; a preset may name a parent whose entries it builds on) and
-// `720p-fsr1` (the shipped 1280x720 render upscaled by the presenter's FSR 1).
+// (the 1080p preset plus the FSR temporal upscaler; a preset may name a parent whose entries it builds on) and
+// `720p-fsr1` (the shipped 1280x720 render upscaled by the presenter's FSR 1). S6 adds `1080p-fsr4p` / `1080p-fsr4q` (the
+// same with AMD's FSR 4 machine-learning upscaler, SDK patch 0470) and the 16:10 sizes `800p`, `900p16`, `1200p`, with
+// `1200p-fsr` and `1200p-fsr4p` (the 1200p render with FSR 3.1/4 at 1.5x / FSR 4 at 2x).
 //
 // Frame-rate target (W4.1): `--mcla_fps_target=60` (cvar below; 0 = the shipped timing, nothing is set) is the whole 60 fps
 // profile in one switch. It is a separate axis from the resolution presets: `--mcla_profile=1080p --mcla_fps_target=60`
@@ -35,7 +37,13 @@ REXCVAR_DEFINE_STRING(mcla_profile, "", "MCLA",
                       "SDK's FSR 3.1 temporal upscaler: the scene is drawn at 1280x720 and upscaled to 1920x1080 "
                       "(temporal_aa=fsr, 1.5x, RCAS 0.3, single-tile scene; needs the render markers, "
                       "mcla_render_markers). '720p-fsr1' = the shipped 1280x720 render, noaa, upscaled by the "
-                      "presenter's FSR 1 (present_effect=fsr) to a 1920x1080 window. Read once, in OnPreSetup")
+                      "presenter's FSR 1 (present_effect=fsr) to a 1920x1080 window. '1080p-fsr4p' / "
+                      "'1080p-fsr4q' = the 1080p render with AMD's FSR 4 (the machine-learning upscaler, "
+                      "temporal_aa_upscaler=fsr4; FSR 3.1.6 where the device lacks it) from 960x540 (Performance, "
+                      "2x) / 1280x720 (Quality, 1.5x). 16:10 (Vert+ camera, the Flash UI in a 16:9 band): '800p' = "
+                      "1280x800, '900p16' = 1440x900, '1200p' = 1920x1200, '1200p-fsr' = 1200p with the scene at "
+                      "1280x800 upscaled by FSR (1.5x), '1200p-fsr4p' = 1200p from 960x600 by FSR 4 (2x). "
+                      "Read once, in OnPreSetup")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_INT32(mcla_fps_target, 0, "MCLA",
@@ -142,6 +150,17 @@ static_assert(sizing::Resolve({1600, 900}, {1600, 900}).verdict == sizing::Verdi
 static_assert(sizing::IsSixteenNine(1920, 1080) && sizing::IsSixteenNine(1600, 900));
 static_assert(sizing::RenderTargetMaxHeight(1080) == 1088 && sizing::RenderTargetMaxHeight(900) == 912);
 
+// The 16:10 sizes (Vert+, the hooks' kLimits go up to 1920x1200): accepted as asked (no rounding), taller than 16:9, and
+// a single tile fits the 4096-tile EDRAM the default profile sets (colour and depth each within 2048 tiles).
+constexpr bool AcceptedAs(uint32_t width, uint32_t height) {
+  const sizing::Resolution r = sizing::Resolve({int32_t(width), int32_t(height)}, {width, height});
+  return r.verdict == sizing::Verdict::kOn && r.width == width && r.height == height && sizing::IsTall(width, height);
+}
+static_assert(AcceptedAs(1280, 800) && AcceptedAs(1440, 900) && AcceptedAs(1920, 1200));
+static_assert(!sizing::IsSixteenNine(1280, 800) && !sizing::IsSixteenNine(1440, 900) && !sizing::IsSixteenNine(1920, 1200));
+static_assert(sizing::RenderTargetMaxHeight(800) == 800 && sizing::RenderTargetMaxHeight(1200) == 1200);
+static_assert(sizing::SingleTileFits(1440, 900, 1, 4096) && sizing::SingleTileFits(1920, 1200, 1, 4096));
+
 constexpr CvarDefault k1080pDefaults[] = {
     // The scene-size hook (mcla_ws_scene_size.cpp) writes 1920x1080 into the game's width/height options.
     {"mcla_widescreen_width", "1920"},
@@ -172,6 +191,71 @@ constexpr CvarDefault k900pDefaults[] = {
     {"mcla_ws_ui_probe", "false"},
 };
 
+// The 16:10 presets (owner request, ORC): the back buffer is taller than 16:9, so the camera goes Vert+ (the vertical
+// angle is widened: mcla_ws_tall_fov.cpp) and the Flash UI is drawn in a 16:9 band (mcla_ws_ui.cpp). Same recipe as the
+// 16:9 ones (the scene size, the guest video mode, the window, noaa); the probe off.
+//   mcla_ws_ui_squeeze=268       0x10C: the UI-phase viewports outside a movie draw (0x100) and the movie draw kinds 2 and 3
+//                                (the 3D objects in a movie) narrowed to the 16:9 band (mcla_ws_ui.cpp: "compare 0x10C").
+//   render_target_max_height     the rows of the tallest host render target, as in 900p; 800 rows are inside the default
+//                                profile's 1024.
+//   mcla_ws_single_tile=true     one 1x scene surface (the FSR squeeze wants it, SingleTileFits checks that 1440x900 and
+//                                1920x1200 fit the 4096-tile EDRAM).
+constexpr CvarDefault k800pDefaults[] = {
+    {"mcla_widescreen_width", "1280"},
+    {"mcla_scene_height", "800"},
+    {"video_mode_width", "1280"},
+    {"video_mode_height", "800"},
+    {"window_width", "1280"},
+    {"window_height", "800"},
+    {"mcla_noaa", "true"},
+    {"mcla_ws_ui_squeeze", "268"},
+    {"mcla_ws_ui_probe", "false"},
+};
+
+constexpr CvarDefault k900p16Defaults[] = {
+    {"mcla_widescreen_width", "1440"},
+    {"mcla_scene_height", "900"},
+    {"video_mode_width", "1440"},
+    {"video_mode_height", "900"},
+    {"window_width", "1440"},
+    {"window_height", "900"},
+    {"render_target_max_height", "912"},  // 900 rows aligned to the 16-row tile
+    {"mcla_noaa", "true"},
+    {"mcla_ws_single_tile", "true"},
+    {"mcla_ws_ui_squeeze", "268"},
+    {"mcla_ws_ui_probe", "false"},
+};
+
+constexpr CvarDefault k1200pDefaults[] = {
+    {"mcla_widescreen_width", "1920"},
+    {"mcla_scene_height", "1200"},
+    {"video_mode_width", "1920"},
+    {"video_mode_height", "1200"},
+    {"window_width", "1920"},
+    {"window_height", "1200"},
+    {"render_target_max_height", "1200"},  // already a multiple of the 16-row tile
+    {"mcla_noaa", "true"},
+    {"mcla_ws_single_tile", "true"},
+    {"mcla_ws_ui_squeeze", "268"},
+    {"mcla_ws_ui_probe", "false"},
+};
+
+// 1200p-fsr / 1200p-fsr4p: the 1200p render with the scene drawn at 1280x800 (1.5x) or 960x600 (2x) and upscaled to
+// 1920x1200, FSR as in the 1080p-fsr family below (1.5x with RCAS 0.3; the FSR 4 Performance preset with RCAS 0.2).
+static_assert(1920 * 2 / 3 == 1280 && 1200 * 2 / 3 == 800 && 1920 / 2 == 960 && 1200 / 2 == 600,
+              "1.5x and 2x of 1920x1200 are whole sizes");
+constexpr CvarDefault k1200pFsrDefaults[] = {
+    {"temporal_aa", "fsr"},
+    {"temporal_aa_upscale", "1.5"},
+    {"temporal_aa_sharpness", "0.3"},
+    {"temporal_aa_upscaler", "auto"},
+};
+constexpr CvarDefault k1200pFsr4pDefaults[] = {
+    {"temporal_aa_upscaler", "fsr4"},
+    {"temporal_aa_upscale", "2.0"},
+    {"temporal_aa_sharpness", "0.2"},
+};
+
 // 1080p-fsr (W5.6): the 1080p render above (the back buffer, the post-processing and the HUD at 1920x1080), with the 3D
 // scene drawn at 1280x720 and upscaled to 1920x1080 by the SDK's FSR 3.1 temporal pass (owner decision, M6: the 720p
 // scene upscaled with FSR 3). The pass runs where the game draws its motion blur, between the scene and the tone map, found
@@ -191,6 +275,27 @@ constexpr CvarDefault k1080pFsrDefaults[] = {
     {"temporal_aa_upscale", "1.5"},
     {"temporal_aa_sharpness", "0.3"},
     {"mcla_ws_single_tile", "true"},
+    // Which FSR the SDK's signed runtime runs (SDK patch 0470; D3D12): auto = the newest the device offers, FSR 4.1
+    // (the machine-learning upscaler) on the 880M when amd_fidelityfx_loader_dx12.dll and amd_fidelityfx_upscaler_dx12.dll
+    // are next to mcla.exe, else FSR 3.1; fsr3 pins FSR 3.1.6 for a comparison. Without those two DLLs the FSR 3.1.4 built
+    // with the SDK runs whatever this says.
+    {"temporal_aa_upscaler", "auto"},
+};
+
+// 1080p-fsr4p / 1080p-fsr4q (S6, SDK patch 0470): AMD's FSR 4.1 (the machine-learning upscaler; the Radeon 800M series has
+// its INT8 model since the FidelityFX SDK 2.4) in place of FSR 3.1. Performance (2x) draws the scene at 960x540 and costs
+// about 3.5 ms for the pass on the 880M (probe, S6); Quality (1.5x) draws it at 1280x720. Where the device offers no FSR 4
+// the signed runtime's FSR 3.1.6 runs instead (logged). RCAS 0.2 is the SDK's own default sharpness.
+static_assert(1920 / 2 == 960 && 1080 / 2 == 540, "2x of 1920x1080 is the 960x540 scene");
+constexpr CvarDefault k1080pFsr4pDefaults[] = {
+    {"temporal_aa", "fsr"},
+    {"temporal_aa_upscaler", "fsr4"},
+    {"temporal_aa_upscale", "2.0"},
+    {"temporal_aa_sharpness", "0.2"},
+    {"mcla_ws_single_tile", "true"},
+};
+constexpr CvarDefault k1080pFsr4qDefaults[] = {
+    {"temporal_aa_upscale", "1.5"},
 };
 
 // 720p-fsr1 (W5.6): the cheap comparison (W5.5 A4). The game stays at the shipped 1280x720 (nothing in the table sets
@@ -218,13 +323,36 @@ constexpr Preset kPresets[] = {
     {"900p", "1600x900 internal render, 1x (noaa): the cheaper fallback, present scaled to 1080p", k900pDefaults,
      sizeof(k900pDefaults) / sizeof(k900pDefaults[0]), nullptr},
     {"1080p-fsr",
-     "the 1080p render with the scene drawn at 1280x720 and upscaled to 1920x1080 by FSR 3.1 (temporal_aa=fsr, 1.5x, "
-     "RCAS 0.3, single-tile scene; the render markers are written while temporal_aa=fsr)",
+     "the 1080p render with the scene drawn at 1280x720 and upscaled to 1920x1080 by FSR (temporal_aa=fsr, 1.5x, "
+     "RCAS 0.3, single-tile scene; temporal_aa_upscaler=auto: FSR 4.1 where AMD's signed runtime is next to the "
+     "executable and the device offers it, else FSR 3.1; the render markers are written while temporal_aa=fsr)",
      k1080pFsrDefaults, sizeof(k1080pFsrDefaults) / sizeof(k1080pFsrDefaults[0]), "1080p"},
+    {"1080p-fsr4p",
+     "the 1080p render with the scene drawn at 960x540 (Performance, 2x) and upscaled to 1920x1080 by AMD's FSR 4 "
+     "(temporal_aa_upscaler=fsr4, RCAS 0.2, single-tile scene; FSR 3.1.6 where the device lacks it)",
+     k1080pFsr4pDefaults, sizeof(k1080pFsr4pDefaults) / sizeof(k1080pFsr4pDefaults[0]), "1080p"},
+    {"1080p-fsr4q",
+     "the 1080p render with the scene drawn at 1280x720 (Quality, 1.5x) and upscaled to 1920x1080 by AMD's FSR 4 "
+     "(1080p-fsr4p with 1.5x)",
+     k1080pFsr4qDefaults, sizeof(k1080pFsr4qDefaults) / sizeof(k1080pFsr4qDefaults[0]), "1080p-fsr4p"},
     {"720p-fsr1",
      "the shipped 1280x720 render, noaa, upscaled by the presenter's FSR 1 (EASU + RCAS, present_effect=fsr) to the "
      "window (1920x1080; fullscreen takes the desktop size)",
      k720pFsr1Defaults, sizeof(k720pFsr1Defaults) / sizeof(k720pFsr1Defaults[0]), nullptr},
+    {"800p", "16:10 1280x800 internal render, 1x (noaa), Vert+ camera, the Flash UI in a 16:9 band", k800pDefaults,
+     sizeof(k800pDefaults) / sizeof(k800pDefaults[0]), nullptr},
+    {"900p16", "16:10 1440x900 internal render, 1x (noaa), single-tile scene, Vert+ camera, the Flash UI in a 16:9 band",
+     k900p16Defaults, sizeof(k900p16Defaults) / sizeof(k900p16Defaults[0]), nullptr},
+    {"1200p", "16:10 1920x1200 internal render, 1x (noaa), single-tile scene, Vert+ camera, the Flash UI in a 16:9 band",
+     k1200pDefaults, sizeof(k1200pDefaults) / sizeof(k1200pDefaults[0]), nullptr},
+    {"1200p-fsr",
+     "the 1200p render with the scene drawn at 1280x800 and upscaled to 1920x1200 by FSR (temporal_aa=fsr, 1.5x, RCAS "
+     "0.3, temporal_aa_upscaler=auto: FSR 4.1 where AMD's signed runtime is there, else FSR 3.1)",
+     k1200pFsrDefaults, sizeof(k1200pFsrDefaults) / sizeof(k1200pFsrDefaults[0]), "1200p"},
+    {"1200p-fsr4p",
+     "the 1200p render with the scene drawn at 960x600 (Performance, 2x) and upscaled to 1920x1200 by AMD's FSR 4 "
+     "(temporal_aa_upscaler=fsr4, RCAS 0.2; FSR 3.1.6 where the device lacks it)",
+     k1200pFsr4pDefaults, sizeof(k1200pFsr4pDefaults) / sizeof(k1200pFsr4pDefaults[0]), "1200p-fsr"},
 };
 
 // ---- frame-rate targets (W4.1) --------------------------------------------------------------------------------
@@ -274,6 +402,11 @@ constexpr CvarDefault kFps60Defaults[] = {
     // "on while mcla_sim60 is on", so these rows only name them in the log; 0 switches one off, 1 forces it on.
     {"mcla_input_title_latch", "-1"},
     {"mcla_input_menu_repeat", "-1"},
+    // Not a timing cvar: every render-target trim (the 60 s idle one) waits for the GPU to finish a frame and costs one
+    // 20-29 ms frame, a spike in the 16.7 ms pace (S2 lever 1: 30 of 34 trims inside the measured windows had a frame over
+    // 20 ms within 0.1 s). 0 = never; the render targets stay (6-200 MB of the shared memory). A GPU plugin cvar, so
+    // LogFpsTarget applies it in phase 2, after the default profile's 60.
+    {"render_target_trim_seconds", "0"},
 };
 
 struct FpsTarget {
@@ -438,6 +571,13 @@ void LogFpsTarget(Tally* tally) {
   if (phase.target != target) {
     ApplyFpsTarget();
     late = true;
+  }
+  // The GPU plugin's cvars do not exist in phase 0: an entry that was MISSING then is applied now, after the default
+  // profile's own value for it (phase 2 applies that first), so the target's value wins.
+  for (Applied& applied : phase.results) {
+    if (applied.outcome == Outcome::kMissing) {
+      applied.outcome = Apply(*applied.entry);
+    }
   }
   if (target == 0) {
     REXLOG_INFO("[mcla-profile] fps target 0 ({}): the shipped timing, no frame-rate preset (mcla_sim60 and "

@@ -809,6 +809,15 @@ purpose = "UI: cvar fullscreen_mode (desktop|guest|WxH[@Hz]; default desktop = u
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0470-fsr4-signed-upscaler"
+source = "local"
+path = "patches/sdk/0470-fsr4-signed-upscaler.patch"
+sha256 = "f2ddb8a3c68c6866c871da51ecb730a0bdf5f1dcd2c90e0430421a353df46a4b"
+purpose = "Windows D3D12: AMD's signed FidelityFX 2.4.0 runtime (loader + upscaler, fetched at configure time and pinned by SHA-256; MIT) lets temporal_aa=fsr run FSR 4.1.2 on the Radeon 800M and RDNA 2+, with FSR 3.1.6 fallback inside the runtime and the built FSR 3.1.4 when the DLLs are absent. Cvars temporal_aa_upscaler (auto|fsr3|fsr4), temporal_aa_upscaler_active. No reactive mask with FSR 4. Applied after 0480 (independent). Not built before the next SDK build."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]

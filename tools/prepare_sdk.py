@@ -875,6 +875,9 @@ def plan_build(L: Layout, args: argparse.Namespace) -> BuildPlan:
     configure = [cmake, "--preset", PRESET, "-DREXGLUE_USE_VULKAN=ON", "-DREXGLUE_ENABLE_TRACY=OFF",
                  "-DREXGLUE_ENABLE_FSR=ON", "-DCMAKE_C_COMPILER=" + clang.as_posix(),
                  "-DCMAKE_CXX_COMPILER=" + clangxx.as_posix(), "-DCMAKE_MAKE_PROGRAM=" + Path(ninja).as_posix()]
+    ffx_signed = L.work / "toolchain" / "ffx-signed"  # patch 0470's pinned signed FidelityFX DLLs, cached (58 MB)
+    if ffx_signed.is_dir():
+        configure.append("-DREXGLUE_FSR_SIGNED_DIR=" + ffx_signed.as_posix())
     configure += args.cmake_arg or []
     build = [cmake, "--build", str(bindir), "--config", args.config]
     if jobs:

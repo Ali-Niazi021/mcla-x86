@@ -1,0 +1,774 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Wed, 25 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0470: AMD's signed FSR runtime for temporal_aa=fsr on Direct3D 12: FSR 4.1 (ML) on the Radeon 880M, FSR 3.1.6 fallback
+
+Source: Ours, written for this SDK (S6, from the S5 report $WORK/scratch/S5/REPORT.md). The calls are the public
+  FidelityFX SDK 2.4.0 ffx-api (MIT): ffxQueryDescGetVersions, ffxOverrideVersion, ffxQueryGetProviderVersion and
+  ffxCreateContextDescUpscaleVersion (type and struct as in ffx_upscale.h of that tag); nothing is taken from LARecomp
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause). The two DLLs
+  it fetches are AMD's signed FidelityFX SDK 2.4.0 binaries, listed under the MIT licence in that tag's docs/license.md
+  (fetched at configure time and never vendored; the licence is installed next to them)
+Purpose: temporal_aa=fsr runs FSR 4.1.2 (the machine-learning upscaler; the Radeon 800M series has its INT8 model since
+  FidelityFX SDK 2.4) instead of FSR 3.1.4 when AMD's signed runtime (amd_fidelityfx_loader_dx12.dll +
+  amd_fidelityfx_upscaler_dx12.dll) is next to the executable; the same inputs and the same ffx-api calls. Cvar
+  temporal_aa_upscaler (GPU, string, auto|fsr3|fsr4, default auto, hot reload: the upscaler is made again) and the
+  transient temporal_aa_upscaler_active ("FSR 4.1.2", "FSR 3.1.6", "FSR 3.1.4 (built)", "none"). Log line `Temporal AA:
+  FSR 4.1.2 ready for 1920x1080 from 960x540 (Direct3D 12) after N ms` (the real version, from
+  ffxQueryGetProviderVersion). FSR 4 needs no reactive mask: its snapshots are not made. A failed FSR 4 context is made
+  again pinned to FSR 3.1.6; without the signed DLLs the FSR 3.1.4 built from source runs as before (frame generation and
+  Vulkan are untouched). cmake: REXGLUE_FSR_SIGNED (ON), REXGLUE_FSR_SIGNED_DIR. Windows with D3D12 only. Not built before
+  the next SDK build.
+Bucket: REDO
+
+0470-fsr4-signed-upscaler.patch (mcla-x86 S6; design and licence check in $WORK/scratch/S5/REPORT.md, probe in $WORK/scratch/S6/probe)
+
+Change.
+  * cmake/rexglue_fsr_signed.cmake (new; included after rexglue_fsr.cmake): when WIN32, REXGLUE_ENABLE_FSR and D3D12 are on
+    (option REXGLUE_FSR_SIGNED, ON) it fetches, from the commit of the v2.4.0 tag of GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+    (7539ae8b6568ad29ed78a753404351daf3b5cca7, raw.githubusercontent.com), Kits/FidelityFX/signedbin/
+    amd_fidelityfx_loader_dx12.dll (SHA-256 e2191d3c0828be45eb8affd4e3ec0378f2293adc345b772a7170edcf3b021ecb, 39,184 bytes),
+    amd_fidelityfx_upscaler_dx12.dll (aad4fccccb29084a655f9a4f9f613bd22c8c03fb4a0f8840148cc6543b4ccace, 57,664,272 bytes)
+    and docs/license.md (410f9c138e766e846acf2dc93db768198def0293a017d7e3296815b451688dbe), checks each against its SHA-256
+    (through a temporary name, renamed only once verified) and installs the DLLs to bin/ and the licence as
+    bin/amd_fidelityfx_signed_LICENSE.md. REXGLUE_FSR_SIGNED_DIR (cache path) may name a folder that already holds the
+    three files. A file that cannot be fetched or verified is a warning, not an error: the SDK builds without them and the
+    GPU plugin runs the FSR 3.1.4 it built. The configure summary gains `FSR (signed runtime): ...`.
+  * src/graphics/temporal_aa_fsr.h: the 2.x create-description type (0x0001000B) and FFX_UPSCALER_VERSION (4.1.2), defined
+    here rather than by bumping the 1.1.4 headers the Vulkan backend and frame generation use; FsrRuntime::Load(api,
+    signed_loader = false) and signed_loader(); FsrUpscalerVersion, FsrListUpscalerVersions (ffxQueryDescGetVersions:
+    count, then ids and names together, names copied), FsrPickUpscalerVersion (the newest of fsr4 = 4.x / fsr3 = 3.x), FsrLabel.
+  * src/graphics/temporal_aa.cpp: the two cvars; Load tries amd_fidelityfx_loader_dx12.dll when
+    amd_fidelityfx_upscaler_dx12.dll is beside it, and falls back to amd_fidelityfx_dx12.dll (so every caller of
+    Load("vk") and the PS5 static link behave as before); the helpers above.
+  * src/graphics/d3d12/temporal_aa.cpp: Load("dx12", true); on the context thread the chain is create -> version
+    (signed runtime only) -> ffxOverrideVersion (only when fsr3/fsr4 pins one; fsr4 without an FSR 4 offered warns and pins
+    FSR 3) -> backend; the offered versions are logged; a failed create is tried once more pinned to FSR 3; the ready line
+    carries the version the runtime reports; temporal_aa_upscaler_active is published on the submission thread when the
+    context is first used and reset to none on release; a changed temporal_aa_upscaler releases the context at the end of
+    the frame (the size-change path); TaaSnapshot returns false with an FSR 4 provider (no luminance snapshots, no
+    reactive mask: temporal_aa_reactive is ignored); TaaCheckAvailable accepts the loader pair or the built DLL.
+
+Evidence (probe $WORK/scratch/S6/probe/probe.exe, a D3D12 device on the Radeon 880M, driver 32.0.32029.2010, Windows 11
+24H2, in-box D3D12 (no Agility SDK), the pinned DLLs next to it):
+  * CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL) answers highest 6_9: SM 6.6 (FSR 4's CS_6_6) is there.
+  * ffxQuery(GET_VERSIONS, upscaler) -> 3 versions, names "4.1.2", "3.1.6", "2.3.4" (no "FSR " prefix), ids
+    0xF5A5CA1E01001002 / 0xF5A5CA1E00C01006 / 0xF5A5CA1E00803004 (low 32 bits = (major<<22)|(minor<<12)|patch).
+  * No override -> provider "4.1.2" (context made in ~140 ms); pinned: 4.1.2, 3.1.6 (~0.9 s), 2.3.4 all create.
+  * One dispatch 960x540 -> 1920x1080 on zeroed inputs, RCAS 0.2, GPU timestamps, 120 runs after 20 warm-up, three
+    runs: FSR 4.1.2 median 3.48 / 3.69 / 3.60 ms (min 3.25-3.53, p95 3.6-4.3); FSR 3.1.6 median 1.79 / 1.95 ms; FSR 2.3.4
+    1.80 ms. (S5 had estimated 3.2-3.4 ms for FSR 4; the probe is idle-GPU and static content, the game's pass may differ.)
+Checked: the cmake fetch, hash mismatch (soft failure), the REXGLUE_FSR_SIGNED_DIR path and the install step in a small
+project; the scratch tree configures (summary `FSR (signed runtime): ON (...)`); clang++ 20.1.8 -fsyntax-only with the SDK's
+Release flags on src/graphics/temporal_aa.cpp, d3d12/temporal_aa.cpp, vulkan/temporal_aa.cpp and vulkan/frame_generation.cpp:
+no new diagnostics. Not run in the game.
+---
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 64a86fd9..d01177ed 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -252,6 +252,9 @@ add_subdirectory(thirdparty)
+ # FSR 3.1 runtime libraries for temporal anti-aliasing (optional)
+ include(cmake/rexglue_fsr.cmake)
+ 
++# AMD's signed FSR runtime (FSR 4.1) for the Direct3D 12 backend (optional)
++include(cmake/rexglue_fsr_signed.cmake)
++
+ # Enable warnings after thirdparty
+ add_compile_options(
+     -Wall
+@@ -292,6 +295,7 @@ message(STATUS "  Graphics: D3D12=${REXGLUE_USE_D3D12} Vulkan=${REXGLUE_USE_VULK
+ message(STATUS "  FidelityFX: ${REXGLUE_ENABLE_FIDELITYFX}")
+ if(REXGLUE_ENABLE_FSR)
+     message(STATUS "  FSR (temporal AA): ${REXGLUE_FSR_STATUS}")
++    message(STATUS "  FSR (signed runtime): ${REXGLUE_FSR_SIGNED_STATUS}")
+ else()
+     message(STATUS "  FSR (temporal AA): OFF")
+ endif()
+diff --git a/cmake/rexglue_fsr_signed.cmake b/cmake/rexglue_fsr_signed.cmake
+new file mode 100644
+index 00000000..d51f9e6a
+--- /dev/null
++++ b/cmake/rexglue_fsr_signed.cmake
+@@ -0,0 +1,121 @@
++# rexglue_fsr_signed.cmake - AMD's signed FSR runtime, for FSR 4 (patch 0470-fsr4-signed-upscaler)
++#
++# FSR 4 (the machine-learning upscaler) is only distributed as AMD's signed binaries, never as source,
++# so cmake/rexglue_fsr.cmake (FSR 3.1 built from source) cannot make it. FidelityFX SDK 2.4.0 ships two
++# of them for Direct3D 12:
++#   amd_fidelityfx_loader_dx12.dll    the ffx-api entry points (the same five exports as the runtime built
++#                                     from source); picks the effect version and loads the effect DLL
++#   amd_fidelityfx_upscaler_dx12.dll  FSR 4.1.2, FSR 3.1.6 and FSR 2.3.4 (57.7 MB)
++# This file fetches them, with the SDK's licence, and installs them next to the SDK's own DLLs; the GPU
++# plugin loads the loader from the executable's folder (src/graphics/temporal_aa.cpp, FsrRuntime::Load) and
++# falls back to the runtime built from source when they are not there.
++#
++# The files come from the commit of the v2.4.0 tag of AMD's FidelityFX-SDK repository and are checked
++# against pinned SHA-256 hashes, so what is installed is exactly what was reviewed. Nothing is vendored. The
++# licence (docs/license.md of that commit) lists these two DLLs among the files under the MIT licence.
++# REXGLUE_FSR_SIGNED_DIR may point at a folder that already holds the three files (checked the same way),
++# which saves the 57.7 MB download for every new build tree.
++#
++# Optional, like the rest of FSR: when a file can't be fetched or verified the SDK builds without them and
++# the GPU plugin runs the FSR 3.1 it built from source. Windows with the Direct3D 12 backend only.
++
++set(REXGLUE_FSR_SIGNED_STATUS "OFF")
++if(NOT WIN32 OR NOT REXGLUE_ENABLE_FSR OR NOT REXGLUE_USE_D3D12)
++    return()
++endif()
++
++option(REXGLUE_FSR_SIGNED "Fetch AMD's signed FSR runtime (FSR 4.1.2, 3.1.6, 2.3.4; FidelityFX SDK 2.4.0, MIT) and install it next to the executable" ON)
++set(REXGLUE_FSR_SIGNED_DIR "" CACHE PATH
++    "A folder holding amd_fidelityfx_loader_dx12.dll, amd_fidelityfx_upscaler_dx12.dll and license.md of FidelityFX SDK 2.4.0's signedbin (checked by SHA-256; fetched into the build tree otherwise)")
++if(NOT REXGLUE_FSR_SIGNED)
++    set(REXGLUE_FSR_SIGNED_STATUS "OFF (REXGLUE_FSR_SIGNED)")
++    return()
++endif()
++
++# FidelityFX-SDK tag v2.4.0.
++set(_rexglue_fsr_signed_commit "7539ae8b6568ad29ed78a753404351daf3b5cca7")
++set(_rexglue_fsr_signed_url "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/${_rexglue_fsr_signed_commit}")
++# name; path in the repository; SHA-256
++set(_rexglue_fsr_signed_files
++    "amd_fidelityfx_loader_dx12.dll|Kits/FidelityFX/signedbin/amd_fidelityfx_loader_dx12.dll|e2191d3c0828be45eb8affd4e3ec0378f2293adc345b772a7170edcf3b021ecb"
++    "amd_fidelityfx_upscaler_dx12.dll|Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_dx12.dll|aad4fccccb29084a655f9a4f9f613bd22c8c03fb4a0f8840148cc6543b4ccace"
++    "license.md|docs/license.md|410f9c138e766e846acf2dc93db768198def0293a017d7e3296815b451688dbe")
++set(_rexglue_fsr_signed_dest "${CMAKE_BINARY_DIR}/_deps/ffx-signed")
++
++# Whether `file` exists and its SHA-256 is `hash`.
++function(_rexglue_fsr_signed_matches ok_var file hash)
++    set(${ok_var} FALSE PARENT_SCOPE)
++    if(EXISTS "${file}")
++        file(SHA256 "${file}" actual)
++        if(actual STREQUAL "${hash}")
++            set(${ok_var} TRUE PARENT_SCOPE)
++        endif()
++    endif()
++endfunction()
++
++# Puts the verified file in the build tree: already there, or copied from REXGLUE_FSR_SIGNED_DIR, or
++# downloaded through a temporary name that is renamed only once verified.
++function(_rexglue_fsr_signed_fetch ok_var name path hash)
++    set(${ok_var} FALSE PARENT_SCOPE)
++    set(dest "${_rexglue_fsr_signed_dest}/${name}")
++    _rexglue_fsr_signed_matches(ok "${dest}" "${hash}")
++    if(ok)
++        set(${ok_var} TRUE PARENT_SCOPE)
++        return()
++    endif()
++    file(MAKE_DIRECTORY "${_rexglue_fsr_signed_dest}")
++    if(REXGLUE_FSR_SIGNED_DIR)
++        _rexglue_fsr_signed_matches(ok "${REXGLUE_FSR_SIGNED_DIR}/${name}" "${hash}")
++        if(ok)
++            file(COPY_FILE "${REXGLUE_FSR_SIGNED_DIR}/${name}" "${dest}" ONLY_IF_DIFFERENT)
++            set(${ok_var} TRUE PARENT_SCOPE)
++            return()
++        endif()
++    endif()
++    set(tmp "${dest}.tmp")
++    file(REMOVE "${tmp}")
++    message(STATUS "FSR: fetching ${name} (FidelityFX SDK 2.4.0, ${_rexglue_fsr_signed_commit})")
++    # (Not EXPECTED_HASH: a mismatch there is a configure error, not a status.)
++    file(DOWNLOAD "${_rexglue_fsr_signed_url}/${path}" "${tmp}"
++         STATUS status TLS_VERIFY ON INACTIVITY_TIMEOUT 60 TIMEOUT 900)
++    list(GET status 0 code)
++    list(GET status 1 reason)
++    _rexglue_fsr_signed_matches(ok "${tmp}" "${hash}")
++    if(NOT code EQUAL 0 OR NOT ok)
++        if(code EQUAL 0)
++            set(reason "the SHA-256 is not the pinned ${hash}")
++        endif()
++        set(_rexglue_fsr_signed_why "${name}: ${reason}" PARENT_SCOPE)
++        file(REMOVE "${tmp}")
++        return()
++    endif()
++    file(RENAME "${tmp}" "${dest}")
++    set(${ok_var} TRUE PARENT_SCOPE)
++endfunction()
++
++set(_rexglue_fsr_signed_ok TRUE)
++set(_rexglue_fsr_signed_why "")
++foreach(entry IN LISTS _rexglue_fsr_signed_files)
++    string(REPLACE "|" ";" fields "${entry}")
++    list(GET fields 0 name)
++    list(GET fields 1 path)
++    list(GET fields 2 hash)
++    _rexglue_fsr_signed_fetch(ok "${name}" "${path}" "${hash}")
++    if(NOT ok)
++        set(_rexglue_fsr_signed_ok FALSE)
++        break()
++    endif()
++endforeach()
++
++if(_rexglue_fsr_signed_ok)
++    install(FILES "${_rexglue_fsr_signed_dest}/amd_fidelityfx_loader_dx12.dll"
++                  "${_rexglue_fsr_signed_dest}/amd_fidelityfx_upscaler_dx12.dll"
++            DESTINATION "${CMAKE_INSTALL_BINDIR}")
++    # AMD's licence travels with the binaries.
++    install(FILES "${_rexglue_fsr_signed_dest}/license.md" DESTINATION "${CMAKE_INSTALL_BINDIR}"
++            RENAME amd_fidelityfx_signed_LICENSE.md)
++    set(REXGLUE_FSR_SIGNED_STATUS "ON (FidelityFX SDK 2.4.0 signed loader + upscaler: FSR 4.1.2, 3.1.6, 2.3.4)")
++else()
++    message(WARNING "FSR: AMD's signed FSR runtime is unavailable (${_rexglue_fsr_signed_why}); FSR 4 will not be offered, the FSR 3.1 built from source stays (set REXGLUE_FSR_SIGNED_DIR to a folder with the three files of FidelityFX SDK 2.4.0's signedbin to avoid the download)")
++    set(REXGLUE_FSR_SIGNED_STATUS "ON, but the files could not be fetched (see the warning above)")
++endif()
+diff --git a/src/graphics/d3d12/temporal_aa.cpp b/src/graphics/d3d12/temporal_aa.cpp
+index 31096711..c77a55da 100644
+--- a/src/graphics/d3d12/temporal_aa.cpp
++++ b/src/graphics/d3d12/temporal_aa.cpp
+@@ -11,6 +11,7 @@
+ #include <thread>
+ #include <vector>
+ 
++#include <rex/cvar.h>
+ #include <rex/filesystem.h>
+ #include <rex/graphics/d3d12/command_processor.h>
+ #include <rex/graphics/flags.h>
+@@ -24,6 +25,9 @@
+ #include <ffx_api/dx12/ffx_api_dx12.h>
+ #endif
+ 
++// Defined in ../temporal_aa.cpp.
++REXCVAR_DECLARE(std::string, temporal_aa_upscaler);
++
+ namespace rex::graphics::d3d12 {
+ 
+ namespace shaders {
+@@ -65,7 +69,15 @@ struct D3D12CommandProcessor::TaaFsr {
+ #if defined(REX_HAS_FSR) && REX_HAS_FSR
+   FsrRuntime runtime;
+   ffxContext context = nullptr;
++  // temporal_aa_upscaler when the context was made: another value makes it again.
++  std::string upscaler_want;
++  // The upscaler that runs ("FSR 4.1.2"), set by the thread that makes the context before it
++  // sets kReady; temporal_aa_upscaler_active takes it on the submission thread.
++  std::string provider;
++  bool provider_published = false;
+ #endif
++  // FSR 4 (the machine-learning upscaler): it needs no reactive mask, so none is made.
++  std::atomic<bool> ml{false};
+   // Set on the submission thread when FSR's dispatch failed.
+   std::atomic<bool> dispatch_failed{false};
+   // Released, destroyed once the submissions that may use them are done.
+@@ -173,19 +185,29 @@ ID3D12Resource* D3D12CommandProcessor::TaaFrameVectors() const {
+ 
+ bool D3D12CommandProcessor::TaaCheckAvailable() {
+ #if defined(REX_HAS_FSR) && REX_HAS_FSR
++  const std::filesystem::path folder = rex::filesystem::GetExecutableFolder();
+   // Loaded (and kept), not only looked for: a DLL whose imports fail (the Visual C++ runtime
+   // missing) is there and unusable.
+-  std::string error;
+-  switch (rex::platform::CheckLoadable(
+-      rex::filesystem::GetExecutableFolder() / "amd_fidelityfx_dx12.dll", &error)) {
+-    case rex::platform::LibraryCheck::kLoads:
+-      return true;
+-    case rex::platform::LibraryCheck::kFailed:
+-      REXGPU_WARN("Temporal AA: amd_fidelityfx_dx12.dll is there but doesn't load ({})", error);
+-      return false;
+-    default:
+-      return false;
++  auto loads = [&](const char* name) {
++    std::string error;
++    switch (rex::platform::CheckLoadable(folder / name, &error)) {
++      case rex::platform::LibraryCheck::kLoads:
++        return true;
++      case rex::platform::LibraryCheck::kFailed:
++        REXGPU_WARN("Temporal AA: {} is there but doesn't load ({})", name, error);
++        return false;
++      default:
++        return false;
++    }
++  };
++  // AMD's signed runtime (FSR 4: the loader and the effect DLL it loads), else the FSR 3.1
++  // built with the SDK.
++  std::error_code exists_error;
++  if (std::filesystem::exists(folder / "amd_fidelityfx_upscaler_dx12.dll", exists_error) &&
++      loads("amd_fidelityfx_loader_dx12.dll")) {
++    return true;
+   }
++  return loads("amd_fidelityfx_dx12.dll");
+ #else
+   return false;
+ #endif
+@@ -229,6 +251,14 @@ void D3D12CommandProcessor::TaaRelease() {
+   fsr.render_width = 0;
+   fsr.render_height = 0;
+   fsr.dispatch_failed.store(false, std::memory_order_relaxed);
++#if defined(REX_HAS_FSR) && REX_HAS_FSR
++  if (fsr.provider_published) {
++    rex::cvar::SetFlagByName("temporal_aa_upscaler_active", "none");
++  }
++  fsr.provider_published = false;
++  fsr.provider.clear();
++  fsr.ml.store(false, std::memory_order_relaxed);
++#endif
+   fsr.state.store(TaaFsr::kNone, std::memory_order_release);
+ }
+ 
+@@ -479,8 +509,9 @@ bool D3D12CommandProcessor::TaaEnsureReactiveTextures() {
+ }
+ 
+ bool D3D12CommandProcessor::TaaSnapshot(uint32_t slot, uint32_t color_target_key) {
+-  if (!TaaReady() || slot > 1 || !TaaCreatePipeline() || !TaaEnsureReactiveTextures() ||
+-      !BeginSubmission(true)) {
++  // (FSR 4 needs no reactive mask: none is made, which saves the snapshots' GPU time.)
++  if (!TaaReady() || slot > 1 || taa_fsr_->ml.load(std::memory_order_acquire) ||
++      !TaaCreatePipeline() || !TaaEnsureReactiveTextures() || !BeginSubmission(true)) {
+     return false;
+   }
+   TaaFsr& fsr = *taa_fsr_;
+@@ -698,6 +729,12 @@ void D3D12CommandProcessor::TaaRun(const D3D12Shader& pixel_shader) {
+     taa_release_pending_ = true;
+     return;
+   }
++  if (state == TaaFsr::kReady && fsr.runtime.signed_loader() &&
++      fsr.upscaler_want != REXCVAR_GET(temporal_aa_upscaler)) {
++    // temporal_aa_upscaler changed: made again with the new one, from the end of this frame.
++    taa_release_pending_ = true;
++    return;
++  }
+   if (fsr.dispatch_failed.load(std::memory_order_acquire)) {
+     TaaSetUnavailable("its dispatch failed");
+     fsr.state.store(TaaFsr::kFailed, std::memory_order_release);
+@@ -736,11 +773,17 @@ void D3D12CommandProcessor::TaaRun(const D3D12Shader& pixel_shader) {
+     fsr.height = height;
+     fsr.render_width = render_width;
+     fsr.render_height = render_height;
+-    if (!fsr.runtime.Load("dx12")) {
+-      TaaSetUnavailable("amd_fidelityfx_dx12.dll couldn't be loaded");
++    if (!fsr.runtime.Load("dx12", true)) {
++      TaaSetUnavailable("neither amd_fidelityfx_loader_dx12.dll nor amd_fidelityfx_dx12.dll could be loaded");
+       fsr.state.store(TaaFsr::kFailed, std::memory_order_release);
+       return;
+     }
++    if (!fsr.runtime.signed_loader() && REXCVAR_GET(temporal_aa_upscaler) != "auto") {
++      REXGPU_WARN(
++          "Temporal AA: temporal_aa_upscaler={} needs AMD's signed FSR runtime (the loader and "
++          "the upscaler DLL next to the executable); the FSR 3.1.4 built with the SDK runs",
++          REXCVAR_GET(temporal_aa_upscaler));
++    }
+     ID3D12Device* device = GetD3D12Provider().GetDevice();
+     D3D12_RESOURCE_DESC desc = {};
+     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+@@ -804,19 +847,77 @@ void D3D12CommandProcessor::TaaRun(const D3D12Shader& pixel_shader) {
+     if (TaaDebug() == 1) {
+       flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
+     }
++    fsr.upscaler_want = REXCVAR_GET(temporal_aa_upscaler);
++    fsr.provider.clear();
++    fsr.ml.store(false, std::memory_order_relaxed);
+     fsr.thread = std::thread([&fsr, device, width, height, render_width, render_height, flags]() {
+       auto start = std::chrono::steady_clock::now();
++      const bool signed_loader = fsr.runtime.signed_loader();
+       ffxCreateBackendDX12Desc backend = {};
+       backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
+       backend.device = device;
+       ffxCreateContextDescUpscale create = {};
+       create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+-      create.header.pNext = &backend.header;
+       create.flags = flags;
+       create.maxRenderSize = {render_width, render_height};
+       create.maxUpscaleSize = {width, height};
+       create.fpMessage = FsrRuntime::Message;
+-      ffxReturnCode_t result = fsr.runtime.create(&fsr.context, &create.header, nullptr);
++      // With AMD's signed runtime: the version of the API this was built against, and the
++      // version to use if one is pinned (without one the runtime picks the newest the device
++      // supports: FSR 4 on RDNA 2 and newer and the Radeon 800M series).
++      ffxCreateContextDescUpscaleVersion api_version = {};
++      api_version.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
++      api_version.version = FFX_UPSCALER_VERSION;
++      ffxOverrideVersion override_version = {};
++      override_version.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
++      // create, then the API version (signed runtime only), the override (if pinned), the backend.
++      auto create_context = [&](uint64_t pinned_id) {
++        ffxApiHeader* tail = &create.header;
++        if (signed_loader) {
++          tail->pNext = &api_version.header;
++          tail = &api_version.header;
++        }
++        if (pinned_id) {
++          override_version.versionId = pinned_id;
++          tail->pNext = &override_version.header;
++          tail = &override_version.header;
++        }
++        tail->pNext = &backend.header;
++        fsr.context = nullptr;
++        return fsr.runtime.create(&fsr.context, &create.header, nullptr);
++      };
++      std::vector<FsrUpscalerVersion> versions;
++      uint64_t pinned = 0;
++      if (signed_loader) {
++        versions = FsrListUpscalerVersions(fsr.runtime, device);
++        std::string offered;
++        for (const FsrUpscalerVersion& version : versions) {
++          offered += (offered.empty() ? "" : ", ") + version.name;
++        }
++        REXGPU_INFO("Temporal AA: the FSR runtime offers {} (temporal_aa_upscaler={})",
++                    offered.empty() ? std::string("no upscaler") : offered, fsr.upscaler_want);
++        if (fsr.upscaler_want != "auto") {
++          pinned = FsrPickUpscalerVersion(versions, fsr.upscaler_want, nullptr);
++          if (!pinned && fsr.upscaler_want == "fsr4") {
++            REXGPU_WARN("Temporal AA: FSR 4 is not offered on this device; using FSR 3");
++            pinned = FsrPickUpscalerVersion(versions, "fsr3", nullptr);
++          }
++          if (!pinned) {
++            REXGPU_WARN("Temporal AA: temporal_aa_upscaler={} is not offered here; the runtime picks",
++                        fsr.upscaler_want);
++          }
++        }
++      }
++      ffxReturnCode_t result = create_context(pinned);
++      if (result != FFX_API_RETURN_OK && signed_loader) {
++        // The upscaler picked (FSR 4 or another) could not be made: FSR 3, once.
++        std::string fallback_name;
++        const uint64_t fallback = FsrPickUpscalerVersion(versions, "fsr3", &fallback_name);
++        if (fallback && fallback != pinned) {
++          REXGPU_WARN("Temporal AA: creating FSR failed ({}); trying FSR {}", result, fallback_name);
++          result = create_context(fallback);
++        }
++      }
+       if (result != FFX_API_RETURN_OK) {
+         fsr.context = nullptr;
+         REXGPU_ERROR("Temporal AA: creating FSR failed ({})", result);
+@@ -824,7 +925,21 @@ void D3D12CommandProcessor::TaaRun(const D3D12Shader& pixel_shader) {
+         fsr.state.store(TaaFsr::kFailed, std::memory_order_release);
+         return;
+       }
+-      REXGPU_INFO("Temporal AA: FSR 3.1 ready for {}x{}{} (Direct3D 12) after {} ms", width, height,
++      // Which upscaler the runtime made (the signed one's choice, or the built one's version).
++      ffxQueryGetProviderVersion provider_version = {};
++      provider_version.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
++      std::string provider_name;
++      if (fsr.runtime.query(&fsr.context, &provider_version.header) == FFX_API_RETURN_OK &&
++          provider_version.versionName) {
++        provider_name = provider_version.versionName;
++      }
++      if (provider_name.empty() && !signed_loader) {
++        provider_name = "3.1.4";
++      }
++      fsr.provider = FsrLabel(provider_name) + (signed_loader ? "" : " (built)");
++      fsr.ml.store(fsr.provider.rfind("FSR 4", 0) == 0, std::memory_order_release);
++      REXGPU_INFO("Temporal AA: {} ready for {}x{}{} (Direct3D 12) after {} ms", fsr.provider, width,
++                  height,
+                   render_width != width || render_height != height
+                       ? fmt::format(" from {}x{}", render_width, render_height)
+                       : std::string(),
+@@ -842,6 +957,11 @@ void D3D12CommandProcessor::TaaRun(const D3D12Shader& pixel_shader) {
+   if (fsr.thread.joinable()) {
+     fsr.thread.join();
+   }
++  if (state == TaaFsr::kReady && !fsr.provider_published) {
++    // Published here, on the submission thread, not by the thread that made the context.
++    fsr.provider_published = true;
++    rex::cvar::SetFlagByName("temporal_aa_upscaler_active", fsr.provider);
++  }
+ 
+   // The motion vectors (with upscaling, also FSR's colour and depth inputs, gathered at the
+   // render size from the output-size textures of the squeezed scene).
+diff --git a/src/graphics/temporal_aa.cpp b/src/graphics/temporal_aa.cpp
+index 807c7a71..4ddb4e43 100644
+--- a/src/graphics/temporal_aa.cpp
++++ b/src/graphics/temporal_aa.cpp
+@@ -102,6 +102,27 @@ REXCVAR_DEFINE_STRING(temporal_aa_upscale_available, "unknown", "GPU",
+     .allowed({"unknown", "yes", "no"})
+     .lifecycle(rex::cvar::Lifecycle::kHotReload)
+     .transient();
++REXCVAR_DEFINE_STRING(temporal_aa_upscaler, "auto", "GPU",
++                      "Which AMD FSR temporal_aa = fsr runs on Direct3D 12 "
++                      "(0470-fsr4-signed-upscaler.patch), when AMD's signed runtime "
++                      "(amd_fidelityfx_loader_dx12.dll and amd_fidelityfx_upscaler_dx12.dll, "
++                      "FidelityFX SDK 2.4) is next to the executable:\n"
++                      " auto: the newest the device supports (FSR 4.1, the machine-learning "
++                      "upscaler, on RDNA 2 and newer and the Radeon 800M series; FSR 3.1.6 "
++                      "elsewhere)\n"
++                      " fsr4: FSR 4 (FSR 3 if the device doesn't offer it)\n"
++                      " fsr3: FSR 3.1.6\n"
++                      "Without the signed runtime the FSR 3.1.4 built with the SDK runs, whatever "
++                      "this says. FSR 4 needs no reactive mask: temporal_aa_reactive is ignored "
++                      "with it. A change is made on the next frame (the upscaler is made again).")
++    .allowed({"auto", "fsr3", "fsr4"})
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_STRING(temporal_aa_upscaler_active, "none", "GPU",
++                      "FSR upscaling, set by the GPU plugin once the upscaler exists: the one "
++                      "that runs (FSR 4.1.2, FSR 3.1.6, FSR 3.1.4 (built) for the FSR built with "
++                      "the SDK), or none")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload)
++    .transient();
+ 
+ namespace rex::graphics {
+ 
+@@ -711,7 +732,11 @@ void CommandProcessor::TaaEndFrame() {
+ 
+ #if defined(REX_HAS_FSR) && REX_HAS_FSR
+ 
++#include <cctype>
++#include <cstdlib>
++#include <filesystem>
+ #include <string>
++#include <system_error>
+ 
+ #include <rex/filesystem.h>
+ #if !(defined(REX_FSR_STATIC) && REX_FSR_STATIC)
+@@ -738,7 +763,7 @@ bool FsrRuntime::Linked() {
+ }
+ #endif
+ 
+-bool FsrRuntime::Load(const char* api) {
++bool FsrRuntime::Load(const char* api, bool signed_loader) {
+   if (tried_) {
+     return create != nullptr;
+   }
+@@ -747,6 +772,7 @@ bool FsrRuntime::Load(const char* api) {
+   // Linked into the executable (the PS5 can't load modules), if the game's
+   // link had FidelityFX's static libraries (weak references otherwise).
+   (void)api;
++  (void)signed_loader;
+   if (!Linked()) {
+     REXGPU_WARN("Temporal AA: FidelityFX isn't linked into the executable; FSR is unavailable");
+     return false;
+@@ -759,33 +785,51 @@ bool FsrRuntime::Load(const char* api) {
+   REXGPU_INFO("Temporal AA: FidelityFX linked in");
+   return true;
+ #else
++  const std::filesystem::path folder = rex::filesystem::GetExecutableFolder();
++  // Loads `name` from the executable's folder and resolves the entry points; false (logged, with
++  // what then happens) if it isn't there or lacks them.
++  auto load = [&](const std::string& name, const char* then) {
++    auto* library = new rex::platform::DynamicLibrary();
++    if (!library->Load(folder / name, rex::platform::SymbolResolution::kImmediate)) {
++      REXGPU_WARN("Temporal AA: {} isn't next to the executable; {}", name, then);
++      delete library;
++      return false;
++    }
++    create = library->GetSymbol<PfnFfxCreateContext>("ffxCreateContext");
++    destroy = library->GetSymbol<PfnFfxDestroyContext>("ffxDestroyContext");
++    configure = library->GetSymbol<PfnFfxConfigure>("ffxConfigure");
++    query = library->GetSymbol<PfnFfxQuery>("ffxQuery");
++    dispatch = library->GetSymbol<PfnFfxDispatch>("ffxDispatch");
++    if (!create || !destroy || !configure || !query || !dispatch) {
++      REXGPU_WARN("Temporal AA: {} lacks the ffx-api entry points; {}", name, then);
++      create = nullptr;
++      delete library;
++      return false;
++    }
++    // Kept loaded for the process's lifetime (contexts may outlive a backend).
++    library_ = library;
++    REXGPU_INFO("Temporal AA: loaded {}", name);
++    return true;
++  };
+ #if REX_PLATFORM_WIN32
+-  std::string name = std::string("amd_fidelityfx_") + api + ".dll";
++  if (signed_loader) {
++    // AMD's signed runtime: the loader, and the effect DLL it loads from the same folder.
++    const std::string effect = std::string("amd_fidelityfx_upscaler_") + api + ".dll";
++    const char* then = "using the FSR 3.1 built with the SDK";
++    std::error_code error;
++    if (!std::filesystem::exists(folder / effect, error)) {
++      REXGPU_INFO("Temporal AA: {} isn't next to the executable (AMD's signed FSR runtime, FSR 4); {}",
++                  effect, then);
++    } else if (load(std::string("amd_fidelityfx_loader_") + api + ".dll", then)) {
++      signed_ = true;
++      return true;
++    }
++  }
++  return load(std::string("amd_fidelityfx_") + api + ".dll", "FSR is unavailable");
+ #else
+-  std::string name = std::string("libamd_fidelityfx_") + api + ".so";
++  (void)signed_loader;
++  return load(std::string("libamd_fidelityfx_") + api + ".so", "FSR is unavailable");
+ #endif
+-  std::filesystem::path path = rex::filesystem::GetExecutableFolder() / name;
+-  auto* library = new rex::platform::DynamicLibrary();
+-  if (!library->Load(path, rex::platform::SymbolResolution::kImmediate)) {
+-    REXGPU_WARN("Temporal AA: {} isn't next to the executable; FSR is unavailable", name);
+-    delete library;
+-    return false;
+-  }
+-  create = library->GetSymbol<PfnFfxCreateContext>("ffxCreateContext");
+-  destroy = library->GetSymbol<PfnFfxDestroyContext>("ffxDestroyContext");
+-  configure = library->GetSymbol<PfnFfxConfigure>("ffxConfigure");
+-  query = library->GetSymbol<PfnFfxQuery>("ffxQuery");
+-  dispatch = library->GetSymbol<PfnFfxDispatch>("ffxDispatch");
+-  if (!create || !destroy || !configure || !query || !dispatch) {
+-    REXGPU_WARN("Temporal AA: {} lacks the ffx-api entry points; FSR is unavailable", name);
+-    create = nullptr;
+-    delete library;
+-    return false;
+-  }
+-  // Kept loaded for the process's lifetime (contexts may outlive a backend).
+-  library_ = library;
+-  REXGPU_INFO("Temporal AA: loaded {}", name);
+-  return true;
+ #endif  // REX_FSR_STATIC
+ }
+ 
+@@ -801,6 +845,73 @@ void FsrRuntime::Message(uint32_t type, const wchar_t* message) {
+   }
+ }
+ 
++std::vector<FsrUpscalerVersion> FsrListUpscalerVersions(const FsrRuntime& runtime, void* device) {
++  std::vector<FsrUpscalerVersion> versions;
++  if (!runtime.query) {
++    return versions;
++  }
++  ffxQueryDescGetVersions query = {};
++  query.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
++  query.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
++  query.device = device;
++  uint64_t count = 0;
++  query.outputCount = &count;
++  // The count, then the ids and the names together (their order may differ between queries).
++  if (runtime.query(nullptr, &query.header) != FFX_API_RETURN_OK || !count) {
++    return versions;
++  }
++  std::vector<uint64_t> ids(count);
++  std::vector<const char*> names(count);
++  query.versionIds = ids.data();
++  query.versionNames = names.data();
++  if (runtime.query(nullptr, &query.header) != FFX_API_RETURN_OK) {
++    return versions;
++  }
++  count = std::min<uint64_t>(count, ids.size());
++  for (uint64_t i = 0; i < count; ++i) {
++    FsrUpscalerVersion& version = versions.emplace_back();
++    version.id = ids[i];
++    // A copy: the runtime may overwrite the name with a later query.
++    version.name = names[i] ? names[i] : "";
++    // The name's first number ("4.1.2", "FSR 4.1.2 *"); else the id's own, FFX_UPSCALER_MAKE_VERSION's
++    // major (bit 31 marks a driver-provided version).
++    size_t digit = 0;
++    while (digit < version.name.size() && !std::isdigit(static_cast<unsigned char>(version.name[digit]))) {
++      ++digit;
++    }
++    version.major = digit < version.name.size() ? uint32_t(std::atoi(version.name.c_str() + digit))
++                                                : uint32_t((ids[i] & 0x7FFFFFFFu) >> 22);
++  }
++  return versions;
++}
++
++uint64_t FsrPickUpscalerVersion(const std::vector<FsrUpscalerVersion>& versions,
++                                std::string_view want, std::string* name_out) {
++  const uint32_t major = want == "fsr4" ? 4 : want == "fsr3" ? 3 : 0;
++  const FsrUpscalerVersion* best = nullptr;
++  for (const FsrUpscalerVersion& version : versions) {
++    if (version.major == major &&
++        (!best || (version.id & 0x7FFFFFFFu) > (best->id & 0x7FFFFFFFu))) {
++      best = &version;
++    }
++  }
++  if (!best) {
++    return 0;
++  }
++  if (name_out) {
++    *name_out = best->name;
++  }
++  return best->id;
++}
++
++std::string FsrLabel(std::string_view name) {
++  if (name.empty()) {
++    return "FSR";
++  }
++  return std::isdigit(static_cast<unsigned char>(name[0])) ? "FSR " + std::string(name)
++                                                           : std::string(name);
++}
++
+ }  // namespace rex::graphics
+ 
+ #endif  // REX_HAS_FSR
+diff --git a/src/graphics/temporal_aa_fsr.h b/src/graphics/temporal_aa_fsr.h
+index c495d854..02e7af6f 100644
+--- a/src/graphics/temporal_aa_fsr.h
++++ b/src/graphics/temporal_aa_fsr.h
+@@ -1,16 +1,40 @@
+ /**
+- * Temporal anti-aliasing (rexglue-temporal-aa.patch): the AMD FSR 3.1 runtime
+- * (FidelityFX SDK 1.1.4 ffx-api, MIT, built from source by
+- * cmake/rexglue_fsr.cmake), loaded at run time from the executable's folder.
++ * Temporal anti-aliasing (rexglue-temporal-aa.patch): the AMD FSR runtime, loaded at
++ * run time from the executable's folder. Either the FSR 3.1 runtime built from
++ * source (FidelityFX SDK 1.1.4 ffx-api, MIT, cmake/rexglue_fsr.cmake), or AMD's signed
++ * runtime of FidelityFX SDK 2.4 (MIT, cmake/rexglue_fsr_signed.cmake): a loader that
++ * has the same entry points and picks FSR 4.1 (the machine-learning upscaler), FSR 3.1.6
++ * or FSR 2.3.4 for the device (0470-fsr4-signed-upscaler.patch).
+  */
+ 
+ #pragma once
+ 
+ #if defined(REX_HAS_FSR) && REX_HAS_FSR
+ 
++#include <cstdint>
++#include <string>
++#include <string_view>
++#include <vector>
++
+ #include <ffx_api/ffx_api.h>
+ #include <ffx_api/ffx_upscale.h>
+ 
++// FidelityFX SDK 2.x (MIT, Kits/FidelityFX/upscalers/include/ffx_upscale.h): the upscaler's
++// create description wants the version of the API the application was built against chained
++// to it. Defined here rather than by bumping the 1.1.4 headers (thirdparty/fidelityfx-api)
++// that the Vulkan backend and frame generation build against too.
++#ifndef FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION
++#define FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION 0x0001000Bu
++#define FFX_UPSCALER_MAKE_VERSION(major, minor, patch) \
++  (((major) << 22) | ((minor) << 12) | (patch))
++// SDK 2.4.0's FFX_UPSCALER_VERSION (4.1.2).
++#define FFX_UPSCALER_VERSION FFX_UPSCALER_MAKE_VERSION(4, 1, 2)
++struct ffxCreateContextDescUpscaleVersion {
++  ffxCreateContextDescHeader header;
++  uint32_t version;  ///< The version of the API the application was built against.
++};
++#endif
++
+ namespace rex::graphics {
+ 
+ // What both backends create FSR with. The prebuilt Vulkan shaders are made for
+@@ -25,9 +49,14 @@ struct FsrRuntime {
+   PfnFfxConfigure configure = nullptr;
+   PfnFfxQuery query = nullptr;
+   PfnFfxDispatch dispatch = nullptr;
+-  // Loads amd_fidelityfx_<api> (dx12 or vk) the first time; false (logged
+-  // once) if it isn't there.
+-  bool Load(const char* api);
++  // Loads, the first time, either AMD's signed runtime (signed_loader: amd_fidelityfx_loader_<api>.dll,
++  // which loads amd_fidelityfx_upscaler_<api>.dll from the same folder; dx12 only) or, if that isn't
++  // there or doesn't load (or signed_loader is false), amd_fidelityfx_<api> (dx12 or vk) built from
++  // source. False (logged once) if neither is there.
++  bool Load(const char* api, bool signed_loader = false);
++  // Whether Load loaded AMD's signed runtime: the upscaler's version is the loader's to choose
++  // (an ffxOverrideVersion pins one), and the create description wants the API version.
++  bool signed_loader() const { return signed_; }
+   // Logs FidelityFX's messages.
+   static void Message(uint32_t type, const wchar_t* message);
+ #if defined(REX_FSR_STATIC) && REX_FSR_STATIC
+@@ -37,9 +66,29 @@ struct FsrRuntime {
+ 
+  private:
+   bool tried_ = false;
++  bool signed_ = false;
+   void* library_ = nullptr;
+ };
+ 
++// One upscaler the signed runtime offers for a device.
++struct FsrUpscalerVersion {
++  uint64_t id = 0;   // for ffxOverrideVersion; only ever a value the query returned
++  std::string name;  // the runtime's name ("4.1.2", "3.1.6", "2.3.4"; a driver-provided one ends in " *")
++  uint32_t major = 0;  // 4 is FSR 4 (machine learning), 3 FSR 3.x, 2 FSR 2.x
++};
++
++// ffxQueryDescGetVersions for the upscaler on `device` (an ID3D12Device*): every version the runtime
++// offers there, names copied. Empty if the query failed (or the runtime isn't the signed one).
++std::vector<FsrUpscalerVersion> FsrListUpscalerVersions(const FsrRuntime& runtime, void* device);
++
++// The newest of the family `want` names ("fsr4": FSR 4.x, "fsr3": FSR 3.x) in `versions`: its id
++// (and name), or 0 if there is none.
++uint64_t FsrPickUpscalerVersion(const std::vector<FsrUpscalerVersion>& versions,
++                                std::string_view want, std::string* name_out);
++
++// The name for logs and temporal_aa_upscaler_active: "FSR 4.1.2" for the runtime's "4.1.2".
++std::string FsrLabel(std::string_view name);
++
+ }  // namespace rex::graphics
+ 
+ #endif  // REX_HAS_FSR

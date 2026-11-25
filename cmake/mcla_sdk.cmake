@@ -79,7 +79,7 @@ message(STATUS "mcla: ReXGlue SDK ${REXGLUE_VERSION_STRING} at ${MCLA_SDK_PREFIX
 # rexglue_configure_target() stages rexruntime and the GPU plugin too, but not the FidelityFX DLLs of an installed
 # SDK (it looks for them under their in-tree target names).
 function(mcla_stage_sdk_runtime exe_target)
-  file(GLOB _dlls CONFIGURE_DEPENDS "${MCLA_SDK_PREFIX}/bin/*.dll")
+  file(GLOB _dlls CONFIGURE_DEPENDS "${MCLA_SDK_PREFIX}/bin/*.dll" "${MCLA_SDK_PREFIX}/bin/amd_fidelityfx_signed_*.md")
   add_custom_target(${exe_target}_stage_sdk_dlls ALL
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_dlls} "$<TARGET_FILE_DIR:${exe_target}>"
     COMMENT "Staging the SDK's DLLs next to ${exe_target}.exe"
