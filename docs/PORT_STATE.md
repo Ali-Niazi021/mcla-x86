@@ -24,8 +24,9 @@ Owner: ORC. The plan is [PLAN.md](PLAN.md); this file tracks where execution sta
 
 ## Current phase
 
-**1080p60 sprint + launcher (2026-11-25).** Swarm: VER S1 benching, P1 GPU profiling (RGP + GPU timestamps), R1 shader
-translator study, O2 swap-path patch, TOOLS bench telemetry. Launcher (`launcher/`) built and reviewed.
+**Wrapped up for now (2026-11-25).** Playable on the Radeon 880M laptop: 720p60 and 30 fps modes pass their gates;
+1080p holds 60.0 fps average with occasional dips (p99 20–22 ms vs the 20 ms bar). Launcher done. Resume from the
+task board's Todo list.
 
 ## Milestones
 
@@ -36,45 +37,35 @@ translator study, O2 swap-path patch, TOOLS bench telemetry. Launcher (`launcher
 | M1 | Codegen clean, exe links, tests pass | **pass**: `codegen ok: cpp=121 functions=30204 unresolved=0 fingerprint=da9ab3c2…`; `gate: high 0 medium 0`; RelWithDebInfo 62 s, Release 68 s, 0 warnings; `100% tests passed` (3/3) | 2026-11-24 |
 | M2 | Title screen | **pass** (b2.1, D3D12): `first engine frame` t+4.4 s, `Startup/Startup_Checks` t+30.6 s, 13/13 profile cvars, `fatal=0 unregistered=0`; title visible; audio endpoint opened. Owner check (audible music/SFX) pending | 2026-11-24 |
 | M3 | Free-roam driving, 10 min soak | **pass** (b2.1): new profile → `cutscene -> free-roam` 136.9 s, save-backup lines ×2, drove 52 mph, pause open/close; fixture `after_intro`; 600 s soak `fatal=0` (run w2.1-m3c); parity with E2: cars coloured, no missing geometry/flashes. Owner check (radio balance) pending | 2026-11-24 |
-| M4 | Locked 30 fps at 720p | **open**: run w3.4-m4 met avg 30.00 and world/real 1.0004 but p99 was 35.1–35.2 ms (limit 35.0). Root cause: the CP's `Sleep(1)` swap-gate poll. Fixed by SDK patch 0430 (series 84), not yet re-gated | |
-| M5 | 60 fps at 720p | **close, not met**: `mcla_fps_target=60,mcla_present_immediate=-1,mcla_ws_single_tile=true` gives a stable run (w4.2-m5g-immst-stable) of avg 59.42, p99 25.25, world/real 0.9998 (bar: ≥59.5, ≤20). The run without the hold (w4.2-m5m2-immst) gets 60.00 / p99 22.66 | |
-| M6 | 60 fps at 1080p on the 880M | **open**: native 1080p single tile 55.3–56.7 fps (GPU ms p50 17.1–17.8); 900p single tile 59.4; FSR 3 (720p→1080p) 49.3 (pass 4.1 ms), FSR 4 (540p→1080p) 37.5 (pass 6.4 ms): **upscaling is slower than native on the 880M**. 16:10 1280x800 exclusive 57.2. Package power-capped at ~35 W, GPU at ~1.4 GHz of 2.9 GHz; ~8–13 ms of the GPU frame doesn't scale with clock (R6) | |
-| M7 | Polish | todo | |
+| M4 | Locked 30 fps at 720p | **pass** (V4m4, series 94): avg 30.00, p99 33.89 (≤35), max 39.2, world/real 1.000 | 2026-11-25 |
+| M5 | 60 fps at 720p | **pass** (V4m5): avg 60.00, p99 17.40, 0.00 % > 25 ms, max 26.7; GPU p50 10.6 ms | 2026-11-25 |
+| M6 | 60 fps at 1080p on the 880M | **near**: native 1080p single tile with the defaults + `mcla_gfx_preset=perf` (MyASUS Performance mode, ~45–50 W package): avg 59.95–60.00, 0.07–0.08 % > 25 ms, max 27.6–31.0, but p99 20.14 / 22.01 (bar 20) in two gates (V4m6, V4m6b). Upscaling loses here (FSR 3 49 fps, FSR 4 37 fps). 16:10 1280x800 ~57 fps (pre-optimization) | |
+| Launcher | Settings UI + Launch | **done**: `mcla_launcher.exe` (schema-driven, presets, validation); end-to-end launch to the title (V4-launcher) | 2026-11-25 |
 
 ## Task board
 
 ### Doing
 
-- Optimization round (see "Sprint findings" below): S1 VER benches, P1 profile, R1 shaders, O2 swap path.
+(nothing)
 
 ### Todo (next actions, in order)
 
-1. **Owner's quick 1080p60 test on the new power adapter**, reporting back to Ali if 1080p60 changed. This was interrupted
-   by the pause. Build at HEAD (`python tools/codegen.py`, then a Release rebuild), then
-   `python tools/bench.py --flow bench_drive --fixture after_intro --seconds 240 --no-warmup` with these variants:
-   - `n1080:mcla_profile=1080p,mcla_fps_target=60,mcla_present_immediate=-1,mcla_sim_hold30_s=0`
-   - `n1080st` (the same, plus `mcla_ws_single_tile=true`)
-   - `n1080fsr:mcla_profile=1080p-fsr,…`
-   - `fsr1:mcla_profile=720p-fsr1,…`
-   - `immnoaa` (the 720p reference)
-
-   Record the power adapter in the notes.
-2. **M4 re-gate on series 84** (0430/0440): `bench.py … --parked --gate m4 --variant sim30:mcla_sim60=true,mcla_sim_cap=30,mcla_fps_cap=30`.
-3. **M5 closing:** the p99 tail and the 60→30 hold drops. Check the census (`[mcla-swap]`) and the `[mcla-input-fix]` lines
-   (the input-fix hooks are new since the last codegen). Candidates are the hold thresholds and the remaining GPU-heavy
-   streets. The bar is `--gate m5` on `immst` with the hold on.
-4. **M6 per the owner:** FSR 3 (`mcla_profile=1080p-fsr`, render markers) against 720p+FSR1. Check `temporal_aa_debug=4/7`
-   and look for ghosting in shots. Optional: FSR 4.1 on the 800M series (licence and SM 6.6 checks first).
-5. **Controllers:** hand test of XInput, Xbox, DS4 and DualSense (owner).
-6. **60 fps gameplay fixes not yet done.** These are LARecomp-derived in Renan's port, so re-derive them from the PPC:
+1. **M6 p99 tail** (20–22 ms vs 20): the misses come in bursts in heavy streets. Candidates: SDK 04e0 tone-map transfer
+   skip (fixed for the tone map's ALWAYS stencil after V4; needs a game run with `tonemap_transfer_skip=true,
+   tonemap_transfer_skip_poison=true`, expect `[tonemap-skip] N skipped, 0 kept`, ~0.55 ms); 04a0's fused gamma paint
+   (refused while a UI overlay is registered: `swap_direct_present: the gamma ramp is not applied …: a UI overlay is
+   shown`); R1-E texture fast path (needs a runtime count of signed/gamma fetches); R2 full-resource clears; the
+   `dxbc_ps_ieee_mul` white-frame question (V3). Owner check: M6 again with MyASUS Standard to split power-mode effects.
+2. **60 fps gameplay fixes not yet done.** LARecomp-derived in Renan's port, so re-derive from the PPC:
    - **Warp hang:** override `sub_8221BE98`; it calls `sub_8221B790`/`sub_8221B8C8`. The warper state is at
      `*(0x8286D8D4)+0x51240`, with the state word at +288.
    - **Checkpoint sweep:** override `sub_822653A8`, plus a mid-asm hook at `0x82688200` in `sub_826881A8` (`r1`, `r31`,
      `r27`).
    - **Bike gyro:** `sub_823688B8`, constants at `0x8236895C` (`f13`, 0.40) and `0x823689F0` (`f0`, 0.15), with
      k(dt) = 1-(1-k30)^(30dt).
-7. GAME (low): the skip-intro hook causes 3 boot-time `Resolve region is empty` errors.
-8. W0.8 E1 Xenia baseline: waits for Ali.
+3. **Owner checks:** audio (music, SFX, radio balance), controllers by hand (XInput/Xbox, DS4, DualSense), races.
+4. GAME (low): the skip-intro hook causes 3 boot-time `Resolve region is empty` errors.
+5. W0.8 E1 Xenia baseline (optional).
 
 ### Done
 
@@ -112,8 +103,9 @@ PLAN §7.2. Shared contracts for wave 1:
 ## Next actions
 
 See "Todo (next actions, in order)" in the task board. Note for resuming: the SDK install at `$WORK/sdk/install` is
-series 84 (`5e4b01ee959eb13a`); since the last codegen, new hooks were added (input fixes, physical pool), so run
-`python tools/codegen.py` before the next build. The role files are in `.omp/agents/` (local, gitignored).
+series 94 (`fd9b4e47d09a0e4f`); the repo's series has a newer 04e0 (fingerprint `7bcdf49bed3a73c8`), so run
+`python tools/prepare_sdk.py reset` + `build` before the next game build. Codegen is current (`7c0b18d7…`, 30204
+functions). Role files are in `.omp/agents/` (local, gitignored). Every heavy job goes through `tools/heavy_lock.py`.
 
 ## Sprint findings (2026-11-25)
 
