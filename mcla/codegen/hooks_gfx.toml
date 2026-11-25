@@ -52,3 +52,14 @@ registers = ["r4"]
 address = 0x825F69A0
 name = "mcla_hook_gfx_shadow_res"
 registers = ["r10"]
+
+# [G7] mcla_gfx_impostor_interval: sub_8230DDD0 (per-type impostor generator, called by the type loop sub_8230EE20),
+# BEFORE `and r9,r10,r11` at 0x8230DE50 (word 0x7D495838; `cmpwi cr6,r9,0 ; bne 0x8230DE6C` follows: regenerate when
+# the mask has this frame's bit). r10 = the type's frame mask `lwz r10,152(r31)` ([r31+0x98]), r11 = this frame's
+# bit(s) (0b0101 / 0b1010 by frame parity, or 1 << (frame & 3); the three arms join at 0x8230DE4C), r31 = the type
+# (`mr r31,r3`). The hook may rewrite r10 / r11 to thin out the regeneration. NEEDS A RE-CODEGEN (new entry).
+# mcla/hooks/mcla_gfx_impostors.cpp
+[[midasm_hook]]
+address = 0x8230DE50
+name = "mcla_hook_gfx_impostor_throttle"
+registers = ["r10", "r11", "r31"]
