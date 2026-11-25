@@ -9,7 +9,7 @@ Conventions used by this file:
 - A setting's `id` is the cvar it drives (`--<cvar>=<value>`). The only launcher-only setting is `close_on_launch`
   (`cvar: null`, `emit: never`). The launcher hard-codes two ids: `close_on_launch`, and the setting whose cvar is
   `game_data_root` (a `path`, checked before Launch).
-- `default` is what the launcher starts with: the "Recommended" preset (1080p, 60 fps, FSR). Where that differs from the
+- `default` is what the launcher starts with: the "Recommended (1080p)" preset (native 1080p, single tile, MSAA off, 60 fps profile, Performance scene detail). Where that differs from the
   cvar's own default (or from what `mcla/profile/pc_profile.cpp` applies), the setting uses `emit: always`, so the command
   line fully decides the run. Everything else uses `emit: nondefault` and its default equals the game's effective default
   (the cvar's, or the profile's: `anisotropic_override` 5 and `mnk_mode` true).
@@ -18,7 +18,8 @@ Conventions used by this file:
   `mnk_mode`, the window size needs windowed mode. A hidden setting is never emitted.
 - `mcla_profile` values are the presets of `pc_profile.cpp` (`default`, `800p`, `900p16`, `900p`, `1080p`, `1200p`); the FSR
   variants (`1080p-fsr`, `1080p-fsr4p`, ...) are the base size plus `temporal_aa*` cvars, so the upscaler is a separate
-  choice. `720p-fsr1` is the shipped size plus `present_effect=fsr`.
+  choice. The FSR version defaults to `fsr3` (never `auto`) and is always emitted; the FSR 4 preset sets `fsr4`, 2x, sharpness 0.2.
+  Presets name `mcla_gfx_preset=default` for "as shipped" (an empty value would be an empty `--name=` argument). `720p-fsr1` is the shipped size plus `present_effect=fsr`.
 - `fullscreen_mode` and `temporal_aa_upscaler` come from SDK patches 0480 and 0470 (`patches/sdk`); both default to the
   patch's default and are only emitted when changed, so a build without those patches ignores them.
 - Presets (`presets`) list every setting they own, so applying one is deterministic; a preset that no longer matches the

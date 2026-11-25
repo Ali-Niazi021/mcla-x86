@@ -13,59 +13,46 @@
   "presets": [
     {
       "id": "recommended",
-      "label": "Recommended (1080p 60, FSR)",
-      "help": "The target setup: a 1920x1080 picture at 60 fps, the 3D scene drawn at 1280x720 and upscaled by AMD FSR (FSR 4 where the GPU and AMD's runtime offer it). Needs a fast GPU; see Balanced or Performance if it stutters.",
+      "label": "Recommended (1080p)",
+      "help": "True 1920x1080, single-tile scene, MSAA off, the 60 fps profile with late-frame release and the Performance scene-detail preset. Whether it holds 60 fps depends on the GPU (about 55 fps measured on a Radeon 880M); pick Balanced or Performance if it does not.",
       "set": {
         "mcla_profile": "1080p",
         "mcla_noaa": true,
         "mcla_ws_single_tile": true,
         "mcla_fps_target": 60,
         "mcla_present_immediate": -1,
-        "mcla_gfx_preset": "",
+        "mcla_gfx_preset": "perf",
         "present_effect": "bilinear",
         "fullscreen_mode": "desktop",
-        "temporal_aa": "fsr",
-        "temporal_aa_upscaler": "auto",
+        "temporal_aa": "off",
+        "temporal_aa_upscaler": "fsr3",
         "temporal_aa_upscale": 1.5,
         "temporal_aa_sharpness": 0.3
       }
     },
     {
-      "id": "quality_1080",
-      "label": "Quality 1080p",
-      "help": "Native 1920x1080 at 60 fps, no upscaler: the sharpest picture, the heaviest load (about 53 fps on a Radeon 880M integrated GPU).",
-      "set": {
-        "mcla_profile": "1080p",
-        "mcla_noaa": true,
-        "mcla_ws_single_tile": true,
-        "mcla_fps_target": 60,
-        "mcla_present_immediate": -1,
-        "mcla_gfx_preset": "",
-        "present_effect": "bilinear",
-        "fullscreen_mode": "desktop",
-        "temporal_aa": "off"
-      }
-    },
-    {
       "id": "balanced_900",
-      "label": "Balanced 900p 60",
-      "help": "1600x900 at 60 fps, no upscaler, scaled to the screen by the presenter. Measured to hold 60 fps on a Radeon 880M integrated GPU.",
+      "label": "Balanced (900p 60)",
+      "help": "1600x900 at the 60 fps profile, no upscaler, scaled to the screen by the presenter (about 59 fps measured on a Radeon 880M).",
       "set": {
         "mcla_profile": "900p",
         "mcla_noaa": true,
         "mcla_ws_single_tile": true,
         "mcla_fps_target": 60,
         "mcla_present_immediate": -1,
-        "mcla_gfx_preset": "",
+        "mcla_gfx_preset": "perf",
         "present_effect": "bilinear",
         "fullscreen_mode": "desktop",
-        "temporal_aa": "off"
+        "temporal_aa": "off",
+        "temporal_aa_upscaler": "fsr3",
+        "temporal_aa_upscale": 1.5,
+        "temporal_aa_sharpness": 0.3
       }
     },
     {
       "id": "performance_720",
-      "label": "Performance 720p 60",
-      "help": "The shipped 1280x720 at 60 fps with MSAA off, plus the Performance scene-detail preset: the lightest 60 fps setup.",
+      "label": "Performance (720p 60)",
+      "help": "The shipped 1280x720 at the 60 fps profile with MSAA off and the Performance scene-detail preset: the lightest 60 fps setup (held 60 fps on a Radeon 880M).",
       "set": {
         "mcla_profile": "default",
         "mcla_noaa": true,
@@ -75,28 +62,54 @@
         "mcla_gfx_preset": "perf",
         "present_effect": "bilinear",
         "fullscreen_mode": "desktop",
-        "temporal_aa": "off"
+        "temporal_aa": "off",
+        "temporal_aa_upscaler": "fsr3",
+        "temporal_aa_upscale": 1.5,
+        "temporal_aa_sharpness": 0.3
+      }
+    },
+    {
+      "id": "fsr4_1080",
+      "label": "FSR 4 (1080p from 540p, experimental)",
+      "help": "A 1920x1080 picture with the 3D scene drawn at 960x540 and upscaled by AMD FSR 4 (the 1080p-fsr4p profile: 2x, sharpness 0.2). Needs AMD's signed runtime DLLs next to mcla.exe and a Radeon RDNA 2 or newer / 800M series GPU; otherwise it runs FSR 3.1.6. Experimental.",
+      "set": {
+        "mcla_profile": "1080p",
+        "mcla_noaa": true,
+        "mcla_ws_single_tile": true,
+        "mcla_fps_target": 60,
+        "mcla_present_immediate": -1,
+        "mcla_gfx_preset": "perf",
+        "present_effect": "bilinear",
+        "fullscreen_mode": "desktop",
+        "temporal_aa": "fsr",
+        "temporal_aa_upscaler": "fsr4",
+        "temporal_aa_upscale": 2.0,
+        "temporal_aa_sharpness": 0.2
       }
     },
     {
       "id": "native_panel_800",
-      "label": "Native panel 1280x800 60",
-      "help": "A 1280x800 (16:10) render at 60 fps for a 16:10 laptop panel: the display is switched to the game's mode so the panel's scaler fills the screen with no black bars (falls back to desktop scaling if the mode is missing).",
+      "label": "Native panel 16:10 (1280x800, exclusive fullscreen)",
+      "help": "A 1280x800 (16:10) render at the 60 fps profile for a 16:10 laptop panel. Fullscreen switches the display to the game's mode (the highest multiple of 60 Hz, 120 preferred) so the panel's scaler fills the screen with no black bars; falls back to desktop scaling if the display has no such mode.",
       "set": {
         "mcla_profile": "800p",
         "mcla_noaa": true,
         "mcla_ws_single_tile": true,
         "mcla_fps_target": 60,
         "mcla_present_immediate": -1,
-        "mcla_gfx_preset": "",
+        "mcla_gfx_preset": "default",
         "present_effect": "bilinear",
         "fullscreen_mode": "guest",
-        "temporal_aa": "off"
+        "temporal_aa": "off",
+        "temporal_aa_upscaler": "fsr3",
+        "temporal_aa_upscale": 1.5,
+        "temporal_aa_sharpness": 0.3,
+        "fullscreen": true
       }
     },
     {
       "id": "shipped",
-      "label": "Shipped (console-like 30)",
+      "label": "Shipped (console 30)",
       "help": "The console's own look and timing: 1280x720, 2x MSAA, locked 30 fps.",
       "set": {
         "mcla_profile": "default",
@@ -104,10 +117,13 @@
         "mcla_ws_single_tile": false,
         "mcla_fps_target": 30,
         "mcla_present_immediate": 0,
-        "mcla_gfx_preset": "",
+        "mcla_gfx_preset": "default",
         "present_effect": "bilinear",
         "fullscreen_mode": "desktop",
-        "temporal_aa": "off"
+        "temporal_aa": "off",
+        "temporal_aa_upscaler": "fsr3",
+        "temporal_aa_upscale": 1.5,
+        "temporal_aa_sharpness": 0.3
       }
     }
   ],
@@ -124,8 +140,8 @@
         {"value": "default", "label": "1280x720 (shipped, 16:9)", "help": "The console's own size. With MSAA off it is the cheapest setting."},
         {"value": "800p", "label": "1280x800 (16:10)", "help": "Matches a 16:10 laptop panel. Vert+ camera, HUD in a 16:9 band."},
         {"value": "900p16", "label": "1440x900 (16:10)", "help": "16:10 at 900 rows. Vert+ camera, HUD in a 16:9 band."},
-        {"value": "900p", "label": "1600x900 (16:9)", "help": "A step below 1080p; measured to hold 60 fps on a Radeon 880M where native 1080p does not."},
-        {"value": "1080p", "label": "1920x1080 (16:9)", "help": "True 1920x1080 render, MSAA off. Heavy on integrated GPUs; pair it with the FSR upscaler to render less."},
+        {"value": "900p", "label": "1600x900 (16:9)", "help": "A step below 1080p; about 59 fps measured on a Radeon 880M (native 1080p: about 55)."},
+        {"value": "1080p", "label": "1920x1080 (16:9)", "help": "True 1920x1080 render, MSAA off. Heavy on integrated GPUs (about 55 fps measured on a Radeon 880M)."},
         {"value": "1200p", "label": "1920x1200 (16:10)", "help": "16:10 at 1200 rows. Vert+ camera, HUD in a 16:9 band. The heaviest size."}
       ],
       "advanced": false,
@@ -145,14 +161,17 @@
     {
       "id": "fullscreen_mode",
       "label": "Fullscreen mode",
-      "help": "How fullscreen is done: scale the picture on the desktop, or switch the display to the game's video mode.",
+      "help": "How fullscreen is done: scale the picture on the desktop, switch the display to the game's video mode, or switch it to a fixed mode.",
       "category": "display",
       "type": "enum",
       "cvar": "fullscreen_mode",
       "default": "desktop",
       "options": [
         {"value": "desktop", "label": "Desktop size (borderless)", "help": "Borderless window at the desktop's size; the game scales (and letterboxes) the picture itself. Safe everywhere."},
-        {"value": "guest", "label": "Switch the display to the game's mode", "help": "Changes the display mode to the game's video mode (e.g. 1280x800 or 1920x1080) at the highest refresh rate that is a multiple of 60 Hz (120 preferred), so the monitor's own scaler fills the panel. Falls back to the desktop size (see the log) if the display has no such mode."}
+        {"value": "guest", "label": "Switch the display to the game's mode", "help": "Changes the display mode to the game's video mode (e.g. 1280x800 or 1920x1080) at the highest refresh rate that is a multiple of 60 Hz (120 preferred), so the monitor's own scaler fills the panel. Falls back to the desktop size (see the log) if the display has no such mode."},
+        {"value": "1280x800@120", "label": "1280x800 @ 120 Hz (display mode)", "help": "Switches the display to exactly 1280x800 at 120 Hz (a 16:10 laptop panel mode); the panel's scaler fills the screen. Falls back to the desktop size if the display has no such mode."},
+        {"value": "1600x1000@120", "label": "1600x1000 @ 120 Hz (display mode)", "help": "Switches the display to exactly 1600x1000 at 120 Hz (16:10); the panel's scaler fills the screen. Falls back to the desktop size if the display has no such mode."},
+        {"value": "1920x1200@120", "label": "1920x1200 @ 120 Hz (display mode)", "help": "Switches the display to exactly 1920x1200 at 120 Hz (16:10); the panel's scaler fills the screen. Falls back to the desktop size if the display has no such mode."}
       ],
       "advanced": false,
       "requires": {"fullscreen": true},
@@ -191,7 +210,7 @@
     {
       "id": "monitor",
       "label": "Monitor",
-      "help": "Which display the game opens on: 0 = default, 1 = primary, 2 = second monitor, and so on.",
+      "help": "Which display the game opens on: 0 = default display; N = the Nth display in SDL's list.",
       "category": "display",
       "type": "int",
       "cvar": "monitor",
@@ -269,35 +288,35 @@
     {
       "id": "temporal_aa",
       "label": "Upscaler (AMD FSR)",
-      "help": "AMD FSR temporal upscaling: the 3D scene is drawn smaller and upscaled to the output size, with temporal anti-aliasing. HUD and post-processing stay at full size. Needs: MSAA disabled, Single-tile scene on, Direct3D 12.",
+      "help": "AMD FSR temporal upscaling: the 3D scene is drawn smaller and upscaled to the output size, with temporal anti-aliasing. HUD and post-processing stay at full size. Needs: MSAA disabled, Single-tile scene on, Direct3D 12. The FSR pass costs about 4 ms on a Radeon 880M, so it is slower than native 1080p there; it pays off only where shading dominates.",
       "category": "graphics",
       "type": "enum",
       "cvar": "temporal_aa",
-      "default": "fsr",
+      "default": "off",
       "options": [
         {"value": "off", "label": "Off (native resolution)", "help": "The scene is drawn at the output size, no temporal pass."},
-        {"value": "fsr", "label": "AMD FSR (temporal upscaler)", "help": "Draws the scene at output size divided by the quality ratio and upscales it with FSR 3.1 or FSR 4."}
+        {"value": "fsr", "label": "AMD FSR (temporal upscaler)", "help": "Draws the scene at output size divided by the quality ratio and upscales it with the FSR version chosen below."}
       ],
       "advanced": false,
       "requires": {"mcla_noaa": true, "mcla_ws_single_tile": true, "mcla_gpu_backend": "d3d12"},
-      "emit": "always"
+      "emit": "nondefault"
     },
     {
       "id": "temporal_aa_upscaler",
       "label": "FSR version",
-      "help": "Which FSR runs. FSR 4 (the machine-learning upscaler) needs AMD's signed runtime DLLs next to mcla.exe; without them the FSR 3.1 built into the game runs whatever this says.",
+      "help": "Which FSR runs. FSR 4 (the machine-learning upscaler) needs AMD's signed runtime DLLs next to mcla.exe and a supported Radeon; without the DLLs the FSR 3.1 built into the game runs whatever this says.",
       "category": "graphics",
       "type": "enum",
       "cvar": "temporal_aa_upscaler",
-      "default": "auto",
+      "default": "fsr3",
       "options": [
-        {"value": "auto", "label": "Auto (newest the GPU supports)", "help": "FSR 4.1 on RDNA 2 and newer and the Radeon 800M series when AMD's signed runtime is next to mcla.exe, else FSR 3.1."},
-        {"value": "fsr3", "label": "FSR 3.1", "help": "Pins FSR 3.1.6, e.g. to compare it with FSR 4."},
-        {"value": "fsr4", "label": "FSR 4", "help": "AMD's machine-learning upscaler; the game falls back to FSR 3.1.6 where the GPU does not offer it."}
+        {"value": "fsr3", "label": "FSR 3.1", "help": "AMD FSR 3.1 (the temporal upscaler built into the game; FSR 3.1.6 with AMD's runtime)."},
+        {"value": "fsr4", "label": "FSR 4 (ML)", "help": "AMD's machine-learning upscaler (experimental here); the game falls back to FSR 3.1.6 where the GPU or the runtime does not offer it."},
+        {"value": "auto", "label": "Auto (FSR 4 if available, else FSR 3.1)", "help": "FSR 4.1 on RDNA 2 and newer and the Radeon 800M series when AMD's signed runtime is next to mcla.exe, else FSR 3.1."}
       ],
       "advanced": false,
       "requires": {"temporal_aa": "fsr"},
-      "emit": "nondefault"
+      "emit": "always"
     },
     {
       "id": "temporal_aa_upscale",
@@ -310,9 +329,9 @@
       "options": [
         {"value": 1.0, "label": "Native AA (1.0x)", "help": "No upscaling: FSR only anti-aliases at the output size."},
         {"value": 1.3333, "label": "Ultra Quality (1.33x)", "help": "Scene at three quarters of the output size."},
-        {"value": 1.5, "label": "Quality (1.5x)", "help": "Scene at two thirds of the output size (1280x720 for 1080p). The recommended setting."},
+        {"value": 1.5, "label": "Quality (1.5x)", "help": "Scene at two thirds of the output size (1280x720 for 1080p)."},
         {"value": 1.7, "label": "Balanced (1.7x)", "help": "A little less than two thirds of the output size."},
-        {"value": 2.0, "label": "Performance (2x)", "help": "Scene at half the output size (960x540 for 1080p). Pairs well with FSR 4."},
+        {"value": 2.0, "label": "Performance (2x)", "help": "Scene at half the output size (960x540 for 1080p). The FSR 4 preset uses it."},
         {"value": 3.0, "label": "Ultra Performance (3x)", "help": "Scene at a third of the output size. Visibly soft."}
       ],
       "advanced": false,
@@ -322,7 +341,7 @@
     {
       "id": "temporal_aa_sharpness",
       "label": "FSR sharpness",
-      "help": "Sharpening (RCAS) applied after FSR, 0 = off to 1 = strongest. 0.3 suits FSR 3.1; 0.2 is the SDK default and what the FSR 4 presets use.",
+      "help": "Sharpening (RCAS) applied after FSR, 0 = off to 1 = strongest. 0.3 suits FSR 3.1; 0.2 is the SDK default and what the FSR 4 preset uses.",
       "category": "graphics",
       "type": "float",
       "cvar": "temporal_aa_sharpness",
@@ -392,15 +411,15 @@
       "category": "graphics",
       "type": "enum",
       "cvar": "mcla_gfx_preset",
-      "default": "",
+      "default": "perf",
       "options": [
-        {"value": "", "label": "Full (as shipped)", "help": "No change to the game's own detail levels."},
+        {"value": "default", "label": "Full (as shipped)", "help": "No change to the game's own detail levels."},
         {"value": "perf", "label": "Performance", "help": "Car paint and reflection views drawn every 2nd frame, shadow distance 0.6, vehicle LOD 0.7, city LOD 0.67, sun-shadow map 512. Near-identical picture; an estimated 1-2 ms of GPU time saved at 1080p."},
         {"value": "perfplus", "label": "Performance+", "help": "Performance plus no far shadow cascade and no tree impostors."},
         {"value": "lowest", "label": "Lowest", "help": "Performance plus no sun shadows (the game's own night path): the largest saving, at the price of every sun shadow."}
       ],
       "advanced": false,
-      "emit": "nondefault"
+      "emit": "always"
     },
     {
       "id": "mcla_gfx_shadow_res",
