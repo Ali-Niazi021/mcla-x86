@@ -98,6 +98,9 @@ constexpr uint32_t kPhaseUI = 0x20000000;
 
 // The renderer's phase enable mask: the word the phase loop ANDs with [renderer+364] (0x822E6608); see the sub_822E6408 override.
 constexpr uint32_t kRendererPhaseEnableMask = 448;
+// The draw-type enable mask the game ORs the shadow types into every frame (sub_822F3BD8, called from sub_822C0980 at
+// 0x822C0A08, before the phase loop at 0x822C0B08); the loop runs phase bits in this AND the word above.
+constexpr uint32_t kRendererDrawTypeMask = 364;
 
 constexpr uint32_t kD3DDevicePointer = 0x82839254;
 constexpr uint32_t kDeviceWritePointer = 48;
@@ -208,16 +211,22 @@ extern "C" REX_FUNC(sub_822C0980) {
 // The render phase loop: what is drawn after it in the frame (Bink movies) is over the finished picture.
 //
 // With MCLA_HOOK_GFX_PHASES the same override also lets the loop leave phases out of a frame (mcla_gfx_env_interval,
-// mcla_gfx_reflection_interval: mcla_gfx_tune.cpp, PhasesToSkip(), which also explains the phase bits). The loop runs a phase
-// only when its bit is set in [renderer+364] & [renderer+448] (reads at 0x822E6624 / 0x822E6608, once, before the first
-// phase); [renderer+448] is the phase enable mask (-1 from the constructor) and nothing else reads or writes it while a frame
-// is drawn, so the bits of the phases left out are cleared here, before the original runs, and OR-ed back after it: the game
-// never sees a changed mask outside this call. Only the bits that were set and that this call cleared are put back. The call is
-// made on the render thread; with every interval at 1 PhasesToSkip() is 0 and nothing is read or written.
+// mcla_gfx_reflection_interval, mcla_gfx_far_cascades_interval: mcla_gfx_tune.cpp, PhasesToSkip(), which also explains the
+// phase bits). The loop runs a phase only when its bit is set in [renderer+364] & [renderer+448] (reads at 0x822E6624 /
+// 0x822E6608, once, before the first phase); [renderer+448] is the phase enable mask (-1 from the constructor) and nothing
+// else reads or writes it while a frame is drawn, so the bits of the phases left out are cleared here, before the original
+// runs, and OR-ed back after it: the game never sees a changed mask outside this call. Only the bits that were set and that
+// this call cleared are put back. The call is made on the render thread; with every interval at 1 nothing is read or written
+// (PhasesToSkip() is 0). The far cascades are only left out after a frame they were active in, so PhasesToSkip() is told which
+// phases would run: [renderer+364] & [renderer+448].
 extern "C" REX_FUNC(sub_822E6408) {
 #if MCLA_HOOK_GFX_PHASES
   const uint32_t renderer = ctx.r3.u32;  // the original takes the renderer in r3 and uses the register
-  const uint32_t skip = mcla::gfxtune::PhasesToSkip();
+  uint32_t active = 0;
+  if (mcla::gfxtune::PhasesActive() && renderer >= 0x10000) {
+    active = REX_LOAD_U32(renderer + kRendererPhaseEnableMask) & REX_LOAD_U32(renderer + kRendererDrawTypeMask);
+  }
+  const uint32_t skip = mcla::gfxtune::PhasesToSkip(active);
   uint32_t left_out = 0;
   if (skip && renderer >= 0x10000) {
     const uint32_t mask = REX_LOAD_U32(renderer + kRendererPhaseEnableMask);

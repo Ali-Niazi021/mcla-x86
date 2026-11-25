@@ -31,6 +31,10 @@
 //                              reads [renderer+448] & [renderer+364]; the override in mcla_fsr_markers.cpp clears the bits in
 //                              [renderer+448] around the loop on the frames that are left out (PhasesToSkip())
 //   mcla_gfx_reflection_interval  the same for the reflection view phase (0x2); at 2 it falls on the frames the env map is left out
+//   mcla_gfx_far_cascades_interval  N = 2: the far shadow cascades 2 / 3 (phases 0x80 / 0x100) on alternate frames, the skipped
+//                              cascade's light matrices held (sub_825F61F0 override) and the shadow atlas in memory of its own
+//                              (mcla_gfx_shadow_private; sub_825F4EF8 override): mcla_gfx_far_cascades.cpp
+//   mcla_gfx_impostor_interval  N >= 2: a tree-impostor type is regenerated at most every N-th frame (mid-asm hook 0x8230DE50)
 //   mcla_gfx_shadow_res       0 = shipped 640; 512 or 384 = the edge of the sun-shadow map (mid-asm hook 0x825F69A0 in the CShadowMap
 //                              constructor, mcla_gfx_shadow_res.cpp). Read when the shadow map is created: a world load
 //   mcla_gfx_impostors        false = no tree impostors (the game's own `noimpostors` switch, plus the guard of the refresh loop
@@ -78,6 +82,9 @@
 #endif
 #ifndef MCLA_HOOK_GFX_PHASES
 #define MCLA_HOOK_GFX_PHASES 0
+#endif
+#ifndef MCLA_HOOK_GFX_FAR_CASCADES
+#define MCLA_HOOK_GFX_FAR_CASCADES 0
 #endif
 #ifndef MCLA_HOOK_FSR_MARKERS
 #define MCLA_HOOK_FSR_MARKERS 0
@@ -131,12 +138,33 @@ REXCVAR_DEFINE_BOOL(mcla_gfx_impostors, true, "MCLA",
                     "MCLA quality knob: false = no tree impostors (the game's own noimpostors switch; with it the game's refresh "
                     "loop would never end, so mcla_gfx_impostors.cpp guards it). Applies to impostors created after the change. "
                     "true = as shipped");
+REXCVAR_DEFINE_INT32(mcla_gfx_far_cascades_interval, 1, "MCLA",
+                     "MCLA quality knob: the two far sun-shadow cascades, 2 and 3 (phases 0x80 / 0x100), are drawn on "
+                     "alternate frames (N = 2: cascade 2 on odd frames, cascade 3 on even ones; every N-th frame each), their light "
+                     "matrices held for the receivers so the static far shadows do not slide. 1 = every frame, as shipped; "
+                     "0 = as shipped plus a one-time log of the four cascade light matrices (index order check). "
+                     "Live (phase loop override + the sub_825F61F0 setter override, mcla_gfx_far_cascades.cpp, build flag "
+                     "MCLA_HOOK_GFX_FAR_CASCADES). The shadow atlas needs memory of its own for this (mcla_gfx_shadow_private)")
+    .range(0, 8);
+REXCVAR_DEFINE_INT32(mcla_gfx_shadow_private, -1, "MCLA",
+                     "MCLA quality knob: the shadow atlas render target gets its own physical memory instead of a slot of the "
+                     "shared render-target pool (which the post-processing targets reuse each frame, so a cascade that is not "
+                     "redrawn would be reloaded from memory holding post data). -1 = auto (on while "
+                     "mcla_gfx_far_cascades_interval > 1), 0 = off, 1 = on. Read when the shadow map is created (a world load; "
+                     "override of sub_825F4EF8)")
+    .range(-1, 1);
+REXCVAR_DEFINE_INT32(mcla_gfx_impostor_interval, 1, "MCLA",
+                     "MCLA quality knob: a tree-impostor type is regenerated at most every N-th frame (the game regenerates the "
+                     "untuned types, mask 3, every frame; 128x128 view, clear and resolve each). 1 = as shipped, 2 = every 2nd "
+                     "frame, 0 = as shipped plus a statistics line every 300 frames. Live (mid-asm hook 0x8230DE50, "
+                     "mcla_gfx_impostors.cpp)")
+    .range(0, 8);
 REXCVAR_DEFINE_STRING(mcla_gfx_preset, "", "MCLA",
                       "MCLA quality preset for a weak GPU, a bundle of the mcla_gfx_* knobs, applied once at first use as app "
-                      "defaults (a knob set by hand wins): '' = as shipped; perf = env_interval 2, reflection_interval 2, "
-                      "shadow_dist 0.6, traffic_lod 0.7, city_lod 0.67, shadow_res 512; perf+ (perfplus) = perf + dl_disable 256 "
-                      "(no far cascade) + impostors off; lowest = perf + shadow_mode 1 (no sun shadows). Logs "
-                      "'[mcla-gfx] preset <name>: ...' once");
+                      "defaults (a knob set by hand wins): '' = as shipped; perf = env_interval 2, far_cascades_interval 2, "
+                      "impostor_interval 2, shadow_dist 0.6, traffic_lod 0.7, city_lod 0.67, shadow_res 512 (the reflection "
+                      "view stays every frame); perf+ (perfplus) = perf + dl_disable 256 (no far cascade) + impostors off; "
+                      "lowest = perf + shadow_mode 1 (no sun shadows). Logs '[mcla-gfx] preset <name>: ...' once");
 REXCVAR_DEFINE_STRING(mcla_gfx_dump, "none", "MCLA",
                       "MCLA debug: log guest words once per change of this string, 'ADDR/COUNT+...' "
                       "(ADDR as in mcla_gfx_poke). Live");
@@ -487,7 +515,7 @@ void Dump() {
 // 0x200 culling, 0x400 fast shadow collector, 0x800 shadow prepass = the start of the main view (the FSR scene marker). Checked
 // against code: the shadow phase handler sub_823120C8 (r18 = the phase bit) does `addi r11,r18,-32; cmplwi r11,224` + a jump
 // table that gives 0x20 / 0x40 / 0x80 / 0x100 the cascade index 0..3, `cmpwi r18,1024` gives 0x400 index 4, and 0x1000 / 0x2000 /
-// 0x4000 / 0x800 get 5 / 6 / 7 / 8 (0x82312220-0x823122C4); the fast shadow path of sub_822F3BD8 removes 0x71E0 (the four cascades
+// 0x4000 / 0x800 get 5 / 6 / 7 / 8 (the table at 0x8231223C..0x82312260, the cases 0x823125E4..0x82312640); the fast shadow path of sub_822F3BD8 removes 0x71E0 (the four cascades
 // + collectors 0x1000 / 0x2000 / 0x4000) from +364. So entry 5 = 0x20 and the entries before it (render targets, reflection, env 0,
 // env 1, particle collision) are 0x1, 0x2, 0x4, 0x8, 0x10. The same bits as RenanQueiroz/mcla-recomp's frame-structure notes
 // (cascades 0x20..0x100, env map 0x4 | 0x8, reflection 0x2) and the iOS port's mcla_gfx_dl_clear (2 / 4 / 8).
@@ -495,9 +523,23 @@ constexpr uint32_t kPhaseReflection = 0x2;
 constexpr uint32_t kPhaseEnvMaps = 0x4 | 0x8;
 constexpr uint32_t kMaxInterval = 8;
 
+// The far shadow cascades: 0x80 = cascade 2 and 0x100 = cascade 3 (the phases the shadow handler sub_823120C8 gives the index
+// 2 and 3). Skipping one leaves its draws, its clear and its resolve into its quarter of the shadow atlas out of the frame;
+// its light matrices ([[CShadowMap+0x18]+4i]+0x10, uploaded for the shadow collector by sub_825F61F0) are held by the setter
+// override of mcla_gfx_far_cascades.cpp, which reads FarCascadePhasesSkipped(). Cascades 0 and 1 are never skipped.
+constexpr uint32_t kPhaseFarCascade2 = 0x80;
+constexpr uint32_t kPhaseFarCascade3 = 0x100;
+
+struct FarState {
+  bool was_active = false;  // the phase was in the active mask at the previous phase loop call (render thread only)
+};
+
 std::atomic<uint32_t> g_env_interval{1};
 std::atomic<uint32_t> g_reflection_interval{1};
+std::atomic<uint32_t> g_far_interval{1};
+std::atomic<uint32_t> g_far_skipped{0};
 std::atomic<uint32_t> g_phase_frame{0};
+FarState g_far[2];  // cascade 2, cascade 3; touched by the render thread only
 
 uint32_t ClampInterval(int32_t value) {
   return value <= 1 ? 1u : (uint32_t(value) > kMaxInterval ? kMaxInterval : uint32_t(value));
@@ -507,16 +549,20 @@ uint32_t ClampInterval(int32_t value) {
 void PublishPhaseIntervals() {
   const uint32_t env = ClampInterval(REXCVAR_GET(mcla_gfx_env_interval));
   const uint32_t reflection = ClampInterval(REXCVAR_GET(mcla_gfx_reflection_interval));
+  const uint32_t far_interval = MCLA_HOOK_GFX_FAR_CASCADES ? ClampInterval(REXCVAR_GET(mcla_gfx_far_cascades_interval)) : 1u;
   if (env == g_env_interval.load(std::memory_order_relaxed) &&
-      reflection == g_reflection_interval.load(std::memory_order_relaxed)) {
+      reflection == g_reflection_interval.load(std::memory_order_relaxed) &&
+      far_interval == g_far_interval.load(std::memory_order_relaxed)) {
     return;
   }
   g_env_interval.store(env, std::memory_order_relaxed);
   g_reflection_interval.store(reflection, std::memory_order_relaxed);
+  g_far_interval.store(far_interval, std::memory_order_relaxed);
   REXLOG_INFO(
-      "[mcla-gfx] phases: environment map (0x{:X}) drawn every {} frame(s), reflection view (0x{:X}) every {} frame(s) "
-      "(1 = as shipped; the skipped frames keep the last picture)",
-      kPhaseEnvMaps, env, kPhaseReflection, reflection);
+      "[mcla-gfx] phases: environment map (0x{:X}) drawn every {} frame(s), reflection view (0x{:X}) every {} frame(s), "
+      "far shadow cascades 2 / 3 (0x{:X} / 0x{:X}) every {} frame(s), alternating (cascade 2 on frames = 1 mod N, 3 on 0 mod N), "
+      "light matrices held (1 = as shipped; the skipped frames keep the last picture)",
+      kPhaseEnvMaps, env, kPhaseReflection, reflection, kPhaseFarCascade2, kPhaseFarCascade3, far_interval);
 }
 
 // ---- mcla_gfx_preset ----------------------------------------------------------------------------------------------
@@ -530,11 +576,14 @@ struct PresetKnob {
   const char* value;
 };
 
-// perf: near-identical picture, about 1.2-1.8 ms of GPU at 1080p on the 880M [INFERENCE from scratch/S3/REPORT.md].
+// perf: near-identical picture, about 1.2-1.8 ms of GPU at 1080p on the 880M [INFERENCE from scratch/S3/REPORT.md], plus the
+// R4 levers: the far cascades on alternate frames and the tree-impostor regeneration at most every 2nd frame (R4 #2 and #5,
+// not measured yet). The reflection view stays every frame (R4: the mirror shows near cars, 30 Hz would show).
 constexpr PresetKnob kPresetPerf[] = {
-    {"mcla_gfx_env_interval", "2"},        // car paint / speedometer reflection at 30 Hz
-    {"mcla_gfx_reflection_interval", "2"},  // reflection view at 30 Hz, on the other frames than the env map
-    {"mcla_gfx_shadow_dist", "0.6"},        // sections past 120 m cast no cascade shadows
+    {"mcla_gfx_env_interval", "2"},               // car paint / speedometer reflection at 30 Hz
+    {"mcla_gfx_far_cascades_interval", "2"},      // cascades 2 / 3 on alternate frames, matrices held; the atlas goes private
+    {"mcla_gfx_impostor_interval", "2"},          // a tree-impostor type regenerated at most every 2nd frame
+    {"mcla_gfx_shadow_dist", "0.6"},              // sections past 120 m cast no cascade shadows
     {"mcla_gfx_traffic_lod", "0.7"},
     {"mcla_gfx_city_lod", "0.67"},
     {"mcla_gfx_shadow_res", "512"},  // 640 -> 512: ~36 % less cascade fill; read when the shadow map is created
@@ -612,11 +661,17 @@ void EnsurePreset() {
   std::call_once(once, ApplyPreset);
 }
 
-uint32_t PhasesToSkip() {
+uint32_t PhasesToSkip(uint32_t active_phases) {
   const uint32_t env = g_env_interval.load(std::memory_order_relaxed);
   const uint32_t reflection = g_reflection_interval.load(std::memory_order_relaxed);
-  if (env <= 1 && reflection <= 1) {
-    return 0;  // as shipped: nothing written, nothing counted
+  const uint32_t far_interval = g_far_interval.load(std::memory_order_relaxed);
+  if (env <= 1 && reflection <= 1 && far_interval <= 1) {
+    // As shipped: nothing written, nothing counted (the far-cascade state is only dropped when it was in use).
+    if (g_far_skipped.load(std::memory_order_relaxed) != 0 || g_far[0].was_active || g_far[1].was_active) {
+      g_far_skipped.store(0, std::memory_order_relaxed);
+      g_far[0].was_active = g_far[1].was_active = false;
+    }
+    return 0;
   }
   // The frames are the phase loop's own calls. The first `interval` frames draw everything (the textures exist before they
   // are reused); after that the env map is drawn on frames = 0 mod N and the reflection view on frames = 1 mod N, so at N = 2
@@ -629,7 +684,60 @@ uint32_t PhasesToSkip() {
   if (reflection > 1 && frame >= reflection && frame % reflection != 1) {
     skip |= kPhaseReflection;
   }
+#if MCLA_HOOK_GFX_FAR_CASCADES
+  // The far shadow cascades (see the block above kPhaseFarCascade2): cascade 2 is drawn on frames = 1 mod N and cascade 3 on
+  // frames = 0 mod N, so at N = 2 they take turns. A cascade is always drawn on the first frame it is active after being
+  // inactive (start of the world, day after night, the preset switched on): its matrices and its slice of the atlas
+  // do not exist before that.
+  uint32_t far_skip = 0;
+  for (int k = 0; k < 2; ++k) {
+    FarState& state = g_far[k];
+    const uint32_t bit = k == 0 ? kPhaseFarCascade2 : kPhaseFarCascade3;
+    if (far_interval <= 1 || !(active_phases & bit)) {
+      state.was_active = false;
+      continue;
+    }
+    const bool forced = !state.was_active;
+    state.was_active = true;
+    if (!forced && frame % far_interval != (k == 0 ? 1u : 0u) % far_interval) {
+      far_skip |= bit;
+    }
+  }
+  g_far_skipped.store(far_skip, std::memory_order_relaxed);
+  skip |= far_skip;
+#else
+  (void)active_phases;
+#endif
   return skip;
+}
+
+bool PhasesActive() {
+  return g_env_interval.load(std::memory_order_relaxed) > 1 || g_reflection_interval.load(std::memory_order_relaxed) > 1 ||
+         g_far_interval.load(std::memory_order_relaxed) > 1;
+}
+
+uint32_t FarCascadePhasesSkipped() { return g_far_skipped.load(std::memory_order_relaxed); }
+
+uint32_t FarCascadesInterval() {
+  EnsurePreset();
+  return ClampInterval(REXCVAR_GET(mcla_gfx_far_cascades_interval));
+}
+
+bool FarCascadesDump() {
+  EnsurePreset();
+  return REXCVAR_GET(mcla_gfx_far_cascades_interval) <= 0;
+}
+
+bool ShadowAtlasPrivate() {
+  EnsurePreset();
+  const int32_t mode = REXCVAR_GET(mcla_gfx_shadow_private);
+  return mode < 0 ? ClampInterval(REXCVAR_GET(mcla_gfx_far_cascades_interval)) > 1 : mode > 0;
+}
+
+uint32_t ImpostorInterval() {
+  EnsurePreset();
+  const int32_t value = REXCVAR_GET(mcla_gfx_impostor_interval);
+  return value <= 0 ? 0u : ClampInterval(value);
 }
 
 uint32_t ShadowMapSize() {
@@ -704,13 +812,15 @@ mcla::hooks::Registration g_reg_ambient("gfx-ambient", "mcla_gfx_ambient_density
                                         MCLA_HOOK_GFX_AMBIENT_ZONE != 0,
                                         [] { return REXCVAR_GET(mcla_gfx_ambient_density) != 1.0; },
                                         /*default_on=*/false);
-// The phase skip is an override of sub_822E6408 in mcla_fsr_markers.cpp: it needs both build flags.
+// The phase skip is an override of sub_822E6408 in mcla_fsr_markers.cpp: it needs both build flags (the far cascades also
+// MCLA_HOOK_GFX_FAR_CASCADES, which makes PhasesToSkip() take them).
 mcla::hooks::Registration g_reg_phases("gfx-phases", "mcla_gfx_env_interval",
                                        MCLA_HOOK_GFX_PHASES != 0 && MCLA_HOOK_FSR_MARKERS != 0,
                                        [] {
                                          mcla::gfxtune::EnsurePreset();
                                          return REXCVAR_GET(mcla_gfx_env_interval) > 1 ||
-                                                REXCVAR_GET(mcla_gfx_reflection_interval) > 1;
+                                                REXCVAR_GET(mcla_gfx_reflection_interval) > 1 ||
+                                                REXCVAR_GET(mcla_gfx_far_cascades_interval) > 1;
                                        },
                                        /*default_on=*/false);
 }  // namespace

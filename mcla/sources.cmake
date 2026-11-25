@@ -36,7 +36,10 @@
 #             too: mcla_gfx_env_interval / mcla_gfx_reflection_interval), GFX_SHADOW_RES (mid-asm hook 0x825F69A0, cvar
 #             mcla_gfx_shadow_res; its codegen entry goes in hooks_gfx.toml) and GFX_IMPOSTORS (function overrides of
 #             sub_8230B778 / sub_8230D988, cvar mcla_gfx_impostors, no codegen entry); mcla_gfx_preset (perf, perf+, lowest)
-#             is a bundle of these and the older knobs
+#             is a bundle of these and the older knobs; GFX_FAR_CASCADES (R4: far shadow cascades on alternate frames: the schedule in
+#             PhasesToSkip, overrides of sub_825F61F0 / sub_825F4EF8; cvars mcla_gfx_far_cascades_interval / mcla_gfx_shadow_private;
+#             needs GFX_PHASES + FSR_MARKERS) and GFX_IMPOSTOR_THROTTLE (mid-asm hook 0x8230DE50, cvar mcla_gfx_impostor_interval; its
+#             codegen entry goes in hooks_gfx.toml)
 #   fsr       FSR_MARKERS (W5.6): function overrides of sub_822C0980 / sub_822E6408 / sub_822E55D0 that write the guest
 #             render markers (PM4 NOP 'REXM') the SDK's FSR 3.1 temporal AA / upscaling needs; no codegen entry (link-time
 #             override of the generated weak functions); cvar mcla_render_markers (-1 = auto: on while temporal_aa=fsr)
@@ -92,6 +95,8 @@ set(MCLA_HOOK_DEFINITIONS
     MCLA_HOOK_GFX_PHASES=1
     MCLA_HOOK_GFX_SHADOW_RES=1
     MCLA_HOOK_GFX_IMPOSTORS=1
+    MCLA_HOOK_GFX_FAR_CASCADES=1
+    MCLA_HOOK_GFX_IMPOSTOR_THROTTLE=1
     # FSR render markers, 60 fps input fixes (W5.6)
     MCLA_HOOK_FSR_MARKERS=1
     MCLA_HOOK_INPUT_TITLE_LATCH=1

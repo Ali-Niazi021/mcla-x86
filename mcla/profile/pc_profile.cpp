@@ -139,6 +139,10 @@ constexpr CvarDefault kProfileDefaults[] = {
 // scene instead of two 2x MSAA tiles. At 1x the game's own tiling is 2 tiles of 672 rows at 1920x1080 and 2 of 800 at
 // 1600x900 (mcla_ws_sizing.h GameSceneTiling), against 4 tiles of 320 rows with MSAA at 1080p.
 //
+// `mcla_ws_single_tile=true` merges that 1x scene into ONE tile (log: `[mcla-ws-single-tile] merged 1920x1080 1x into 1
+// tile`): every scene draw is recorded once instead of replayed per tile. R4 / S1: -0.6 ms GPU on the 880M at 1080p (mean
+// 18.67 -> 18.05 ms, p50 18.55 -> 17.82), the same pass and the same picture. The 16:10 and the FSR presets already had it.
+//
 // The UI squeeze stays off (mcla_ws_ui_squeeze=0: at exactly 16:9 the Flash stage already fits the buffer, nothing
 // to narrow), and so does its probe, which would only count calls on the 60 fps path; the aspect and cutscene hooks
 // idle by themselves at exactly 16:9.
@@ -149,6 +153,8 @@ static_assert(sizing::Resolve({1920, 1080}, {1920, 1080}).verdict == sizing::Ver
 static_assert(sizing::Resolve({1600, 900}, {1600, 900}).verdict == sizing::Verdict::kOn);
 static_assert(sizing::IsSixteenNine(1920, 1080) && sizing::IsSixteenNine(1600, 900));
 static_assert(sizing::RenderTargetMaxHeight(1080) == 1088 && sizing::RenderTargetMaxHeight(900) == 912);
+// One 1x tile must fit the 4096-tile EDRAM the default profile sets (colour and depth each within 2048 tiles).
+static_assert(sizing::SingleTileFits(1920, 1080, 1, 4096) && sizing::SingleTileFits(1600, 900, 1, 4096));
 
 // The 16:10 sizes (Vert+, the hooks' kLimits go up to 1920x1200): accepted as asked (no rounding), taller than 16:9, and
 // a single tile fits the 4096-tile EDRAM the default profile sets (colour and depth each within 2048 tiles).
@@ -174,6 +180,7 @@ constexpr CvarDefault k1080pDefaults[] = {
     // Replaces the default profile's 1024, which would cut the bottom 56 rows.
     {"render_target_max_height", "1088"},
     {"mcla_noaa", "true"},
+    {"mcla_ws_single_tile", "true"},
     {"mcla_ws_ui_squeeze", "0"},
     {"mcla_ws_ui_probe", "false"},
 };
@@ -187,6 +194,7 @@ constexpr CvarDefault k900pDefaults[] = {
     {"window_height", "900"},
     {"render_target_max_height", "912"},  // 900 rows aligned to the 16-row tile
     {"mcla_noaa", "true"},
+    {"mcla_ws_single_tile", "true"},
     {"mcla_ws_ui_squeeze", "0"},
     {"mcla_ws_ui_probe", "false"},
 };
