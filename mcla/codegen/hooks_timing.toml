@@ -132,3 +132,46 @@ address = 0x82419920
 name = "mcla_hook_swap_census"
 registers = ["r7", "r8", "r10", "r11", "r27", "r30"]
 after_instruction = true
+
+# [A7a] mcla_input_title_latch (W5.6): sub_82614D30, the per-pad update (sub_82615154 calls it once per game
+# update for pads 0..3, record 0x82905388 + 64 n), BEFORE `lbz r11,46(r31)` at the join where the d-pad
+# branches meet (a label: the branch at 0x82615038 lands here). r31 = the pad record: +8 = the new button
+# mask, +12 = the previous update's (sub_8260B668 copies +8 to +12 and clears +8 at the head, the branches
+# above OR the new bits into +8). The early return at 0x82614D70 (the query at 0x82614D5C answered nonzero) skips it. Read only.
+# mcla/hooks/mcla_input_title_latch.cpp, flag MCLA_HOOK_INPUT_TITLE_LATCH, cvar mcla_input_title_latch.
+# NEEDS A RE-CODEGEN (new entry).
+[[midasm_hook]]
+address = 0x82615048
+name = "mcla_hook_input_pad_update"
+registers = ["r31"]
+
+# [A7b] mcla_input_title_latch: sub_822C8AF8 (IS_PAD_BUTTON_DOWN(pad, button), a gap function the codegen
+# finds itself), BEFORE `cntlzw r6,r8` (0x822C8B30 `and r8,r9,r3` just made r8 = (prev ^ new) & (1 << button) &
+# new, the press; `rlwinm r5,r6,27,31,31 ; xori ; stw` turn it into the answer). r8 = the press (the hook may
+# set it), r6 = the pad (script argument 0), r5 = the button (argument 1); r6 and r5 are overwritten
+# right after. mcla/hooks/mcla_input_title_latch.cpp (same flag and cvar as A7a). NEEDS A RE-CODEGEN
+# (new entry).
+[[midasm_hook]]
+address = 0x822C8B34
+name = "mcla_hook_input_pad_poll"
+registers = ["r8", "r6", "r5"]
+
+# [A7c] mcla_input_menu_repeat (W5.6): sub_82223CD8, the UI input object's update, loop over the 24 menu
+# inputs (r31 = 0..23), the press branch (down now, not before), BEFORE `stbx r27,r31,r28` (threshold[r31] = 7;
+# `stbx r21,r31,r29` count = 0 and the key-down call follow). r31 = the input. Read only: records the
+# time of the key down. mcla/hooks/mcla_input_menu_repeat.cpp, flag MCLA_HOOK_INPUT_MENU_REPEAT, cvar
+# mcla_input_menu_repeat. NEEDS A RE-CODEGEN (new entry).
+[[midasm_hook]]
+address = 0x822240C0
+name = "mcla_hook_input_key_press"
+registers = ["r31"]
+
+# [A7d] mcla_input_menu_repeat: sub_82223CD8, the held branch (down now and before), BEFORE `stbx r8,r31,r29`
+# (count[r31] = r8; `cmplw cr6,r10,r8 ; bne` follows and the repeat fires when they are equal). r8 = count + 1
+# (`clrlwi r8,r9,24`), r10 = the threshold (`lbzx r10,r31,r28`), r31 = the input. The hook may lower r8 to
+# r10 - 1: the stored count is one short, the compare fails and the next update asks again.
+# mcla/hooks/mcla_input_menu_repeat.cpp (same flag and cvar as A7c). NEEDS A RE-CODEGEN (new entry).
+[[midasm_hook]]
+address = 0x822241CC
+name = "mcla_hook_input_key_repeat"
+registers = ["r8", "r10", "r31"]
