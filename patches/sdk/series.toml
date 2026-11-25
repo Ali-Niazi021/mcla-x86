@@ -782,6 +782,33 @@ purpose = "Windows: the guest vblank grid of 0400 takes its phase and rate from 
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0450-skip-overwritten-transfers-fix"
+source = "local"
+path = "patches/sdk/0450-skip-overwritten-transfers-fix.patch"
+sha256 = "ee8890774971847f29b6b285c6021bc5eb63b4db1d5be66d3b0c47c5f3e63e7a"
+purpose = "skip_overwritten_transfers (default stays false): GetOverwrittenRectangle no longer screens a rectangle-list draw out for the guest's cull / polygon mode / polygon offset bits (the host ignores them for a rectangle list: IsPrimitivePolygonal is false), only for user clip planes; every rejection records its reason. Cvars skip_overwritten_transfers_log (why each draw was cut or kept, once per shader pair and outcome, with the registers read, plus a 10 s summary) and skip_overwritten_transfers_poison (fill what isn't transferred with junk to check exactness). Not built before the next SDK build."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0460-batched-stretch-resolve"
+source = "local"
+path = "patches/sdk/0460-batched-stretch-resolve.patch"
+sha256 = "19246dcd6fd0f63b1c6f849db13e30e4b19eee95d32c3e22c219d5228ff13293"
+purpose = "D3D12: the direct resolve shaders that read a single-sampled render target through the FSR squeeze's stretch get batched-load variants (resolve_direct_batched_{fast,full}_{32,64}bpp_stretch[_scaled], DXBC built with fxc from the xenia 0b2ffa3 shader tree by build_resolve_shaders.py), picked with resolve_direct_batched_loads; values bit for bit the unbatched ones. Vulkan's stretch resolves stay unbatched (no Vulkan SDK to build SPIR-V). Not built before the next SDK build."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0480-fullscreen-display-mode"
+source = "local"
+path = "patches/sdk/0480-fullscreen-display-mode.patch"
+sha256 = "578e4e81374ae7a677c19a8a6a25c0b9be0369295c27dcc85e183b3124e1e7da"
+purpose = "UI: cvar fullscreen_mode (desktop|guest|WxH[@Hz]; default desktop = unchanged borderless). Exclusive fullscreen: SDL switches the display to the guest's size at the highest multiple-of-60 Hz (120 preferred) so the display's scaler fills the panel and the presenter paints guest-size; closest larger mode or desktop fallback, logged. D3D12 presenter logs its swap chain size. Not built before the next SDK build."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]

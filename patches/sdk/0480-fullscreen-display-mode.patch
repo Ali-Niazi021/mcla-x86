@@ -1,0 +1,438 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Wed, 25 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0480: fullscreen_mode, an exclusive display mode at the guest's size (the display's scaler fills the panel)
+
+Source: Ours, written for this SDK (S8; the cvar proposed in $WORK/scratch/S4/REPORT.md section 3). The SDK's SDL3 window
+  code and the SDL3 display-mode API are used as they are
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: Native-panel 60 fps. Cvar fullscreen_mode (UI/Window, string, default "desktop" = today's borderless fullscreen
+  at the desktop's size, nothing changes). "guest" = switch the display to the guest's video mode (video_mode_width x
+  video_mode_height, resolved as xboxkrnl_video.cpp does) at the highest refresh rate that is a multiple of 60 Hz (120
+  preferred); "WxH" or "WxH@Hz" (also "guest@Hz", "1080p") = that mode. SDL3 switches the display while the window is
+  fullscreen (SDL_SetWindowFullscreenMode with a mode of SDL_GetFullscreenDisplayModes, then SDL_SetWindowFullscreen),
+  so the window's client area is exactly the mode's size, the D3D12 presenter's swap chain is made at that size and
+  paints that many pixels, and the GPU's display engine scales it to the panel. No exact size: the closest larger mode
+  (SDL_GetClosestFullscreenDisplayMode). No usable mode: the desktop mode, with the reason. One line either way:
+  `[ui] fullscreen mode 1280x800@120.00 (requested guest = 1280x800)` or `[ui] fullscreen mode desktop (requested ...: why)`.
+  The presenter logs `D3D12Presenter: swap chain 1280x800 for a 1280x800 surface (1:1), tearing allowed` (first 32).
+  Not built before the next SDK build.
+Bucket: REDO
+
+0480-fullscreen-display-mode.patch (mcla-x86 S8)
+
+Why. The presenter's swap chain is the size of the window's client area (D3D12Presenter::
+ConnectOrReconnectPaintingToSurfaceFromUIThread: min(surface, 16384), DXGI_SCALING_NONE when they are equal). Fullscreen is
+borderless at the desktop's size (WindowSDL::OpenImpl / ApplyNewFullscreen: SDL_SetWindowFullscreen(true) with the default
+NULL mode), so on the 3200x2000 panel the presenter paints 6.4 MP for a 1280x800 guest (FSR 1 EASU+RCAS about 4.5 ms by
+S4's estimate, bilinear 0.3-0.6 ms) and the DWM composes it. With the display switched to the guest's size the presenter
+paints the guest's 1:1 and no shader pays for the up-scale.
+
+Change.
+  * include/rex/ui/flags.h, src/ui/window.cpp: the cvar (kRequiresRestart: it is read each time the window enters
+    fullscreen; the `fullscreen` cvar's live toggle re-reads it).
+  * src/ui/window_sdl.cpp (anonymous namespace): ParseFullscreenMode (desktop | guest[@Hz] | WxH[@Hz], the size part is
+    video_mode_util::TryParseResolutionPreset, so 1280x800, 1080p, 4k work), GetGuestVideoModeSize (the same precedence as
+    xboxkrnl_video.cpp: video_mode_width/height if set, else window_width/height, else `resolution`, else the cvars'
+    defaults), ChooseDisplayMode (SDL_GetFullscreenDisplayModes of the window's display; exact size, else
+    SDL_GetClosestFullscreenDisplayMode; then the refresh: the one asked for (nearest, noted when more than 0.5 Hz off),
+    or the best multiple of 60 Hz within 0.5 Hz (59.94 and 119.88 count): 120 first, else the highest, else, when the
+    display has none at that size, the highest rate with a note), ApplyFullscreenMode (SDL_SetWindowFullscreenMode, NULL
+    for the desktop kind or on any failure). OpenImpl calls it before SDL_SetWindowFullscreen(true) and, after
+    SDL_ShowWindow (the window is hidden until then, SDL applies a pending fullscreen when it is shown), warns once if the
+    window is not the mode's size. ApplyNewFullscreen calls it when entering fullscreen; leaving puts the desktop mode back.
+  * src/ui/d3d12/d3d12_presenter.cpp: one INFO line per swap chain (re)connection, the first 32 (window drags must not
+    flood the log), with the swap chain's size, the surface's, and whether tearing is allowed. No behaviour change: the swap
+    chain was and is made at the surface's size, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING and Present(0, ALLOW_TEARING) as before.
+
+What SDL3 does (thirdparty/sdl3 release-3.4.0-428-g8bf3b7215, read, not run):
+  * Entering: SDL_UpdateFullscreenMode (SDL_video.c:1907) -> SDL_SetDisplayModeForDisplay -> WIN_SetDisplayMode
+    (windows/SDL_windowsmodes.c:847, ChangeDisplaySettingsExW with CDS_FULLSCREEN), then WIN_SetWindowFullscreen puts a
+    WS_POPUP window over the monitor's new bounds. It is the GDI mode change, not DXGI exclusive fullscreen: the swap chain
+    stays a windowed flip-model one (DXGI_MWA_NO_ALT_ENTER still set), so ALLOW_TEARING keeps working; a swap chain that
+    equals the monitor's mode, in a window that covers it, is what the DWM needs for independent flip [INFERENCE: DWM
+    behaviour, not observed here]. The display modes carry the DEVMODE's whole
+    refresh rate (120 -> 120/1; 119 and 59 are turned into 119.88 and 59.94).
+  * Alt-tab / focus loss: SDL_OnWindowFocusLost -> SDL_ShouldMinimizeOnFocusLoss (SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS,
+    default "auto": an exclusive-mode window minimizes) -> SDL_OnWindowMinimized -> SDL_UpdateFullscreenMode(LEAVE): the
+    desktop mode is back. Restoring the window -> SDL_OnWindowRestored -> ENTER: the mode again. The environment variable
+    SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS=0 keeps the mode on focus loss.
+  * Leaving fullscreen (cvar `fullscreen` false) and SDL_DestroyWindow (SDL_video.c:4503, which WindowSDL's destructor
+    reaches) restore the desktop mode. If the process dies without destroying the window the mode is the OS's to put back
+    (CDS_FULLSCREEN is the temporary kind) [INFERENCE, not tried: it would flip this machine's display].
+  * SDL sends SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED for each size change, WindowSDL turns it into OnActualSizeUpdate, the
+    presenter resizes its swap chain (ResizeBuffers keeps the tearing flag): this is the path of a mode change at any
+    time; the DPI/display-scale change that a mode below the desktop's brings (SDL: 100 %) goes through OnDpiChanged.
+
+The guest vblank's display lock (0440) and a mode change [from reading graphics_system.cpp; not run]:
+  * UpdateDisplayLock runs on every guest vblank: it takes the helper's new stamps, fits the line, recomputes k =
+    round(guest period / display period) and (re)locks when k changes, unlocks after a stale display (no stamp for 4
+    periods + 50 ms, at once) or 30 evaluations in a row of a rate that does not fit. Every 2 s it looks up the game window
+    (FindGameWindow: the largest visible, non-minimized top-level window of the process) and its monitor, and restarts the
+    helper when the monitor changed or the window is gone.
+  * At start-up the window is already in its mode when the first lookup finds it, so the lock starts on the new rate: `display
+    lock on: output 120.0xxx Hz ... every 2 of them` (k = 2 at 120 Hz) within about 3 s of the window opening. Mode at 60 Hz:
+    k = 1. Alt-tab: the window is minimized, FindGameWindow finds none, the helper is stopped (`display lock off`, the QPC
+    grid carries on), and the restored window is found at the next lookup (<= 2 s) and locked after >= 48 stamps.
+  * If WaitForVBlank on the helper's IDXGIOutput stops working across the switch, `failed` is set, the lock is dropped and
+    the lookup is retried after 5 s; if it keeps working, the fit follows (nine stamps in a row off the line restart it).
+    A refresh that is no k x 60 Hz leaves the QPC grid (`display lock not used`), as before. Nothing in 0440 needs a change.
+
+Checked (this machine: 3200x2000 panel, 120 Hz; nothing here switched its display mode):
+  * clang++ 20.1.8 -fsyntax-only with the SDK's Release flags on window_sdl.cpp, window.cpp, d3d12_presenter.cpp: 0 errors,
+    no new warnings; clang-format clean (the repo's .clang-format) on the touched files.
+  * A harness that compiles the patch's ParseFullscreenMode and ChooseDisplayMode as they are against the SDK's SDL3
+    (SDL_Init(VIDEO) only, enumeration only). The primary display lists 28 modes (14 sizes x 60 and 120 Hz, 24 bits,
+    density 1; 3200x2000 down to 640x480, 1280x800, 1920x1200 and 1600x1000 among them). guest 1280x800 -> 1280x800@120;
+    1920x1200 -> @120; 1280x800@60 -> 60; @144 -> 120 with the note; 1300x800 -> 1600x1000 with the note; 4000x3000 -> no
+    mode (desktop + reason); parse: desktop, "", guest, GUEST@120, 1280x800, 1080p, 4k, "1280 x 800" accepted;
+    desktop@120, 1280x, x800, guest@, @0, @5000, bogus refused.
+  * Not run: the game, the mode switch itself, the presenter in the new mode.
+Verify (Verifier, in a run with --fullscreen_mode=guest and a 1280x800 guest): the two lines above in the log, in this
+order, then `[guest-vblank] display lock on ... every 2` and `src=display` in the 10 s lines; PresentMon PresentMode
+"Hardware: Independent Flip" (not "Composed: Flip") with the allow-tearing flag; the desktop is back after alt-tab, after
+a clean exit and after taskkill /F (scratch/S8/enum_modes.py prints the current mode on its first line); GPU busy
+against the same run with fullscreen_mode=desktop. If tearing shows (on a fixed-refresh panel a Present(0, ALLOW_TEARING)
+in independent flip flips at once, mid-scan-out [INFERENCE]), --d3d12_allow_variable_refresh_rate_and_tearing=false
+presents without the flag.
+---
+diff --git a/include/rex/ui/flags.h b/include/rex/ui/flags.h
+index fa2ef605..0d5fa006 100644
+--- a/include/rex/ui/flags.h
++++ b/include/rex/ui/flags.h
+@@ -29,6 +29,7 @@ REXCVAR_DECLARE(bool, host_present_from_non_ui_thread);
+ REXCVAR_DECLARE(int32_t, window_width);
+ REXCVAR_DECLARE(int32_t, window_height);
+ REXCVAR_DECLARE(bool, fullscreen);
++REXCVAR_DECLARE(std::string, fullscreen_mode);
+ REXCVAR_DECLARE(int32_t, monitor);
+ REXCVAR_DECLARE(std::string, video_driver);
+ 
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 2fdb6fa6..52b43879 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -538,6 +538,21 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+   }
+   SetHdrOutputActive(paint_context_.swap_chain_hdr);
+ 
++  // LOCAL PATCH - MCLA (0480): the swap chain is made, and resized, at the surface's size. In an
++  // exclusive fullscreen mode (fullscreen_mode) that is the display mode's, so the presenter paints
++  // exactly that many pixels. Logged for the first 32 (re)connections, so that a window being
++  // dragged doesn't flood the log.
++  static uint32_t swap_chain_logged = 0;
++  if (swap_chain_logged < 32) {
++    ++swap_chain_logged;
++    const bool swap_chain_is_surface_size =
++        new_swap_chain_width == new_surface_width && new_swap_chain_height == new_surface_height;
++    REXLOG_INFO("D3D12Presenter: swap chain {}x{} for a {}x{} surface ({}), tearing {}",
++                new_swap_chain_width, new_swap_chain_height, new_surface_width, new_surface_height,
++                swap_chain_is_surface_size ? "1:1" : "stretched",
++                paint_context_.swap_chain_allows_tearing ? "allowed" : "off");
++  }
++
+   ID3D12Device* device = provider_.GetDevice();
+ 
+   // Create the RTV descriptors.
+diff --git a/src/ui/window.cpp b/src/ui/window.cpp
+index 297d7931..d292858f 100644
+--- a/src/ui/window.cpp
++++ b/src/ui/window.cpp
+@@ -36,6 +36,17 @@ REXCVAR_DEFINE_INT32(window_height, 0, "UI/Window",
+ // in sync whenever this cvar is changed at runtime.
+ REXCVAR_DEFINE_BOOL(fullscreen, true, "UI/Window", "Start the window in fullscreen mode");
+ 
++// LOCAL PATCH - MCLA (0480): what "fullscreen" means. Read each time the window enters fullscreen.
++REXCVAR_DEFINE_STRING(
++    fullscreen_mode, "desktop", "UI/Window",
++    "Fullscreen kind: \"desktop\" = borderless at the desktop's size; \"guest\" = switch the "
++    "display to the guest's video mode (video_mode_width x video_mode_height) at the highest "
++    "refresh rate that is a multiple of 60 Hz (120 preferred); \"WxH\" or \"WxH@Hz\" (e.g. "
++    "1280x800@120) = switch the display to that mode. The display's own scaler then fills the "
++    "panel and the presenter only paints that size. Falls back to \"desktop\" (logged) when the "
++    "display has no such mode")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
+                      "Monitor index to display on (0 = default, 1 = primary, 2 = "
+                      "second monitor, etc.)")
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 10abf030..5ebfe5c3 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -14,9 +14,17 @@
+ #include <rex/ui/window_sdl.h>
+ 
+ #include <algorithm>
++#include <cctype>
+ #include <cmath>
++#include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <filesystem>
++#include <string>
++#include <string_view>
++#include <tuple>
++
++#include <fmt/format.h>
+ 
+ #define UTF_CPP_CPLUSPLUS 201703L  // -fno-char8_t
+ #include <utf8.h>
+@@ -83,6 +91,218 @@ uint32_t ResolveWindowHeight(uint32_t requested_height) {
+   return requested_height;
+ }
+ 
++// LOCAL PATCH - MCLA (0480): fullscreen_mode. "desktop" keeps SDL's borderless fullscreen at the
++// desktop's size. Any other value asks for an exclusive fullscreen mode: SDL switches the display
++// to it while the window is fullscreen (ChangeDisplaySettingsEx on Windows), so the window's client
++// area, hence the presenter's swap chain, is exactly that size and the display's own scaler fills
++// the panel. SDL puts the desktop mode back when the window leaves fullscreen, is destroyed, or
++// loses focus (SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS "auto" minimizes an exclusive-mode window),
++// and takes the mode again when it is restored.
++struct FullscreenModeRequest {
++  bool exclusive = false;  // false: "desktop"
++  bool guest = false;      // the size is the guest's video mode
++  int32_t width = 0;
++  int32_t height = 0;
++  double refresh_hz = 0.0;  // 0: the highest multiple of 60 Hz, 120 preferred
++};
++
++bool EqualsIgnoreCase(std::string_view a, std::string_view b) {
++  return std::equal(a.begin(), a.end(), b.begin(), b.end(), [](char x, char y) {
++    return std::tolower(static_cast<unsigned char>(x)) ==
++           std::tolower(static_cast<unsigned char>(y));
++  });
++}
++
++// "desktop" | "guest"[@Hz] | "WxH"[@Hz] (anything video_mode_util's resolution parser takes:
++// 1280x800, 1080p, ...).
++bool ParseFullscreenMode(std::string_view text, FullscreenModeRequest& request) {
++  request = {};
++  while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
++    text.remove_prefix(1);
++  }
++  while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
++    text.remove_suffix(1);
++  }
++  std::string_view size = text;
++  if (const size_t at = text.find('@'); at != std::string_view::npos) {
++    size = text.substr(0, at);
++    const std::string hz_text(text.substr(at + 1));
++    char* hz_end = nullptr;
++    request.refresh_hz = std::strtod(hz_text.c_str(), &hz_end);
++    if (hz_text.empty() || hz_end != hz_text.c_str() + hz_text.size() ||
++        !(request.refresh_hz >= 1.0 && request.refresh_hz <= 1000.0)) {
++      return false;
++    }
++  }
++  if (size.empty() || EqualsIgnoreCase(size, "desktop")) {
++    return request.refresh_hz == 0.0;
++  }
++  request.exclusive = true;
++  if (EqualsIgnoreCase(size, "guest")) {
++    request.guest = true;
++    return true;
++  }
++  return rex::graphics::video_mode_util::TryParseResolutionPreset(size, request.width,
++                                                                  request.height);
++}
++
++// The guest's video mode size, resolved the way xboxkrnl_video.cpp does
++// (GetConfiguredVideoModeWidth/Height).
++void GetGuestVideoModeSize(int32_t& width, int32_t& height) {
++  width = REXCVAR_GET(video_mode_width);
++  height = REXCVAR_GET(video_mode_height);
++  int32_t preset_width = 0;
++  int32_t preset_height = 0;
++  const bool has_preset =
++      rex::graphics::video_mode_util::TryGetResolutionPresetFromCVar(preset_width, preset_height);
++  if (!rex::cvar::HasNonDefaultValue("video_mode_width")) {
++    if (rex::cvar::HasNonDefaultValue("window_width") && REXCVAR_GET(window_width) > 0) {
++      width = REXCVAR_GET(window_width);
++    } else if (has_preset) {
++      width = preset_width;
++    }
++  }
++  if (!rex::cvar::HasNonDefaultValue("video_mode_height")) {
++    if (rex::cvar::HasNonDefaultValue("window_height") && REXCVAR_GET(window_height) > 0) {
++      height = REXCVAR_GET(window_height);
++    } else if (has_preset) {
++      height = preset_height;
++    }
++  }
++  width = std::clamp(width, 640, 0x0FFF);
++  height = std::clamp(height, 480, 0x0FFF);
++}
++
++// k when `hz` is within half a hertz of k x 60 Hz (59.94 and 119.88 count), else 0.
++int MultipleOf60(float hz) {
++  const int k = int(std::lround(hz / 60.0f));
++  return k >= 1 && std::fabs(hz - 60.0f * float(k)) <= 0.5f ? k : 0;
++}
++
++// The display mode for a request on `display`: the size asked for if the display lists it, else the
++// smallest listed size at least that large (SDL_GetClosestFullscreenDisplayMode); the refresh rate
++// asked for (nearest), or the best multiple of 60 Hz (120 if the display has it, else the highest;
++// no multiple: the highest rate).
++bool ChooseDisplayMode(SDL_DisplayID display, int32_t width, int32_t height, double wanted_hz,
++                       SDL_DisplayMode& chosen, std::string& note, std::string& why_not) {
++  int count = 0;
++  SDL_DisplayMode** modes = SDL_GetFullscreenDisplayModes(display, &count);
++  if (!modes || count <= 0) {
++    why_not = fmt::format("the display lists no fullscreen modes ({})", SDL_GetError());
++    SDL_free(modes);
++    return false;
++  }
++  int target_width = width;
++  int target_height = height;
++  bool exact = false;
++  for (int i = 0; i < count && !exact; ++i) {
++    exact = modes[i]->w == width && modes[i]->h == height && modes[i]->pixel_density <= 1.0f;
++  }
++  if (!exact) {
++    SDL_DisplayMode closest;
++    if (!SDL_GetClosestFullscreenDisplayMode(display, width, height, 0.0f, false, &closest)) {
++      why_not = fmt::format("the display has no mode of at least {}x{}", width, height);
++      SDL_free(modes);
++      return false;
++    }
++    target_width = closest.w;
++    target_height = closest.h;
++    note = fmt::format("the display has no {}x{} mode, the closest larger one is {}x{}", width,
++                       height, target_width, target_height);
++  }
++  // Higher tuple = better: more colour bits last, so only a tie on the refresh rate falls through
++  // to them.
++  const auto rank = [&](const SDL_DisplayMode& m) {
++    const int bits = SDL_BITSPERPIXEL(m.format);
++    if (wanted_hz > 0.0) {
++      return std::make_tuple(0, -std::fabs(double(m.refresh_rate) - wanted_hz), 0.0, bits);
++    }
++    const int k = MultipleOf60(m.refresh_rate);
++    if (k == 2) {
++      return std::make_tuple(3, 0.0, 0.0, bits);
++    }
++    if (k > 0) {
++      return std::make_tuple(2, double(k), -std::fabs(double(m.refresh_rate) - 60.0 * k), bits);
++    }
++    return std::make_tuple(1, double(m.refresh_rate), 0.0, bits);
++  };
++  const SDL_DisplayMode* best = nullptr;
++  for (int i = 0; i < count; ++i) {
++    const SDL_DisplayMode* m = modes[i];
++    if (m->w == target_width && m->h == target_height && m->pixel_density <= 1.0f &&
++        (!best || rank(*m) > rank(*best))) {
++      best = m;
++    }
++  }
++  if (!best) {
++    why_not = fmt::format("the display has no {}x{} mode at a pixel density of 1", target_width,
++                          target_height);
++    SDL_free(modes);
++    return false;
++  }
++  if (wanted_hz > 0.0) {
++    if (std::fabs(double(best->refresh_rate) - wanted_hz) > 0.5) {
++      note += fmt::format("{}no {} Hz at {}x{}, the nearest is {:.2f} Hz", note.empty() ? "" : "; ",
++                          wanted_hz, target_width, target_height, best->refresh_rate);
++    }
++  } else if (MultipleOf60(best->refresh_rate) == 0) {
++    note += fmt::format(
++        "{}no multiple of 60 Hz at {}x{} (the guest's vblank can't lock to the display), "
++        "using the highest",
++        note.empty() ? "" : "; ", target_width, target_height);
++  }
++  chosen = *best;
++  SDL_free(modes);
++  return true;
++}
++
++// Sets the window's fullscreen display mode from fullscreen_mode, before
++// SDL_SetWindowFullscreen(true). Desktop (the default, or a value that can't be used, logged) is
++// SDL's borderless fullscreen: a NULL mode.
++void ApplyFullscreenMode(SDL_Window* window) {
++  const std::string& spec = REXCVAR_GET(fullscreen_mode);
++  FullscreenModeRequest request;
++  if (!ParseFullscreenMode(spec, request)) {
++    REXLOG_WARN(
++        "[ui] fullscreen mode desktop (fullscreen_mode \"{}\" is not desktop, guest, WxH or "
++        "WxH@Hz)",
++        spec);
++    request = {};
++  }
++  if (!request.exclusive) {
++    SDL_SetWindowFullscreenMode(window, nullptr);
++    return;
++  }
++  int32_t width = request.width;
++  int32_t height = request.height;
++  std::string requested = spec;
++  if (request.guest) {
++    GetGuestVideoModeSize(width, height);
++    requested = fmt::format("{} = {}x{}", spec, width, height);
++  }
++  SDL_DisplayID display = SDL_GetDisplayForWindow(window);
++  if (!display) {
++    display = SDL_GetPrimaryDisplay();
++  }
++  SDL_DisplayMode mode;
++  std::string note;
++  std::string why_not;
++  if (!ChooseDisplayMode(display, width, height, request.refresh_hz, mode, note, why_not)) {
++    REXLOG_WARN("[ui] fullscreen mode desktop (requested {}: {})", requested, why_not);
++    SDL_SetWindowFullscreenMode(window, nullptr);
++    return;
++  }
++  if (!SDL_SetWindowFullscreenMode(window, &mode)) {
++    REXLOG_WARN(
++        "[ui] fullscreen mode desktop (requested {}: SDL_SetWindowFullscreenMode failed: {})",
++        requested, SDL_GetError());
++    SDL_SetWindowFullscreenMode(window, nullptr);
++    return;
++  }
++  REXLOG_INFO("[ui] fullscreen mode {}x{}@{:.2f} (requested {}{})", mode.w, mode.h,
++              mode.refresh_rate, requested, note.empty() ? std::string() : "; " + note);
++}
++
+ MouseEvent::Button TranslateSDLMouseButton(Uint8 button) {
+   switch (button) {
+     case SDL_BUTTON_LEFT:
+@@ -158,7 +378,9 @@ bool WindowSDL::OpenImpl() {
+   }
+ 
+   if (IsFullscreen()) {
+-    // Borderless desktop fullscreen (a NULL display mode is SDL3's default).
++    // Borderless desktop fullscreen (a NULL display mode is SDL3's default), or the display mode
++    // fullscreen_mode asks for (0480); SDL switches the display when the window is shown below.
++    ApplyFullscreenMode(sdl_window_);
+     SDL_SetWindowFullscreen(sdl_window_, true);
+   }
+ #if REX_PLATFORM_MAC
+@@ -177,6 +399,16 @@ bool WindowSDL::OpenImpl() {
+   int pixel_width = 0;
+   int pixel_height = 0;
+   SDL_GetWindowSizeInPixels(sdl_window_, &pixel_width, &pixel_height);
++  // LOCAL PATCH - MCLA (0480): in an exclusive mode the window must now be exactly the mode's size,
++  // the presenter's swap chain is made at the window's.
++  if (const SDL_DisplayMode* fullscreen_mode = SDL_GetWindowFullscreenMode(sdl_window_);
++      IsFullscreen() && fullscreen_mode &&
++      (pixel_width != fullscreen_mode->w || pixel_height != fullscreen_mode->h)) {
++    REXLOG_WARN(
++        "[ui] the fullscreen window is {}x{} px for a {}x{} mode: the swap chain follows the "
++        "window",
++        pixel_width, pixel_height, fullscreen_mode->w, fullscreen_mode->h);
++  }
+   WindowDestructionReceiver destruction_receiver(this);
+   OnActualSizeUpdate(uint32_t(pixel_width), uint32_t(pixel_height), destruction_receiver);
+   if (destruction_receiver.IsWindowDestroyed()) {
+@@ -282,6 +514,10 @@ void WindowSDL::ApplyNewFullscreen() {
+   if (!sdl_window_) {
+     return;
+   }
++  if (IsFullscreen()) {
++    ApplyFullscreenMode(
++        sdl_window_);  // LOCAL PATCH - MCLA (0480); leaving fullscreen puts the desktop mode back
++  }
+   SDL_SetWindowFullscreen(sdl_window_, IsFullscreen());
+ }
+ 

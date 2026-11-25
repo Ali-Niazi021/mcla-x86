@@ -1,0 +1,352 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Tue, 24 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0450: skip_overwritten_transfers: a rectangle list's guest cull and polygon bits no longer block it; why-not log; poison check
+
+Source: Ours, written for this SDK (S2 lever 4). The feature is Renan Queiroz's rexglue-skip-overwritten-transfers (already
+  in the series, default off because "it does not do its main job yet"); the poison check is the idea of his
+  launcher/dev/overwrite-poison.sdk.patch (TMPOVW) re-done as a cvar, nothing copied
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched file is ReXGlue SDK code (BSD-3-Clause)
+Purpose: RenderTargetCache::GetOverwrittenRectangle (cache.cpp) screened a draw out when the GUEST had a cull mode, a polygon
+  mode or a polygon offset set. For a rectangle list the HOST ignores all of those (draw_util::IsPrimitivePolygonal is false
+  for it: no cull mode, solid fill, front/back offsets unused in both backends), so a title that leaves the bits from the draws
+  before makes every one of its rectangle-list passes "kept" for nothing - the likeliest reason the tone map was kept 444/444
+  times. Now only user clip planes (which can cut a part off) screen it out there. Cvars skip_overwritten_transfers_log
+  (false: why each draw was cut or kept, once per vertex shader / pixel shader / outcome, with the registers read, and a
+  10 s summary) and skip_overwritten_transfers_poison (false: fill what isn't transferred with junk, to see a draw that doesn't
+  rewrite all of it). skip_overwritten_transfers itself stays off. Not built or run.
+Bucket: REDO
+
+0450-skip-overwritten-transfers-fix.patch (mcla-x86 ORC; S2 lever 4, $WORK/scratch/S2/REPORT.md)
+
+What was known. Renan's note (patches/README.md, gpu-round2-2026-10-27.md): with the cut on, the tone map's draw (VS
+1FAB9787BCA32D7C, PS E5EBEFAE4D165CBA: a rectangle list, 3 auto-indexed vertices, blending One/Zero/Add, all four components
+written, no depth or stencil, no kill, viewport and scissor 1280x720, at EDRAM tile 720 over the scene colour's range from tile
+1024) was "kept 444 times ... line 1455" of his layered tree, so its 0.91 ms (39 ms frame, 2-CU RDNA2) was never saved, while
+some smaller post-chain draws were cut. His TMPOVW patch prints the __LINE__ of the `return false` that rejected the draw.
+
+Why. That line is in the first screening checks of GetOverwrittenRectangle. The poison patch's own hunks put its `return false`
+statements at 1432 (draw initiator), 1440 (user clip planes / cull / polygon mode / polygon offset), 1448 (depth, stencil, colour
+mask), 1456 (write mask), 1466 (blend), 1474 (kill / alpha test), ...; his layered tree has the depth-read-state patch's 7 lines above
+the function, so 1455 is 1448 + 7 (depth / stencil / colour mask zero) or 1440 + 15 (the cull group) or 1432 + 23 (the initiator),
+depending on what else the layers added. [INFERENCE] The tone map's state as he recorded it passes the initiator, depth /
+stencil, write mask, blend, kill, MSAA and viewport / scissor checks (he lists exactly those as its state), and the only screening
+check not covered by his description of the draw is the cull / clip / polygon group at old cache.cpp:1538-1543 (series 84), so that
+is the finding; it is not proven without a run, which is why the patch also logs the reason of every kept draw. The group is
+over-conservative for the host, so relaxing it is exact whether or not it was the one:
+  * draw_util.h:61-87: IsPrimitivePolygonal is false for kRectangleList ("the current geometry shader doesn't care about the
+    winding order - allowing backface culling for rectangles currently breaks 4D53082D").
+  * d3d12/pipeline_cache.cpp:1450-1487 and vulkan/pipeline_cache.cpp:1786-1811: the cull mode, the front/back polygon offsets
+    and the wireframe fill mode are set only `if (primitive_polygonal)`; for a rectangle list: no culling, solid, and
+    GetPreferredFacePolygonOffset uses only the parallelogram offset, which moves depth (an accepted draw has no depth test
+    or write, and the vertices' z is checked against the clip planes in the analysis).
+  So whatever cull_front / cull_back / poly_mode / poly_offset_front|back_enable / poly_offset_para_enable the guest left set,
+  the host rewrites the whole rectangle. (A title can leave those bits as the draws before it had them; how this one sets
+  them for the tone map was not recorded anywhere I could read.)
+
+Change (src/graphics/pipeline/render_target/cache.cpp only; no header changes):
+  * The screening check now rejects only pa_cl_clip_cntl.ucp_ena.
+  * Every `return false` of GetOverwrittenRectangle goes through OverwriteRejected("reason") (a file-static pointer to a string
+    literal; the CP thread only). 13 reasons: not one auto-indexed 3-vertex rectangle list or tessellated; user clip planes;
+    depth or stencil used or no colour written; components not all written; blending not a plain replacement; pixels can be
+    discarded; MSAA above 4x or no pitch; the vertex shader's position/kill depends on a fetch; a vertex killed / position not
+    fully written / W not positive and finite; clipped by near or far plane; not corners of one axis-aligned rectangle or out of
+    range; two vertices coincide; no pixel surely covered.
+  * skip_overwritten_transfers_log (hot reload): for each draw that needed transfers (only with skip_overwritten_transfers on),
+      skip_overwritten_transfers: cut to the rectangle 0,0 1280x720 - vertex shader 1FAB..., pixel shader E5EB..., 1x MSAA; RB_DEPTHCONTROL ..., RB_COLOR_MASK ..., RB_BLENDCONTROL0 ..., RB_COLORCONTROL ..., PA_SU_SC_MODE_CNTL ..., PA_CL_CLIP_CNTL ..., PA_CL_VTE_CNTL ..., VGT_DRAW_INITIATOR ...
+      skip_overwritten_transfers: kept (<reason>) - vertex shader ..., pixel shader ..., <n>x MSAA; <the same registers>
+    once for each (vertex shader, pixel shader, outcome) (at most 256), and every 10 s
+      skip_overwritten_transfers: N draws needed ownership transfers in 10.0 s: C cut to a rectangle, K kept: <reason> xN; ...
+  * skip_overwritten_transfers_poison (hot reload): after the ownership change, the rectangle that was cut is cleared to
+    0x8040C0208040C020 in every colour render target of the draw (TransferAndClearRenderTargets with no transfers), so a draw
+    that does not rewrite every pixel of it leaves the junk in the picture instead of a stale value that happens to be right.
+    A picture with the cut and the poison on must equal the picture with it off.
+
+Not exact until checked: skip_overwritten_transfers stays false. Check (frozen world, per Renan's harness: four shots a scene, on /
+off / on / off, free roam, pause menu, title, driving, D3D12 at 1x and the 1080p preset): --skip_overwritten_transfers=true
+--skip_overwritten_transfers_poison=true against off must show no differing pixel among the comparable ones; then the default can
+go to true (the profile, mcla/profile/pc_profile.cpp, is the place for the MCLA title).
+
+clang++ 20.1.8 -fsyntax-only of cache.cpp with the SDK's Release flags: 0 errors, the one warning that was there.
+
+---
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index 844c9a03..0c15bc8b 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -11,10 +11,14 @@
+ 
+ #include <algorithm>
+ #include <bitset>
++#include <chrono>
+ #include <cfloat>
+ #include <cmath>
+ #include <cstring>
+ #include <iterator>
++#include <map>
++#include <set>
++#include <string>
+ #include <tuple>
+ #include <unordered_set>
+ #include <utility>
+@@ -55,6 +59,19 @@ REXCVAR_DEFINE_BOOL(skip_overwritten_transfers, false, "GPU",
+                     "such as a full-screen post-processing pass), only where it can be proven")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// LOCAL PATCH - MCLA (0450): skip_overwritten_transfers' diagnostics and development check.
++REXCVAR_DEFINE_BOOL(skip_overwritten_transfers_log, false, "GPU",
++                    "With skip_overwritten_transfers: log, once for each vertex shader, pixel shader and outcome, the "
++                    "draws that need ownership transfers - cut to a rectangle, or kept and why - with the registers "
++                    "the analysis reads, and a summary every 10 seconds")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(skip_overwritten_transfers_poison, false, "GPU",
++                    "Development check of skip_overwritten_transfers: fill what it doesn't transfer with a junk value "
++                    "(0x8040C0208040C020) instead of leaving the old contents, so that a draw that doesn't rewrite "
++                    "all of it shows in the picture")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_UINT32(edram_tiles, 2048, "GPU",
+                       "Size of the EDRAM emulated, in tiles: 2048 as on the console, or 4096 for "
+                       "titles patched to draw more at once than the console could hold (a "
+@@ -101,6 +118,78 @@ REXCVAR_DEFINE_BOOL(d3d12_depth_resolve_read_state, true, "GPU/D3D12",
+ 
+ namespace rex::graphics {
+ 
++namespace {
++
++// LOCAL PATCH - MCLA (0450): why GetOverwrittenRectangle last said no (a string literal), for
++// skip_overwritten_transfers_log.
++const char* g_overwrite_reject_reason = "";
++
++bool OverwriteRejected(const char* reason) {
++  g_overwrite_reject_reason = reason;
++  return false;
++}
++
++// What became of a draw that needed ownership transfers: once for every vertex shader, pixel shader and outcome (at
++// most 256), the registers the analysis reads; every 10 seconds, the counts. The CP thread only.
++void LogOverwriteOutcome(const RegisterFile& regs, const Shader& vertex_shader,
++                         const Shader& pixel_shader, bool cut, uint32_t rectangle_x,
++                         uint32_t rectangle_y, uint32_t rectangle_width, uint32_t rectangle_height) {
++  static std::set<std::tuple<uint64_t, uint64_t, const char*>> seen;
++  static std::map<const char*, uint64_t> kept_reasons;
++  static uint64_t analysed = 0, cut_count = 0;
++  static std::chrono::steady_clock::time_point window_start = std::chrono::steady_clock::now();
++  const char* reason = g_overwrite_reject_reason;
++  ++analysed;
++  if (cut) {
++    ++cut_count;
++  } else {
++    ++kept_reasons[reason];
++  }
++  const uint64_t vs_hash = vertex_shader.ucode_data_hash();
++  const uint64_t ps_hash = pixel_shader.ucode_data_hash();
++  if (seen.size() < 256 && seen.emplace(vs_hash, ps_hash, cut ? "" : reason).second) {
++    const uint32_t msaa = uint32_t(1) << uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples);
++    if (cut) {
++      REXGPU_INFO(
++          "skip_overwritten_transfers: cut to the rectangle {},{} {}x{} - vertex shader {:016X}, pixel shader "
++          "{:016X}, {}x MSAA; RB_DEPTHCONTROL {:08X}, RB_COLOR_MASK {:08X}, RB_BLENDCONTROL0 {:08X}, "
++          "RB_COLORCONTROL {:08X}, PA_SU_SC_MODE_CNTL {:08X}, PA_CL_CLIP_CNTL {:08X}, PA_CL_VTE_CNTL {:08X}, "
++          "VGT_DRAW_INITIATOR {:08X}",
++          rectangle_x, rectangle_y, rectangle_width, rectangle_height, vs_hash,
++          ps_hash, msaa, regs[XE_GPU_REG_RB_DEPTHCONTROL], regs[XE_GPU_REG_RB_COLOR_MASK],
++          regs[XE_GPU_REG_RB_BLENDCONTROL0], regs[XE_GPU_REG_RB_COLORCONTROL],
++          regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL], regs[XE_GPU_REG_PA_CL_CLIP_CNTL],
++          regs[XE_GPU_REG_PA_CL_VTE_CNTL], regs[XE_GPU_REG_VGT_DRAW_INITIATOR]);
++    } else {
++      REXGPU_INFO(
++          "skip_overwritten_transfers: kept ({}) - vertex shader {:016X}, pixel shader {:016X}, {}x MSAA; "
++          "RB_DEPTHCONTROL {:08X}, RB_COLOR_MASK {:08X}, RB_BLENDCONTROL0 {:08X}, RB_COLORCONTROL {:08X}, "
++          "PA_SU_SC_MODE_CNTL {:08X}, PA_CL_CLIP_CNTL {:08X}, PA_CL_VTE_CNTL {:08X}, VGT_DRAW_INITIATOR {:08X}",
++          reason, vs_hash, ps_hash, msaa, regs[XE_GPU_REG_RB_DEPTHCONTROL], regs[XE_GPU_REG_RB_COLOR_MASK],
++          regs[XE_GPU_REG_RB_BLENDCONTROL0], regs[XE_GPU_REG_RB_COLORCONTROL],
++          regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL], regs[XE_GPU_REG_PA_CL_CLIP_CNTL],
++          regs[XE_GPU_REG_PA_CL_VTE_CNTL], regs[XE_GPU_REG_VGT_DRAW_INITIATOR]);
++    }
++  }
++  const auto now = std::chrono::steady_clock::now();
++  const double seconds = std::chrono::duration<double>(now - window_start).count();
++  if (seconds >= 10.0) {
++    std::string reasons;
++    for (const auto& kept : kept_reasons) {
++      reasons += (reasons.empty() ? ": " : "; ") + std::string(kept.first) + " x" + std::to_string(kept.second);
++    }
++    REXGPU_INFO(
++        "skip_overwritten_transfers: {} draws needed ownership transfers in {:.1f} s: {} cut to a rectangle, {} "
++        "kept{}",
++        analysed, seconds, cut_count, analysed - cut_count, reasons);
++    analysed = cut_count = 0;
++    kept_reasons.clear();
++    window_start = now;
++  }
++}
++
++}  // namespace
++
+ void RenderTargetCache::GetPSIColorFormatInfo(xenos::ColorRenderTargetFormat format,
+                                               uint32_t write_mask, float& clamp_rgb_low,
+                                               float& clamp_alpha_low, float& clamp_rgb_high,
+@@ -937,10 +1026,17 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+         break;
+       }
+     }
+-    if (transfers_needed &&
+-        GetOverwrittenRectangle(vertex_shader, *pixel_shader, normalized_depth_control,
+-                                normalized_color_mask, last_update_overwritten_rectangle_)) {
+-      last_update_overwritten_rectangle_valid_ = true;
++    if (transfers_needed) {
++      last_update_overwritten_rectangle_valid_ =
++          GetOverwrittenRectangle(vertex_shader, *pixel_shader, normalized_depth_control,
++                                  normalized_color_mask, last_update_overwritten_rectangle_);
++      if (REXCVAR_GET(skip_overwritten_transfers_log)) {
++        LogOverwriteOutcome(regs, vertex_shader, *pixel_shader, last_update_overwritten_rectangle_valid_,
++                            last_update_overwritten_rectangle_.x_pixels,
++                            last_update_overwritten_rectangle_.y_pixels,
++                            last_update_overwritten_rectangle_.width_pixels,
++                            last_update_overwritten_rectangle_.height_pixels);
++      }
+     }
+   }
+ 
+@@ -958,6 +1054,22 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+     return true;
+   }
+ 
++  // Development check (skip_overwritten_transfers_poison): instead of leaving the old contents where the transfers were
++  // left out, fill that rectangle with a value that doesn't look like anything, so a draw that doesn't rewrite all of it
++  // shows up (a stale value that happens to be right would hide that).
++  if (last_update_overwritten_rectangle_valid_ && REXCVAR_GET(skip_overwritten_transfers_poison)) {
++    static const std::vector<Transfer> no_transfers;
++    for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
++      if (!(depth_and_color_rts_used_bits & (uint32_t(1) << i)) || !rts[i]) {
++        continue;
++      }
++      RenderTarget* poison_render_target = rts[i];
++      const uint64_t poison_value = UINT64_C(0x8040C0208040C020);
++      TransferAndClearRenderTargets(1, &poison_render_target, &no_transfers, &poison_value, nullptr,
++                                    last_update_overwritten_rectangle_);
++    }
++  }
++
+   // If everything succeeded, update the used render targets.
+   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+     last_update_used_render_targets_[i] =
+@@ -1531,15 +1643,16 @@ bool RenderTargetCache::GetOverwrittenRectangle(const Shader& vertex_shader,
+       (xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type) &&
+        regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
+            xenos::VGTOutputPath::kTessellationEnable)) {
+-    return false;
++    return OverwriteRejected("not one auto-indexed 3-vertex rectangle list, or tessellated");
+   }
+   auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
+   auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+-  if (pa_cl_clip_cntl.ucp_ena || pa_su_sc_mode_cntl.cull_front || pa_su_sc_mode_cntl.cull_back ||
+-      pa_su_sc_mode_cntl.poly_mode != xenos::PolygonModeEnable::kDisabled ||
+-      pa_su_sc_mode_cntl.poly_offset_front_enable || pa_su_sc_mode_cntl.poly_offset_back_enable ||
+-      pa_su_sc_mode_cntl.poly_offset_para_enable) {
+-    return false;
++  // Culling, the polygon mode and the front and back polygon offsets are for polygonal primitives, and the host draws a
++  // rectangle list as one that isn't (draw_util::IsPrimitivePolygonal; Direct3D 12 and Vulkan: no cull mode, solid fill,
++  // only the parallelogram offset, which moves depth): however the guest has those bits set (a title leaves them as the
++  // draws before it had them), the host draws the whole rectangle. User clip planes can take a part of it away.
++  if (pa_cl_clip_cntl.ucp_ena) {
++    return OverwriteRejected("user clip planes are enabled");
+   }
+ 
+   // Nothing but color, all components of every color render target replaced:
+@@ -1547,7 +1660,7 @@ bool RenderTargetCache::GetOverwrittenRectangle(const Shader& vertex_shader,
+   // tested away.
+   if (normalized_depth_control.z_enable || normalized_depth_control.stencil_enable ||
+       !normalized_color_mask) {
+-    return false;
++    return OverwriteRejected("depth or stencil is used, or no color is written");
+   }
+   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+     uint32_t rt_write_mask = (normalized_color_mask >> (4 * i)) & 0b1111;
+@@ -1555,7 +1668,7 @@ bool RenderTargetCache::GetOverwrittenRectangle(const Shader& vertex_shader,
+       continue;
+     }
+     if (rt_write_mask != 0b1111) {
+-      return false;
++      return OverwriteRejected("a color render target's components are not all written");
+     }
+     auto rb_blendcontrol =
+         regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+@@ -1565,7 +1678,7 @@ bool RenderTargetCache::GetOverwrittenRectangle(const Shader& vertex_shader,
+         rb_blendcontrol.alpha_srcblend != xenos::BlendFactor::kOne ||
+         rb_blendcontrol.alpha_destblend != xenos::BlendFactor::kZero ||
+         rb_blendcontrol.alpha_comb_fcn != xenos::BlendOp::kAdd) {
+-      return false;
++      return OverwriteRejected("blending is not a plain replacement");
+     }
+   }
+   auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+@@ -1573,12 +1686,12 @@ bool RenderTargetCache::GetOverwrittenRectangle(const Shader& vertex_shader,
+       (rb_colorcontrol.alpha_test_enable &&
+        rb_colorcontrol.alpha_func != xenos::CompareFunction::kAlways) ||
+       rb_colorcontrol.alpha_to_mask_enable) {
+-    return false;
++    return OverwriteRejected("pixels can be discarded (kill, alpha test or alpha to mask)");
+   }
+   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+   xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
+   if (msaa_samples > xenos::MsaaSamples::k4X || !rb_surface_info.surface_pitch) {
+-    return false;
++    return OverwriteRejected("MSAA above 4x, or no surface pitch");
+   }
+ 
+   // The vertices, on the CPU. The vertex shader may fetch textures (the tone
+@@ -1605,7 +1718,7 @@ bool RenderTargetCache::GetOverwrittenRectangle(const Shader& vertex_shader,
+   }
+   interpreter.SetExportSink(nullptr);
+   if (!vertices_known) {
+-    return false;
++    return OverwriteRejected("the vertex shader's position or kill depends on a fetch the CPU can't evaluate");
+   }
+ 
+   // The vertices in pixels, as the host shaders transform them: the division
+@@ -1635,7 +1748,7 @@ bool RenderTargetCache::GetOverwrittenRectangle(const Shader& vertex_shader,
+     const ClearRectangleVertexExportSink& vertex = vertices[i];
+     float w = vertex.position[3];
+     if (vertex.killed || vertex.position_mask != 0b1111 || !(w > 0.0f) || !(w < FLT_MAX)) {
+-      return false;
++      return OverwriteRejected("a vertex is killed, its position isn't fully written, or its W isn't positive and finite");
+     }
+     // The factor the host shaders multiply by: 1 / W, or W as it is if the
+     // vertex shader gives 1 / W.
+@@ -1645,7 +1758,7 @@ bool RenderTargetCache::GetOverwrittenRectangle(const Shader& vertex_shader,
+       // Not clipped away by the near and the far planes.
+       float z = vertex.position[2] * (pa_cl_vte_cntl.vtx_z_fmt ? 1.0f : w_factor);
+       if (!(z >= (pa_cl_clip_cntl.dx_clip_space_def ? 0.0f : -1.0f) && z <= 1.0f)) {
+-        return false;
++        return OverwriteRejected("a vertex is clipped by the near or far plane");
+       }
+     }
+     for (uint32_t j = 0; j < 2; ++j) {
+@@ -1661,13 +1774,13 @@ bool RenderTargetCache::GetOverwrittenRectangle(const Shader& vertex_shader,
+     if (!(edges[i][0] < edges[i][1]) || (a != edges[i][0] && a != edges[i][1]) ||
+         (b != edges[i][0] && b != edges[i][1]) || (c != edges[i][0] && c != edges[i][1]) ||
+         !(edges[i][0] > -4096.0f) || !(edges[i][1] < 4096.0f)) {
+-      return false;
++      return OverwriteRejected("the three vertices aren't corners of one axis-aligned rectangle, or it is out of range");
+     }
+   }
+   for (uint32_t i = 0; i < 3; ++i) {
+     for (uint32_t j = i + 1; j < 3; ++j) {
+       if (pixels[i][0] == pixels[j][0] && pixels[i][1] == pixels[j][1]) {
+-        return false;
++        return OverwriteRejected("two vertices are at the same place");
+       }
+     }
+   }
+@@ -1719,7 +1832,7 @@ bool RenderTargetCache::GetOverwrittenRectangle(const Shader& vertex_shader,
+                                            scissor.offset[i] + scissor.extent[i])));
+     high = std::min(high, int32_t(limits[i]));
+     if (low >= high) {
+-      return false;
++      return OverwriteRejected("no pixel is surely covered");
+     }
+     covered[i][0] = low;
+     covered[i][1] = high;
