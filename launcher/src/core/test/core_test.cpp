@@ -70,7 +70,7 @@ int g_failures = 0;
     if (text_.find(needle) == std::string::npos) {                                                       \
       ++g_failures;                                                                                      \
       std::printf("FAIL %s:%d: %s does not contain \"%s\"\n  text: %s\n", __FILE__, __LINE__, #text,    \
-                  needle, text_.c_str());                                                                \
+                  std::string(needle).c_str(), text_.c_str());                                           \
     }                                                                                                    \
   } while (0)
 
@@ -132,6 +132,33 @@ void WriteText(const fs::path& path, const std::string& text) {
 fs::path g_temp;  // scratch folder of this run
 
 fs::path Temp(const char* name) { return g_temp / name; }
+
+fs::path SelfExe() {
+  wchar_t buf[MAX_PATH * 2] = {};
+  GetModuleFileNameW(nullptr, buf, static_cast<DWORD>(std::size(buf)));
+  return buf;
+}
+
+// A game executable that asks for the UTF-8 code page: a copy of this program with such a manifest added (set by main).
+fs::path g_utf8_exe;
+
+const char kUtf8Manifest[] =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
+    "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\"><application>"
+    "<windowsSettings><activeCodePage xmlns=\"http://schemas.microsoft.com/SMI/2019/WindowsSettings\">UTF-8</activeCodePage>"
+    "</windowsSettings></application></assembly>";
+
+bool MakeUtf8Exe(const fs::path& dest) {
+  std::error_code ec;
+  fs::create_directories(dest.parent_path(), ec);
+  fs::copy_file(SelfExe(), dest, fs::copy_options::overwrite_existing, ec);
+  if (ec) return false;
+  const HANDLE update = BeginUpdateResourceW(dest.c_str(), FALSE);
+  if (!update) return false;
+  const BOOL added = UpdateResourceW(update, RT_MANIFEST, MAKEINTRESOURCEW(1), MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL),
+                                     const_cast<char*>(kUtf8Manifest), sizeof(kUtf8Manifest) - 1);
+  return EndUpdateResourceW(update, added ? FALSE : TRUE) && added;
+}
 
 Schema MustParse(const std::string& text, const char* what) {
   std::string error = "unset";
@@ -196,6 +223,7 @@ const char* kSchemaText = R"JSON({
      "cvar": "game_data_root", "default": ""},
     {"id": "tag", "label": "Tag", "help": "h", "category": "misc", "type": "string", "cvar": "user_tag", "default": "",
      "emit": "always"},
+    {"id": "key", "label": "Key", "help": "h", "category": "misc", "type": "string", "cvar": "keybind_a", "default": "A"},
     {"id": "log", "label": "Log", "help": "h", "category": "misc", "type": "bool", "cvar": "log_enabled", "default": true,
      "emit": "always"},
     {"id": "secret", "label": "Secret", "help": "h", "category": "misc", "type": "bool", "cvar": "x_never",
@@ -204,8 +232,8 @@ const char* kSchemaText = R"JSON({
   ]
 })JSON";
 
-// The arguments with the `emit: always` settings first-class: a default Values gives exactly these.
-const Args kDefaultArgs = {L"--user_tag=", L"--log_enabled=true"};
+// What a default Values gives: the `emit: always` settings that have a value ("tag" is empty, so it is not passed).
+const Args kDefaultArgs = {L"--log_enabled=true"};
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Tests
@@ -242,7 +270,7 @@ void TestSchemaParse() {
   const Schema s = MustParse(kSchemaText, "kSchemaText");
   CHECK_EQ(s.version, 1);
   CHECK_EQ(s.categories.size(), size_t(2));
-  CHECK_EQ(s.settings.size(), size_t(13));
+  CHECK_EQ(s.settings.size(), size_t(14));
   CHECK_EQ(s.presets.size(), size_t(3));
   CHECK_EQ(s.warnings.size(), size_t(1));  // the deliberately empty preset; "_comment" and // comments are not reported
   CHECK_HAS(s.warnings.empty() ? "" : s.warnings[0], "\"set\" is empty");
@@ -433,8 +461,8 @@ void TestBuildArgs() {
   // A value equal to the default is not emitted (an enum's "" default, a float given as an int).
   CHECK_EQ(BuildArgs(s, Vals(s, {{"profile", ""}, {"scale", 1}, {"fps", 0}, {"vsync", true}})), kDefaultArgs);
   // Floats: shortest text that reads back, no trailing zeros; tiny differences from the default are not a change.
-  CHECK_EQ(BuildArgs(s, Vals(s, {{"scale", 1.5}})), (Args{L"--resolution_scale=1.5", L"--user_tag=", L"--log_enabled=true"}));
-  CHECK_EQ(BuildArgs(s, Vals(s, {{"scale", 2.0}})), (Args{L"--resolution_scale=2", L"--user_tag=", L"--log_enabled=true"}));
+  CHECK_EQ(BuildArgs(s, Vals(s, {{"scale", 1.5}})), (Args{L"--resolution_scale=1.5", L"--log_enabled=true"}));
+  CHECK_EQ(BuildArgs(s, Vals(s, {{"scale", 2.0}})), (Args{L"--resolution_scale=2", L"--log_enabled=true"}));
   CHECK_EQ(BuildArgs(s, Vals(s, {{"scale", 1.0000000000001}})), kDefaultArgs);
   CHECK_EQ(FormatCvarValue(Json(0.1)), std::string("0.1"));
   CHECK_EQ(FormatCvarValue(Json(true)), std::string("true"));
@@ -443,20 +471,20 @@ void TestBuildArgs() {
   CHECK_EQ(FormatCvarValue(Json(1.0 / 3.0)), std::string("0.3333333333333333"));
 
   // emit: always puts a default on the command line; emit: never keeps a changed value off it; launcher-only never.
-  CHECK_EQ(BuildArgs(s, Vals(s, {{"log", false}})), (Args{L"--user_tag=", L"--log_enabled=false"}));
+  CHECK_EQ(BuildArgs(s, Vals(s, {{"log", false}})), (Args{L"--log_enabled=false"}));
   CHECK_EQ(BuildArgs(s, Vals(s, {{"secret", true}, {"close", true}})), kDefaultArgs);
 
   // requires: hidden settings are not emitted whatever their stored value is.
   CHECK_EQ(BuildArgs(s, Vals(s, {{"fsr_sharp", 0.8}})), kDefaultArgs);  // fsr is off
-  CHECK_EQ(BuildArgs(s, Vals(s, {{"fsr", true}})), (Args{L"--mcla_fsr=true", L"--user_tag=", L"--log_enabled=true"}));
+  CHECK_EQ(BuildArgs(s, Vals(s, {{"fsr", true}})), (Args{L"--mcla_fsr=true", L"--log_enabled=true"}));
   CHECK_EQ(BuildArgs(s, Vals(s, {{"fsr", true}, {"fsr_sharp", 0.8}})),
-           (Args{L"--mcla_fsr=true", L"--mcla_fsr_sharp=0.8", L"--user_tag=", L"--log_enabled=true"}));
+           (Args{L"--mcla_fsr=true", L"--mcla_fsr_sharp=0.8", L"--log_enabled=true"}));
   // Chain: fsr_adv needs fsr_sharp == 0.5, which itself needs fsr.
   CHECK_EQ(BuildArgs(s, Vals(s, {{"fsr", false}, {"fsr_sharp", 0.5}, {"fsr_adv", 3}})), kDefaultArgs);
   CHECK_EQ(BuildArgs(s, Vals(s, {{"fsr", true}, {"fsr_sharp", 0.8}, {"fsr_adv", 3}})),
-           (Args{L"--mcla_fsr=true", L"--mcla_fsr_sharp=0.8", L"--user_tag=", L"--log_enabled=true"}));
+           (Args{L"--mcla_fsr=true", L"--mcla_fsr_sharp=0.8", L"--log_enabled=true"}));
   CHECK_EQ(BuildArgs(s, Vals(s, {{"fsr", true}, {"fsr_sharp", 0.5}, {"fsr_adv", 3}})),
-           (Args{L"--mcla_fsr=true", L"--mcla_fsr_sharp=0.5", L"--mcla_fsr_adv=3", L"--user_tag=", L"--log_enabled=true"}));
+           (Args{L"--mcla_fsr=true", L"--mcla_fsr_sharp=0.5", L"--mcla_fsr_adv=3", L"--log_enabled=true"}));
   const SettingDef* sharp = s.FindSetting("fsr_sharp");
   const SettingDef* adv = s.FindSetting("fsr_adv");
   CHECK(sharp && adv);
@@ -471,12 +499,18 @@ void TestBuildArgs() {
   // A stored value of the wrong type or outside the range is ignored (the default stands), never emitted.
   CHECK_EQ(BuildArgs(s, Vals(s, {{"vsync", "no"}, {"fps", 9999}, {"profile", "4k"}, {"scale", "big"}})), kDefaultArgs);
 
-  // Values the command line must carry whole: spaces, quotes, trailing backslash, non-ASCII, empty.
-  const Args raw = BuildArgs(s, Vals(s, {{"data_root", "C:\\Program Files\\\xC3\x9C" "ser\\"}, {"tag", "say \"hi\""}}));
-  CHECK_EQ(raw, (Args{L"--game_data_root=C:\\Program Files\\\u00DC" L"ser\\", L"--user_tag=say \"hi\"", L"--log_enabled=true"}));
+  // Values the command line must carry whole: spaces, quotes, trailing backslash, non-ASCII. A path setting is passed
+  // absolute and normalised (here: forward slashes, trailing slash).
+  const fs::path base = L"C:\\Games\\Midnight Club";
+  const Args raw = BuildArgs(
+      s, Vals(s, {{"data_root", "C:/Program Files/\xC3\x9C" "ser/"}, {"tag", "say \"hi\""}, {"key", "D:\\x y\\"}}), nullptr,
+      base);
+  CHECK_EQ(raw, (Args{L"--game_data_root=C:\\Program Files\\\u00DC" L"ser", L"--user_tag=say \"hi\"", L"--keybind_a=D:\\x y\\",
+                      L"--log_enabled=true"}));
   const fs::path exe = L"C:\\Program Files\\mcla\\mcla.exe";
   const std::wstring line = FormatCommandLine(exe, raw);
-  CHECK_HAS(WideToUtf8(line), "\"--game_data_root=C:\\Program Files\\\xC3\x9C" "ser\\\\\"");
+  CHECK_HAS(WideToUtf8(line), "\"--game_data_root=C:\\Program Files\\\xC3\x9C" "ser\"");
+  CHECK_HAS(WideToUtf8(line), "\"--keybind_a=D:\\x y\\\\\"");  // the trailing backslash is doubled in front of the quote
   Args round = {exe.native()};
   round.insert(round.end(), raw.begin(), raw.end());
   CHECK_EQ(ArgvOf(line), round);
@@ -485,7 +519,7 @@ void TestBuildArgs() {
   Values p = DefaultValues(s);
   std::string error;
   CHECK(ApplyPreset(s, "p1080", p, &error));
-  CHECK_EQ(BuildArgs(s, p), (Args{L"--mcla_profile=1080p", L"--mcla_fps_target=60", L"--user_tag=", L"--log_enabled=true"}));
+  CHECK_EQ(BuildArgs(s, p), (Args{L"--mcla_profile=1080p", L"--mcla_fps_target=60", L"--log_enabled=true"}));
   const Preset* match = MatchingPreset(s, p);
   CHECK(match && match->id == "p1080");
   p["tag"] = "x";  // not part of a preset: still matches
@@ -523,7 +557,7 @@ void TestStore() {
   CHECK(!fs::exists(Temp("store/launcher.json.tmp")));
   const Json saved = Json::parse(ReadText(file));
   CHECK_EQ(saved.at("version"), Json(kSettingsFileVersion));
-  CHECK_EQ(saved.at("values").size(), size_t(13));  // every setting is written
+  CHECK_EQ(saved.at("values").size(), size_t(14));  // every setting is written
   CHECK_EQ(saved.at("values").at("tag"), Json("caf\xC3\xA9"));
   CHECK_HAS(ReadText(file), "caf\xC3\xA9");  // UTF-8, not \u escapes
   notes.clear();
@@ -557,17 +591,18 @@ void TestStore() {
   Json bad = Json::object();
   bad["version"] = 1;
   bad["values"] = Json{{"vsync", "yes"}, {"fps", 9999}, {"scale", -3}, {"profile", "4k"}, {"mode", 3.0}, {"tag", 5},
-                       {"fsr", true}};
+                       {"fsr", true}, {"key", ""}};
   WriteText(file, bad.dump());
   notes.clear();
   const Values repaired = LoadValues(s, file, &notes);
-  CHECK_EQ(notes.size(), size_t(5));
+  CHECK_EQ(notes.size(), size_t(6));
   CHECK_EQ(repaired.at("vsync"), Json(true));      // default
   CHECK_EQ(repaired.at("fps"), Json(240));         // clamped
   CHECK_EQ(repaired.at("scale"), Json(0.5));       // clamped
   CHECK_EQ(repaired.at("profile"), Json(""));      // default
   CHECK_EQ(repaired.at("mode"), Json(3));          // 3.0 is the integer option 3
   CHECK_EQ(repaired.at("tag"), Json(""));          // default
+  CHECK_EQ(repaired.at("key"), Json("A"));         // "" is not a value over a non-empty default
   CHECK_EQ(repaired.at("fsr"), Json(true));
   std::string all_notes;
   for (const std::string& n : notes) all_notes += n + "\n";
@@ -602,15 +637,15 @@ void TestStore() {
 }
 
 void TestDataRoot() {
-  CHECK(!ValidateGameDataRoot({}).ok);
-  CHECK_HAS(ValidateGameDataRoot({}).issues.at(0), "No game data folder");
-  CHECK_HAS(ValidateGameDataRoot(Temp("no_such_dir")).issues.at(0), "does not exist");
+  CHECK(!ValidateGameDataRoot({}, g_utf8_exe).ok);
+  CHECK_HAS(ValidateGameDataRoot({}, g_utf8_exe).issues.at(0), "No game data folder");
+  CHECK_HAS(ValidateGameDataRoot(Temp("no_such_dir"), g_utf8_exe).issues.at(0), "does not exist");
   WriteText(Temp("a_file"), "x");
-  CHECK_HAS(ValidateGameDataRoot(Temp("a_file")).issues.at(0), "not a folder");
+  CHECK_HAS(ValidateGameDataRoot(Temp("a_file"), g_utf8_exe).issues.at(0), "not a folder");
 
   const fs::path root = Temp("data");
   fs::create_directories(root);
-  DataRootCheck c = ValidateGameDataRoot(root);
+  DataRootCheck c = ValidateGameDataRoot(root, g_utf8_exe);
   CHECK(!c.ok);
   CHECK_EQ(c.issues.size(), size_t(5));  // default.xex + the four archives
   CHECK_HAS(c.issues.at(0), "default.xex is missing");
@@ -620,7 +655,7 @@ void TestDataRoot() {
   WriteText(root / "default.xex", "tiny");
   for (const char* name : {"xarchive_audio.rpf", "xarchive_audlo.rpf", "xarchive_cache.rpf", "xarchive_music.rpf"})
     WriteText(root / name, "x");
-  c = ValidateGameDataRoot(root);
+  c = ValidateGameDataRoot(root, g_utf8_exe);
   CHECK(!c.ok);
   CHECK_EQ(c.issues.size(), size_t(1));
   CHECK_HAS(c.issues.at(0), "default.xex is 4 bytes");
@@ -629,20 +664,20 @@ void TestDataRoot() {
   std::error_code ec;
   fs::resize_file(root / "default.xex", kDefaultXexSize, ec);
   CHECK(!ec);
-  c = ValidateGameDataRoot(root);
+  c = ValidateGameDataRoot(root, g_utf8_exe);
   CHECK(c.ok);
   CHECK(c.issues.empty());
 
   fs::remove(root / "xarchive_music.rpf");
   WriteText(root / "xarchive_cache.rpf", "");
-  c = ValidateGameDataRoot(root);
+  c = ValidateGameDataRoot(root, g_utf8_exe);
   CHECK(!c.ok);
   CHECK_EQ(c.issues.size(), size_t(2));
 
   // The parent of the real folder: a hint to the subfolder.
   fs::create_directories(Temp("data_parent/game"));
   WriteText(Temp("data_parent/game/default.xex"), "x");
-  CHECK_HAS(ValidateGameDataRoot(Temp("data_parent")).issues.at(0), "subfolder \"game\"");
+  CHECK_HAS(ValidateGameDataRoot(Temp("data_parent"), g_utf8_exe).issues.at(0), "subfolder \"game\"");
 
   // FindGameExeIn
   CHECK(FindGameExeIn(Temp("data")).empty());
@@ -650,6 +685,161 @@ void TestDataRoot() {
   CHECK(FindGameExeIn(Temp("data")) == Temp("data") / "mcla.exe");
   CHECK(!LauncherDir().empty());
   CHECK(DefaultSchemaPath().filename() == L"settings.json");
+}
+
+void TestUtf8Manifest() {
+  CHECK(ManifestRequestsUtf8(kUtf8Manifest));
+  CHECK(ManifestRequestsUtf8("<assembly><ws2:activeCodePage xmlns:ws2=\"x\">\n  Utf-8 </ws2:activeCodePage></assembly>"));
+  CHECK(!ManifestRequestsUtf8("<activeCodePage>Legacy</activeCodePage>"));
+  CHECK(!ManifestRequestsUtf8("<!-- <activeCodePage>UTF-8</activeCodePage> -->"));
+  CHECK(!ManifestRequestsUtf8("<assembly><application/></assembly>"));
+  CHECK(!ManifestRequestsUtf8("<activeCodePage/>"));
+  CHECK(!ManifestRequestsUtf8("<activeCodePage>"));
+  CHECK(!ManifestRequestsUtf8(""));
+
+  // Real executables: the resource is read from the file.
+  WriteText(Temp("notpe/mcla.exe"), "MZ not an executable");
+  CHECK(!GameUsesUtf8CodePage({}));
+  CHECK(!GameUsesUtf8CodePage(Temp("nope.exe")));
+  CHECK(!GameUsesUtf8CodePage(Temp("notpe/mcla.exe")));
+  CHECK(!GameUsesUtf8CodePage(SelfExe()));  // this program has no such manifest
+  CHECK(GameUsesUtf8CodePage(g_utf8_exe));
+  CHECK(GameUsesUtf8CodePage(g_utf8_exe));  // (the second answer comes from the cache)
+}
+
+// A complete data folder, whatever its name.
+void MakeDataRoot(const fs::path& dir) {
+  fs::create_directories(dir);
+  WriteText(dir / "default.xex", "x");
+  std::error_code ec;
+  fs::resize_file(dir / "default.xex", kDefaultXexSize, ec);
+  for (const char* name : {"xarchive_audio.rpf", "xarchive_audlo.rpf", "xarchive_cache.rpf", "xarchive_music.rpf"})
+    WriteText(dir / name, "x");
+}
+
+void TestNonAsciiPaths() {
+  const fs::path plain = SelfExe();  // a game executable without the UTF-8 manifest
+  const fs::path odd = g_temp / L"d\u00E4t\u00E4";
+  MakeDataRoot(odd);
+
+  CHECK_EQ(NonAsciiPathProblem(L"C:\\plain\\dir", plain), std::string());
+  CHECK_HAS(NonAsciiPathProblem(odd, plain), "path contains non-ASCII characters; the game cannot open it yet: ");
+  CHECK_EQ(NonAsciiPathProblem(odd, g_utf8_exe), std::string());
+  CHECK(IsAsciiPath(L"C:\\plain") && !IsAsciiPath(odd));
+
+  // The data root: the only problem of a complete folder is its name.
+  DataRootCheck c = ValidateGameDataRoot(odd, plain);
+  CHECK(!c.ok);
+  CHECK_EQ(c.issues.size(), size_t(1));
+  CHECK_HAS(c.issues.empty() ? "" : c.issues[0], "path contains non-ASCII characters; the game cannot open it yet");
+  c = ValidateGameDataRoot(odd, g_utf8_exe);
+  CHECK(c.ok);
+  CHECK(!ValidateGameDataRoot(odd).ok);  // no game exe given: FindGameExe(), none next to this test
+  c = ValidateGameDataRoot(g_temp / L"missing_d\u00E4t\u00E4", plain);  // both problems are reported
+  CHECK_EQ(c.issues.size(), size_t(2));
+
+  // The user data root: empty is fine.
+  CHECK(ValidateUserDataRoot({}, plain).ok);
+  c = ValidateUserDataRoot(odd, plain);
+  CHECK(!c.ok);
+  CHECK_HAS(c.issues.empty() ? "" : c.issues[0], "The user data folder path contains non-ASCII characters");
+  CHECK(ValidateUserDataRoot(odd, g_utf8_exe).ok);
+  CHECK(ValidateUserDataRoot(Temp("no_such_user_dir"), g_utf8_exe).ok);  // the game creates it
+  WriteText(Temp("user_file"), "x");
+  CHECK(!ValidateUserDataRoot(Temp("user_file"), g_utf8_exe).ok);
+
+  // Through the settings: every active path setting, not the other string settings.
+  const Schema s = MustParse(kSchemaText, "kSchemaText");
+  const Values v = Vals(s, {{"data_root", PathToUtf8(odd)}, {"tag", "caf\xC3\xA9"}});
+  std::vector<PathProblem> problems = CheckPathSettings(s, v, plain);
+  CHECK_EQ(problems.size(), size_t(1));
+  if (!problems.empty()) {
+    CHECK_EQ(problems[0].setting_id, std::string("data_root"));
+    CHECK_HAS(problems[0].message, "Game folder: path contains non-ASCII characters; the game cannot open it yet");
+  }
+  CHECK(CheckPathSettings(s, v, g_utf8_exe).empty());
+  CHECK(CheckPathSettings(s, Vals(s, {{"data_root", "C:\\plain"}}), plain).empty());
+  CHECK(CheckPathSettings(s, DefaultValues(s), plain).empty());
+  // A relative path is judged where it resolves to.
+  CHECK_EQ(CheckPathSettings(s, Vals(s, {{"data_root", "sub"}}), plain, L"C:\\Users\\Jos\u00E9\\mcla").size(), size_t(1));
+  CHECK(CheckPathSettings(s, Vals(s, {{"data_root", "sub"}}), plain, L"C:\\Users\\Jose\\mcla").empty());
+}
+
+void TestEmptyValuesAndPaths() {
+  const Schema s = MustParse(kSchemaText, "kSchemaText");
+  const fs::path base = L"C:\\Games\\Midnight Club";
+  const SettingDef* key = s.FindSetting("key");
+  const SettingDef* tag = s.FindSetting("tag");
+  CHECK(key && tag);
+  if (!key || !tag) return;
+
+  // An empty string setting is not passed (`--name=` would swallow the next argument): "tag" has `emit: always`.
+  std::vector<std::string> notes;
+  CHECK_EQ(BuildArgs(s, DefaultValues(s), &notes, base), kDefaultArgs);
+  CHECK_EQ(notes.size(), size_t(1));
+  CHECK_HAS(notes.empty() ? "" : notes[0], "\"Tag\" is empty: it is not passed to the game");
+  CHECK_EQ(BuildArgs(s, DefaultValues(s), nullptr, base), kDefaultArgs);  // notes are optional
+
+  // A string with a non-empty default: "" is not a value, the default stands.
+  std::string why;
+  CHECK(!CheckValue(*key, Json(""), &why));
+  CHECK_HAS(why, "the default is used");
+  CHECK(CheckValue(*key, Json("B")));
+  CHECK(CheckValue(*tag, Json("")));  // its default is empty: "" is fine
+  const Values emptied = Vals(s, {{"key", ""}});
+  CHECK_EQ(EffectiveValue(*key, emptied), Json("A"));
+  notes.clear();
+  CHECK_EQ(BuildArgs(s, emptied, &notes, base), kDefaultArgs);
+  CHECK_EQ(notes.size(), size_t(2));  // the tag, and the key that fell back to its default
+  CHECK_HAS(notes.size() > 1 ? notes[1] : "", "\"Key\" is empty: its default is used");
+  CHECK_EQ(BuildArgs(s, Vals(s, {{"key", "B"}}), nullptr, base), (Args{L"--keybind_a=B", L"--log_enabled=true"}));
+  // Whatever the values, no argument is empty or ends in '=' (and so none swallows its successor).
+  for (const char* text : {"", " ", "\t", "x"}) {
+    const Args args = BuildArgs(s, Vals(s, {{"key", text}, {"data_root", text}, {"tag", text}}), nullptr, base);
+    for (const std::wstring& a : args) CHECK(!a.empty() && a.back() != L'=');
+  }
+  // A blank path is empty too.
+  notes.clear();
+  CHECK_EQ(BuildArgs(s, Vals(s, {{"data_root", "   "}}), &notes, base), kDefaultArgs);
+  CHECK_EQ(notes.size(), size_t(2));
+  CHECK_HAS(notes.empty() ? "" : notes[0], "\"Game folder\" is empty: it is not passed to the game");
+
+  // An enum option with the empty value that is not the default passes nothing: the schema warns, BuildArgs skips it.
+  std::string error;
+  const Schema es = ParseSchema(
+      Doc(Set("e", R"("type":"enum","cvar":"e_cvar","default":"perf","options":[{"value":"","label":"None"},{"value":"perf","label":"Perf"}])")),
+      &error, "t");
+  CHECK(error.empty());
+  CHECK_EQ(es.warnings.size(), size_t(1));
+  CHECK_HAS(es.warnings.empty() ? "" : es.warnings[0], "empty value");
+  Values ev = DefaultValues(es);
+  CHECK(BuildArgs(es, ev).empty());
+  ev["e"] = "";
+  notes.clear();
+  CHECK(BuildArgs(es, ev, &notes).empty());
+  CHECK_EQ(notes.size(), size_t(1));
+
+  // Paths are passed absolute and normalised; a relative one is taken from the launcher's folder.
+  const auto root_arg = [&](const char* value) {
+    return BuildArgs(s, Vals(s, {{"data_root", value}}), nullptr, base).front();
+  };
+  CHECK_EQ(root_arg("data"), std::wstring(L"--game_data_root=C:\\Games\\Midnight Club\\data"));
+  CHECK_EQ(root_arg("..\\x\\.\\y\\"), std::wstring(L"--game_data_root=C:\\Games\\x\\y"));
+  CHECK_EQ(root_arg("  data  "), std::wstring(L"--game_data_root=C:\\Games\\Midnight Club\\data"));
+  CHECK_EQ(root_arg("D:/Game Data/"), std::wstring(L"--game_data_root=D:\\Game Data"));
+  CHECK_EQ(root_arg("D:\\a\\..\\b"), std::wstring(L"--game_data_root=D:\\b"));
+  CHECK_EQ(root_arg("D:\\"), std::wstring(L"--game_data_root=D:\\"));
+  CHECK_EQ(root_arg("."), std::wstring(L"--game_data_root=C:\\Games\\Midnight Club"));
+  CHECK_EQ(ResolvePath({}, base), fs::path());
+  CHECK_EQ(ResolvePath(L"data", base), fs::path(L"C:\\Games\\Midnight Club\\data"));
+  CHECK_EQ(ResolvePath(L"C:\\Games\\Midnight Club\\data\\", base), fs::path(L"C:\\Games\\Midnight Club\\data"));
+  // Other string settings are not paths: passed as they are.
+  CHECK_EQ(BuildArgs(s, Vals(s, {{"key", "a/b/"}}), nullptr, base),
+           (Args{L"--keybind_a=a/b/", L"--log_enabled=true"}));
+  // A relative root with no explicit base is taken from the launcher's folder (this program's).
+  const Args rel = BuildArgs(s, Vals(s, {{"data_root", "gamedata"}}));
+  CHECK_EQ(rel.front(), L"--game_data_root=" + (LauncherDir() / L"gamedata").lexically_normal().native());
+  CHECK_HAS(ValidateGameDataRoot(L"gamedata", g_utf8_exe).issues.at(0), PathToUtf8((LauncherDir() / L"gamedata").native()));
 }
 
 // The child of TestLaunch: this executable run as `core_test --child-echo <out> args...` writes its working directory
@@ -680,12 +870,6 @@ bool WaitUntilExit(GameProcess& p, int timeout_ms) {
     Sleep(10);
   }
   return true;
-}
-
-fs::path SelfExe() {
-  wchar_t buf[MAX_PATH * 2] = {};
-  GetModuleFileNameW(nullptr, buf, static_cast<DWORD>(std::size(buf)));
-  return buf;
 }
 
 void TestLaunch() {
@@ -845,6 +1029,12 @@ int main() {
   g_temp = fs::temp_directory_path(ec) / (L"mcla_launcher_core_test_" + std::to_wstring(GetCurrentProcessId()));
   fs::remove_all(g_temp, ec);
   fs::create_directories(g_temp, ec);
+  g_utf8_exe = Temp("utf8/mcla.exe");
+  if (!MakeUtf8Exe(g_utf8_exe)) {
+    ++g_checks;
+    ++g_failures;
+    std::printf("FAIL: cannot make the UTF-8 manifest stand-in executable\n");
+  }
 
   // A crash or an exception in one test must fail this program, never leave a dialog waiting for somebody to click.
   SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
@@ -868,6 +1058,9 @@ int main() {
   run("build args", TestBuildArgs);
   run("store", TestStore);
   run("data root", TestDataRoot);
+  run("utf8 manifest", TestUtf8Manifest);
+  run("non-ascii paths", TestNonAsciiPaths);
+  run("empty and paths", TestEmptyValuesAndPaths);
   run("launch", TestLaunch);
   run("real schema", TestRealSchema);
 

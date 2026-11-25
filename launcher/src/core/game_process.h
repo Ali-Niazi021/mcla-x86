@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace launcher {
@@ -19,14 +20,42 @@ std::filesystem::path LauncherDir();
 std::filesystem::path FindGameExe();
 std::filesystem::path FindGameExeIn(const std::filesystem::path& dir);
 
+// A path as the game will get it: a relative one is taken from the launcher's folder (`base_dir`, empty = LauncherDir();
+// the game starts in that folder too), the result is absolute and lexically normalised (preferred separators, no "." or
+// ".." parts, no trailing separator except on a root such as C:\). An empty path stays empty.
+std::filesystem::path ResolvePath(const std::filesystem::path& path, const std::filesystem::path& base_dir = {});
+
+// Every character of the path is ASCII (the only paths the game can open unless it asks for the UTF-8 code page).
+bool IsAsciiPath(const std::filesystem::path& path);
+
+// Does an application manifest (XML text) ask for the UTF-8 ANSI code page: <activeCodePage>UTF-8</activeCodePage>.
+bool ManifestRequestsUtf8(std::string_view manifest_xml);
+
+// Does the game executable carry such a manifest (its RT_MANIFEST resources are read; an empty, missing or manifest-less
+// file is false). Only then can the game open a path with non-ASCII characters: the SDK turns the UTF-8 cvar value into
+// a path through the ANSI code page (rex_app.cpp). The answer is cached per file, size and modification time.
+bool GameUsesUtf8CodePage(const std::filesystem::path& game_exe);
+
+// "" when the game can open `resolved_path` (all ASCII, or the game asks for the UTF-8 code page: `game_exe`, empty =
+// FindGameExe()); otherwise "path contains non-ASCII characters; the game cannot open it yet: <path>" (callers put the
+// subject in front: "The game data folder " + ...).
+std::string NonAsciiPathProblem(const std::filesystem::path& resolved_path, const std::filesystem::path& game_exe = {});
+
 struct DataRootCheck {
   bool ok = false;
   std::vector<std::string> issues;  // UTF-8, human readable, one per problem; empty when ok
 };
 
 // Is `root` the folder with the extracted game files: default.xex (9,252,864 bytes) and xarchive_{audio,audlo,cache,
-// music}.rpf present. An empty path is "no folder chosen".
-DataRootCheck ValidateGameDataRoot(const std::filesystem::path& root);
+// music}.rpf present. An empty path is "no folder chosen". A relative `root` is taken from the launcher's folder
+// (ResolvePath), as BuildArgs passes it. A path with non-ASCII characters is an issue ("path contains non-ASCII
+// characters; the game cannot open it yet") unless the game executable (`game_exe`, empty = FindGameExe()) asks for the
+// UTF-8 code page.
+DataRootCheck ValidateGameDataRoot(const std::filesystem::path& root, const std::filesystem::path& game_exe = {});
+
+// The user data folder (cvar user_data_root): empty is fine (the game picks its own); otherwise the same non-ASCII rule,
+// and an existing path must be a folder.
+DataRootCheck ValidateUserDataRoot(const std::filesystem::path& root, const std::filesystem::path& game_exe = {});
 
 // One game process started by the launcher.
 class GameProcess {

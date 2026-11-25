@@ -312,6 +312,14 @@ void ParseSetting(Report& r, size_t index, const Json& j, const Schema& schema, 
     if (CheckValue(d, j["default"], &why)) d.default_value = CanonicalValue(d, j["default"]);
     else r.Error(where, "default " + Show(j["default"]) + ": " + why);
   }
+  if (type_ok && d.type == SettingType::Enum && d.default_value.is_string() && !d.default_value.get<std::string>().empty()) {
+    for (const Option& o : d.options) {
+      if (o.value.is_string() && o.value.get<std::string>().empty()) {
+        r.Warn(where, "the option with the empty value \"\" passes nothing to the game (an empty value cannot be given on the command line), which is not the default");
+        break;
+      }
+    }
+  }
 
   if (const auto it = j.find("requires"); it != j.end()) {
     if (!it->is_object()) {
@@ -562,6 +570,10 @@ bool CheckValue(const SettingDef& def, const Json& value, std::string* why) {
     case SettingType::String:
     case SettingType::Path:
       if (!value.is_string()) return fail(std::string("expected a string, got ") + KindOf(value));
+      // An empty value cannot go on the command line (`--name=` makes the parser take the next argument as the value), so
+      // for a setting that has a default, "" means "use the default".
+      if (value.get<std::string>().empty() && def.default_value.is_string() && !def.default_value.get<std::string>().empty())
+        return fail("empty; the default is used instead");
       return true;
   }
   return fail("unknown setting type");

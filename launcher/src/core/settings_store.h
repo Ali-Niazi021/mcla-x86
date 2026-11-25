@@ -56,7 +56,27 @@ std::string FormatCvarValue(const Json& value);
 // setting in schema order that has a cvar, is not `emit: never` and is active, `--<cvar>=<value>` when `emit: always`
 // or when the effective value differs from the default. Bools are true/false. Quote with FormatCommandLine (text.h);
 // GameProcess::Launch does.
-std::vector<std::wstring> BuildArgs(const Schema& schema, const Values& values);
+//
+// An empty value is never passed: `--name=` makes the game's parser (CLI11) take the NEXT argument as the value of
+// `name`. A string or path that is empty is skipped, and a string setting with a non-empty default whose value is ""
+// gets that default (CheckValue). Each such skip is described in *notes (when given), one message each.
+//
+// A `path` setting's value is passed as an absolute, normalised path (ResolvePath): a relative one is taken from
+// `base_dir`, empty = the launcher's folder, where the game starts too.
+std::vector<std::wstring> BuildArgs(const Schema& schema, const Values& values, std::vector<std::string>* notes = nullptr,
+                                    const std::filesystem::path& base_dir = {});
+
+struct PathProblem {
+  std::string setting_id;
+  std::string message;  // UTF-8, ready to show: "<setting label>: path contains non-ASCII characters; ..."
+};
+
+// Problems with the values of the active `path` settings that have a cvar (game_data_root, user_data_root, cache_root,
+// ...): a path with non-ASCII characters that the game cannot open (NonAsciiPathProblem; `game_exe` empty =
+// FindGameExe()). Empty values are skipped. The data root's folder contents are ValidateGameDataRoot's job (it reports
+// the non-ASCII problem too: skip its setting here when showing both).
+std::vector<PathProblem> CheckPathSettings(const Schema& schema, const Values& values,
+                                           const std::filesystem::path& game_exe = {}, const std::filesystem::path& base_dir = {});
 
 // %LOCALAPPDATA%\mcla_x86\launcher.json
 std::filesystem::path DefaultSettingsPath();

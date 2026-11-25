@@ -115,16 +115,70 @@ std::string FormatCvarValue(const Json& value) {
   }
 }
 
-std::vector<std::wstring> BuildArgs(const Schema& schema, const Values& values) {
+namespace {
+
+std::string TrimBlanks(std::string s) {
+  const auto blank = [](char c) { return c == ' ' || c == '\t'; };
+  while (!s.empty() && blank(s.back())) s.pop_back();
+  size_t first = 0;
+  while (first < s.size() && blank(s[first])) ++first;
+  return s.substr(first);
+}
+
+// A string or path setting whose stored value is "" while its default is not: CheckValue refuses that value, so the
+// default is what BuildArgs uses.
+bool EmptyOverDefault(const SettingDef& def, const Values& values) {
+  if (def.type != SettingType::String && def.type != SettingType::Path) return false;
+  const auto it = values.find(def.id);
+  return it != values.end() && it->second.is_string() && it->second.get<std::string>().empty() &&
+         def.default_value.is_string() && !def.default_value.get<std::string>().empty();
+}
+
+// The text of a value on the command line: a path setting's value as an absolute, normalised path.
+std::string CvarText(const SettingDef& def, const Json& value, const std::filesystem::path& base_dir) {
+  std::string text = FormatCvarValue(value);
+  if (def.type != SettingType::Path) return text;
+  text = TrimBlanks(std::move(text));
+  if (text.empty()) return text;
+  return PathToUtf8(ResolvePath(PathFromUtf8(text), base_dir));
+}
+
+}  // namespace
+
+std::vector<std::wstring> BuildArgs(const Schema& schema, const Values& values, std::vector<std::string>* notes,
+                                    const std::filesystem::path& base_dir) {
+  const auto note = [&](std::string message) {
+    if (notes) notes->push_back(std::move(message));
+  };
   std::vector<std::wstring> args;
   for (const SettingDef& def : schema.settings) {
     if (!def.cvar || def.cvar->empty() || def.emit == EmitMode::Never) continue;
     if (!IsActive(schema, values, def)) continue;
     const Json& value = EffectiveValue(def, values);
+    if (EmptyOverDefault(def, values)) note("\"" + def.label + "\" is empty: its default is used.");
     if (def.emit != EmitMode::Always && SameValue(value, def.default_value)) continue;
-    args.push_back(L"--" + Utf8ToWide(*def.cvar) + L"=" + Utf8ToWide(FormatCvarValue(value)));
+    const std::string text = CvarText(def, value, base_dir);
+    if (text.empty()) {  // `--name=` would make the game's parser take the next argument as the value
+      note("\"" + def.label + "\" is empty: it is not passed to the game.");
+      continue;
+    }
+    args.push_back(L"--" + Utf8ToWide(*def.cvar) + L"=" + Utf8ToWide(text));
   }
   return args;
+}
+
+std::vector<PathProblem> CheckPathSettings(const Schema& schema, const Values& values, const std::filesystem::path& game_exe,
+                                           const std::filesystem::path& base_dir) {
+  std::vector<PathProblem> problems;
+  for (const SettingDef& def : schema.settings) {
+    if (def.type != SettingType::Path || !def.cvar || def.cvar->empty() || def.emit == EmitMode::Never) continue;
+    if (!IsActive(schema, values, def)) continue;
+    const std::string text = TrimBlanks(FormatCvarValue(EffectiveValue(def, values)));
+    if (text.empty()) continue;
+    const std::string problem = NonAsciiPathProblem(ResolvePath(PathFromUtf8(text), base_dir), game_exe);
+    if (!problem.empty()) problems.push_back({def.id, def.label + ": " + problem});
+  }
+  return problems;
 }
 
 std::filesystem::path DefaultSettingsPath() {

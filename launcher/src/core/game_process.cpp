@@ -2,6 +2,8 @@
 
 #include <array>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <system_error>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -69,13 +71,136 @@ std::filesystem::path FindGameExeIn(const std::filesystem::path& dir) {
 
 std::filesystem::path FindGameExe() { return FindGameExeIn(LauncherDir()); }
 
-DataRootCheck ValidateGameDataRoot(const std::filesystem::path& root) {
+std::filesystem::path ResolvePath(const std::filesystem::path& path, const std::filesystem::path& base_dir) {
+  if (path.empty()) return path;
+  const std::filesystem::path base = base_dir.empty() ? LauncherDir() : base_dir;
+  std::error_code ec;
+  std::filesystem::path resolved;
+  if (path.is_absolute()) {
+    resolved = path;
+  } else if (path.has_root_name() || path.has_root_directory() || base.empty()) {
+    resolved = std::filesystem::absolute(path, ec);  // C:dir and \dir depend on the current drive / directory
+    if (ec) resolved = path;
+  } else {
+    resolved = base / path;
+  }
+  resolved = resolved.lexically_normal();
+  if (!resolved.has_filename() && resolved != resolved.root_path()) resolved = resolved.parent_path();  // C:\a\b\ -> C:\a\b
+  return resolved;
+}
+
+bool IsAsciiPath(const std::filesystem::path& path) {
+  for (const wchar_t c : path.native())
+    if (c > 0x7F) return false;
+  return true;
+}
+
+bool ManifestRequestsUtf8(std::string_view xml) {
+  const auto lower = [](char c) { return static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c); };
+  size_t pos = 0;
+  while ((pos = xml.find('<', pos)) != std::string_view::npos) {
+    if (xml.substr(pos, 4) == "<!--") {  // a comment: skip to its end
+      const size_t end = xml.find("-->", pos + 4);
+      if (end == std::string_view::npos) return false;
+      pos = end + 3;
+      continue;
+    }
+    const size_t close = xml.find('>', pos);
+    if (close == std::string_view::npos) return false;
+    // Tag name without "<" and without a namespace prefix ("ws2:activeCodePage").
+    std::string_view tag = xml.substr(pos + 1, close - pos - 1);
+    const size_t name_end = tag.find_first_of(" \t\r\n/");
+    std::string_view name = tag.substr(0, name_end);
+    if (const size_t colon = name.find(':'); colon != std::string_view::npos) name.remove_prefix(colon + 1);
+    const bool self_closing = !tag.empty() && tag.back() == '/';
+    pos = close + 1;
+    if (self_closing || name.size() != 14) continue;
+    std::string lowered(name);
+    for (char& c : lowered) c = lower(c);
+    if (lowered != "activecodepage") continue;
+    // The element's text up to the next tag.
+    std::string_view value = xml.substr(pos, xml.find('<', pos) == std::string_view::npos ? std::string_view::npos
+                                                                                           : xml.find('<', pos) - pos);
+    while (!value.empty() && (value.front() == ' ' || value.front() == '\t' || value.front() == '\r' || value.front() == '\n'))
+      value.remove_prefix(1);
+    if (value.size() >= 5) {
+      std::string head(value.substr(0, 5));
+      for (char& c : head) c = lower(c);
+      if (head == "utf-8") return true;
+    }
+  }
+  return false;
+}
+
+namespace {
+
+BOOL CALLBACK ScanManifest(HMODULE module, LPCWSTR type, LPWSTR name, LONG_PTR param) {
+  bool* found = reinterpret_cast<bool*>(param);
+  if (const HRSRC resource = FindResourceW(module, name, type)) {
+    const DWORD size = SizeofResource(module, resource);
+    if (const HGLOBAL loaded = LoadResource(module, resource)) {
+      if (const void* data = LockResource(loaded)) {
+        if (ManifestRequestsUtf8(std::string_view(static_cast<const char*>(data), size))) {
+          *found = true;
+          return FALSE;  // enough
+        }
+      }
+    }
+  }
+  return TRUE;
+}
+
+struct ManifestAnswer {
+  std::uintmax_t size = 0;
+  std::filesystem::file_time_type time;
+  bool utf8 = false;
+};
+
+}  // namespace
+
+bool GameUsesUtf8CodePage(const std::filesystem::path& game_exe) {
+  if (game_exe.empty()) return false;
+  std::error_code ec;
+  const std::uintmax_t size = std::filesystem::file_size(game_exe, ec);
+  if (ec) return false;
+  const auto time = std::filesystem::last_write_time(game_exe, ec);
+  if (ec) return false;
+
+  static std::mutex mutex;
+  static std::map<std::wstring, ManifestAnswer> cache;
+  const std::wstring key = game_exe.native();
+  {
+    const std::lock_guard<std::mutex> lock(mutex);
+    const auto it = cache.find(key);
+    if (it != cache.end() && it->second.size == size && it->second.time == time) return it->second.utf8;
+  }
+
+  bool found = false;
+  if (const HMODULE module = LoadLibraryExW(game_exe.c_str(), nullptr, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE)) {
+    EnumResourceNamesW(module, RT_MANIFEST, ScanManifest, reinterpret_cast<LONG_PTR>(&found));  // false when it has none
+    FreeLibrary(module);
+  }
+  const std::lock_guard<std::mutex> lock(mutex);
+  cache[key] = ManifestAnswer{size, time, found};
+  return found;
+}
+
+std::string NonAsciiPathProblem(const std::filesystem::path& resolved_path, const std::filesystem::path& game_exe) {
+  if (IsAsciiPath(resolved_path)) return {};
+  if (GameUsesUtf8CodePage(game_exe.empty() ? FindGameExe() : game_exe)) return {};
+  return "path contains non-ASCII characters; the game cannot open it yet: " + PathToUtf8(resolved_path);
+}
+
+DataRootCheck ValidateGameDataRoot(const std::filesystem::path& given, const std::filesystem::path& game_exe) {
   DataRootCheck check;
-  const std::string shown = PathToUtf8(root);
-  if (root.empty()) {
+  if (given.empty()) {
     check.issues.push_back("No game data folder is set.");
     return check;
   }
+  const std::filesystem::path root = ResolvePath(given);
+  const std::string shown = PathToUtf8(root);
+  if (const std::string problem = NonAsciiPathProblem(root, game_exe); !problem.empty())
+    check.issues.push_back("The game data folder " + problem);
   std::error_code ec;
   if (!std::filesystem::exists(root, ec)) {
     check.issues.push_back("The game data folder does not exist: " + shown);
@@ -112,6 +237,20 @@ DataRootCheck ValidateGameDataRoot(const std::filesystem::path& root) {
     }
   }
 
+  check.ok = check.issues.empty();
+  return check;
+}
+
+DataRootCheck ValidateUserDataRoot(const std::filesystem::path& given, const std::filesystem::path& game_exe) {
+  DataRootCheck check;
+  if (!given.empty()) {
+    const std::filesystem::path root = ResolvePath(given);
+    if (const std::string problem = NonAsciiPathProblem(root, game_exe); !problem.empty())
+      check.issues.push_back("The user data folder " + problem);
+    std::error_code ec;
+    if (std::filesystem::exists(root, ec) && !std::filesystem::is_directory(root, ec))
+      check.issues.push_back("The user data path is not a folder: " + PathToUtf8(root));
+  }
   check.ok = check.issues.empty();
   return check;
 }

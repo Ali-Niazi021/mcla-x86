@@ -101,7 +101,9 @@ Schema LoadSchema(const std::filesystem::path& path, std::string* error);
 Schema ParseSchema(std::string_view text, std::string* error, std::string_view source = "schema");
 
 // True when `value` is a valid value of `def`: right JSON type, inside min..max, one of the options. Otherwise false and
-// *why (when given) says what is wrong. An Int setting accepts integers only; a Float setting accepts any number.
+// *why (when given) says what is wrong. An Int setting accepts integers only; a Float setting accepts any number. A
+// String or Path setting whose default is not empty rejects "" (an empty value cannot be put on the command line:
+// `--name=` makes the game's parser take the next argument as its value), so EffectiveValue falls back to the default.
 bool CheckValue(const SettingDef& def, const Json& value, std::string* why = nullptr);
 
 // The canonical JSON form of a valid value: a Float setting's number as double, an Int setting's as integer; every
