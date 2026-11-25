@@ -9,6 +9,31 @@ Owner: ORC (merges what tasks report). One entry per non-obvious finding, newest
 
 ---
 
+### Sprint P1/R6 Where the 880M's time goes
+**Symptom** 1080p single tile ~17.8 ms GPU; game-side detail cuts barely moved it. **Cause** (1) the package is capped at
+~35 W, so the GPU runs ~1.25–1.6 GHz of 2.9 and loses more when any other CPU work runs (agent builds, rga, VS Code,
+Defender); (2) ~6.5 ms of the frame is emulation work, mostly the resolve → shared memory → texture reload round trip
+(~3.5–3.9 ms), frame-end page re-uploads (25–30 MB/frame, ~2,200 copies that split passes into drains), EDRAM transfers,
+swap. **Fix** 0490 dual-write (−0.6 ms), 04a0 swap from the RT (−0.35), `clear_memory_page_state=false`, quad lists as
+triangles; window pixel-exact (a "1080p" window was 2880x1620 at 150 % DPI). **Evidence** P1/R3/R5/R6 reports, METRICS
+V3d-*. **Cost** a day of swarm work.
+
+### Sprint S1 Upscaling loses on a power-capped iGPU
+**Symptom** FSR 3 (720p→1080p) 49 fps, FSR 4 (540p→1080p) 37 fps, native 1080p 55+. **Cause** the FSR 3.1 pass is 4.1 ms
+and FSR 4.1 6.4 ms on the 880M, more than the smaller scene saves (68 % of the frame doesn't scale with pixels).
+**Fix** native resolution + emulation fixes. **Evidence** METRICS s1-fsr3, s1c-fsr4p.
+
+### Sprint R1/R8 The DXBC translator is the next big lever
+**Symptom** ~25 VALU per Xenos instruction slot in pixel shaders. **Cause** the 0×anything=0 emulation (27 %), no
+`refactoringAllowed` (no FMA), `sample_d` with hand gradients, serial texture fetches, the control-flow loop; vertex
+fetch is a chain of branches. **Fix** 04b0 (PS options, −48 % VALU with all five), 04d0 (VS straight-line fetch), behind
+cvars folded into the shader modification so caches never mix. **Evidence** RGA gfx1150 on the 1,061-shader corpus.
+
+### Sprint Process Benchmarks need the machine to themselves
+**Symptom** the same variant measured ±2 ms apart; world/real collapsed mid-run. **Cause** builds/rga outside the heavy
+lock (`prepare_sdk --work` used a scratch lock), and the APU's shared power budget. **Fix** global lock for every
+CPU-heavy job, telemetry (GPU clock, package W, non-game CPU) and a TAINTED flag in every bench row.
+
 ### W3.4-fix Present jitter was the CP's Sleep(1) poll, not the display
 **Symptom** M4 p99 35.1–35.2 ms (limit 35.0) at cap 30 with an exact guest vblank on an exact 120.000 Hz panel.
 **Cause** `MsBetweenPresents` lag-1 autocorrelation −0.50 = independent per-swap delay; the swap gate's `WAIT_REG_MEM`
