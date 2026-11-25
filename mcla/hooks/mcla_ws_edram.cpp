@@ -263,10 +263,13 @@ void mcla_hook_ws_edram_surface(PPCRegister& r31) {
   }
   const uint32_t end = s.base + s.tiles();
   const uint32_t limit = mcla::ws::EdramLimitInForce();
-  REXLOG_INFO("[mcla-ws-edram] surface {:3}: {}x{} {} format 0x{:08X} {}, tiles {}..{} ({}), placed by {}{}",
+  uint64_t free_bytes = 0, total_bytes = 0;
+  const bool have_memory = mcla::ws::PhysicalMemory(&free_bytes, &total_bytes);
+  REXLOG_INFO("[mcla-ws-edram] surface {:3}: {}x{} {} format 0x{:08X} {}, tiles {}..{} ({}), placed by {}{}; guest "
+              "physical {:.1f} MiB free",
               n + 1, s.width(), s.height(), MsaaName(s.msaa()), s.format, s.depth() ? "depth" : "colour",
               s.base, end == 0 ? 0 : end - 1, s.tiles(), (s.flags & kPlacedByD3D) ? "D3D" : "the game",
-              end > limit ? " PAST THE EDRAM LIMIT IN FORCE" : "");
+              end > limit ? " PAST THE EDRAM LIMIT IN FORCE" : "", have_memory ? double(free_bytes) / 1048576.0 : -1.0);
 }
 
 #else  // MCLA_HOOK_WS_EDRAM == 0: keeps hooks_widescreen.toml linking, does nothing.

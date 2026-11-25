@@ -112,7 +112,8 @@ void LogSizing(uint32_t width, uint32_t height) {
   const uint32_t host = mcla::ws::HostEdramTiles();
   const uint32_t device = sizing::DeviceSurfaceTiles(width, height);
   const int32_t left_console = sizing::FreeTilesAfterDeviceSurfaces(sizing::kConsoleEdramTiles, width, height);
-  const sizing::Ratio growth = sizing::PoolGrowth(width, height);
+  const uint64_t pool = mcla::ws::PoolBytesFor(sizing::kHdPoolBytes, width, height);
+  const uint32_t reduce_kib = sizing::PhysicalPoolReductionKiB(sizing::PhysicalGrowthBytes(width, height, pool));
   const sizing::SceneTiling t1 = sizing::GameSceneTiling(width, height, 1);
   const sizing::SceneTiling t2 = sizing::GameSceneTiling(width, height, 2);
   const uint64_t unit = sizing::TextureBlockUnit(width, height);
@@ -122,14 +123,17 @@ void LogSizing(uint32_t width, uint32_t height) {
                                       std::to_string(sizing::FreeTilesAfterDeviceSurfaces(host, width, height)) + " left";
   REXLOG_INFO("[mcla-wide] sizing: device surfaces 2 x {} EDRAM tiles ({} left of the game's 2048, {}; the shipped "
               "1280x720 has {}); scene tiling 1x {} x {} rows, 2x {} x {} rows, one tile at 1x {}; render-target pool "
-              "x{:.3f} -> {} bytes; front-buffer block 4 x {} bytes, uncut zero-fill overshoot {} bytes{}",
+              "x{:.3f} -> {} bytes; front-buffer block 4 x {} bytes, uncut zero-fill overshoot {} bytes{}; the game's "
+              "physical pool gives back {} KiB (the 0x821312DC hook; no '[mcla-ws-phys-pool]' line at boot means it is "
+              "not in the generated code)",
               device, left_console, edram, sizing::kShippedFreeTiles, t1.count, t1.tile_rows, t2.count, t2.tile_rows,
               sizing::SingleTileFits(width, height, 1, host) ? "fits the GPU EDRAM" : "does not fit",
-              growth.value(), sizing::ScaledPoolBytes(sizing::kHdPoolBytes, growth), unit,
+              double(pool) / double(sizing::kHdPoolBytes), pool, unit,
               sizing::TextureClearOvershoot(width, height),
               reaches ? " (reaches a heap's guard word: mcla_ws_texclear_clamp or the SDK's MmQueryAllocationSize fix "
                         "is needed)"
-                      : "");
+                      : "",
+              reduce_kib);
   if (left_console < 0) {
     if (host != 0 && sizing::FreeTilesAfterDeviceSurfaces(host, width, height) < 0) {
       REXLOG_ERROR("[mcla-wide] error: the two device surfaces need {} EDRAM tiles but the GPU emulates only {} "
@@ -222,6 +226,15 @@ void mcla_hook_ws_scene_size(PPCRegister& r1) {
                 mode_w, mode_h, width, height, width, height);
   }
   LogSizing(width, height);
+  // The physical-pool hook (boot) sized the game's pool for the size the cvars and the SDK's video mode planned; this
+  // is the size the game really got.
+  const sizing::Resolution planned = mcla::ws::PlannedResolution();
+  if (planned.verdict != sizing::Verdict::kOn || planned.width != width || planned.height != height) {
+    REXLOG_ERROR("[mcla-wide] error: the boot-time plan was {} ({}x{}) but the back buffer is {}x{}: the game's physical "
+                 "pool was sized for the plan (mcla_ws_phys_pool.cpp)",
+                 planned.verdict == sizing::Verdict::kOn ? "on" : "off", planned.width, planned.height, width, height);
+  }
+  mcla::ws::LogPhysicalMemory("device init");
   if (!REXCVAR_QUERY(bool, mcla_noaa)) {
     const sizing::SceneTiling t2 = sizing::GameSceneTiling(width, height, 2);
     const sizing::SceneTiling t1 = sizing::GameSceneTiling(width, height, 1);

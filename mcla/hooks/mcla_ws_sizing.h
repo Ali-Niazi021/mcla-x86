@@ -12,6 +12,8 @@
 //                        a bump allocator per slot with no bounds check, every texture rounded up to 32 texels a
 //                        side, so the pool must grow by the largest growth of any 32-aligned target whose sides
 //                        are the screen's divided by 1, 2, 4, 8 or 16 (area, not width).
+//   PoolAreaGrowth()     the default pool policy: the AREA ratio (x2.25 at 1920x1080), Xenia's 0x1626000. The k-max
+//   AreaPoolBytes()      PoolGrowth above is the conservative override (x2.667 there, 4.3 MB more).
 //   DeviceSurfaceTiles() EDRAM tiles of a D3D-created surface (sub_8240F238 V): ceil(W/80) x align16(H) / 16 at
 //                        1x, H doubled at 2x, both at 4x, x2 for 64-bit formats. The two device surfaces
 //                        (colour and depth, W x H at 1x whatever `noaa` says) are placed by D3D itself and are
@@ -27,6 +29,9 @@
 //                        textures, 4 x S, S = align32(W) x align32(H) x 4): the SDK's MmQueryAllocationSize
 //                        overshoot of the zero-fill is 2 S bytes past the block (mcla_ws_texclear.cpp).
 //   RenderTargetMaxHeight() the SDK cvar render_target_max_height must be at least the back buffer's rows.
+//   Physical*()          the guest's 512 MiB of physical memory: what a bigger back buffer adds (the front-buffer
+//                        block plus the pool) and how much of the game's own 299.5 MiB physical pool to give back
+//                        for it (Xenia's 32 MiB at 1920x1080; mcla_ws_phys_pool.cpp).
 //
 // Not game facts but this port's decisions: the limits of the accepted sizes (kLimitsM6 now, kLimitsM7 reserved:
 // 2560 x 1200 is the optional M7 16:10 / ultrawide step and is NOT accepted until a build selects it), and the
@@ -269,11 +274,26 @@ constexpr Ratio PoolGrowth(uint32_t width, uint32_t height) {
   return best;
 }
 
-// `shipped` x growth, rounded up to 64 KiB (the kernel's allocation granularity for the pool).
-constexpr uint64_t ScaledPoolBytes(uint32_t shipped, Ratio growth) {
-  constexpr uint64_t kPage = 0x10000;
+// `shipped` x growth, rounded up to `granularity` bytes: 64 KiB, the kernel's allocation granularity for the pool,
+// unless the caller says otherwise (AreaPoolBytes uses the 4 KiB page, which is what Xenia's value is a multiple of).
+constexpr uint64_t ScaledPoolBytes(uint32_t shipped, Ratio growth, uint64_t granularity = 0x10000) {
   const uint64_t scaled = (uint64_t(shipped) * growth.num + growth.den - 1) / growth.den;
-  return (scaled + kPage - 1) / kPage * kPage;
+  return (scaled + granularity - 1) / granularity * granularity;
+}
+
+// The pool's growth as the AREA ratio (W x H) / (1280 x 720), never below 1: 2.25 at 1920x1080, 1.5625 at 1600x900.
+// This is Xenia's choice for 1920x1080 (the pool constant 0x1626000 = 0x9D8000 x 2.25) and the default policy; the
+// conservative max-over-aligned-targets PoolGrowth above is x2.667 there and stays as the explicit override.
+constexpr Ratio PoolAreaGrowth(uint32_t width, uint32_t height) {
+  const uint64_t num = uint64_t(width) * height;
+  const uint64_t den = uint64_t(kBaseWidth) * kBaseHeight;
+  return num > den ? Ratio{num, den} : Ratio{1, 1};
+}
+
+// The pool for a width x height buffer under the area policy, in whole 4 KiB pages: 23,224,320 at 1920x1080,
+// 16,128,000 at 1600x900, `shipped` unchanged at 1280x720.
+constexpr uint64_t AreaPoolBytes(uint32_t shipped, uint32_t width, uint32_t height) {
+  return ScaledPoolBytes(shipped, PoolAreaGrowth(width, height), 4096);
 }
 
 // ---- EDRAM -----------------------------------------------------------------------------------------------------
@@ -352,6 +372,40 @@ constexpr uint64_t TextureClearOvershoot(uint32_t width, uint32_t height) { retu
 // mcla_ws_texclear clamp or an SDK that counts from the address. 1280x720: no (0x730000); 1440: yes.
 constexpr bool TextureClearReachesHeap(uint32_t width, uint32_t height) {
   return TextureClearOvershoot(width, height) > kRingAndHeapReach;
+}
+
+// ---- the guest's physical memory -------------------------------------------------------------------------------
+//
+// The console has 512 MiB of physical memory and the title takes it top-down at boot: its own physical pool first
+// (sub_82131228: 306,688 KiB = 299.5 MiB, `lis r9,4 ; ori r30,r9,44544` at 0x821312DC), then the game heaps, and what
+// is left below them (about 143 MiB) is all D3D's, the front-buffer block, the render-target pool and every texture
+// the renderer makes. A bigger back buffer grows the block and the pool, nothing else gives way, and the physical heap
+// runs out in the renderer's constructor: `BaseHeap::Alloc failed to find contiguous range`, then RAGE's "Unable to
+// create backup texture for rendertarget" (caller 0x82185D68) at 1920x1080 with the pool at x2.667.
+//
+// Xenia Canary's "1920x1080 Resolution" patch for this title (BSD, xenia-canary/game-patches 545407F8) pays for it
+// by taking the same memory out of the game's own pool: 0x821312DC `ori r30,r9,0x2E00` = 273,920 KiB (267.5 MiB), 32 MiB less,
+// next to an RT pool of 0x1626000 = 23,224,320 bytes = the shipped pool x the AREA ratio 2.25. Those two numbers are
+// exactly what these functions give at 1920x1080.
+
+constexpr uint32_t kPhysicalPoolKiB = 0x4AE00;  // the shipped pool in KiB: 306,688 (299.5 MiB)
+
+// The four-allocation front-buffer block (two front buffers, the device colour and depth textures): 4 S.
+constexpr uint64_t FrontBufferBlockBytes(uint32_t width, uint32_t height) { return 4 * TextureBlockUnit(width, height); }
+
+// How much more physical memory a width x height back buffer needs than 1280x720: the block's growth plus the pool's
+// (`pool_bytes` = what the pool will be created with; the shipped kHdPoolBytes when it is not scaled).
+constexpr uint64_t PhysicalGrowthBytes(uint32_t width, uint32_t height, uint64_t pool_bytes) {
+  const uint64_t block = FrontBufferBlockBytes(width, height);
+  const uint64_t base_block = FrontBufferBlockBytes(kBaseWidth, kBaseHeight);
+  return (block > base_block ? block - base_block : 0) + (pool_bytes > kHdPoolBytes ? pool_bytes - kHdPoolBytes : 0);
+}
+
+// How many KiB to take out of the game's physical pool for that growth: whole MiB, rounded up, plus 2 MiB of slack.
+// 1920x1080 with the area pool: 31,252,480 bytes = 29.8 MiB -> 30 + 2 = 32 MiB = 32,768 KiB, Xenia's number. 0 when nothing grows.
+constexpr uint32_t PhysicalPoolReductionKiB(uint64_t growth_bytes) {
+  constexpr uint64_t kMiB = 1024 * 1024;
+  return growth_bytes == 0 ? 0u : uint32_t(((growth_bytes + kMiB - 1) / kMiB + 2) * 1024);
 }
 
 // ---- SDK cvars -------------------------------------------------------------------------------------------------

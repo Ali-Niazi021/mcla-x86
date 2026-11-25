@@ -68,12 +68,16 @@
 #ifndef MCLA_HOOK_WS_SINGLE_TILE
 #define MCLA_HOOK_WS_SINGLE_TILE 0
 #endif
+#ifndef MCLA_HOOK_WS_PHYS_POOL
+#define MCLA_HOOK_WS_PHYS_POOL 0
+#endif
 
 REXCVAR_DECLARE(int32_t, mcla_widescreen_width);
 REXCVAR_DECLARE(int32_t, mcla_scene_height);
 REXCVAR_DECLARE(int32_t, mcla_ws_aspect_mask);
 REXCVAR_DECLARE(bool, mcla_ws_cutscene_fov);
 REXCVAR_DECLARE(bool, mcla_ws_rt_pool_scale);
+REXCVAR_DECLARE(int32_t, mcla_ws_rt_pool_percent);
 REXCVAR_DECLARE(bool, mcla_ws_rt_pool_guard);
 REXCVAR_DECLARE(int32_t, mcla_ws_edram_reuse);
 REXCVAR_DECLARE(bool, mcla_ws_edram_log);
@@ -121,6 +125,22 @@ sizing::Resolution ResolveRequest(uint32_t mode_width, uint32_t mode_height);
 
 // Called by the scene-size hook only, after the game's option words hold the size. 0 x 0 = off.
 void Publish(uint32_t width, uint32_t height);
+
+// The back buffer the cvars ask for, resolved BEFORE the guest runs (what the scene-size hook will resolve at device
+// init, from the same video mode: the SDK's own VdQueryVideoMode answer). The physical-pool hook (0x821312DC, boot)
+// needs the size long before the device exists. Computed once.
+sizing::Resolution PlannedResolution();
+
+// The shared render-target pool for a width x height back buffer, from the shipped `shipped` bytes: the area policy
+// (Xenia's 2.25 at 1920x1080) unless mcla_ws_rt_pool_percent is set (e.g. 267 = the conservative x2.667).
+uint64_t PoolBytesFor(uint32_t shipped, uint32_t width, uint32_t height);
+
+// The guest's physical memory (the 512 MiB parent heap): free and total bytes. False before the kernel exists.
+bool PhysicalMemory(uint64_t* free_bytes, uint64_t* total_bytes);
+
+// `[mcla-wide] guest physical memory at <where>: N MiB free of M MiB` (INFO). A few hooks call it at the points where
+// the title takes memory (boot, device init, the renderer's pool) so a physical-heap fatal can be read off the log.
+void LogPhysicalMemory(const char* where);
 
 // The EDRAM the GPU emulates, in tiles (rex::system::IGraphicsSystem::edram_tile_count: the SDK's edram_tiles
 // cvar, 2048 or 4096 where the host allows it); 0 until the GPU has started.

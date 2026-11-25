@@ -6,11 +6,13 @@
 #include "nfsmw_pch.h"
 
 #include <rex/cvar.h>
+#include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/runtime.h>
 #include <rex/system/interfaces/graphics.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
+#include <rex/system/xvideo.h>
 
 #include "mcla_guest.h"
 #include "mcla_hooks.h"
@@ -38,8 +40,15 @@ REXCVAR_DEFINE_BOOL(mcla_ws_cutscene_fov, true, "MCLA",
                     "zooming in; only with widescreen on and a back buffer that is not exactly 16:9");
 REXCVAR_DEFINE_BOOL(mcla_ws_rt_pool_scale, true, "MCLA",
                     "MCLA widescreen: grow the renderer's shared render-target pool with the back "
-                    "buffer (it is a fixed 10.3 MB sized for 1280x720; factor = the largest growth of a "
-                    "32-texel-aligned target, 1.4 at 1560x720, 2.667 at 1920x1080); only with widescreen on");
+                    "buffer (it is a fixed 10.3 MB sized for 1280x720; default factor = the area ratio, "
+                    "Xenia's x2.25 at 1920x1080 = 23,224,320 bytes; see mcla_ws_rt_pool_percent); only with "
+                    "widescreen on");
+REXCVAR_DEFINE_INT32(mcla_ws_rt_pool_percent, 0, "MCLA",
+                     "MCLA widescreen: the render-target pool as a percentage of the shipped 10.3 MB. 0 = auto: "
+                     "the area ratio of the back buffer to 1280x720 (225 at 1920x1080, Xenia's value). 267 = the "
+                     "conservative x2.667 (the largest growth of a 32-texel-aligned target) that the 1920x1080 boot "
+                     "ran out of guest physical memory with. Read at the renderer's creation; the physical-pool "
+                     "hook (mcla_ws_phys_pool_reduce_mib) pays for whatever it is");
 
 REXCVAR_DEFINE_BOOL(mcla_ws_rt_pool_guard, true, "MCLA",
                     "MCLA widescreen: a render-target texture that does not fit in what is left of the "
@@ -113,6 +122,46 @@ double UiBlockWidth() {
 sizing::Resolution ResolveRequest(uint32_t mode_width, uint32_t mode_height) {
   return sizing::Resolve({REXCVAR_GET(mcla_widescreen_width), REXCVAR_GET(mcla_scene_height)},
                          {mode_width, mode_height});
+}
+
+
+sizing::Resolution PlannedResolution() {
+  static const sizing::Resolution planned = [] {
+    rex::system::X_VIDEO_MODE mode{};
+    rex::kernel::xboxkrnl::VdQueryVideoMode(&mode);
+    return ResolveRequest(uint32_t(mode.display_width), uint32_t(mode.display_height));
+  }();
+  return planned;
+}
+
+uint64_t PoolBytesFor(uint32_t shipped, uint32_t width, uint32_t height) {
+  const int32_t percent = REXCVAR_GET(mcla_ws_rt_pool_percent);
+  if (percent > 0) {
+    return sizing::ScaledPoolBytes(shipped, sizing::Ratio{uint64_t(percent), 100});
+  }
+  return sizing::AreaPoolBytes(shipped, width, height);
+}
+
+bool PhysicalMemory(uint64_t* free_bytes, uint64_t* total_bytes) {
+  rex::system::KernelState* kernel = rex::system::kernel_state();
+  rex::memory::Memory* memory = kernel ? kernel->memory() : nullptr;
+  rex::memory::BaseHeap* heap = memory ? memory->GetPhysicalHeap() : nullptr;
+  if (!heap) {
+    return false;
+  }
+  const uint64_t page = heap->page_size();
+  *total_bytes = uint64_t(heap->GetTotalPageCount()) * page;
+  *free_bytes = uint64_t(heap->GetUnreservedPageCount()) * page;
+  return true;
+}
+
+void LogPhysicalMemory(const char* where) {
+  uint64_t free_bytes = 0, total_bytes = 0;
+  if (!PhysicalMemory(&free_bytes, &total_bytes)) {
+    return;
+  }
+  REXLOG_INFO("[mcla-wide] guest physical memory at {}: {:.1f} MiB free of {:.1f} MiB", where,
+              double(free_bytes) / 1048576.0, double(total_bytes) / 1048576.0);
 }
 
 void Publish(uint32_t width, uint32_t height) {

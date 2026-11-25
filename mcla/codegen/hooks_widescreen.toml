@@ -242,3 +242,17 @@ jump_address_on_true = 0x82410E48
 address = 0x8217A700
 name = "mcla_hook_ws_single_tile"
 registers = ["r7", "r8", "r18", "r19", "r25", "r28"]
+
+# [W5.1c] mcla_ws_phys_pool: sub_82131228 (the boot heap setup), AFTER `ori r30,r9,44544` (r9 = 0x40000 from
+# `lis r9,4`): r30 = the game's own physical pool in KiB, 0x4AE00 = 306,688 KiB = 299.5 MiB. The next
+# instructions (`cmplwi cr6,r10,0 ; bne`) do not touch r30; its first use is `subf r11,r29,r30` at 0x82131310,
+# then the pool's size arithmetic and the allocator (r30 << 10 bytes), so the hook sees the value the `ori`
+# computed and sets a smaller one. This is the site Xenia Canary's "1920x1080 Resolution" patch edits (BSD,
+# xenia-canary/game-patches: `ori r30,r9,0x2E00` = 0x42E00 = 273,920 KiB, 32 MiB less), so the memory a
+# bigger back buffer needs comes out of the game's own pool. Build flag MCLA_HOOK_WS_PHYS_POOL, cvar
+# mcla_ws_phys_pool_reduce_mib. mcla/hooks/mcla_ws_phys_pool.cpp. NEEDS A RE-CODEGEN (new entry).
+[[midasm_hook]]
+address = 0x821312DC
+name = "mcla_hook_ws_physical_pool"
+registers = ["r30"]
+after_instruction = true

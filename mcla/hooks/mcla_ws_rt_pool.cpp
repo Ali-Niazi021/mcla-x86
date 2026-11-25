@@ -17,23 +17,21 @@
 // predicted first failure. The game's own option `nosharingrendertargetmem` (node 0x8287E0E4)
 // skips the pool.
 //
-// New size (changed after run W-1, WIDESCREEN.md section 13). The pool's allocator (sub_82183748) is
-// a bump pointer per slot with NO bounds check: a texture that does not fit is placed past the
-// pool's end, over whatever the kernel put after the block. That was the `sysMemSimpleAllocator`
-// "guard word trashed" fatal at 1432 / 1440 with the first version of this hook (scale by area)
-// and the null read with the scale off. Scaling by area is too little because every texture is
-// rounded up to 32 texels a side: at 1280 the full, half, quarter and eighth widths (1280, 640,
-// 320, 160) are multiples of 32 and waste nothing, at 1560 they are 1568, 800, 416 and 224. So:
-//     factor = max over k = 1, 2, 4, 8, 16 of
-//              align32(ceil(W / k)) x align32(ceil(H / k)) / (align32(ceil(1280 / k)) x align32(ceil(720 / k)))
-// (mcla_ws_sizing.h PoolGrowth), which bounds the growth of every target whose sides are the
-// screen's divided by a power of two; fixed-size targets do not grow. Every slot cursor is a sum
-// of such sizes, so no cursor grows by more than the factor. 1560x720: 224 / 160 = 1.4 ->
-// 14,483,456 bytes (13.8 MiB) after rounding up to 64 KiB; 1360: 1.2; 1600x900: 1.867 ->
-// 19,267,584; 1920x1080: 2.667 (k = 8: 256 x 160 against 160 x 96) -> 27,525,120 (26.2 MiB).
-// The screen size is read from the game's own words 0x827D4274 / 0x827D4278 (not the cvar), so a
-// back buffer that did not come out as asked is scaled by what it really is and is reported. Only
-// the HD constant is touched; any other size (SD formula) is left alone.
+// New size (changed after run W-1, WIDESCREEN.md section 13, and again by the first 1920x1080 boot). The pool's
+// allocator (sub_82183748) is a bump pointer per slot with NO bounds check: a texture that does not fit is placed
+// past the pool's end, over whatever the kernel put after the block. That was the `sysMemSimpleAllocator`
+// "guard word trashed" fatal at 1432 / 1440 with the first version of this hook (scale by area), later traced to the
+// zero-fill overrun (mcla_ws_texclear.cpp), not to the pool. The conservative answer was the largest growth of a
+// 32-aligned target (mcla_ws_sizing.h PoolGrowth: 1560x720 x1.4, 1920x1080 x2.667 = 27,525,120 bytes), and it is what
+// ran the 1920x1080 boot out of guest physical memory (`BaseHeap::Alloc failed to find contiguous range`, then RAGE's
+// "Unable to create backup texture for rendertarget"): the pool and the four-allocation front-buffer block grow by
+// 35.6 MB there and nothing gives way. The default is now the AREA ratio, which is what Xenia Canary's working
+// "1920x1080 Resolution" patch for this title sets (BSD, game-patches 545407F8: 0x822E4924 = 0x1626000 =
+// 23,224,320 bytes = 0x9D8000 x 2.25), and the game's own physical pool gives the memory back
+// (mcla_ws_phys_pool.cpp, Xenia's 0x821312DC). The old factor stays one cvar away (mcla_ws_rt_pool_percent=267), and
+// the guard below catches a texture that still does not fit. The screen size is read from the game's own words
+// 0x827D4274 / 0x827D4278 (not the cvar), so a back buffer that did not come out as asked is scaled by what it really
+// is and is reported. Only the HD constant is touched; any other size (SD formula) is left alone.
 //
 // mcla_ws_rt_pool_guard (W8), the safety net for the same allocator. sub_82177EB0 (RAGE's render
 // target texture create) chooses where the texture's memory comes from:
@@ -120,14 +118,18 @@ void mcla_hook_ws_rt_pool(PPCRegister& r29) {
     }
     return;
   }
-  // The largest growth of a 32-texel-aligned target whose sides are the screen's divided by 1..16.
-  const sizing::Ratio growth = sizing::PoolGrowth(width, height);
-  const uint64_t rounded = sizing::ScaledPoolBytes(before, growth);
+  // The pool policy: the area ratio (Xenia's choice), or mcla_ws_rt_pool_percent (267 = the old max-over-targets factor).
+  const uint64_t rounded = mcla::ws::PoolBytesFor(before, width, height);
   r29.u64 = rounded;
   if (first) {
-    REXLOG_INFO("[mcla-ws-rt-pool] shared target pool {} -> {} bytes ({:.1f} -> {:.1f} MB, x{:.3f} = the "
-                "largest growth of a 32-texel-aligned target) for a {}x{} back buffer",
-                before, rounded, before / 1.0e6, double(rounded) / 1.0e6, growth.value(), width, height);
+    const double factor = double(rounded) / double(before);
+    REXLOG_INFO("[mcla-ws-rt-pool] shared target pool {} -> {} bytes ({:.1f} -> {:.1f} MB, x{:.3f}, {}) for a {}x{} "
+                "back buffer",
+                before, rounded, before / 1.0e6, double(rounded) / 1.0e6, factor,
+                REXCVAR_GET(mcla_ws_rt_pool_percent) > 0 ? "mcla_ws_rt_pool_percent"
+                                                         : "the area ratio, as Xenia's 1920x1080 patch",
+                width, height);
+    mcla::ws::LogPhysicalMemory("the renderer's pool creation");
   }
 }
 
