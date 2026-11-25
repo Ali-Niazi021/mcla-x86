@@ -29,11 +29,12 @@
 //   on          X             Y             Y              min(X, world)   Y overrides the world's cap (diagnostic)
 //
 // THE PRESET. `--mcla_fps_target=60` (mcla/profile/pc_profile.cpp, W4.1) is the whole 60 fps profile in one switch: it
-// sets mcla_sim60=true and mcla_fps_cap=60 (the "on 60 0" row above, M5) and writes out the hooks' own defaults that the
-// profile relies on (mcla_present_interval=-1 auto, video_mode_refresh_rate=60, mcla_smoothing_fix, mcla_ui_30hz,
-// mcla_race_clock=retail, mcla_sim_pace). mcla_sim_cap stays 0: the world's cap IS the host cap. With it: the world cap
-// is 60, the host limiter runs at min(60, EffectiveCap()), and the present interval is round(60 Hz / 60) = 1; a 60 -> 30
-// hold gives world 30, limiter 30, interval 2 (the shipped value) by itself. mcla_fps_target=30 is the "off 30" row.
+// sets mcla_sim60=true and mcla_fps_cap=0 (the "on 0 0" row above: the guest's vblank swap gate, SDK 0430, paces the
+// swaps; R7) and writes out the hooks' own defaults that the profile relies on (mcla_present_interval=-1 auto,
+// video_mode_refresh_rate=60, mcla_smoothing_fix, mcla_ui_30hz, mcla_race_clock=retail, mcla_sim_pace). mcla_sim_cap
+// stays 0, so the world cap is 60 and the present interval round(60 Hz / 60) = 1; a 60 -> 30 hold gives world 30,
+// pacer 30, interval 2 (the shipped value) by itself. --mcla_fps_cap=60 brings the host limiter back.
+// mcla_fps_target=30 is the "off 30" row.
 //
 // The limiter's rate is mcla_fps_cap lowered to EffectiveCap() while mcla_sim60 is on: the 60 -> 30 hold and the
 // 120 -> 60 tier lower it for their duration, and it is never raised. It runs on the thread that presents, from the

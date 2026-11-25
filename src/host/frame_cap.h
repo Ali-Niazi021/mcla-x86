@@ -13,7 +13,7 @@
 // THE CVARS (defined in mcla_app.cpp):
 //   mcla_fps_cap          0 (default: no host limiter, the shipped behaviour), 30, 60 or 120. Live.
 //   mcla_fps_cap_spin     wait by spinning only (mode=spin): a whole core, for A/B of the timer's precision. Live.
-//   mcla_fps_cap_tail_us  the part of each wait that is spun after the timer (default 1000 us), for the limiter and
+//   mcla_fps_cap_tail_us  the part of each wait that is spun after the timer (default 250 us, R7), for the limiter and
 //                         for the sim60 game-thread pacer (mcla_sim_pace). The high-resolution timer wakes late by
 //                         0.1 to 0.8 ms in one wait of ten (measured, scratch W3.3: lateness p99 0.45-0.85 ms with a
 //                         300-400 us tail, 0.04-0.11 ms with 1000 us). Live.

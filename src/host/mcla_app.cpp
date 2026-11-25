@@ -63,10 +63,12 @@ REXCVAR_DEFINE_INT32(mcla_fps_cap, 0, "MCLA",
 REXCVAR_DEFINE_BOOL(mcla_fps_cap_spin, false, "MCLA",
                     "Frame cap: wait by spinning on the clock alone (log mode=spin) instead of a high-resolution "
                     "timer plus a short spin. Burns a core; for A/B of the timer's precision. Live");
-REXCVAR_DEFINE_INT32(mcla_fps_cap_tail_us, 1000, "MCLA",
+REXCVAR_DEFINE_INT32(mcla_fps_cap_tail_us, 250, "MCLA",
                      "Frame cap and sim pacer: microseconds at the end of every wait that are spun after the timer "
-                     "wakes (the high-resolution timer wakes late by up to ~0.8 ms with a short tail; 1000 us "
-                     "measured p99 lateness 0.1 ms). Larger = more even frames, more CPU. Live")
+                     "wakes (the high-resolution timer wakes late by up to ~0.8 ms with a short tail: W3.3 measured p99 "
+                     "lateness 0.45-0.85 ms with 300-400 us and 0.1 ms with 1000 us; R7 trimmed the default 1000 -> 250 "
+                     "because every wait spun its whole tail, about 0.12 core at the cap, and the 60 fps preset now runs "
+                     "no host limiter: the guest vblank gates the swaps). Larger = more even frames, more CPU. Live")
     .range(100, 4000);
 
 namespace {

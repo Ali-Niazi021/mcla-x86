@@ -50,7 +50,8 @@ REXCVAR_DEFINE_INT32(mcla_fps_target, 0, "MCLA",
                      "MCLA frame-rate target preset, applied as app defaults at startup (any cvar given explicitly "
                      "still wins). 0 = the shipped timing: nothing is set (the guest's present interval 2 holds 30 "
                      "fps; no host cap, mcla_sim60 off). 30 = locked 30 (mcla_fps_cap=30, the shipped timing). 60 = "
-                     "the 60 fps profile: mcla_sim60=true, mcla_fps_cap=60, the A5 present interval on the guest "
+                     "the 60 fps profile: mcla_sim60=true, mcla_fps_cap=0 (no host limiter: the guest vblank's swap gate "
+                     "paces the swaps at the 60 Hz video_mode_refresh_rate), the A5 present interval on the guest "
                      "vblank rate (1 at 60 Hz), k(dt) camera and chassis, Flash movies at 30 Hz, countdown and race "
                      "clock. 120 is reserved (M7) and is not applied. Independent of mcla_profile (the resolution)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -385,10 +386,15 @@ constexpr CvarDefault kFps30Defaults[] = {
 constexpr CvarDefault kFps60Defaults[] = {
     // The master switch of every hook of the 60 fps timing (mcla_t_common.h). Source: iOS catalog.cpp:120.
     {"mcla_sim60", "true"},
-    // The host limiter at the swap. With mcla_sim60 the world's cap follows it (mcla_sim_cap stays 0), and the limiter
-    // runs at min(this, the world's cap): a 60 -> 30 hold lowers both. Source: iOS catalog.cpp:120 (ios_fps_cap);
-    // mcla_t_common.cpp PaceAtSwap; the table in mcla_t_common.h ("on 60 0").
-    {"mcla_fps_cap", "60"},
+    // NO host limiter at 60 (mcla_fps_cap=0; the iOS row's ios_fps_cap=60 has no counterpart needed here): the guest's
+    // vblank (video_mode_refresh_rate=60, set below by this same table) already gates every swap to the display's grid
+    // (SDK patch 0430, the swap gate), and a limiter on top of it only adds a second, unsynchronised clock. W3.4's cap-0 run
+    // had the better cadence: 8.7 % of frames held over 40 ms against 23.9 % with the cap at 60 (R7 item 2). The world's cap
+    // is then "none known" = 60 (mcla_sim_cap 0 and mcla_fps_cap 0: mcla_t_common.h, row "on 0 0": the quantiser, the pacer
+    // and the A5 interval all read it as 60), and the 60 -> 30 hold still works without the limiter: EffectiveCap() drops to 30,
+    // so the A5 hook returns the interval 2 (60 Hz / 30) and the game-thread pacer sleeps 1/30 s; PaceAtSwap() has nothing to
+    // lower. Use `--mcla_fps_cap=60` to get the limiter back (the "on 60 0" row).
+    {"mcla_fps_cap", "0"},
     // A5, auto (the hook's own default): the guest's presentation interval 2 is lowered to
     // round(video_mode_refresh_rate / 60) = 1 on every swap that had an engine-timer frame; loads and logos keep 2.
     // 0 would switch the hook off and the guest would hold 30 fps. mcla_t_present_interval.cpp.
