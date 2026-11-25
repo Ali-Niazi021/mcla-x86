@@ -1,6 +1,7 @@
 // Midnight Club: Los Angeles: the pure sizing maths of the widescreen hooks (docs/PLAN.md 3.8, W5.1).
 //
-// Header-only, constexpr, <cstdint> only: no SDK, no guest memory, no cvars. The hooks (mcla_ws_*.cpp) and the
+// Header-only, <cstdint> and <cmath> only: no SDK, no guest memory, no cvars. Everything is constexpr but VertPlusFov.
+// The hooks (mcla_ws_*.cpp) and the
 // unit tests (mcla/tests, a TESTS slice) include exactly this file. Everything is "W x H" (back buffer in
 // pixels), never "W x 720": 720p is the special case 1280 x 720 of every formula here.
 //
@@ -33,11 +34,16 @@
 //                        block plus the pool) and how much of the game's own 299.5 MiB physical pool to give back
 //                        for it (Xenia's 32 MiB at 1920x1080; mcla_ws_phys_pool.cpp).
 //
-// Not game facts but this port's decisions: the limits of the accepted sizes (kLimitsM6 now, kLimitsM7 reserved:
-// 2560 x 1200 is the optional M7 16:10 / ultrawide step and is NOT accepted until a build selects it), and the
-// rounding (W down to a multiple of 8, H down to a multiple of 4).
+//   IsTall() / UiBlockHeight() / VertPlusFov()
+//                        a buffer taller than 16:9 (1920x1200, 1280x800): the camera goes Hor- unless the vertical
+//                        angle is widened (Vert+, mcla_ws_tall_fov.cpp), and the Flash UI is drawn in a 16:9 band.
+//
+// Not game facts but this port's decisions: the limits of the accepted sizes (kLimits: 1280..1920 x 720..1200, bounded
+// by what one EDRAM surface can reach, see Limits), and the rounding (W down to a multiple of 8, H down to a multiple
+// of 4).
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 
 namespace mcla::ws::sizing {
@@ -56,15 +62,28 @@ constexpr uint32_t kRingAndHeapReach = 0x810010;  // bytes past the front-buffer
 constexpr uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
 constexpr uint32_t AlignUp(uint32_t value, uint32_t alignment) { return CeilDiv(value, alignment) * alignment; }
 
+// ---- the D3D surface ---------------------------------------------------------------------------------------------
+
+// msaa = the renderer's MSAA mode as the game stores it: 1 (none), 2, 4.
+constexpr uint32_t MsaaScaleX(uint32_t msaa) { return msaa >= 4 ? 2 : 1; }
+constexpr uint32_t MsaaScaleY(uint32_t msaa) { return msaa >= 2 ? 2 : 1; }
+
+// EDRAM tiles (80 x 16 samples, 5120 bytes) of one D3D surface the way the title's create-surface computes it.
+constexpr uint32_t DeviceSurfaceTiles(uint32_t width, uint32_t height, uint32_t msaa = 1, bool is_64bpp = false) {
+  return CeilDiv(width * MsaaScaleX(msaa), 80) * (AlignUp(height * MsaaScaleY(msaa), 16) / 16) *
+         (is_64bpp ? 2u : 1u);
+}
+
 // ---- accepted sizes --------------------------------------------------------------------------------------------
 
 struct Limits {
   uint32_t min_width, max_width, min_height, max_height;
 };
-// M6: up to 1920 x 1080 (one 1x scene on the 880M). M7 (reserved, not selected by any cvar): 2560 x 1200 for
-// 16:10 and ultrawide. W must exceed the shipped 1280, H is at least the shipped 720.
-inline constexpr Limits kLimitsM6{kBaseWidth + 8, 1920, kBaseHeight, 1080};
-inline constexpr Limits kLimitsM7{kBaseWidth + 8, 2560, kBaseHeight, 1200};
+// The sizes this port accepts: 1280..1920 wide, 720..1200 high. Exactly 1280x720 is the game's own size (off). The
+// upper end is what one surface can reach: a D3D surface is at most 2048 EDRAM tiles (the console's, and as far as
+// a host render target reaches from its base), which 1920x1200 (24 x 75 = 1800) is inside and 2048x1280 (2080) or
+// 2560x1200 (2400) are not; Resolve rejects those with kEdramSurface whatever `limits` says.
+inline constexpr Limits kLimits{kBaseWidth, 1920, kBaseHeight, 1200};
 
 constexpr uint32_t kWidthStep = 8;   // widths are rounded down to a multiple of 8
 constexpr uint32_t kHeightStep = 4;  // heights down to a multiple of 4 (900 and 1080 are, neither is a multiple of 8 / 16)
@@ -90,13 +109,15 @@ enum class Reason : uint8_t {
   // kOff
   kWidthZero,         // mcla_widescreen_width=0
   kAutoModeUnknown,   // auto, but the guest's video mode could not be read
-  kAutoModeNotLarger, // auto, the mode is not larger than 1280x720 (no --resolution=WxH)
+  kAutoModeNotLarger, // auto, the mode is smaller than 1280x720 in W or H (no --resolution=WxH)
+  kShippedSize,       // the request resolves to exactly 1280x720: the game's own size, nothing to do
   // kRejected
   kWidthNegative,     // a negative width other than -1
   kWidthRange,        // outside min_width..max_width after rounding
   kHeightNegative,
   kHeightRange,       // outside min_height..max_height after rounding (an explicit scene height, or the mode's)
   kTooNarrow,         // narrower than 4:3: the game's own IsWidescreen is false there, the aspect hooks cannot act
+  kEdramSurface,      // a device surface of more than 2048 EDRAM tiles: a surface cannot reach further
 };
 
 // Bits of Resolution::notes (a successful answer that differs from the literal request).
@@ -124,7 +145,9 @@ constexpr const char* Describe(Reason reason) {
     case Reason::kAutoModeUnknown:
       return "auto: the guest's video mode could not be read";
     case Reason::kAutoModeNotLarger:
-      return "auto: the video mode is not larger than 1280x720 (pass --resolution=WxH)";
+      return "auto: the video mode is smaller than 1280x720 (pass --resolution=WxH)";
+    case Reason::kShippedSize:
+      return "1280x720 is the game's own size";
     case Reason::kWidthNegative:
       return "mcla_widescreen_width is negative but not -1 (auto)";
     case Reason::kWidthRange:
@@ -135,18 +158,22 @@ constexpr const char* Describe(Reason reason) {
       return "height outside the accepted range";
     case Reason::kTooNarrow:
       return "narrower than 4:3 (the game's widescreen branch is not taken)";
+    case Reason::kEdramSurface:
+      return "a device surface would need more than 2048 EDRAM tiles (more than one surface can reach)";
   }
   return "";
 }
 
 // The back buffer from the two cvars and the video mode. Pure; never logs.
 //   width  0   off.
-//   width -1   auto: W x H = the video mode, when it is larger than 1280x720 in both W (>= min_width) and H
-//              (>= min_height); an explicit scene height replaces the mode's H.
+//   width -1   auto: W x H = the video mode, when it is at least 1280x720 (and not exactly that: larger in W or in H);
+//              an explicit scene height replaces the mode's H.
 //   width  W   W x H, H = the explicit scene height, else the video mode's height when the mode's width is W
 //              (the profile's `video_mode_width/height` = the scene), else the shipped 720.
-// W rounds down to a multiple of 8, H to a multiple of 4; a result outside `limits` is rejected, not clamped.
-constexpr Resolution Resolve(Request request, VideoMode mode, const Limits& limits = kLimitsM6) {
+// W rounds down to a multiple of 8, H to a multiple of 4; a result outside `limits` is rejected, not clamped. A result
+// of exactly 1280x720 is kOff (kShippedSize). Narrower than 4:3 is kTooNarrow, and a device surface of more than 2048
+// EDRAM tiles is kEdramSurface.
+constexpr Resolution Resolve(Request request, VideoMode mode, const Limits& limits = kLimits) {
   Resolution r{};
   const bool mode_known = mode.width != 0 && mode.height != 0;
   bool automatic = false;
@@ -161,7 +188,8 @@ constexpr Resolution Resolve(Request request, VideoMode mode, const Limits& limi
       r.reason = Reason::kAutoModeUnknown;
       return r;
     }
-    if (mode.width < limits.min_width || mode.height < limits.min_height) {
+    if (mode.width < limits.min_width || mode.height < limits.min_height ||
+        (mode.width == kBaseWidth && mode.height == kBaseHeight)) {
       r.reason = Reason::kAutoModeNotLarger;
       return r;
     }
@@ -215,9 +243,20 @@ constexpr Resolution Resolve(Request request, VideoMode mode, const Limits& limi
     r.height = height;
     return r;
   }
+  if (rounded_width == kBaseWidth && rounded_height == kBaseHeight) {
+    r.reason = Reason::kShippedSize;
+    return r;
+  }
   if (uint64_t(rounded_width) * 3 < uint64_t(rounded_height) * 4) {
     r.verdict = Verdict::kRejected;
     r.reason = Reason::kTooNarrow;
+    r.width = rounded_width;
+    r.height = rounded_height;
+    return r;
+  }
+  if (DeviceSurfaceTiles(rounded_width, rounded_height) > kConsoleEdramTiles) {
+    r.verdict = Verdict::kRejected;
+    r.reason = Reason::kEdramSurface;
     r.width = rounded_width;
     r.height = rounded_height;
     return r;
@@ -249,8 +288,38 @@ constexpr double AspectOf(uint32_t width, uint32_t height) {
 }
 
 // The width in screen pixels of a 16:9 block of the screen's full height: the Flash stage's own shape (1280 at
-// 720 lines). The UI squeeze narrows a full-width viewport to this.
+// 720 lines). The UI squeeze narrows a full-width viewport to this on a buffer wider than 16:9.
 constexpr double UiBlockWidth(uint32_t height) { return double(height) * 16.0 / 9.0; }
+
+// A back buffer taller than 16:9 (1920x1200, 1280x800, 1440x900). The game's widescreen branch is still taken
+// (the video mode's is-wide test is W x 3 >= H x 4) and its 16:9 constants are hooked to W/H, which with the vertical
+// FOV fixed (Perspective: tanH = tanV x aspect) leaves less than the 16:9 horizontal view: Hor-. Vert+ (VertPlusFov)
+// and the UI's 16:9 band are the answers.
+constexpr bool IsTall(uint32_t width, uint32_t height) { return height != 0 && uint64_t(width) * 9 < uint64_t(height) * 16; }
+
+// The height in screen pixels of a 16:9 block of the screen's full width: the Flash stage's own shape on a tall
+// buffer (720 at 1280 wide, 1080 at 1920). The UI band is this tall, centred vertically.
+constexpr double UiBlockHeight(uint32_t width) { return double(width) * 9.0 / 16.0; }
+
+// The game's 16/9 constant as the single-precision float it is (0x8201E7EC, 3FE38E39), widened.
+inline constexpr double kSixteenNine = double(16.0f / 9.0f);
+
+// sub_8217CB68 turns the FOV (the FULL vertical angle in degrees) into tanV = tan(fov x k), k = 0x820086A8 = 3C0EFA35
+// = pi / 360, and Perspective keeps it: tanH = tanV x aspect. Vert+ keeps the 16:9 horizontal view on a taller buffer
+// by widening the vertical angle: tanV' = tanV x (16/9) / aspect, so tanH' = tanV x 16/9 whatever the camera's own
+// lerp of the aspect (it multiplies both). 60 degrees -> 65.36 at 1.6 (1920x1200), 45 -> 49.43; the identity at
+// aspect >= 16/9 (a wider buffer stays Hor+, which is the game's own behaviour). Not constexpr: <cmath>.
+inline double VertPlusFov(double fov_degrees, double aspect, double k) {
+  if (!(aspect > 0.0) || aspect >= kSixteenNine - 1e-4 || !(k > 0.0)) {
+    return fov_degrees;
+  }
+  return std::atan(std::tan(fov_degrees * k) * (kSixteenNine / aspect)) / k;
+}
+
+// temporal_aa=fsr squeezes only a scene surface whose pitch equals the output width (SDK temporal_aa.cpp:349); the
+// game's tile surface pitch is the width rounded up to 160, so the output width must be a multiple of 160 (1280, 1440,
+// 1600, 1920 are; 1680 is not).
+constexpr bool FsrSqueezeWidthOk(uint32_t width) { return width % 160 == 0; }
 
 // ---- render-target pool ----------------------------------------------------------------------------------------
 
@@ -291,22 +360,14 @@ constexpr Ratio PoolAreaGrowth(uint32_t width, uint32_t height) {
 }
 
 // The pool for a width x height buffer under the area policy, in whole 4 KiB pages: 23,224,320 at 1920x1080,
-// 16,128,000 at 1600x900, `shipped` unchanged at 1280x720.
+// 16,130,048 at 1600x900, `shipped` unchanged at 1280x720.
 constexpr uint64_t AreaPoolBytes(uint32_t shipped, uint32_t width, uint32_t height) {
   return ScaledPoolBytes(shipped, PoolAreaGrowth(width, height), 4096);
 }
 
 // ---- EDRAM -----------------------------------------------------------------------------------------------------
 
-// msaa = the renderer's MSAA mode as the game stores it: 1 (none), 2, 4.
-constexpr uint32_t MsaaScaleX(uint32_t msaa) { return msaa >= 4 ? 2 : 1; }
-constexpr uint32_t MsaaScaleY(uint32_t msaa) { return msaa >= 2 ? 2 : 1; }
-
-// EDRAM tiles (80 x 16 samples, 5120 bytes) of one D3D surface the way the title's create-surface computes it.
-constexpr uint32_t DeviceSurfaceTiles(uint32_t width, uint32_t height, uint32_t msaa = 1, bool is_64bpp = false) {
-  return CeilDiv(width * MsaaScaleX(msaa), 80) * (AlignUp(height * MsaaScaleY(msaa), 16) / 16) *
-         (is_64bpp ? 2u : 1u);
-}
+// (MsaaScaleX / MsaaScaleY / DeviceSurfaceTiles are above, next to Resolve, which uses them.)
 
 // Tiles left over for the targets D3D places itself, after both device surfaces (negative: they do not fit).
 constexpr int32_t FreeTilesAfterDeviceSurfaces(uint32_t edram_tiles, uint32_t width, uint32_t height) {

@@ -70,17 +70,21 @@ constexpr uint32_t kModeHeightOffset = 100;
 
 // What a rejected value would have needed, for the error line.
 std::string RejectionDetail(const sizing::Resolution& r) {
-  const sizing::Limits& l = sizing::kLimitsM6;
+  const sizing::Limits& l = sizing::kLimits;
   switch (r.reason) {
     case sizing::Reason::kWidthRange:
       return "accepted widths " + std::to_string(l.min_width) + ".." + std::to_string(l.max_width) +
-             " (rounded down to a multiple of " + std::to_string(sizing::kWidthStep) + "; 2560 is reserved for M7)";
+             " (rounded down to a multiple of " + std::to_string(sizing::kWidthStep) + ")";
     case sizing::Reason::kHeightRange:
       return "accepted heights " + std::to_string(l.min_height) + ".." + std::to_string(l.max_height) +
-             " (rounded down to a multiple of " + std::to_string(sizing::kHeightStep) + "; 1200 is reserved for M7), got " +
+             " (rounded down to a multiple of " + std::to_string(sizing::kHeightStep) + "), got " +
              std::to_string(r.height);
     case sizing::Reason::kTooNarrow:
       return std::to_string(r.width) + "x" + std::to_string(r.height) + " is narrower than 4:3";
+    case sizing::Reason::kEdramSurface:
+      return std::to_string(r.width) + "x" + std::to_string(r.height) + " needs " +
+             std::to_string(sizing::DeviceSurfaceTiles(r.width, r.height)) +
+             " EDRAM tiles a surface, one surface reaches " + std::to_string(sizing::kConsoleEdramTiles);
     default:
       return "";
   }
@@ -102,7 +106,7 @@ std::string NotesText(uint32_t notes) {
     add("height from the video mode (mcla_scene_height=0)");
   }
   if (notes & sizing::kNoteModeHeightIgnored) {
-    add("the video mode's height is outside 720..1080: scene height stays 720");
+    add("the video mode's height is outside the accepted heights: scene height stays 720");
   }
   return text;
 }
@@ -217,7 +221,9 @@ void mcla_hook_ws_scene_size(PPCRegister& r1) {
   REXLOG_INFO("[mcla-wide] mode {}x{}, back buffer {}x{} (options width/height set), aspect {:.4f}{}, aspect mask {}, "
               "cutscene fov {}, rt pool scale {}{}{}",
               mode_w, mode_h, width, height, mcla::ws::Aspect(),
-              mcla::ws::SixteenNine() ? " (16:9: the aspect and cutscene hooks stay idle)" : "",
+              mcla::ws::SixteenNine() ? " (16:9: the aspect and cutscene hooks stay idle)"
+              : mcla::ws::Tall()      ? " (taller than 16:9: Vert+ camera, the UI in a 16:9 band)"
+                                      : "",
               REXCVAR_GET(mcla_ws_aspect_mask), REXCVAR_GET(mcla_ws_cutscene_fov) ? "on" : "off",
               REXCVAR_GET(mcla_ws_rt_pool_scale) ? "on" : "off", notes.empty() ? "" : ", ", notes);
   if (!mode_known || mode_w != width || mode_h != height) {
@@ -226,6 +232,23 @@ void mcla_hook_ws_scene_size(PPCRegister& r1) {
                 mode_w, mode_h, width, height, width, height);
   }
   LogSizing(width, height);
+  if (sizing::IsTall(width, height) && REXCVAR_QUERY(bool, mcla_noaa)) {
+    // The game's own 1x tiling of a tall buffer can end in a sliver of a tile (1440x900: 2 x 896 rows, the second one 4).
+    const sizing::SceneTiling t1 = sizing::GameSceneTiling(width, height, 1);
+    const uint32_t last_rows = t1.count > 1 ? height - (t1.count - 1) * t1.tile_rows : t1.tile_rows;
+    if (t1.count > 1 && !REXCVAR_QUERY(bool, mcla_ws_single_tile)) {
+      REXLOG_WARN("[mcla-wide] the 1x scene of {}x{} is {} tiles of {} rows (the last has {}): --mcla_ws_single_tile=true "
+                  "draws it as one{}",
+                  width, height, t1.count, t1.tile_rows, last_rows,
+                  last_rows < 32 ? " (mandatory here: a tile that short is not worth its resolve)" : "");
+    }
+  }
+  if (rex::cvar::GetFlagByName("temporal_aa") == "fsr" && !sizing::FsrSqueezeWidthOk(width)) {
+    REXLOG_WARN("[mcla-wide] temporal_aa=fsr squeezes only a scene surface whose pitch equals the output width, and the "
+                "game's tile surface pitch is the width rounded up to 160: {} is not a multiple of 160 ({} would "
+                "be), so the FSR pass will not arm",
+                width, sizing::AlignUp(width, 160));
+  }
   // The physical-pool hook (boot) sized the game's pool for the size the cvars and the SDK's video mode planned; this
   // is the size the game really got.
   const sizing::Resolution planned = mcla::ws::PlannedResolution();

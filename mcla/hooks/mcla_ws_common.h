@@ -5,20 +5,23 @@
 //
 //   mcla_widescreen_width (int)
 //     0    off: the game runs exactly as shipped (1280x720, 16:9). Default.
-//     W    (1288..1920, rounded down to a multiple of 8) a real W x H back buffer, Hor+ camera, rt pool scaled by
-//          area. Needs the SDK's video mode to be W x H too (--resolution=WxH, or video_mode_width/height) or the
-//          presenter stretches the picture; the log line of the scene-size hook says so.
-//     -1   auto: W x H = the video mode's size when it is larger than 1280x720 (what the launcher's "Fit this
-//          screen" passes as --resolution=1560x720, and --resolution=1920x1080); otherwise off.
+//     W    (1280..1920, rounded down to a multiple of 8) a real W x H back buffer, Hor+ camera (Vert+ when taller than
+//          16:9), rt pool scaled by area. Needs the SDK's video mode to be W x H too (--resolution=WxH, or
+//          video_mode_width/height) or the presenter stretches the picture; the log line of the scene-size hook
+//          says so.
+//     -1   auto: W x H = the video mode's size when it is at least 1280x720 and not exactly that (what the launcher's
+//          "Fit this screen" passes as --resolution=1560x720, --resolution=1920x1080 and --resolution=1280x800);
+//          otherwise off.
 //
 //   mcla_scene_height (int): the back buffer's height.
 //     0    derived: the video mode's height when the width is auto or equals the mode's width, else 720
 //          (the original W x 720 behaviour).
-//     H    (720..1080, rounded down to a multiple of 4) explicit.
+//     H    (720..1200, rounded down to a multiple of 4) explicit.
 //
-// A value that cannot be honoured (outside the ranges, narrower than 4:3) is not clamped: widescreen stays off and
-// the log gets `[mcla-wide] error: ...`. The ranges and the maths are in mcla_ws_sizing.h (kLimitsM6; 2560 x 1200 is
-// reserved for M7). The profile presets `mcla_profile=1080p` / `900p` (profile/pc_profile.cpp) set both.
+// A value that cannot be honoured (outside the ranges, narrower than 4:3, a device surface of more than 2048 EDRAM
+// tiles) is not clamped: widescreen stays off and the log gets `[mcla-wide] error: ...`. Exactly 1280x720 is the
+// game's own size: off, no error. The ranges and the maths are in mcla_ws_sizing.h (kLimits). The profile presets
+// `mcla_profile=1080p` / `900p` / `800p` / `1200p` ... (profile/pc_profile.cpp) set both.
 //
 // The scene-size hook (W1, mcla_ws_scene_size.cpp) runs once at device init, decides the final W x H from the cvars
 // and the video mode, writes it into the game's two `width` / `height` option words and publishes it here. Every
@@ -71,6 +74,9 @@
 #ifndef MCLA_HOOK_WS_PHYS_POOL
 #define MCLA_HOOK_WS_PHYS_POOL 0
 #endif
+#ifndef MCLA_HOOK_WS_TALL_FOV
+#define MCLA_HOOK_WS_TALL_FOV 0
+#endif
 
 REXCVAR_DECLARE(int32_t, mcla_widescreen_width);
 REXCVAR_DECLARE(int32_t, mcla_scene_height);
@@ -111,6 +117,9 @@ double Aspect();
 // every aspect hook stays idle.
 bool SixteenNine();
 
+// The resolved back buffer is taller than 16:9 (1920x1200, 1280x800, 1440x900): the Vert+ hook and the UI band apply.
+bool Tall();
+
 // For a hook that replaces a 16:9 constant: true (and the aspect in *aspect) when widescreen is on, the buffer is
 // not exactly 16:9 and the mask cvar has `bit` set.
 bool AspectFor(int32_t bit, double* aspect);
@@ -118,6 +127,10 @@ bool AspectFor(int32_t bit, double* aspect);
 // The width in screen pixels of a 16:9 block of the back buffer's full height (1280 at 720 lines, 1920 at 1080);
 // 0 when widescreen is off. The UI squeeze's middle block.
 double UiBlockWidth();
+
+// The height in screen pixels of a 16:9 block of the back buffer's full width (720 at 1280 wide, 1080 at 1920); 0 when
+// widescreen is off. The UI band on a tall buffer.
+double UiBlockHeight();
 
 // Called by the scene-size hook only. Reads the cvars and resolves them against the video mode the game was given
 // (the guest's XGetVideoMode result); pure with respect to the published state.

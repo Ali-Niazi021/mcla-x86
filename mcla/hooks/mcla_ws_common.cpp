@@ -20,15 +20,16 @@
 
 REXCVAR_DEFINE_INT32(mcla_widescreen_width, 0, "MCLA",
                      "MCLA widescreen master switch (docs/mcla/WIDESCREEN.md). 0 = off, the game's own "
-                     "1280x720 (default). 1288..1920 = a real W x H back buffer with a Hor+ camera (H is "
+                     "1280x720 (default). 1280..1920 = a real W x H back buffer with a Hor+ camera, Vert+ when "
+                     "taller than 16:9 (H is "
                      "mcla_scene_height; also pass --resolution=WxH so the presenter does not stretch it). "
-                     "-1 = auto: W x H is the video mode's size when --resolution gave a mode larger than "
-                     "1280x720. A value that cannot be honoured keeps widescreen off and logs "
+                     "-1 = auto: W x H is the video mode's size when --resolution gave a mode that is at least "
+                     "1280x720 and not exactly that. A value that cannot be honoured keeps widescreen off and logs "
                      "'[mcla-wide] error:'. Read once, at device init");
 REXCVAR_DEFINE_INT32(mcla_scene_height, 0, "MCLA",
                      "MCLA widescreen: the back buffer's height with mcla_widescreen_width. 0 = derived: the "
                      "video mode's height when the width is auto or equals the mode's width, else 720 (the "
-                     "original W x 720). Otherwise 720..1080, rounded down to a multiple of 4. Ignored while "
+                     "original W x 720). Otherwise 720..1200, rounded down to a multiple of 4. Ignored while "
                      "mcla_widescreen_width is 0. mcla_profile=1080p sets 1920x1080. Read once, at device "
                      "init");
 REXCVAR_DEFINE_INT32(mcla_ws_aspect_mask, 31, "MCLA",
@@ -105,6 +106,8 @@ double Aspect() {
 
 bool SixteenNine() { return sizing::IsSixteenNine(Width(), Height()); }
 
+bool Tall() { return sizing::IsTall(Width(), Height()); }
+
 bool AspectFor(int32_t bit, double* aspect) {
   const double a = Aspect();
   if (a == 0.0 || SixteenNine() || (REXCVAR_GET(mcla_ws_aspect_mask) & bit) == 0) {
@@ -119,11 +122,15 @@ double UiBlockWidth() {
   return h == 0 ? 0.0 : sizing::UiBlockWidth(h);
 }
 
+double UiBlockHeight() {
+  const uint32_t w = Width();
+  return w == 0 ? 0.0 : sizing::UiBlockHeight(w);
+}
+
 sizing::Resolution ResolveRequest(uint32_t mode_width, uint32_t mode_height) {
   return sizing::Resolve({REXCVAR_GET(mcla_widescreen_width), REXCVAR_GET(mcla_scene_height)},
                          {mode_width, mode_height});
 }
-
 
 sizing::Resolution PlannedResolution() {
   static const sizing::Resolution planned = [] {

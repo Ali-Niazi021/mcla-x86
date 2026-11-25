@@ -10,6 +10,13 @@
 // (stage px per screen px = 1280 / W). A buffer that is not wider than 16:9 (1920x1080, 1600x900, 1440x1080) has
 // no side area: nothing is squeezed or moved, whatever the mask says.
 //
+// Tall buffers (S4: 1280x800, 1440x900, 1920x1200). The stage is stretched to W x H (case S) in both directions, so on a
+// buffer taller than 16:9 the HUD would be taller than authored (x 1.5, y 1.667 at 1920x1200 [INFERENCE]). A whole-buffer
+// viewport (x = y = 0, the full W and H) of mode C / L / R becomes a 16:9 band: height = W x 9/16 (ws::UiBlockHeight()),
+// y = (H - band) / 2 (60 px at 1920x1200, 40 at 1280x800). Mode F is left alone. Bit 0x200 (Flash-space placement) and the
+// edge pieces are off there: the buffer has no side room, and the game's own 16:9 layout already puts the pieces at the
+// band's sides. Use mask 0x10C (268). Open, as at 1568: 3D-in-movie sub-rects, fades, vertical edge anchoring.
+//
 // Three mechanisms (section 15 has the evidence and the reasoning):
 //
 //  1. VIEWPORT SQUEEZE. D3D SetViewport is sub_824162D8(r3 device, f1 x, f2 y, f3 width, f4 height,
@@ -761,11 +768,19 @@ void mcla_hook_ws_ui_viewport(PPCRegister& f1, PPCRegister& f2, PPCRegister& f3,
   }
   g_viewport_calls.fetch_add(1, std::memory_order_relaxed);
   const double wide = double(mcla::ws::Width());
+  const double high = double(mcla::ws::Height());
+  const bool tall = mcla::ws::Tall();
   const double x = f1.f64, width = f3.f64;
-  const bool full_width = x > -0.5 && x < 0.5 && width > wide - 0.5 && width < wide + 0.5;
+  // A candidate spans the whole buffer: x = 0 and the full width; on a tall buffer also y = 0 and the full height (the
+  // 3D objects inside a movie get rects as wide as the buffer too, and must not become a band).
+  bool full_width = x > -0.5 && x < 0.5 && width > wide - 0.5 && width < wide + 0.5;
+  if (tall) {
+    full_width = full_width && f2.f64 > -0.5 && f2.f64 < 0.5 && f4.f64 > high - 0.5 && f4.f64 < high + 0.5;
+  }
   const MovieFrame* frame = TopFrame();
   const bool ui = t_ui_phase;
-  const uint32_t mask = SqueezeMask();
+  // Flash-space placement (bit 0x200) needs side room that a tall buffer does not have: ignored there.
+  const uint32_t mask = tall ? (SqueezeMask() & ~kFlashSpaceBit) : SqueezeMask();
   const uint32_t kind = frame ? std::min<uint32_t>(frame->kind, kKinds) : 0;
   const bool in_movie = frame != nullptr && frame->kind < uint32_t(kKinds);
   if (in_movie) {
@@ -806,8 +821,12 @@ void mcla_hook_ws_ui_viewport(PPCRegister& f1, PPCRegister& f2, PPCRegister& f3,
       why = " (outside a movie draw, bit 0x100 off)";
     }
   }
-  // A buffer that is not wider than its own 16:9 block (1920x1080, 1600x900) has no side area to squeeze into.
-  const bool squeeze = (mode == 'C' || mode == 'L' || mode == 'R') && wide > mcla::ws::UiBlockWidth() + 0.5;
+  // A buffer that is not wider than its own 16:9 block (1920x1080, 1600x900) has no side area to squeeze into; a tall
+  // one has no side area either but a top and bottom one: its viewport becomes a 16:9 band instead.
+  const bool mode_changes = mode == 'C' || mode == 'L' || mode == 'R';
+  const bool squeeze_wide = mode_changes && !tall && wide > mcla::ws::UiBlockWidth() + 0.5;
+  const bool squeeze_tall = mode_changes && tall;
+  const bool squeeze = squeeze_wide || squeeze_tall;
 
   // Log the first few rectangles: per kind in a movie draw, and outside one in the UI phase.
   bool log_it = t_trace && ui;
@@ -838,6 +857,25 @@ void mcla_hook_ws_ui_viewport(PPCRegister& f1, PPCRegister& f2, PPCRegister& f3,
     t_ui_vp_full = full_width && !squeeze;   // stage = W / 1280 px per stage px: Flash-space placement applies
   }
   if (!squeeze) {
+    return;
+  }
+  if (squeeze_tall) {
+    // A tall buffer: the whole-buffer viewport becomes the 16:9 band, centred vertically (60 px at 1920x1200, 40 at
+    // 1280x800). x and the width stay: the stage's 1280 stage px still span the width, the band keeps its shape.
+    const double band = mcla::ws::UiBlockHeight();
+    f4.f64 = double(float(band));
+    f2.f64 = double(float((high - band) * 0.5));
+    static std::atomic<bool> announced{false};
+    if (!announced.exchange(true)) {
+      REXLOG_INFO("[mcla-ws-ui] tall buffer {}x{}: whole-buffer UI viewports become a {:.0f}-row band at y {:.0f} (the "
+                  "16:9 block of the width, mask 0x{:X})",
+                  mcla::ws::Width(), mcla::ws::Height(), band, (high - band) * 0.5, mask);
+    }
+    if (in_movie) {
+      g_viewport_squeezed[kind].fetch_add(1, std::memory_order_relaxed);
+    } else {
+      g_viewport_outside_squeezed.fetch_add(1, std::memory_order_relaxed);
+    }
     return;
   }
   const double base = mcla::ws::UiBlockWidth();  // the middle 16:9 block: 1280 px at 720 lines
@@ -955,7 +993,8 @@ void mcla_hook_ws_ui_piece(PPCRegister& r30) {
   if (first_call && t_ui_phase) {
     LogFirstInstance(*frame, r30.u32);
   }
-  if (!t_ui_vp_full || (SqueezeMask() & kFlashSpaceBit) == 0) {
+  // No side room on a tall buffer: the game's own 16:9 layout already puts the pieces at the band's sides.
+  if (!t_ui_vp_full || (SqueezeMask() & kFlashSpaceBit) == 0 || mcla::ws::Tall()) {
     return;
   }
   const char mode = frame->mode;

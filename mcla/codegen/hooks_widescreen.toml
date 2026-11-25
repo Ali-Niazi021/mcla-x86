@@ -256,3 +256,15 @@ address = 0x821312DC
 name = "mcla_hook_ws_physical_pool"
 registers = ["r30"]
 after_instruction = true
+
+# [S4] mcla_ws_tall_fov: sub_822E5E10 (scene camera), AFTER `fmuls f2,f11,f12` (f2 = the aspect Perspective
+# gets: the lerp f11 times the 16:9 constant f12, from the IsWidescreen branch). f30 = the full vertical FOV in
+# degrees (`fmr f30,f1` at 0x822E5E34, restored by the function's __restfpr_28; the join at 0x822E5E94 hands
+# it to Perspective with `fmr f1,f30`). The explicit-aspect path (`fneg f2,f31 ; b 0x822E5E94`) skips this
+# address. Vert+ for a back buffer taller than 16:9. Build flag MCLA_HOOK_WS_TALL_FOV, cvar mcla_ws_tall_fov.
+# mcla/hooks/mcla_ws_tall_fov.cpp. NEEDS A RE-CODEGEN (new entry).
+[[midasm_hook]]
+address = 0x822E5E90
+name = "mcla_hook_ws_tall_fov"
+registers = ["f2", "f30"]
+after_instruction = true
