@@ -126,6 +126,17 @@ constexpr CvarDefault kProfileDefaults[] = {
     // the GPS, the menus and the car paint (where LARecomp and the iOS Carbon renderer saw stale data). Defined in
     // command_processor.cpp (true); `--clear_memory_page_state=true` brings the old behaviour back.
     {"clear_memory_page_state", "false"},
+    // Pixel-shader translation options (SDK 04b0; each a bit of the shader modification, so caches never mix):
+    // refactoringAllowed (FMA, scalar work on the scalar unit), DXBC mad, sample_b with the same LOD, and loop-free
+    // control flow for forward-jump shaders. RGA gfx1150: -30 % vector ALU, VGPR 78 -> 61; V4: picture right in V4p-on,
+    // GPU p50 -0.5 ms (V4b-opt). dxbc_ps_ieee_mul (no 0*x=0 emulation) stays off: one unexplained white frame in V3.
+    {"dxbc_ps_refactoring_allowed", "true"},
+    {"dxbc_ps_mad", "true"},
+    {"dxbc_sample_bias", "true"},
+    {"dxbc_forward_cf", "true"},
+    // Straight-line vertex fetch (SDK 04d0): static shared-memory binding + branch-free endian swap; exact (4 M-execution
+    // swap test), serial memory rounds per shadow VS 6.8 -> 4.2. V4p-on: no pipeline failures, picture right.
+    {"dxbc_vs_straight_fetch", "true"},
     // Custom vinyls are the only readback the game needs: a 1 MiB, 512x512, format-6 resolve into the
     // vinyl editor's range (readback_resolve itself stays `none`). The owner's and Renan's strings are
     // identical. Source: iOS games/mcla/game_profile.cpp:40; Renan perf_options.cpp:619,652;
