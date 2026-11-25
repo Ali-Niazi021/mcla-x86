@@ -12,14 +12,17 @@
 #   mcla_ws_sizing_test        test_ws_sizing.cpp              hooks/mcla_ws_sizing.h (W x H resolution rules and
 #                                                              rejections, EDRAM tiles, render-target pool, texture
 #                                                              block overshoot). New in the TESTS slice, not an iOS port
+#   mcla_swap_target_test      test_swap_target.cpp            hooks/mcla_t_swap_target.h (the guest swap callback's
+#                                                              target vblank, swap classes, timed-swap hand-off). New
+#                                                              in the TESTS slice too
 #
-# `mcla_unit_tests` is the aggregate target (`cmake --build <dir> --target mcla_unit_tests`). The four executables
+# `mcla_unit_tests` is the aggregate target (`cmake --build <dir> --target mcla_unit_tests`). The five executables
 # are also part of ALL, so a normal full build is followed by `ctest` (multi-config generators: `ctest -C <config>`).
 # Each test is one executable and exits 1 on the first failed check, which is what CTest looks at.
 #
 # Input, set by the root CMakeLists.txt before add_subdirectory(mcla/tests) or with -D on the command line:
-#   MCLA_HOOKS_DIR   directory with mcla_t_sim_math.h, frame_clock_policy.h, mcla_game_state.h, mcla_game_state.cpp
-#                    and mcla_ws_sizing.h.
+#   MCLA_HOOKS_DIR   directory with mcla_t_sim_math.h, frame_clock_policy.h, mcla_game_state.h, mcla_game_state.cpp,
+#                    mcla_ws_sizing.h and mcla_t_swap_target.h.
 #                    Default: ../hooks (mcla/hooks). A relative value is taken from the top-level source directory.
 #
 # From the root: add_subdirectory(mcla/tests) (the root calls enable_testing()). Alone, with no SDK or toolchain
@@ -38,7 +41,7 @@ get_filename_component(_mcla_tests_hooks_dir "${MCLA_HOOKS_DIR}" ABSOLUTE BASE_D
 
 # Say so at configure time when the GAME slice's files are not where the tests expect them.
 foreach(_mcla_tests_input IN ITEMS mcla_t_sim_math.h frame_clock_policy.h mcla_game_state.h mcla_game_state.cpp
-                                   mcla_ws_sizing.h)
+                                   mcla_ws_sizing.h mcla_t_swap_target.h)
   if(NOT EXISTS "${_mcla_tests_hooks_dir}/${_mcla_tests_input}")
     message(FATAL_ERROR "mcla/tests: ${_mcla_tests_input} not found in MCLA_HOOKS_DIR (${_mcla_tests_hooks_dir})")
   endif()
@@ -47,7 +50,7 @@ endforeach()
 add_custom_target(mcla_unit_tests)
 
 # One executable plus one CTest test of the same name. `std` is the C++ standard the iOS port compiled the test with
-# (the new mcla_ws_sizing_test: the one of the root build).
+# (the tests new in this repository: the one of the root build).
 function(mcla_add_unit_test target std)
   add_executable(${target} ${ARGN})
   set_target_properties(${target} PROPERTIES CXX_STANDARD ${std} CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
@@ -72,3 +75,6 @@ mcla_add_unit_test(mcla_present_cadence_test 23 mcla_present_cadence_test.cpp)
 
 mcla_add_unit_test(mcla_ws_sizing_test 23 test_ws_sizing.cpp)
 target_include_directories(mcla_ws_sizing_test PRIVATE "${_mcla_tests_hooks_dir}")
+
+mcla_add_unit_test(mcla_swap_target_test 23 test_swap_target.cpp)
+target_include_directories(mcla_swap_target_test PRIVATE "${_mcla_tests_hooks_dir}")
