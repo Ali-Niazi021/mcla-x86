@@ -42,7 +42,11 @@
 #             codegen entry goes in hooks_gfx.toml)
 #   fsr       FSR_MARKERS (W5.6): function overrides of sub_822C0980 / sub_822E6408 / sub_822E55D0 that write the guest
 #             render markers (PM4 NOP 'REXM') the SDK's FSR 3.1 temporal AA / upscaling needs; no codegen entry (link-time
-#             override of the generated weak functions); cvar mcla_render_markers (-1 = auto: on while temporal_aa=fsr)
+#             override of the generated weak functions); cvar mcla_render_markers (-1 = auto: on while temporal_aa=fsr, or
+#             tonemap_transfer_skip is on, or the SDK's `hdr` is not off: its HDR scene / UI-layer passes need the markers)
+#   hdr       HDR (host side only, no guest code touched): the in-run A/B switcher of the HDR measurements, a background
+#             thread that cycles groups of cvar assignments on a clock (cvars mcla_hdr_ab, mcla_hdr_ab_period_s,
+#             mcla_hdr_ab_start_s; empty mcla_hdr_ab = does nothing; tools/hdr/hdr_ab.py reads its log lines)
 #   input     INPUT_TITLE_LATCH 0x82615048 + 0x822C8B34, INPUT_MENU_REPEAT 0x822240C0 + 0x822241CC (W5.6): the 60 fps input
 #             fixes (a title Start press a polling script misses; one menu tap stepping twice); cvars
 #             mcla_input_title_latch / mcla_input_menu_repeat (-1 = auto: on while mcla_sim60 is on)
@@ -100,7 +104,9 @@ set(MCLA_HOOK_DEFINITIONS
     # FSR render markers, 60 fps input fixes (W5.6)
     MCLA_HOOK_FSR_MARKERS=1
     MCLA_HOOK_INPUT_TITLE_LATCH=1
-    MCLA_HOOK_INPUT_MENU_REPEAT=1)
+    MCLA_HOOK_INPUT_MENU_REPEAT=1
+    # HDR measurement helpers (the A/B switcher)
+    MCLA_HOOK_HDR=1)
 
 set(MCLA_HOOK_INCLUDE_DIRS
     "${CMAKE_CURRENT_LIST_DIR}/hooks"
