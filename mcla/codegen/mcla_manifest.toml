@@ -120,7 +120,7 @@ game_root = "@GAME_ROOT@"
 file_path = "@XEX@"
 out_directory_path = "@OUT_DIR@"
 
-includes = ["overrides.toml", "harvest.toml", "huecos.toml", "hooks.toml", "hooks_widescreen.toml", "hooks_timing.toml", "hooks_gfx.toml"]
+includes = ["overrides.toml", "harvest.toml", "huecos.toml", "hooks.toml", "hooks_widescreen.toml", "hooks_timing.toml", "hooks_gfx.toml", "hooks_vis.toml"]
 
 # --- Root keys (must stay above every sub-table) -----------------------------
 # cr_as_local ONLY. Do NOT enable ctr_as_local / xer_as_local /

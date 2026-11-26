@@ -206,7 +206,7 @@ double QpcMs() {
 
 }  // namespace
 
-void OnFrame() {
+static void AbOnFrame() {
   State& s = St();
   const std::string& text = REXCVAR_GET(mcla_vis_ab);
   if (!s.parsed || text != s.text) {
@@ -226,6 +226,11 @@ void OnFrame() {
     REXLOG_INFO("[mcla-vis] ab t={:.3f} qpc_ms={:.3f} {}={} ({}) now={}", t, qpc_ms, e.name, e.value,
                 ok ? "ok" : "REJECTED", back);
   }
+}
+
+void OnFrame() {
+  AbOnFrame();
+  SceneOnFrame();  // the mcla_dev_* scene cvars (mcla_vis_scene.cpp), after the schedule so a switch it makes applies this frame
 }
 
 }  // namespace mcla::vis

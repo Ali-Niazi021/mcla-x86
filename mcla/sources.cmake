@@ -52,7 +52,10 @@
 #             mcla_input_title_latch / mcla_input_menu_repeat (-1 = auto: on while mcla_sim60 is on)
 #   vis       mcla_vis_ab.cpp (no flag, no codegen entry; the hooks/*.cpp glob below picks it up): the in-run A/B scheduler,
 #             cvar mcla_vis_ab = 'SEC:CVARNAME:VALUE+...' changes cvars at given seconds of one run; mcla::vis::OnFrame() is
-#             called from mcla::gfxtune::OnFrame
+#             called from mcla::gfxtune::OnFrame; mcla_vis_scene.cpp (no flag, no codegen entry): the mcla_dev_* scene cvars (time of
+#             day, weather, road density; dev / test only), called from mcla::vis::OnFrame
+#             VIS_MOTION_BLUR (mid-asm hooks 0x822E85F8 + 0x822E88E0, entries in hooks_vis.toml, cvar mcla_vis_motion_blur): the
+#             length of the motion blur streaks at 60 fps (1 = as the game does, -1 = the streak of a 30 fps frame, > 0 = a multiplier)
 #
 # Not hooks, always compiled (no flag, no [[midasm_hook]] entry; the glob below picks them up): the shared state of a hook
 # group (mcla_t_common.cpp, mcla_ws_common.cpp, mcla_cpu_common.cpp, mcla_gfx_tune.cpp) and the LOCK60 GPU frame governor
@@ -109,6 +112,8 @@ set(MCLA_HOOK_DEFINITIONS
     MCLA_HOOK_GFX_IMPOSTORS=1
     MCLA_HOOK_GFX_FAR_CASCADES=1
     MCLA_HOOK_GFX_IMPOSTOR_THROTTLE=1
+    # visuals
+    MCLA_HOOK_VIS_MOTION_BLUR=1
     # FSR render markers, 60 fps input fixes (W5.6)
     MCLA_HOOK_FSR_MARKERS=1
     MCLA_HOOK_INPUT_TITLE_LATCH=1
