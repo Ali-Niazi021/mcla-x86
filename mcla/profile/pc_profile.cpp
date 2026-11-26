@@ -190,6 +190,19 @@ constexpr CvarDefault kLock60Defaults[] = {
     // Run lk-gov2: busy 11-12 ms at level 0 in normal 1080p driving, sheds within 0.1-0.3 s of a load rise, back at level 0
     // within ~16 s of calm. It only runs with mcla_sim60 (the 60 fps target); the 60 -> 30 hold (mcla_sim_pacer 2) waits for it.
     {"mcla_gov", "true"},
+    // Wave 2, the emulation floor (run lk-fl6, saturated 1080p, within-run A/B, the three together: -0.77 +- 0.02 ms a frame):
+    // SDK 0530: MSAA-source and offset (shadow cascades into the atlas) resolves write their sampled texture directly, so it
+    // is not loaded back. Exact: resolve_dual_write_verify compared every kind (msaa, partial atlas quadrants): 0 bytes
+    // differ (lk-fl2). Scene phase -0.33 ms (texture loads).
+    {"resolve_dual_write_msaa", "true"},
+    // SDK 0450 + 0540: the EDRAM ownership transfers of rectangle draws that provably rewrite their whole target (the post
+    // chain: 960x540, 480x270, 128x128 passes) are skipped; the tone map keeps 04e0's own cut (0540 lets both work). Exact by
+    // the per-draw coverage proof; skip_overwritten_transfers_poison showed no junk (lk-fl2). Post -0.25 ms. Was +6 ms in an
+    // early build (S1); not reproduced (lk-fl1: post -0.39, tone map +0.39 only because 0450 switched 04e0 off).
+    {"skip_overwritten_transfers", "true"},
+    // SDK 0580: the presenter counts the UI overlay as shown only while something is drawn (the achievement toast is always
+    // registered), so 04a0's fused gamma paint is made: the full-screen apply-gamma pass goes (swap -0.18 ms). Same picture.
+    {"ui_overlay_active_when_drawn", "true"},
 };
 
 // ---- presets (W5.1) -------------------------------------------------------------------------------------------

@@ -1,0 +1,809 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Thu, 26 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0520: gpu_timing_ops: GPU time per emulation operation class (resolve, dual-written resolve, texture load, EDRAM transfer, clear, upload, barrier) per render phase
+
+Source: Ours (stream LOCK60 wave 2, F2). Validated in game: runs lk-fl1..lk-fl3
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: D3D12. Cvar gpu_timing_ops (false; with gpu_timing=1): every emulation operation is bracketed by two timestamps (a second
+  query heap, 4096 per frame), summed per (class, phase); CSV columns <group>_<class>_us/_n, an '[gpu-timing] ops' log line, and
+  per-frame resolve kinds (dual-written / msaa fallback / other). Measurement only: each bracket drains the pipeline.
+Bucket: REDO
+
+0520-gpu-timing-ops.patch (mcla-x86 LOCK60 wave 2).
+
+---
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 981d4d2d..06a30662 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -112,12 +112,78 @@ class D3D12CommandProcessor : public CommandProcessor {
+     kGtBar,    // ResourceBarrier batches
+     kGtExp,    // guest draws the draw experiment changed
+     kGtVrs,    // LOCAL PATCH - MCLA (0500): guest draws recorded at a coarse shading rate
++    kGtResDw,    // LOCAL PATCH - MCLA (0520): resolves that also wrote a texture (resolve_dual_write)
++    kGtResMsaa,  // LOCAL PATCH - MCLA (0520): resolve_dual_write fallbacks: the render target read is multisampled
++    kGtResFb,    // LOCAL PATCH - MCLA (0520): resolve_dual_write fallbacks for any other reason
+     kGtCounterCount,
+   };
+   void GpuTimingCount(GpuTimingCounter counter, uint32_t count = 1) {
+     gpu_timing_.counts[gpu_timing_.group][counter] += count;
+   }
+ 
++  // LOCAL PATCH - MCLA (0520): gpu_timing_ops. The classes of emulation operation whose GPU time is bracketed with two
++  // timestamps (begin before the operation's first command, end after its last), per render phase.
++  enum GpuTimingOp : uint32_t {
++    kGtOpResolve,    // IssueCopy (from its BeginSubmission to its return) minus the xfer / clear parts, not dual-written
++    kGtOpResolveDw,  // the same for a resolve that also wrote a texture (resolve_dual_write)
++    kGtOpTexload,    // a texture load, its dispatches and barriers
++    kGtOpXfer,       // PerformTransfersAndResolveClears: the transfer draws (and the host depth stores), also in a resolve
++    kGtOpClear,      // PerformTransfersAndResolveClears: the resolve clears (always inside IssueCopy)
++    kGtOpUpload,     // shared memory uploads (the copies from the upload buffers)
++    kGtOpBarrier,    // SubmitBarriers batches outside the other brackets
++    kGtOpCount,
++  };
++  // Brackets the commands recorded from Start (the constructor, unless `start` is false) to End (the destructor, unless
++  // called before). An operation inside another one's bracket is not bracketed itself (a depth counter): only the
++  // outermost counts, except that an xfer / clear scope inside another bracket (PerformTransfersAndResolveClears in
++  // IssueCopy) carves its time out of it: the outer bracket switches to the xfer / clear class and back at the end.
++  // Does nothing, but one check, when gpu_timing_ops is off for the frame.
++  class GpuTimingOpScope {
++   public:
++    GpuTimingOpScope(D3D12CommandProcessor& command_processor, GpuTimingOp op, bool start = true)
++        : cp_(command_processor), op_(op) {
++      if (start) {
++        Start();
++      }
++    }
++    ~GpuTimingOpScope() { End(); }
++    GpuTimingOpScope(const GpuTimingOpScope&) = delete;
++    GpuTimingOpScope& operator=(const GpuTimingOpScope&) = delete;
++    void Start() {
++      if (!depth_ && cp_.gpu_timing_.ops) {
++        depth_ = cp_.GpuTimingOpBegin(op_, epoch_);
++      }
++    }
++    void Start(GpuTimingOp op) {
++      op_ = op;
++      Start();
++    }
++    void End() {
++      if (depth_) {
++        cp_.GpuTimingOpEnd(depth_, epoch_);
++        depth_ = 0;
++      }
++    }
++    // The commands from here on belong to another class (one shared timestamp ends one bracket and starts the next).
++    void Switch(GpuTimingOp op) {
++      if (depth_) {
++        cp_.GpuTimingOpSwitch(op, depth_, epoch_);
++      }
++    }
++
++   private:
++    D3D12CommandProcessor& cp_;
++    GpuTimingOp op_;
++    uint32_t depth_ = 0;  // the nesting depth of the bracket (1: outermost, recorded); 0: not started
++    uint32_t epoch_ = 0;
++  };
++  // The kind of the resolve being issued (IssueCopy): 1 dual-written, 2 resolve_dual_write fallback because the render
++  // target read is multisampled, 3 another fallback (at most one per resolve; none: not tried). Counted per frame.
++  void GpuTimingResolveKind(uint32_t kind) {
++    gpu_timing_.resolve_kind = kind;
++    ++gpu_timing_.counts[gpu_timing_.group][kind == 1 ? kGtResDw : (kind == 2 ? kGtResMsaa : kGtResFb)];
++  }
++
+   // LOCAL PATCH - MCLA (0500): vrs. Called before every draw the backend records outside IssueDraw (EDRAM transfers,
+   // clears by drawing, the HDR restore): such draws are always at the 1x1 rate; costs a compare when it already is.
+   void VrsEnsureFine() {
+@@ -1120,6 +1186,18 @@ class D3D12CommandProcessor : public CommandProcessor {
+   // Reads the frames whose submissions are done.
+   void GpuTimingCollect();
+   void GpuTimingFlushCsv();
++  // LOCAL PATCH - MCLA (0520): gpu_timing_ops, the brackets (GpuTimingOpScope). Begin returns the nesting depth (0: the
++  // operation is not bracketed: ops off for the frame, no open list), writes the begin timestamp at depth 1; End
++  // writes the end timestamp at depth 1; Switch ends the open bracket and starts one of another class with one shared
++  // timestamp. `epoch` tells a bracket from an earlier frame (the frame ended or was dropped inside it).
++  uint32_t GpuTimingOpBegin(GpuTimingOp op, uint32_t& epoch_out);
++  void GpuTimingOpEnd(uint32_t depth, uint32_t epoch);
++  void GpuTimingOpSwitch(GpuTimingOp op, uint32_t depth, uint32_t epoch);
++  void GpuTimingOpClose();
++  bool GpuTimingOpSwitchRecord(GpuTimingOp op, bool continuation);
++  void GpuTimingOpFlushPending();
++  void GpuTimingOpsFrameEnd();
++  bool GpuTimingOpsInit();
+   // The experiment (0: none) the guest draw about to be recorded gets.
+   uint32_t GpuTimingDrawExperiment(bool memexport_used);
+   void GpuTimingCountDraw(uint32_t host_count, uint32_t experiment) {
+@@ -1185,11 +1263,46 @@ class D3D12CommandProcessor : public CommandProcessor {
+     bool have_last_start = false;
+     uint64_t last_start_ticks = 0;
+     bool in_gap = false;  // an idle mark was written at the end of the last list of the open frame
++    // LOCAL PATCH - MCLA (0520): gpu_timing_ops. The brackets of the operations (GpuTimingOpScope) go to a second
++    // query heap of kRing x kOpSlots timestamps (created when first used), resolved with the frame's other slots into
++    // a second readback buffer. A bracket is a record (class, group of the segment it starts in, begin slot, end
++    // slot); a Switch shares one timestamp between the end of a record and the begin of the next.
++    static constexpr uint32_t kOpSlots = 4096;
++    static constexpr uint32_t kOpNone = 0xFFFFFFFFu;
++    struct OpFrame {
++      bool on = false;
++      uint16_t slots = 0;    // timestamps resolved
++      uint16_t records = 0;
++      uint32_t overflow = 0;  // brackets not recorded for lack of slots
++      uint32_t split = 0;     // brackets cut by the end of a command list (dropped)
++      uint8_t op[kOpSlots];   // GpuTimingOp, 0xFF: dropped
++      uint8_t group[kOpSlots];  // bit 7: the rest of a bracket after a carved-out part (not counted again)
++      uint16_t begin[kOpSlots];
++      uint16_t end[kOpSlots];
++    };
++    bool ops = false;  // the frame being recorded brackets operations (latched at its start; needs mode 2)
++    bool ops_init_failed = false;
++    uint32_t op_epoch = 0;
++    uint32_t op_depth = 0;
++    uint32_t op_slots = 0;
++    uint32_t op_cur = kOpNone;      // the open record
++    uint32_t op_first = 0;          // the first record of the open outermost bracket
++    bool op_carve = false;          // an xfer / clear scope at depth 2 has taken the open record from the outer bracket
++    uint32_t op_carve_restore = 0;  // the outer bracket's class
++    uint64_t op_cur_submission = 0;  // the submission it started in
++    uint32_t op_pending = kOpNone;  // a slot whose timestamp is written when the next list starts
++    uint32_t resolve_kind = 0;      // of the resolve in progress, see GpuTimingResolveKind
++    Microsoft::WRL::ComPtr<ID3D12QueryHeap> op_heap;
++    Microsoft::WRL::ComPtr<ID3D12Resource> op_readback;
++    std::vector<OpFrame> op_frames;
++    std::vector<uint64_t> op_ticks;
+   } gpu_timing_;
+   // Statistics, the CSV and the experiment cycle (defined in command_processor.cpp).
+   struct GpuTimingReport;
+   GpuTimingReport& GpuTimingGetReport();
+-  void GpuTimingProcessFrame(const GpuTiming::Frame& frame, const uint64_t* ticks);
++  // LOCAL PATCH - MCLA (0520): `ops` and `op_ticks` (the slots of ops->slots) are null for a frame without brackets.
++  void GpuTimingProcessFrame(const GpuTiming::Frame& frame, const uint64_t* ticks, const GpuTiming::OpFrame* ops,
++                             const uint64_t* op_ticks);
+   // Logs the statistics if gpu_timing_log_s seconds have passed (or `force`), and writes the CSV rows.
+   void GpuTimingMaybeLog(bool force);
+   std::unique_ptr<GpuTimingReport> gpu_timing_report_;
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index e7b824b4..6eb58bcc 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -150,6 +150,25 @@ REXCVAR_DEFINE_STRING(gpu_timing_csv, "", "GPU/Timing",
+                       "Empty: no file")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// LOCAL PATCH - MCLA (0520): gpu_timing_ops.
++REXCVAR_DEFINE_BOOL(gpu_timing_ops, false, "GPU/Timing",
++                    "With gpu_timing 1: also time the GPU work of each emulation operation per render phase, read at "
++                    "the start of each frame. Each operation is bracketed by two timestamps (begin before its first "
++                    "command, end after its last): resolves (the whole of IssueCopy, with the dual write and the "
++                    "memory write; resolve_dw = the ones that also wrote a texture), texture loads (dispatches and "
++                    "barriers), EDRAM transfers (xfer) and resolve clears (clear), shared memory uploads, and "
++                    "barrier batches outside those (an operation inside another counts for the outer one only, "
++                    "except that the transfers and resolve clears inside a resolve are carved out of it: resolve "
++                    "is then the rest of IssueCopy). "
++                    "Adds the 'ops' log line and, if on when the CSV starts, the <group>_<class>_us / _n columns of "
++                    "gpu_timing_csv. A timestamp is an end-of-pipe point: every bracket makes the GPU drain the work "
++                    "before it (and the begin timestamp may be written before earlier draws have finished, so a "
++                    "bracket can include some of that drain), which costs overlap: the frame gets slower, the phase "
++                    "times are no longer the normal ones, and many brackets (barriers) cost the most. Each frame "
++                    "has room for 4096 timestamps (barrier brackets stop at 3/4 of it), the brackets after that "
++                    "are counted as overflow")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_INT32(gpu_draw_experiment, 0, "GPU/Timing",
+                      "Development, for a cost model: changes every guest draw (not those of the emulation: transfers, "
+                      "clears, resolves, swap, passes; not those that export to memory or run in a host occlusion "
+@@ -238,6 +257,14 @@ struct D3D12CommandProcessor::GpuTimingReport {
+     std::vector<float> busy_percent;
+     std::vector<float> group_ms[GpuTiming::kGroups];
+     uint64_t counts[GpuTiming::kGroups][kGtCounterCount] = {};
++    // LOCAL PATCH - MCLA (0520): gpu_timing_ops, the frames that bracketed operations.
++    uint32_t op_frames = 0;
++    uint64_t op_overflow = 0;
++    uint64_t op_split = 0;
++    std::vector<float> op_total_ms;                // per frame, all classes
++    std::vector<float> op_class_ms[kGtOpCount];    // per frame, a class over the groups
++    double op_us[GpuTiming::kGroups][kGtOpCount] = {};     // the sums over the frames
++    uint64_t op_n[GpuTiming::kGroups][kGtOpCount] = {};
+     void Clear() {
+       frames = 0;
+       frame_ms.clear();
+@@ -246,6 +273,15 @@ struct D3D12CommandProcessor::GpuTimingReport {
+         v.clear();
+       }
+       std::memset(counts, 0, sizeof(counts));
++      // LOCAL PATCH - MCLA (0520): gpu_timing_ops.
++      op_frames = 0;
++      op_overflow = op_split = 0;
++      op_total_ms.clear();
++      for (auto& v : op_class_ms) {
++        v.clear();
++      }
++      std::memset(op_us, 0, sizeof(op_us));
++      std::memset(op_n, 0, sizeof(op_n));
+     }
+   } accumulators[kMaxEntries + 1];
+   std::chrono::steady_clock::time_point last_log;
+@@ -254,6 +290,7 @@ struct D3D12CommandProcessor::GpuTimingReport {
+   std::string csv_path;
+   bool csv_started = false;
+   bool csv_t0_set = false;
++  bool csv_ops = false;  // LOCAL PATCH - MCLA (0520): the file has the gpu_timing_ops columns (decided at its first row)
+   std::chrono::steady_clock::time_point csv_t0;
+   // The experiment cycle: the text it was parsed from, and each entry's assignments.
+   std::string cycle_text;
+@@ -486,6 +523,7 @@ void D3D12CommandProcessor::PushUAVBarrier(ID3D12Resource* resource) {
+ void D3D12CommandProcessor::SubmitBarriers() {
+   UINT barrier_count = UINT(barriers_.size());
+   if (barrier_count != 0) {
++    GpuTimingOpScope gt_op_barrier(*this, kGtOpBarrier);  // LOCAL PATCH - MCLA (0520): gpu_timing_ops
+     deferred_command_list_.D3DResourceBarrier(barrier_count, barriers_.data());
+     barriers_.clear();
+   }
+@@ -4266,6 +4304,7 @@ bool D3D12CommandProcessor::IssueCopy() {
+     return false;
+   }
+   GpuTimingCount(kGtRes);  // LOCAL PATCH - MCLA (04f0)
++  GpuTimingOpScope gt_op_resolve(*this, kGtOpResolve);  // LOCAL PATCH - MCLA (0520): gpu_timing_ops, the whole of IssueCopy
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+   if (readback_mode == ReadbackResolveMode::kDisabled && !IsResolveReadbackSelective() &&
+       !IsUnscaledResolveCopyEnabled()) {
+@@ -5156,6 +5195,8 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     // LOCAL PATCH - MCLA (04f0): a timed frame that got no end timestamp (no submission was open) is dropped.
+     if (gpu_timing_.active) {
+       gpu_timing_.active = false;
++      gpu_timing_.ops = false;  // LOCAL PATCH - MCLA (0520)
++      ++gpu_timing_.op_epoch;   // LOCAL PATCH - MCLA (0520)
+       gpu_timing_.frames[gpu_timing_.ring].state = GpuTiming::Frame::kFree;
+     }
+     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
+@@ -7103,7 +7144,11 @@ std::string GpuTimingTrim(const std::string& text) {
+   return text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
+ }
+ 
+-std::string GpuTimingCsvHeader() {
++// LOCAL PATCH - MCLA (0520): gpu_timing_ops, the classes (GpuTimingOp) of the log and the CSV columns.
++constexpr const char* kGpuTimingOpNames[7] = {"resolve", "resolve_dw", "texload", "xfer", "clear", "upload", "barrier"};
++static_assert(sizeof(kGpuTimingOpNames) / sizeof(kGpuTimingOpNames[0]) == D3D12CommandProcessor::kGtOpCount);
++
++std::string GpuTimingCsvHeader(bool ops) {  // LOCAL PATCH - MCLA (0520): ops
+   std::string header = "seq,cp_frame,guest_frame,t_ms,exp,vrs,frame_us,interval_us,span_us";  // 0500: vrs
+   for (const char* name : kGpuTimingGroupNames) {
+     for (const char* field : {"us", "d", "v", "pso", "cbv", "rt", "res", "xfer", "tex", "bar", "exp", "vrs"}) {
+@@ -7113,6 +7158,14 @@ std::string GpuTimingCsvHeader() {
+   for (uint32_t bit = 0; bit < 30; ++bit) {
+     header += fmt::format(",p{}_us", bit);
+   }
++  if (ops) {  // LOCAL PATCH - MCLA (0520): gpu_timing_ops
++    for (const char* name : kGpuTimingGroupNames) {
++      for (const char* op : kGpuTimingOpNames) {
++        header += fmt::format(",{}_{}_us,{}_{}_n", name, op, name, op);
++      }
++    }
++    header += ",res_dw,res_msaa,res_fb,op_overflow,op_split";
++  }
+   header += '\n';
+   return header;
+ }
+@@ -7166,6 +7219,13 @@ void D3D12CommandProcessor::GpuTimingShutdown() {
+   g.collect_seq = g.seq;
+   g.heap.Reset();
+   g.readback.Reset();
++  // LOCAL PATCH - MCLA (0520): gpu_timing_ops
++  g.ops = false;
++  ++g.op_epoch;
++  g.op_heap.Reset();
++  g.op_readback.Reset();
++  g.op_frames.clear();
++  g.op_ticks.clear();
+ }
+ 
+ D3D12CommandProcessor::GpuTimingReport& D3D12CommandProcessor::GpuTimingGetReport() {
+@@ -7255,6 +7315,8 @@ void D3D12CommandProcessor::GpuTimingFrameBegin() {
+     g.frames[g.ring].state = GpuTiming::Frame::kFree;
+   }
+   g.mode = REXCVAR_GET(gpu_timing) ? 2 : (REXCVAR_GET(gpu_timing_export) ? 1 : 0);
++  g.ops = false;   // LOCAL PATCH - MCLA (0520)
++  ++g.op_epoch;    // LOCAL PATCH - MCLA (0520): brackets of an earlier frame still open are ignored
+   if (!g.mode || !GpuTimingInit()) {
+     g.mode = 0;
+     return;
+@@ -7279,6 +7341,22 @@ void D3D12CommandProcessor::GpuTimingFrameBegin() {
+     g.snapshot = deferred_command_list_.recorded_stats();
+   }
+   deferred_command_list_.D3DEndQuery(g.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, g.ring * GpuTiming::kSlots);
++  // LOCAL PATCH - MCLA (0520): gpu_timing_ops: the frame brackets the operations (the brackets' own query heap).
++  if (!g.op_frames.empty()) {
++    g.op_frames[g.ring].on = false;
++  }
++  if (g.mode == 2 && REXCVAR_GET(gpu_timing_ops) && GpuTimingOpsInit()) {
++    g.ops = true;
++    g.op_depth = 0;
++    g.op_slots = 0;
++    g.op_cur = GpuTiming::kOpNone;
++    g.op_pending = GpuTiming::kOpNone;
++    GpuTiming::OpFrame& op_frame = g.op_frames[g.ring];
++    op_frame.slots = 0;
++    op_frame.records = 0;
++    op_frame.overflow = 0;
++    op_frame.split = 0;
++  }
+ }
+ 
+ void D3D12CommandProcessor::GpuTimingFrameEnd() {
+@@ -7295,6 +7373,7 @@ void D3D12CommandProcessor::GpuTimingFrameEnd() {
+     GpuTimingAttribute();
+     std::memcpy(frame.counts, g.counts, sizeof(frame.counts));
+   }
++  GpuTimingOpsFrameEnd();  // LOCAL PATCH - MCLA (0520): gpu_timing_ops
+   const uint32_t first = g.ring * GpuTiming::kSlots;
+   deferred_command_list_.D3DEndQuery(g.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, first + g.slots);
+   ++g.slots;
+@@ -7323,6 +7402,7 @@ void D3D12CommandProcessor::GpuTimingSubmissionEnd() {
+ 
+ void D3D12CommandProcessor::GpuTimingSubmissionBegin() {
+   GpuTiming& g = gpu_timing_;
++  GpuTimingOpFlushPending();  // LOCAL PATCH - MCLA (0520): gpu_timing_ops
+   if (!g.active || !g.in_gap) {
+     return;
+   }
+@@ -7491,6 +7571,202 @@ uint32_t D3D12CommandProcessor::GpuTimingDrawVertexCount(uint32_t experiment,
+   return std::min(count, first);
+ }
+ 
++// LOCAL PATCH - MCLA (0520): gpu_timing_ops, the operation brackets (see GpuTiming::kOpSlots in the header).
++bool D3D12CommandProcessor::GpuTimingOpsInit() {
++  GpuTiming& g = gpu_timing_;
++  if (g.op_readback) {
++    return true;
++  }
++  if (g.ops_init_failed) {
++    return false;
++  }
++  ID3D12Device* device = GetD3D12Provider().GetDevice();
++  D3D12_QUERY_HEAP_DESC heap_desc = {D3D12_QUERY_HEAP_TYPE_TIMESTAMP, GpuTiming::kRing * GpuTiming::kOpSlots, 0};
++  D3D12_RESOURCE_DESC buffer_desc;
++  ui::d3d12::util::FillBufferResourceDesc(
++      buffer_desc, sizeof(uint64_t) * GpuTiming::kRing * GpuTiming::kOpSlots, D3D12_RESOURCE_FLAG_NONE);
++  if (!device || FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&g.op_heap))) ||
++      FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesReadback,
++                                             GetD3D12Provider().GetHeapFlagCreateNotZeroed(), &buffer_desc,
++                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++                                             IID_PPV_ARGS(&g.op_readback)))) {
++    g.op_heap.Reset();
++    g.op_readback.Reset();
++    g.ops_init_failed = true;
++    REXGPU_WARN("gpu_timing_ops: the timestamp heap of the operation brackets could not be made, it is off");
++    return false;
++  }
++  g.op_frames.resize(GpuTiming::kRing);
++  g.op_ticks.resize(GpuTiming::kOpSlots);
++  REXGPU_INFO("gpu_timing_ops: {} timestamps per frame for the operation brackets", GpuTiming::kOpSlots);
++  return true;
++}
++
++uint32_t D3D12CommandProcessor::GpuTimingOpBegin(GpuTimingOp op, uint32_t& epoch_out) {
++  GpuTiming& g = gpu_timing_;
++  epoch_out = g.op_epoch;
++  if (!g.ops || !g.active || !submission_open_) {
++    return 0;
++  }
++  const uint32_t depth = ++g.op_depth;
++  if (depth != 1) {
++    // Inside another bracket: it counts for the outer one, except that transfers and clears are carved out of it (the
++    // open record becomes theirs until the scope ends: GpuTimingOpEnd).
++    if (depth == 2 && (op == kGtOpXfer || op == kGtOpClear) && g.op_cur != GpuTiming::kOpNone) {
++      const uint32_t outer = g.op_frames[g.ring].op[g.op_cur];
++      if (outer < kGtOpCount && outer != kGtOpXfer && outer != kGtOpClear && GpuTimingOpSwitchRecord(op, false)) {
++        g.op_carve = true;
++        g.op_carve_restore = outer;
++      }
++    }
++    return depth;
++  }
++  g.op_cur = GpuTiming::kOpNone;
++  g.op_carve = false;
++  if (op == kGtOpResolve) {
++    g.resolve_kind = 0;
++  }
++  GpuTiming::OpFrame& of = g.op_frames[g.ring];
++  // The begin and the end: the barrier brackets (the most numerous) leave a quarter of the slots to the others.
++  const uint32_t limit = op == kGtOpBarrier ? GpuTiming::kOpSlots * 3 / 4 : GpuTiming::kOpSlots;
++  if (g.op_slots + 2 > limit || of.records >= GpuTiming::kOpSlots) {
++    ++of.overflow;
++    return depth;
++  }
++  const uint32_t slot = g.op_slots++;
++  deferred_command_list_.D3DEndQuery(g.op_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                     g.ring * GpuTiming::kOpSlots + slot);
++  const uint32_t record = of.records++;
++  of.op[record] = uint8_t(op);
++  of.group[record] = uint8_t(g.group);
++  of.begin[record] = uint16_t(slot);
++  of.end[record] = 0xFFFF;
++  g.op_cur = record;
++  g.op_first = record;
++  g.op_cur_submission = submission_current_;
++  return depth;
++}
++
++void D3D12CommandProcessor::GpuTimingOpEnd(uint32_t depth, uint32_t epoch) {
++  GpuTiming& g = gpu_timing_;
++  if (epoch != g.op_epoch) {
++    return;  // the frame ended (or was dropped) inside the bracket
++  }
++  if (depth == 2 && g.op_carve) {
++    // The carved-out part is over: the rest of the outer bracket is its class again (a continuation, not counted).
++    g.op_carve = false;
++    GpuTimingOpSwitchRecord(GpuTimingOp(g.op_carve_restore), true);
++  }
++  g.op_depth = depth - 1;
++  if (depth == 1) {
++    GpuTimingOpClose();
++  }
++}
++
++void D3D12CommandProcessor::GpuTimingOpClose() {
++  GpuTiming& g = gpu_timing_;
++  const uint32_t record = g.op_cur;
++  g.op_cur = GpuTiming::kOpNone;
++  if (record == GpuTiming::kOpNone) {
++    return;
++  }
++  GpuTiming::OpFrame& of = g.op_frames[g.ring];
++  // The slot is there: a bracket (and each Switch) is only started with one left over for its end.
++  const uint32_t slot = g.op_slots++;
++  of.end[record] = uint16_t(slot);
++  if (g.resolve_kind == 1 && of.op[g.op_first] == kGtOpResolve) {
++    for (uint32_t k = g.op_first; k < of.records; ++k) {  // the parts of the bracket (a carve-out splits it)
++      if (of.op[k] == kGtOpResolve) {
++        of.op[k] = uint8_t(kGtOpResolveDw);
++      }
++    }
++  }
++  if (!submission_open_) {
++    // The list ended inside the operation (a readback that waits for the GPU): the end timestamp goes into the next
++    // list (every slot taken has to be written before it is resolved), and the bracket, which spans the gap, is dropped.
++    g.op_pending = slot;
++    of.op[record] = 0xFF;
++    ++of.split;
++    return;
++  }
++  deferred_command_list_.D3DEndQuery(g.op_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                     g.ring * GpuTiming::kOpSlots + slot);
++  if (g.op_cur_submission != submission_current_) {
++    of.op[record] = 0xFF;
++    ++of.split;
++  }
++}
++
++void D3D12CommandProcessor::GpuTimingOpSwitch(GpuTimingOp op, uint32_t depth, uint32_t epoch) {
++  GpuTiming& g = gpu_timing_;
++  if (epoch != g.op_epoch || !(depth == 1 || (depth == 2 && g.op_carve))) {
++    return;
++  }
++  GpuTimingOpSwitchRecord(op, false);
++}
++
++bool D3D12CommandProcessor::GpuTimingOpSwitchRecord(GpuTimingOp op, bool continuation) {
++  GpuTiming& g = gpu_timing_;
++  if (g.op_cur == GpuTiming::kOpNone || !submission_open_ || g.op_cur_submission != submission_current_) {
++    return false;
++  }
++  GpuTiming::OpFrame& of = g.op_frames[g.ring];
++  if (of.op[g.op_cur] == op) {
++    return false;
++  }
++  if (g.op_slots + 2 > GpuTiming::kOpSlots || of.records >= GpuTiming::kOpSlots) {
++    ++of.overflow;
++    return false;
++  }
++  // One timestamp ends the open bracket and begins the next.
++  const uint32_t slot = g.op_slots++;
++  deferred_command_list_.D3DEndQuery(g.op_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                     g.ring * GpuTiming::kOpSlots + slot);
++  of.end[g.op_cur] = uint16_t(slot);
++  const uint32_t record = of.records++;
++  of.op[record] = uint8_t(op);
++  of.group[record] = uint8_t(g.group | (continuation ? 0x80u : 0u));
++  of.begin[record] = uint16_t(slot);
++  of.end[record] = 0xFFFF;
++  g.op_cur = record;
++  return true;
++}
++
++void D3D12CommandProcessor::GpuTimingOpFlushPending() {
++  GpuTiming& g = gpu_timing_;
++  if (g.op_pending == GpuTiming::kOpNone) {
++    return;
++  }
++  const uint32_t slot = g.op_pending;
++  g.op_pending = GpuTiming::kOpNone;
++  if (g.ops && submission_open_) {
++    deferred_command_list_.D3DEndQuery(g.op_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                       g.ring * GpuTiming::kOpSlots + slot);
++  }
++}
++
++void D3D12CommandProcessor::GpuTimingOpsFrameEnd() {
++  GpuTiming& g = gpu_timing_;
++  if (!g.ops) {
++    return;
++  }
++  if (g.op_cur != GpuTiming::kOpNone) {
++    GpuTimingOpClose();  // the frame's last list ends inside a bracket
++  }
++  GpuTimingOpFlushPending();
++  g.ops = false;
++  g.op_depth = 0;
++  ++g.op_epoch;  // the scopes still open will not touch the next frame
++  GpuTiming::OpFrame& of = g.op_frames[g.ring];
++  of.slots = uint16_t(g.op_slots);
++  of.on = true;
++  if (g.op_slots) {
++    deferred_command_list_.D3DResolveQueryData(g.op_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                               g.ring * GpuTiming::kOpSlots, g.op_slots, g.op_readback.Get(),
++                                               uint64_t(g.ring) * GpuTiming::kOpSlots * sizeof(uint64_t));
++  }
++}
++
+ void D3D12CommandProcessor::GpuTimingCollect() {
+   GpuTiming& g = gpu_timing_;
+   if (!g.readback || g.collect_seq >= g.seq) {
+@@ -7518,7 +7794,22 @@ void D3D12CommandProcessor::GpuTimingCollect() {
+       std::memcpy(ticks, static_cast<const uint8_t*>(mapping) + first_byte, frame.slots * sizeof(uint64_t));
+       const D3D12_RANGE written_range = {0, 0};
+       g.readback->Unmap(0, &written_range);
+-      GpuTimingProcessFrame(frame, ticks);
++      // LOCAL PATCH - MCLA (0520): gpu_timing_ops: the frame's bracket timestamps.
++      const GpuTiming::OpFrame* op_frame = nullptr;
++      if (ring < g.op_frames.size() && g.op_frames[ring].on && g.op_readback && g.op_frames[ring].slots) {
++        const GpuTiming::OpFrame& of = g.op_frames[ring];
++        const uint64_t op_first_byte = uint64_t(ring) * GpuTiming::kOpSlots * sizeof(uint64_t);
++        const D3D12_RANGE op_read_range = {SIZE_T(op_first_byte),
++                                           SIZE_T(op_first_byte + of.slots * sizeof(uint64_t))};
++        void* op_mapping = nullptr;
++        if (SUCCEEDED(g.op_readback->Map(0, &op_read_range, &op_mapping))) {
++          std::memcpy(g.op_ticks.data(), static_cast<const uint8_t*>(op_mapping) + op_first_byte,
++                      of.slots * sizeof(uint64_t));
++          g.op_readback->Unmap(0, &written_range);
++          op_frame = &of;
++        }
++      }
++      GpuTimingProcessFrame(frame, ticks, op_frame, g.op_ticks.data());  // LOCAL PATCH - MCLA (0520): ops
+       any = true;
+     }
+     frame.state = GpuTiming::Frame::kFree;
+@@ -7529,7 +7820,8 @@ void D3D12CommandProcessor::GpuTimingCollect() {
+   }
+ }
+ 
+-void D3D12CommandProcessor::GpuTimingProcessFrame(const GpuTiming::Frame& frame, const uint64_t* ticks) {
++void D3D12CommandProcessor::GpuTimingProcessFrame(const GpuTiming::Frame& frame, const uint64_t* ticks,
++                                                  const GpuTiming::OpFrame* ops, const uint64_t* op_ticks) {  // LOCAL PATCH - MCLA (0520): ops
+   GpuTiming& g = gpu_timing_;
+   const uint64_t start = ticks[0], end = ticks[frame.slots - 1];
+   if (end < start) {
+@@ -7592,6 +7884,37 @@ void D3D12CommandProcessor::GpuTimingProcessFrame(const GpuTiming::Frame& frame,
+     }
+   }
+ 
++  // LOCAL PATCH - MCLA (0520): gpu_timing_ops: the brackets' GPU time and count per (group, class).
++  double op_us[GpuTiming::kGroups][kGtOpCount] = {};
++  uint32_t op_n[GpuTiming::kGroups][kGtOpCount] = {};
++  if (ops) {
++    for (uint32_t k = 0; k < ops->records; ++k) {
++      const uint32_t op = ops->op[k];
++      if (op >= kGtOpCount || ops->begin[k] >= ops->slots || ops->end[k] >= ops->slots) {
++        continue;  // dropped (cut by the end of a list), or not closed
++      }
++      const uint64_t t0 = op_ticks[ops->begin[k]], t1 = op_ticks[ops->end[k]];
++      const uint32_t group = std::min<uint32_t>(ops->group[k] & 0x7F, GpuTiming::kGroups - 1);
++      op_us[group][op] += t1 > t0 ? double(t1 - t0) * g.us_per_tick : 0.0;
++      op_n[group][op] += (ops->group[k] & 0x80) ? 0 : 1;  // the rest of a bracket after a carve-out is not another one
++    }
++    double total_us = 0.0;
++    for (uint32_t op = 0; op < kGtOpCount; ++op) {
++      double class_us = 0.0;
++      for (uint32_t group = 0; group < GpuTiming::kGroups; ++group) {
++        class_us += op_us[group][op];
++        acc.op_us[group][op] += op_us[group][op];
++        acc.op_n[group][op] += op_n[group][op];
++      }
++      acc.op_class_ms[op].push_back(float(class_us * 0.001));
++      total_us += class_us;
++    }
++    acc.op_total_ms.push_back(float(total_us * 0.001));
++    ++acc.op_frames;
++    acc.op_overflow += ops->overflow;
++    acc.op_split += ops->split;
++  }
++
+   const std::string& csv_path = REXCVAR_GET(gpu_timing_csv);
+   if (csv_path.empty()) {
+     return;
+@@ -7605,6 +7928,7 @@ void D3D12CommandProcessor::GpuTimingProcessFrame(const GpuTiming::Frame& frame,
+   if (!r.csv_t0_set) {
+     r.csv_t0_set = true;
+     r.csv_t0 = frame.end_time;
++    r.csv_ops = ops != nullptr;  // LOCAL PATCH - MCLA (0520): the header's gpu_timing_ops columns, for the whole file
+   }
+   std::string& row = r.csv;
+   row += fmt::format("{},{},{},{:.1f},{},{},{},{}", frame.seq, frame.cp_frame, frame.guest_frame,
+@@ -7620,6 +7944,18 @@ void D3D12CommandProcessor::GpuTimingProcessFrame(const GpuTiming::Frame& frame,
+   for (uint32_t bit = 0; bit < 30; ++bit) {
+     row += fmt::format(",{:.0f}", phase_us[bit]);
+   }
++  if (r.csv_ops) {  // LOCAL PATCH - MCLA (0520): gpu_timing_ops; zeros for a frame that had no brackets
++    uint32_t kinds[3] = {};
++    for (uint32_t group = 0; group < GpuTiming::kGroups; ++group) {
++      for (uint32_t op = 0; op < kGtOpCount; ++op) {
++        row += fmt::format(",{:.0f},{}", op_us[group][op], op_n[group][op]);
++      }
++      kinds[0] += frame.counts[group][kGtResDw];
++      kinds[1] += frame.counts[group][kGtResMsaa];
++      kinds[2] += frame.counts[group][kGtResFb];
++    }
++    row += fmt::format(",{},{},{},{},{}", kinds[0], kinds[1], kinds[2], ops ? ops->overflow : 0, ops ? ops->split : 0);
++  }
+   row += '\n';
+ }
+ 
+@@ -7633,7 +7969,7 @@ void D3D12CommandProcessor::GpuTimingFlushCsv() {
+     REXGPU_WARN("gpu_timing: cannot write {}", r.csv_path);
+   } else {
+     if (!r.csv_started) {
+-      out << GpuTimingCsvHeader();
++      out << GpuTimingCsvHeader(r.csv_ops);  // LOCAL PATCH - MCLA (0520): ops
+     }
+     out << r.csv;
+   }
+@@ -7696,6 +8032,48 @@ void D3D12CommandProcessor::GpuTimingMaybeLog(bool force) {
+     }
+     REXGPU_INFO("{}", first);
+     REXGPU_INFO("{}", second);
++    // LOCAL PATCH - MCLA (0520): gpu_timing_ops: per class the total over the groups, per frame (p50 of the GPU ms of
++    // its brackets / mean count), the three (group, class) pairs with the most time, the kinds of resolve.
++    if (acc.op_frames) {
++      const double op_frames = double(acc.op_frames);
++      std::string ops_text = fmt::format("[gpu-timing] ops (exp {}, {} frames; per frame p50 ms/count):",
++                                         entry ? std::to_string(entry - 1) : std::string("-"), acc.op_frames);
++      struct OpPair {
++        double us;
++        uint32_t group, op;
++      };
++      std::vector<OpPair> pairs;
++      for (uint32_t op = 0; op < kGtOpCount; ++op) {
++        uint64_t count = 0;
++        for (uint32_t group = 0; group < GpuTiming::kGroups; ++group) {
++          count += acc.op_n[group][op];
++          if (acc.op_us[group][op] > 0.0) {
++            pairs.push_back({acc.op_us[group][op], group, op});
++          }
++        }
++        ops_text += fmt::format(" {} {:.2f}/{:.1f}", kGpuTimingOpNames[op],
++                                GpuTimingPercentile(acc.op_class_ms[op], 0.5), double(count) / op_frames);
++      }
++      ops_text += fmt::format(" | all {:.2f} | top", GpuTimingPercentile(acc.op_total_ms, 0.5));
++      std::sort(pairs.begin(), pairs.end(), [](const OpPair& a, const OpPair& b) { return a.us > b.us; });
++      for (size_t i = 0; i < std::min<size_t>(3, pairs.size()); ++i) {
++        ops_text += fmt::format(" {}/{} {:.2f} ms ({:.1f})", kGpuTimingGroupNames[pairs[i].group],
++                                kGpuTimingOpNames[pairs[i].op], pairs[i].us * 1e-3 / op_frames,
++                                double(acc.op_n[pairs[i].group][pairs[i].op]) / op_frames);
++      }
++      uint64_t resolves = 0, kinds[3] = {};
++      for (uint32_t group = 0; group < GpuTiming::kGroups; ++group) {
++        resolves += acc.counts[group][kGtRes];
++        kinds[0] += acc.counts[group][kGtResDw];
++        kinds[1] += acc.counts[group][kGtResMsaa];
++        kinds[2] += acc.counts[group][kGtResFb];
++      }
++      ops_text += fmt::format(" | resolves {:.1f}: dual-written {:.1f}, msaa fallback {:.1f}, other fallback {:.1f}",
++                              double(resolves) / frames, double(kinds[0]) / frames, double(kinds[1]) / frames,
++                              double(kinds[2]) / frames);
++      ops_text += fmt::format(" | overflow {} split {}", acc.op_overflow, acc.op_split);
++      REXGPU_INFO("{}", ops_text);
++    }
+     acc.Clear();
+   }
+   GpuTimingFlushCsv();
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index 7a38f336..4646229b 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -1720,8 +1720,9 @@ bool D3D12RenderTargetCache::PrepareDirectResolveDualWrite(
+     const D3D12RenderTarget* direct_source, bool stretching, D3D12TextureCache& texture_cache,
+     D3D12TextureCache::ResolveDualWriteTarget& target_out, ID3D12PipelineState*& pipeline_out) {
+   using Fallback = D3D12TextureCache::ResolveDualWriteFallback;
+-  auto reject = [&texture_cache](Fallback reason) {
++  auto reject = [this, &texture_cache](Fallback reason) {  // LOCAL PATCH - MCLA (0520): gpu_timing_ops (this)
+     texture_cache.CountResolveDualWriteFallback(reason);
++    command_processor_.GpuTimingResolveKind(reason == Fallback::kMultisampled ? 2 : 3);  // LOCAL PATCH - MCLA (0520)
+     return false;
+   };
+   if (IsDrawResolutionScaled()) {
+@@ -4639,6 +4640,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+   ID3D12Device* device = provider.GetDevice();
+   uint64_t current_submission = command_processor_.GetCurrentSubmission();
+   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
++  // LOCAL PATCH - MCLA (0520): gpu_timing_ops: started at the first work (most calls, from the draws, have none).
++  D3D12CommandProcessor::GpuTimingOpScope gt_op(command_processor_, D3D12CommandProcessor::kGtOpXfer, false);
+ 
+   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
+   D3D12_RECT clear_rect;
+@@ -4674,6 +4677,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+         continue;
+       }
+       if (!host_depth_store_set_up) {
++        gt_op.Start(D3D12CommandProcessor::kGtOpXfer);  // LOCAL PATCH - MCLA (0520): gpu_timing_ops
+         // Bindings.
+         // 0 - source.
+         // 1 - EDRAM if bindful.
+@@ -4772,6 +4776,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+     if (!resolve_clear_needed && dest_transfers.empty()) {
+       continue;
+     }
++    // LOCAL PATCH - MCLA (0520): gpu_timing_ops: the first work (a render target with no transfer: a resolve clear).
++    gt_op.Start(dest_transfers.empty() ? D3D12CommandProcessor::kGtOpClear : D3D12CommandProcessor::kGtOpXfer);
+     // Transition the sources, only if not going to be used as destinations
+     // earlier.
+     for (const Transfer& transfer : render_target_transfers[i]) {
+@@ -4940,6 +4946,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+     auto& dest_d3d12_rt = *static_cast<D3D12RenderTarget*>(dest_rt);
+     RenderTargetKey dest_rt_key = dest_d3d12_rt.key();
+ 
++    // LOCAL PATCH - MCLA (0520): gpu_timing_ops: the transfers of this render target are xfer, a clear only is clear.
++    gt_op.Switch(current_transfers.empty() ? D3D12CommandProcessor::kGtOpClear : D3D12CommandProcessor::kGtOpXfer);
+     // Late barrier in case there was cross-copying that prevented merging of
+     // barriers.
+     D3D12_RESOURCE_STATES dest_state = dest_rt_key.is_depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE
+@@ -5395,6 +5403,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+ 
+     // Perform the clear.
+     if (resolve_clear_needed) {
++      gt_op.Switch(D3D12CommandProcessor::kGtOpClear);  // LOCAL PATCH - MCLA (0520): gpu_timing_ops
+       uint64_t clear_value = render_target_resolve_clear_values[i];
+       if (dest_rt_key.is_depth) {
+         uint32_t depth_guest_clear_value = (uint32_t(clear_value) >> 8) & 0xFFFFFF;
+diff --git a/src/graphics/d3d12/shared_memory.cpp b/src/graphics/d3d12/shared_memory.cpp
+index a681d274..e001115d 100644
+--- a/src/graphics/d3d12/shared_memory.cpp
++++ b/src/graphics/d3d12/shared_memory.cpp
+@@ -317,6 +317,9 @@ bool D3D12SharedMemory::UploadRanges(
+     return true;
+   }
+   bool hoist = BeginHoistedUpload(upload_page_ranges);
++  // LOCAL PATCH - MCLA (0520): gpu_timing_ops: in the stream the copies are written to (the hoisted one when hoisting),
++  // from before the transition of an in-place upload to after its last copy (ended before EndHoistedUpload).
++  D3D12CommandProcessor::GpuTimingOpScope gt_op(command_processor_, D3D12CommandProcessor::kGtOpUpload);
+   if (!hoist) {
+     CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
+     command_processor_.SubmitBarriers();
+@@ -353,6 +356,7 @@ bool D3D12SharedMemory::UploadRanges(
+       break;
+     }
+   }
++  gt_op.End();  // LOCAL PATCH - MCLA (0520): gpu_timing_ops
+   if (hoist) {
+     // Also after a failure, to leave the hoisted stream well-formed.
+     hoist_byte_ranges_temp_.clear();
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index 67ed2977..706ea262 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -2140,6 +2140,7 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+     return false;
+   }
+   uint32_t descriptor_write_index = 0;
++  D3D12CommandProcessor::GpuTimingOpScope gt_op(command_processor_, D3D12CommandProcessor::kGtOpTexload);  // LOCAL PATCH - MCLA (0520): gpu_timing_ops
+   command_processor_.SetExternalPipeline(pipeline);
+   command_list.D3DSetComputeRootSignature(load_root_signature_.Get());
+   // Set up the destination descriptor.
+@@ -2786,6 +2787,7 @@ void D3D12TextureCache::FinishResolveDualWrite(const ResolveDualWriteTarget& tar
+                                                uint32_t written_start, uint32_t written_length) {
+   D3D12Texture& texture = *static_cast<D3D12Texture*>(target.texture);
+   MarkRangeAsResolvedWithTextureWritten(written_start, written_length, texture);
++  command_processor_.GpuTimingResolveKind(1);  // LOCAL PATCH - MCLA (0520): gpu_timing_ops, the kind of resolve
+   ++resolve_dual_write_stats_.written;
+   if (texture.dual_write_unused()) {
+     // The previous write has never been used.
