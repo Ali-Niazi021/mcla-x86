@@ -630,7 +630,8 @@ constexpr PresetKnob kPresetLowest[] = {
 //   - FXAA: about +0.3 ms (0.15 to 0.6).
 //   - the shipped car-reflection and far-cascade rates (env_interval 1, far_cascades_interval 1) over perf's 2 and 2: about +0.8 ms.
 //   - the shipped distances (shadow_dist, traffic_lod, city_lod 1.0) over perf's 0.6 / 0.7 / 0.67: about +0.3 to 0.6 ms.
-//   - ultra's 1.5x distances over the shipped ones: about +0.3 ms, with no visible change at the parked spot; what they buy is
+//   - ultra's 1.5x distances over the shipped ones: about +0.3 ms parked and about +1 ms while driving (vis4-drive-tiers, tier 5 against its
+//     neighbours), with no visible change at the parked spot; what they buy is
 //     objects and shadows appearing farther out while driving (pop-in), which is not measured.
 // The same steps, one at a time, are the run-time tiers 2 to 5 (mcla_gfx_tier, ApplyTier).
 constexpr PresetKnob kPresetQuality[] = {
@@ -823,7 +824,8 @@ const TierInfo* Tiers(int* count) {
       {4, "shipped rates (quality)", 0.8f, true,
        "car reflections and far shadow cascade at full rate; the phase skip forces a full draw on the first frame (LEARNINGS: no "
        "flicker since the fix)"},
-      {5, "ultra distances", 0.3f, false, "distances 1.5x: farther objects and shadows appear at the switch"},
+      {5, "ultra distances", 1.0f, false,
+       "distances 1.5x: farther objects and shadows appear at the switch; +0.3 ms parked, about +1 ms while driving (vis4-drive-tiers)"},
   };
   if (count) {
     *count = int(sizeof(kTiers) / sizeof(kTiers[0]));

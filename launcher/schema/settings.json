@@ -479,7 +479,7 @@
       "options": [
         {"value": "default", "label": "Full (as shipped)", "help": "No change to the game's own detail levels."},
         {"value": "quality", "label": "Quality", "help": "The game's full detail (car reflections and all shadow cascades every frame, shipped shadow and detail distances, 640 shadow map) plus FXAA. About 1.5 ms more GPU time than Performance at 1080p on a Radeon 880M: only with headroom."},
-        {"value": "ultra", "label": "Ultra (beyond console)", "help": "Quality with the shadow, city and vehicle detail distances at 1.5x the console's: less pop-in in the distance, about 0.3 ms more."},
+        {"value": "ultra", "label": "Ultra (beyond console)", "help": "Quality with the shadow, city and vehicle detail distances at 1.5x the console's: less pop-in in the distance, about 1 ms more GPU time while driving."},
         {"value": "perf", "label": "Performance", "help": "Car reflections and the second-farthest shadow cascade updated every 2nd frame (30 Hz, the console's own rate), shadow distance 0.6, vehicle LOD 0.7, city LOD 0.67, sun-shadow map 512: a near-identical picture, about 5 points less GPU load at 1080p on a Radeon 880M."},
         {"value": "perfplus", "label": "Performance+", "help": "Performance plus no far shadow cascade and no tree impostors."},
         {"value": "lowest", "label": "Lowest", "help": "Performance plus no sun shadows (the game's own night path): the largest saving, at the price of every sun shadow."}
