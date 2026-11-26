@@ -20,6 +20,7 @@
 #include <iterator>
 #include <string_view>
 
+#include <rex/cvar.h>
 #include <rex/input/device.h>
 #include <rex/input/input.h>
 #include <rex/input/input_driver.h>
@@ -361,6 +362,7 @@ ScriptedInput::~ScriptedInput() {
 
 bool ScriptedInput::Configure(const InputOptions& options, std::string& error) {
   steps_ = std::make_shared<std::vector<Step>>();
+  sched_.clear();
   source_.clear();
 
   std::string script = options.script;
@@ -386,16 +388,17 @@ bool ScriptedInput::Configure(const InputOptions& options, std::string& error) {
   }
 
   std::string parse_error;
-  if (!ParseScript(script, *steps_, parse_error) || !ParseRepeat(options.repeat, *steps_, parse_error)) {
+  if (!ParseScript(script, *steps_, parse_error, &sched_) || !ParseRepeat(options.repeat, *steps_, parse_error)) {
     error = "input script error: " + parse_error;
     steps_->clear();
+    sched_.clear();
     return false;
   }
   return true;
 }
 
 void ScriptedInput::AttachTo(rex::input::InputSystem& input) {
-  if (!active()) {
+  if (!pad_active()) {  // a schedule-only script has no pad to add
     return;
   }
   input.AddDriver(std::make_unique<ScriptPadDriver>(steps_));
@@ -411,12 +414,99 @@ void ScriptedInput::Start() {
     return;
   }
   stop_ = false;
-  REXLOG_INFO("[mcla-input] {} step(s) loaded from {}", steps_->size(), source_);
-  for (const Step& s : *steps_) {
-    REXLOG_INFO("[mcla-input]   {}{} at {:.2f} s, hold {} ms", s.period_s > 0 ? "repeat " : "", s.text, s.at_s,
-                s.hold_ms);
+  if (pad_active()) {
+    REXLOG_INFO("[mcla-input] {} step(s) loaded from {}", steps_->size(), source_);
+    for (const Step& s : *steps_) {
+      REXLOG_INFO("[mcla-input]   {}{} at {:.2f} s, hold {} ms", s.period_s > 0 ? "repeat " : "", s.text, s.at_s,
+                  s.hold_ms);
+    }
   }
+  StartSchedule();
   thread_ = std::thread([this] { LogMain(); });
+}
+
+// Checks the schedule against the cvar registry and logs it with its initial state. Runs from Start (OnPostSetup), when
+// every cvar and plugin exists. A typo in a cvar name must fail the run at once, not leave a long unattended
+// experiment running without its change.
+void ScriptedInput::StartSchedule() {
+  sched_next_ = 0;
+  sched_segment_ = 0;
+  if (sched_.empty()) {
+    return;
+  }
+  std::vector<std::string> checked;
+  for (const SchedStep& s : sched_) {
+    if (s.kind != SchedStep::kSet || std::find(checked.begin(), checked.end(), s.name) != checked.end()) {
+      continue;
+    }
+    checked.push_back(s.name);
+    const rex::cvar::FlagEntry* info = rex::cvar::GetFlagInfo(s.name);
+    if (!info) {
+      REXLOG_ERROR("[mcla-sched] unknown cvar '{}' in step '{}'", s.name, s.text);
+      rex::FlushLogging();
+      std::_Exit(2);  // the script-error exit code
+    }
+    if (info->lifecycle != rex::cvar::Lifecycle::kHotReload) {
+      REXLOG_WARN("[mcla-sched] cvar '{}' is {}: a change at run time may not take effect (step '{}')", s.name,
+                  info->lifecycle == rex::cvar::Lifecycle::kInitOnly ? "init-only" : "restart-only", s.text);
+    }
+    if (info->type == rex::cvar::FlagType::String) {
+      REXLOG_WARN("[mcla-sched] cvar '{}' is a string: changed live, other threads read it without a lock (racy)",
+                  s.name);
+    }
+  }
+
+  REXLOG_INFO("[mcla-sched] {} step(s) loaded from {}", sched_.size(), source_);
+  for (const SchedStep& s : sched_) {
+    REXLOG_INFO("[mcla-sched]   {} at {:.2f} s", s.text, s.at_s);
+  }
+  sched_state_ = SchedState(sched_);
+  for (const std::string& name : sched_state_.cvars()) {
+    sched_state_.SetCvar(name, rex::cvar::GetFlagByName(name));
+  }
+  REXLOG_INFO("[mcla-sched] t={:.3f} segment 0: {}", SecondsSinceProcessStart(), sched_state_.Label());
+  rex::FlushLogging();
+}
+
+// Fires every schedule step that is due at `t`, in order and once each, then writes ONE segment line for the batch:
+// tools/segments.py cuts its windows at those lines, so steps of the same instant must not split the run.
+void ScriptedInput::RunSchedule(double t) {
+  bool ran = false;
+  while (sched_next_ < sched_.size() && sched_[sched_next_].at_s <= t) {
+    const SchedStep& s = sched_[sched_next_++];
+    ran = true;
+    switch (s.kind) {
+      case SchedStep::kSet: {
+        const bool ok = rex::cvar::SetFlagByName(s.name, s.value);
+        // What the cvar holds now is the state, whatever was asked for: a rejected value leaves the old one, and a bool
+        // set as "1" reads back as "true", so equal states always get the same label.
+        const std::string now = rex::cvar::GetFlagByName(s.name);
+        sched_state_.SetCvar(s.name, now);
+        if (ok) {
+          REXLOG_INFO("[mcla-sched] t={:.3f} set {}={} ok now={}", t, s.name, s.value, now);
+        } else {
+          REXLOG_WARN("[mcla-sched] t={:.3f} set {}={} FAILED (rejected) now={}", t, s.name, s.value, now);
+        }
+        break;
+      }
+      case SchedStep::kBurn:
+        sched_state_.SetBurn(s.n);
+        REXLOG_INFO("[mcla-sched] t={:.3f} burn {}", t, s.n);
+        break;
+      case SchedStep::kBurnMem:
+        sched_state_.SetBurnMem(s.n);
+        REXLOG_INFO("[mcla-sched] t={:.3f} burnmem {}", t, s.n);
+        break;
+      case SchedStep::kMark:
+        sched_state_.SetMark(s.name);
+        REXLOG_INFO("[mcla-sched] t={:.3f} mark {}", t, s.name);
+        break;
+    }
+  }
+  if (ran) {
+    REXLOG_INFO("[mcla-sched] t={:.3f} segment {}: {}", t, ++sched_segment_, sched_state_.Label());
+    rex::FlushLogging();
+  }
 }
 
 void ScriptedInput::Stop() {
@@ -430,8 +520,8 @@ void ScriptedInput::Stop() {
   }
 }
 
-// Writes one log line per press (the pad itself needs no thread), and one when a script without repeating steps ends.
-// run_game.py and the humans reading the log line the presses up against the game's own lines.
+// Writes one log line per press (the pad itself needs no thread), and one when a script without repeating steps ends;
+// runs the schedule. run_game.py and the humans reading the log line the presses up against the game's own lines.
 void ScriptedInput::LogMain() {
   std::vector<long> presses(steps_->size(), 0);
   bool endless = false;
@@ -452,6 +542,12 @@ void ScriptedInput::LogMain() {
       break;
     }
     const double t = SecondsSinceProcessStart();
+    if (sched_next_ < sched_.size() && sched_[sched_next_].at_s <= t) {
+      // A cvar change runs other modules' change callbacks: not under our lock (Stop needs it to end this thread).
+      lock.unlock();
+      RunSchedule(t);
+      lock.lock();
+    }
     bool logged = false;
     for (size_t i = 0; i < steps_->size(); ++i) {
       const Step& s = (*steps_)[i];
@@ -463,7 +559,8 @@ void ScriptedInput::LogMain() {
         logged = true;
       }
     }
-    if (!endless && !finished_logged && t >= end_s) {
+    // Only the pad steps end: a schedule keeps the thread busy until Stop.
+    if (pad_active() && !endless && !finished_logged && t >= end_s) {
       finished_logged = true;
       REXLOG_INFO("[mcla-input] t={:.2f} script finished", t);
       logged = true;

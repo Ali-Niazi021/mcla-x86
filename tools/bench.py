@@ -15,6 +15,12 @@ What a bench does
      With `--parked` each measured drive run is followed by a parked run (flow bench_parked), see "Stable 60" below.
   3. A variant is `name:cvar=value,cvar=value` (`base:` = no cvars). Its cvars go to the game as `--cvar` overrides after the
      shared contract of run_game.py; `--cvar k=v` (repeatable) adds cvars to every variant, the variant wins on a clash.
+     `--schedule SPEC` (repeatable) adds a timed schedule (`<s>:set cvar=v`, `burn <n>`, `burnmem <n>`, `mark <label>`; a file, a
+     name in tools/flows/schedules/ or inline `58:set k=v;70:burn 4`; see tools/run_game.py) to the flow of EVERY run, the warm-up
+     too (a `set` that needs new shaders warms them there); it is validated before anything runs, printed in the plan and
+     recorded in metrics.json / bench.json as `schedule` and `burn_events`. The metrics of such a run are the pooled window (all
+     segments mixed): cut it with `python tools/segments.py <run id>` for the per-segment numbers. `--window-pos POS` and
+     `--behind` / `--no-behind` are run_game's window placement (default: bottom-right, just behind the foreground window).
   4. PresentMon 2.6 (`$WORK/toolchain/presentmon/PresentMon-2.6.0-x64.exe`, no admin) is started from run_game's on_start hook
      on the game PID: `--process_id <pid> --output_file <run>/pm.csv --qpc_time_ms --timed <seconds-2> --terminate_after_timed
      --terminate_on_proc_exit --no_console_stats --session_name mcla_bench_<pid> --stop_existing_session`. `--timed` ends the
@@ -352,6 +358,8 @@ _TIME_ABS = ("cpustartqpctimeinms",)                                    # ms on 
 _TIME_REL = (("cpustarttimeinms", 1e-3), ("timeinms", 1e-3), ("cpustarttime", 1e-3), ("timeinseconds", 1.0))
 _FT_COLS = ("msbetweenpresents", "frametime")
 _GPU_COLS = ("msgpubusy", "gpubusy")
+_CPU_COLS = ("mscpubusy",)
+_GWAIT_COLS = ("msgpuwait",)
 
 
 @dataclass
@@ -360,6 +368,8 @@ class PmSeries:
     t: List[float] = field(default_factory=list)          # seconds on the CSV clock
     ft: List[float] = field(default_factory=list)         # ms between presents
     gpu: List[Optional[float]] = field(default_factory=list)
+    cpu: List[Optional[float]] = field(default_factory=list)     # MsCPUBusy (tools/segments.py)
+    gwait: List[Optional[float]] = field(default_factory=list)   # MsGPUWait (tools/segments.py)
 
 
 @dataclass
@@ -396,6 +406,8 @@ def load_pm_csv(path, pid: Optional[int] = None) -> PmCsv:
         idx = {h.strip().lower(): i for i, h in enumerate(header)}
         i_ft = _first_col(idx, _FT_COLS)
         i_gpu = _first_col(idx, _GPU_COLS)
+        i_cpu = _first_col(idx, _CPU_COLS)
+        i_gwait = _first_col(idx, _GWAIT_COLS)
         i_abs = _first_col(idx, _TIME_ABS)
         scale = 1e-3
         clock = "qpc"
@@ -429,10 +441,12 @@ def load_pm_csv(path, pid: Optional[int] = None) -> PmCsv:
             s.t.append(t * scale)
             s.ft.append(ft)
             s.gpu.append(_float_or_none(row[i_gpu]) if i_gpu is not None else None)
+            s.cpu.append(_float_or_none(row[i_cpu]) if i_cpu is not None else None)
+            s.gwait.append(_float_or_none(row[i_gwait]) if i_gwait is not None else None)
             rows += 1
     for s in series.values():               # the first row of a swap chain has no predecessor in the capture
         if s.t:
-            del s.t[0], s.ft[0], s.gpu[0]
+            del s.t[0], s.ft[0], s.gpu[0], s.cpu[0], s.gwait[0]
     return PmCsv(str(path), clock, series, rows, skipped)
 
 
@@ -1215,6 +1229,7 @@ class Result:
     power: str = ""
     warmup: str = ""
     pm_note: str = ""
+    schedule: List[str] = field(default_factory=list)      # --schedule specs the run carried
 
 
 def metrics_of(analysis: Dict) -> Dict:
@@ -1389,7 +1404,8 @@ def pooled(results: Sequence[Result], run_id: str, kind: str, flow: str, variant
                 "sim_cap": first.get("sim_cap"), "wide": first.get("wide"), "built": first.get("built"), "ft": ft, "gpu": gpu,
                 "window": first.get("window"), "pm_clock": first.get("pm_clock"), "pm_rows": 0, "pm_skipped": 0, "fr_rel": None}
     analysis["telemetry"] = {"taint": taints} if taints else None
-    return Result(run_id, kind, variant, flow, rep, results[0].cvars, True, [], analysis, results[0].power, results[0].warmup)
+    return Result(run_id, kind, variant, flow, rep, results[0].cvars, True, [], analysis, results[0].power, results[0].warmup,
+                  schedule=results[0].schedule)
 
 
 def aggregate_line(variant: str, kind: str, results: Sequence[Result]) -> str:
@@ -1410,7 +1426,8 @@ def result_json(res: Result) -> Dict:
             "metrics": metrics_of(a), "world_s": a.get("world_s"), "real_s": a.get("real_s"), "sim_lines": a.get("sim_lines"),
             "sim_frame_times": a.get("sim_ft"), "sim_on": a.get("sim_on"), "wide": a.get("wide"), "built": a.get("built"),
             "window": a.get("window"), "free_roam_log_s": a.get("fr_rel"), "pm_clock": a.get("pm_clock"),
-            "pm_rows": a.get("pm_rows"), "power": res.power, "warmup": res.warmup, "telemetry": a.get("telemetry")}
+            "pm_rows": a.get("pm_rows"), "power": res.power, "warmup": res.warmup, "telemetry": a.get("telemetry"),
+            "schedule": res.schedule, "burn_events": a.get("burn_events")}
 
 
 # ================================================================================================================
@@ -1439,7 +1456,7 @@ def run_one(ctx: Ctx, spec: RunSpec) -> Result:
     opts = run_game.RunOptions(
         flow=spec.flow, fixture=ctx.fixture, seconds=spec.seconds, api=args.api, cvars=["%s=%s" % kv for kv in cvars],
         run_id=spec.run_id, config=args.config, exe=args.exe, lock=False, expect="free-roam", work=str(ctx.work),
-        game=args.game)
+        game=args.game, schedule=list(args.schedule), window_pos=args.window_pos, behind=args.behind)
     pm = PresentMon(ctx.pm_exe, spec.seconds)
     exe_name = Path(args.exe).name if args.exe else "mcla.exe"
     sampler = Sampler(ctx.sampler_exe, spec.seconds, exe_name) if ctx.sampler_exe is not None else None
@@ -1517,6 +1534,7 @@ def run_one(ctx: Ctx, spec: RunSpec) -> Result:
     if summary.get("unregistered") and not summary.get("fatal_log"):
         reasons.append("%d unregistered-function line(s)" % summary["unregistered"])
     analysis["reasons"] = reasons
+    analysis["burn_events"] = summary.get("burn_events")
     pm_note = "killed after the run" if pm.meta.get("killed") else ""
     pm_log = run_dir / "pm.log"
     if reasons and pm_log.is_file():       # PresentMon's own words next to a run that has no usable capture
@@ -1525,7 +1543,7 @@ def run_one(ctx: Ctx, spec: RunSpec) -> Result:
             pm_note = (pm_note + "; " if pm_note else "") + "pm.log: " + words[-200:]
     warmup = ("warm-up run %s dropped" % ", ".join(ctx.warmup_ids)) if ctx.warmup_ids else ""
     res = Result(spec.run_id, spec.kind, spec.variant, spec.flow, spec.rep, cvars, not reasons, reasons, analysis,
-                 power_note(power0, power1), warmup, pm_note)
+                 power_note(power0, power1), warmup, pm_note, list(args.schedule))
     return res
 
 
@@ -1708,6 +1726,16 @@ def make_parser() -> argparse.ArgumentParser:
     ap.add_argument("--guard-at", type=float, default=GUARD_AT_S, metavar="S",
                     help="kill a run that has no `-> free-roam` line S s after its launch (default %g; 0 = off)" % GUARD_AT_S)
     ap.add_argument("--cvar", action="append", default=[], metavar="K=V", help="a cvar for every variant; repeatable")
+    ap.add_argument("--schedule", action="append", default=[], metavar="SPEC",
+                    help="a timed schedule (set / burn / burnmem / mark steps, tools/run_game.py) added to the flow of EVERY run "
+                         "(the warm-up too, so a `set` warms the shaders it needs): a file, a name in tools/flows/schedules/, or "
+                         "inline `58:set k=v;70:burn 4`; repeatable. Recorded in metrics.json / bench.json; cut with tools/segments.py")
+    ap.add_argument("--window-pos", metavar="POS",
+                    help="game window position, run_game.py --window-pos (default bottom-right: bottom-right|bottom-left|top-right|"
+                         "top-left|X,Y)")
+    ap.add_argument("--behind", dest="behind", action="store_true", default=None,
+                    help="game window just behind the foreground window (default on)")
+    ap.add_argument("--no-behind", dest="behind", action="store_false", help="do not place the window behind the foreground one")
     ap.add_argument("--id", metavar="ID", help="bench id, the prefix of the run ids (default bench-<yyyymmdd-HHMMSS>)")
     ap.add_argument("--build-id", metavar="ID", help="METRICS build id (default: the log's build stamp, else ?)")
     ap.add_argument("--note", metavar="TEXT", help="extra METRICS notes")
@@ -1832,6 +1860,9 @@ def cmd_bench(args: argparse.Namespace) -> int:
     if len(set(names)) != len(names):
         raise SetupError("duplicate variant names: %s" % ", ".join(names))
     common = [parse_cvar(c) for c in args.cvar]
+    sched_steps, _ = run_game.load_schedule(args.schedule)    # raises run_game.Fail on a bad --schedule
+    if args.window_pos is not None:
+        run_game.check_window_pos(args.window_pos)
     flow_file = run_game.resolve_flow(args.flow)          # raises run_game.Fail
     header = run_game.flow_header(flow_file.read_text(encoding="utf-8"))
     drive_seconds = float(args.seconds if args.seconds is not None else header.get("seconds", DEFAULT_SECONDS))
@@ -1854,6 +1885,8 @@ def cmd_bench(args: argparse.Namespace) -> int:
     print("plan %s: %d run(s), %d measured; api %s, fixture %s, window = free roam + %g s to %s" % (
         bench_id, len(plan), sum(1 for s in plan if s.kind != "warmup"), args.api, fixture or "none", args.window_skip,
         "the end" if not args.window_seconds else "+%g s" % args.window_seconds), flush=True)
+    if sched_steps:
+        print("schedule: %d step(s) on every run: %s" % (len(sched_steps), "; ".join(st[4] for st in sched_steps)), flush=True)
     print("telemetry: %s" % ("off (--no-telemetry)" if args.no_telemetry else (
         "sampler %s + CPU load" % run_game.posix(ctx.sampler_exe) if ctx.sampler_exe is not None else
         "CPU load only (no sampler.exe at %s: build tools/telemetry)" % run_game.posix(work / SAMPLER_EXE))), flush=True)
