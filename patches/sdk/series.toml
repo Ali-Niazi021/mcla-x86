@@ -944,6 +944,15 @@ purpose = "Presenter: hdr=on stays SDR (logged) when the display is known not to
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0740-hdr-fused-gain"
+source = "local"
+path = "patches/sdk/0740-hdr-fused-gain.patch"
+sha256 = "54807663cc475e3c24de25fc2f6a366ee8e946a351d804d6f22bbecdcb2bfdeb"
+purpose = "Fused HDR refresher: the HDR scene as a gain (HDR curve / game curve, same math) on the game's own pre-UI 8-bit pixel; below the knee bit-identical to SDR, day and night (cvar hdr_scene_fused_gain, default true). Fixes night HDR being 1.1-1.4x brighter than SDR (h2-8). No GPU cost."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]
