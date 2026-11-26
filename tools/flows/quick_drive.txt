@@ -1,0 +1,33 @@
+# MCLA quick flow (iteration runs): boot, free roam, one minute of driving, stop. 118 s in all.
+# The first 118 s of bench_drive.txt, unchanged, so a quick run covers the same streets as the start of a bench drive:
+# Start at 28..34 (title), B taps at 40..49 (close a stray pause), throttle from T+52 in 14 s slices with a gentle steer
+# and an A tap per slice. `-> free-roam` comes at ~36.5 s; the drive window is T+52..118 (66 s).
+# Use: python tools/run_game.py --flow quick_drive --config Release [--cvar k=v]... [--screenshot-every 10]
+#      python tools/bench.py --flow quick_drive --no-warmup --window-skip 16 [--variant ...]
+# Long drives and soaks are the owner's; agents iterate on this flow (one boot, one minute, stop).
+# Format: <second>:<button>[+<button>...][/<hold ms>], '#' comments; seconds count from process start.
+#
+# expect: free-roam
+# seconds: 118
+# fixture: after_intro
+28:start/300
+30:start/300
+32:start/300
+34:start/300
+40:b/300
+43:b/300
+46:b/300
+49:b/300
+52:rt=1/14000
+60:ls_right/500
+64:a/200
+66:rt=1/14000
+74:ls_left/500
+78:a/200
+80:rt=1/14000
+88:ls_right/500
+92:a/200
+94:rt=1/14000
+102:ls_left/500
+106:a/200
+108:rt=1/10000

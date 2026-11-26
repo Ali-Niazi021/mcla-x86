@@ -202,8 +202,18 @@ def work_dir(arg: Optional[str] = None) -> str:
     return arg or os.environ.get("MCLA_WORK") or DEFAULT_WORK
 
 
+def lock_dir(work: Optional[str] = None) -> str:
+    """The lock is machine-global (one GPU, one power budget): $MCLA_LOCK_DIR, else <DEFAULT_WORK>/locks. A stream that
+    works in its own $MCLA_WORK (its own SDK tree and build) still queues behind every other stream's builds and runs.
+    MCLA_LOCK_DIR=work restores the old per-work-tree lock (`work`/locks), for tests of this tool only."""
+    env = os.environ.get("MCLA_LOCK_DIR")
+    if env == "work":
+        return os.path.join(work_dir(work), "locks")
+    return env or os.path.join(DEFAULT_WORK, "locks")
+
+
 def paths(work: Optional[str]) -> Tuple[str, str]:
-    base = os.path.join(work_dir(work), "locks")
+    base = lock_dir(work)
     queue = os.path.join(base, QUEUE_NAME)
     os.makedirs(queue, exist_ok=True)
     return os.path.join(base, LOCK_NAME), queue

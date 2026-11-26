@@ -27,6 +27,9 @@
                    desktop); a screen BitBlt is the fallback (then the window must be visible and not covered:
                    --topmost raises it above other windows without taking focus). summary.json shot_methods counts both.
                    The run keeps the display and the system awake (SetThreadExecutionState), restored at the end.
+  --audio          keep the game's sound (default: the run is muted with --audio_mute=true).
+  --activate       let the game window take the keyboard focus (default: it is shown without activation, so whoever is
+                   working on the machine keeps typing where they were; the scripted pad needs no focus).
   --stop-on-reach  stop (after 5 s for the log to flush) as soon as the expected state is reached.
   --expect STATE   override the flow's `# expect:` header (none|title|menu|free-roam).
   --config C       build config of $WORK/build/bin/<C>/mcla.exe (default RelWithDebInfo). --exe PATH overrides.
@@ -901,6 +904,8 @@ class RunOptions:
     stop_on_reach: bool = False
     expect: Optional[str] = None
     topmost: bool = False
+    audio: bool = False
+    activate: bool = False
     work: Optional[str] = None
     game: Optional[str] = None
 
@@ -930,6 +935,8 @@ def build_args(opts: RunOptions, game_root: Path, user_dir: Path, cache_dir: Pat
         "mcla_gpu_backend": opts.api,
         "input-file": posix(flow_path),
     }
+    if not opts.audio:
+        pairs["audio_mute"] = "true"  # the owner works on this machine while tests run
     for spec in opts.cvars:
         key, eq, value = spec.partition("=")
         key = key.strip().lstrip("-")
@@ -1098,8 +1105,15 @@ def _run_locked(opts: RunOptions, work: Path, game_root: Path, exe: Path, flow_f
         started = time.monotonic()
         try:
             with open(stdout_path, "wb") as out:
+                startupinfo = None
+                if not opts.activate:
+                    # The game's first ShowWindow takes this show state: shown, not activated, so the owner's
+                    # foreground window keeps the keyboard (the scripted pad needs no focus).
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = 4  # SW_SHOWNOACTIVATE
                 proc = subprocess.Popen(command, cwd=str(run_dir), stdin=subprocess.DEVNULL, stdout=out,
-                                        stderr=subprocess.STDOUT, env=env,
+                                        stderr=subprocess.STDOUT, env=env, startupinfo=startupinfo,
                                         creationflags=0x00000200 | 0x08000000)  # NEW_PROCESS_GROUP | NO_WINDOW
         except OSError as e:
             raise Fail("cannot start %s: %s" % (posix(exe), e)) from e
@@ -1268,6 +1282,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="stop %d s after the expected state is reached" % STOP_GRACE_S)
     ap.add_argument("--expect", choices=STATES, help="override the flow's `# expect:` header")
     ap.add_argument("--topmost", action="store_true", help="raise the game window above others for the screenshots")
+    ap.add_argument("--audio", action="store_true", help="do not mute the game (default: --audio_mute=true)")
+    ap.add_argument("--activate", action="store_true",
+                    help="let the game window take the focus (default: shown without activation)")
     ap.add_argument("--work", metavar="W", help="$WORK (default env MCLA_WORK, else %s)" % DEFAULT_WORK)
     ap.add_argument("--game", metavar="G", help="$GAME (default env MCLA_GAME, else %s)" % DEFAULT_GAME)
     ap.add_argument("--check-flow", action="store_true", help="validate the flow file and stop")
@@ -1278,7 +1295,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                       cvars=args.cvar, screenshot_every=args.screenshot_every, run_id=args.run_id,
                       config=args.config, exe=args.exe, lock=not args.no_lock, lock_timeout=args.lock_timeout,
                       stop_on_reach=args.stop_on_reach, expect=args.expect, topmost=args.topmost,
-                      work=args.work, game=args.game)
+                      audio=args.audio, activate=args.activate, work=args.work, game=args.game)
     try:
         if args.summarize:
             return _summarize(args.summarize, opts)
