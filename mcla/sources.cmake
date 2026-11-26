@@ -46,6 +46,11 @@
 #   input     INPUT_TITLE_LATCH 0x82615048 + 0x822C8B34, INPUT_MENU_REPEAT 0x822240C0 + 0x822241CC (W5.6): the 60 fps input
 #             fixes (a title Start press a polling script misses; one menu tap stepping twice); cvars
 #             mcla_input_title_latch / mcla_input_menu_repeat (-1 = auto: on while mcla_sim60 is on)
+#
+# Not hooks, always compiled (no flag, no [[midasm_hook]] entry; the glob below picks them up): the shared state of a hook
+# group (mcla_t_common.cpp, mcla_ws_common.cpp, mcla_cpu_common.cpp, mcla_gfx_tune.cpp) and the LOCK60 GPU frame governor
+# mcla_gov.cpp (pure logic in mcla_gov_math.h, unit-tested in mcla/tests/test_gov.cpp), called once per engine frame from
+# mcla::sim::OnFrameStart; master switch cvar mcla_gov (off = the game as before).
 set(MCLA_HOOK_DEFINITIONS
     # core
     MCLA_HOOK_HEARTBEAT=1
