@@ -53,10 +53,13 @@ REXCVAR_DEFINE_BOOL(mcla_gov, false, "MCLA",
                     "loop on the GPU frame time (SDK export rexgpu_gpu_frame_us; without it, on missed frames): sheds one level of "
                     "mcla_gov_levels when the GPU frame nears the budget, restores slowly, and lets the 60 -> 30 hold start only "
                     "once the last level is reached and the GPU is still over budget. Live");
-REXCVAR_DEFINE_DOUBLE(mcla_gov_shed_ms, 14.8, "MCLA",
+REXCVAR_DEFINE_DOUBLE(mcla_gov_shed_ms, 15.6, "MCLA",
                       "MCLA governor: shed one level when the GPU frame time (the median of the last 4 samples) is above this, in ms "
-                      "(the 60 fps budget is 16.7). A missed frame sheds too when the last sample is within 1 ms below it. Live");
-REXCVAR_DEFINE_DOUBLE(mcla_gov_restore_ms, 12.8, "MCLA",
+                      "(the 60 fps budget is 16.7, minus ~0.7 ms of presenter paint outside the measured frame). The value is the GPU's "
+                      "BUSY time of the frame (SDK 04f0: its lists' spans without the idle gaps between them; at a frame cap the GPU "
+                      "idles inside the frame while the CPU produces it). A missed frame sheds too when the last sample is within 1 ms "
+                      "below it. Live");
+REXCVAR_DEFINE_DOUBLE(mcla_gov_restore_ms, 15.0, "MCLA",
                       "MCLA governor: a restore step (one level back) is only considered while the GPU frame time stays below this, "
                       "in ms: its p90 over the whole of mcla_gov_restore_s. Keep it clearly under mcla_gov_shed_ms (the slack between "
                       "them is the hysteresis). Live");
@@ -70,8 +73,11 @@ REXCVAR_DEFINE_DOUBLE(mcla_gov_restore_s, 4.0, "MCLA",
                       "doubling decays 30 s after the wait it lengthened. Live");
 REXCVAR_DEFINE_STRING(
     mcla_gov_levels,
-    "vrs=1;vrs=2;vrs=3;vrs=3,mcla_gfx_env_interval=4,mcla_gfx_far_cascades_interval=3;"
-    "vrs=4,mcla_gfx_env_interval=4,mcla_gfx_far_cascades_interval=3,mcla_gfx_shadow_dist=0.45,mcla_gfx_city_lod=0.55",
+    // VRS 1-2 first: pop-free and invisible (run lk-vrs1: -0.4 / -0.6 ms; the SDK has no scene levels: slower and blurred).
+    // Then the live knobs. At integration with VISUALS' run-time detail tier (mcla_gfx_tier), the slow steps become
+    // `mcla_gfx_tier=N` entries (one tier per level, never below tier 1 here; the 30 hold stays the last resort).
+    "vrs=1;vrs=2;vrs=2,mcla_gfx_env_interval=4,mcla_gfx_far_cascades_interval=3;"
+    "vrs=2,mcla_gfx_env_interval=4,mcla_gfx_far_cascades_interval=3,mcla_gfx_shadow_dist=0.45,mcla_gfx_city_lod=0.55",
     "MCLA",
     "MCLA governor: the shed levels, ordered by visibility. Levels separated by ';', each a comma-separated list of name=value "
     "settings that HOLD at that level (absolute, not deltas; a setting a level does not mention is at its base value). The first "

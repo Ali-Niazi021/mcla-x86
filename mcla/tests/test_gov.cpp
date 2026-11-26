@@ -414,13 +414,17 @@ void TestBounceWindowAndDecay() {
 }
 
 void TestNotDriving() {
-  // A menu: sheds as everywhere, never restores, and the timer starts over when driving resumes.
+  // A menu, a pause or a load: the level is held (no shed, no restore), and the timer starts over when driving resumes.
   Rig r;
   r.driving = false;
+  r.Run(30, 30.0);
+  CHECK(r.c.Level() == 0, "no shed in a menu, even at 30 ms");
+  r.driving = true;
   r.Run(10, 16.0);
-  CHECK(r.c.Level() >= 1, "sheds in a menu");
+  CHECK(r.c.Level() >= 1, "sheds once driving");
   r.p.max_level = r.c.Level();
   const int shed_to = r.c.Level();
+  r.driving = false;
   CHECK(r.Seconds(20.0, 9.0) < 0 && r.c.Level() == shed_to, "20 s of calm in a menu: no restore");
   r.driving = true;
   CHECK(r.Seconds(3.9, 9.0) < 0 && r.c.Level() == shed_to, "3.9 s after driving resumes: still holding");

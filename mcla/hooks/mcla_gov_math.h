@@ -30,8 +30,8 @@
 //        counted from the end of the delay they lengthened (so a 32 s wait is not eaten by its own decay and the cap is
 //        reachable). This is the guard against DVFS: with slack the GPU clocks down and the frame time rises, so a plain
 //        threshold would restore, see the time rise, shed, and repeat.
-//        Not driving (a menu, a pause, a load): the governor sheds as everywhere, but never restores, and the restore
-//        timer is reset on every change of the driving flag and on every missed frame.
+//        Not driving (a menu, a pause, a load): the level is held (no shed, no restore), and the restore timer is reset on
+//        every change of the driving flag and on every missed frame.
 //        Pinning (Params::force_level >= 0) replaces the loop; a lowered cap or a closed rich range moves the level at once.
 //   Levels below 0 (richer than the configured picture) are the same law mirrored: `Params::min_level` < 0 lets the restore
 //   step go on below 0; it is 0 in v1 unless mcla_gov_allow_rich is set (the table of those levels is mcla_gov_rich_levels).
@@ -525,6 +525,9 @@ class Controller {
   }
 
   Change ClosedLoop(const Input& in, const Params& p, int64_t now, double delay_s) {
+    // Not driving (a menu, a pause, a load): the level is held. Loads hitch for reasons no level helps (streaming, pipeline
+    // creation: run lk-gov2 shed 0 -> 4 on 25-35 ms loading frames), and the pause menu's cost is its UI.
+    if (!in.driving) return Change();
     const int shed_frames = std::max(1, p.shed_frames);
     if (level_ < p.max_level && frames_since_change_ >= uint32_t(shed_frames)) {
       if (signal_live_ && recent_count_ >= kMinMedianSamples) {
