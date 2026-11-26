@@ -926,6 +926,24 @@ purpose = "HDR at about SDR cost (D3D12): hdr_scene_fused (default true) compute
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0720-hdr-fxaa"
+source = "local"
+path = "patches/sdk/0720-hdr-fxaa.patch"
+sha256 = "1590b17913ed02ad59485aa5aa9f08add181cb17fe6002b513ef6d19f475719c"
+purpose = "D3D12: FXAA (swap_post_effect) also on the HDR10 image: the HDR refresher writes PQ codes + luma (alpha) into the FXAA source, then the unchanged FXAA pass; cvar hdr_fxaa (true). h2-6: +0.54 ms in HDR, the same as in SDR; edges AA'd as in SDR."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0730-hdr-on-sdr-fallback"
+source = "local"
+path = "patches/sdk/0730-hdr-on-sdr-fallback.patch"
+sha256 = "3d6c3b54e5c609ab827d254a46d1cf3a06ae7c2b782a09610928e2ecfdb71f8a"
+purpose = "Presenter: hdr=on stays SDR (logged) when the display is known not to be in HDR mode; the last known display state is kept while a query comes back unknown (no flapping of on/auto)."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]

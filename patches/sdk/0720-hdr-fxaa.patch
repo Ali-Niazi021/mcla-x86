@@ -1,0 +1,539 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Thu, 26 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0720: hdr_fxaa: FXAA (swap_post_effect) also runs on the HDR10 image
+
+Source: Ours, written for this SDK (stream HDR, mission 2). The SDK's FXAA pass (fxaa_cs / fxaa_extreme_cs, its root signature
+  and constants) is used unchanged; DXBC of the two changed refresher variants rebuilt with fxc 10.0.26100 (Renan's recipe).
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: With HDR10 output the swap cleared swap_post_effect, so FXAA was lost in HDR. Now (D3D12, no frame generation) the HDR
+  refresher (fused and old variants) writes its PQ code values into the FXAA source texture (R16G16B16A16_UNORM) with luma in
+  alpha (flag bit 16: dot(pq, 0.299/0.587/0.114), the SDR *_fxaa_luma weights on PQ codes, the perceptual analogue of SDR's
+  gamma codes), then the same FXAA pass writes the guest output, exactly as SDR does. Cvar hdr_fxaa (bool, default true, hot
+  reload): false = the old behaviour (FXAA skipped in HDR). Log on change: "HDR: FXAA on the HDR10 image (...)" / "... off
+  (<reason>)". Skipped with frame generation, a debug view or the test pattern. Vulkan unchanged (FXAA stays off in HDR there).
+Bucket: REDO
+
+Run h2-6-val (gpu_timing groups, medians, frame-exact entries): swap group HDR 730 -> 1268 us with FXAA (+0.54 ms), SDR 200 ->
+743 us (+0.54 ms): the same cost. Parked dumps, edges (3x3 contrast > 60 PQ codes, 19 % of pixels): FXAA changes 33.8 % of them
+in HDR (mean 11.2 codes) vs 29.3 % in SDR (11.8); p99.9 unchanged. Known: FXAA's sub-pixel blend in PQ dims 1-px glints more
+than SDR's in gamma (406 -> 95 nits vs 291 -> 110): they end at the SDR+FXAA level.
+---
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 2dee338e..51e4a4dc 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -940,6 +940,12 @@ class D3D12CommandProcessor : public CommandProcessor {
+   Microsoft::WRL::ComPtr<ID3D12RootSignature> fxaa_root_signature_;
+   Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_pipeline_;
+   Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_extreme_pipeline_;
++  // FXAA on the HDR10 image (hdr_fxaa; IssueSwap): what was last said about it in the log (the effect and whether
++  // it ran; why not, if it was chosen and didn't), so that it is said once for every change. UINT32_MAX: nothing yet
++  // (or HDR output was off since).
++  uint32_t hdr_fxaa_noted_key_ = UINT32_MAX;
++  const char* hdr_fxaa_noted_why_not_ = nullptr;
++  uint64_t hdr_fxaa_note_last_ms_ = 0;
+ 
+   struct ResolveDownscaleConstants {
+     uint32_t scale_x;
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 5bb34420..b1125c9f 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -110,6 +110,15 @@ REXCVAR_DEFINE_INT32(hdr_scene_fused_check, 0, "GPU",
+                      "GPU, read back a few frames later, no stall): the log says 'HDR: fused check #k: "
+                      "tone map mismatches M of N px (max d), scene mismatches S (max rel r)'")
+     .range(0, 100000);
++REXCVAR_DEFINE_BOOL(hdr_fxaa, true, "GPU",
++                    "HDR output (Direct3D 12): swap_post_effect = fxaa or fxaa_extreme works on the HDR10 "
++                    "image too: the swap's refresher writes the PQ code values and their luma to the FXAA "
++                    "source image and the FXAA pass runs from it into the output (the same pass and "
++                    "settings as in SDR, on the perceptual PQ values; costs about 33 MB of memory traffic "
++                    "a frame at 1080p more than HDR without it, as much as FXAA costs in SDR). Not with "
++                    "frame generation, a debug view or the test pattern. Off: FXAA is skipped while HDR "
++                    "output is active, as before")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_STRING(hdr_ui_mode, "layer", "GPU",
+                       "HDR output: how the game's UI is told from its scene: layer (the UI is "
+                       "collected in a separate target and composited over the HDR scene) or diff "
+@@ -899,7 +908,8 @@ CommandProcessor::SwapPostEffect CommandProcessor::ParseSwapPostEffect(
+ // IssueSwap), so the actual effect is set directly, no CallInThread; the desired one too, so that
+ // GetDesiredSwapPostEffect and a later SetDesiredSwapPostEffect agree. Only a changed string is parsed, a
+ // changed string that parses to the effect already in use (init set it, or "FXAA" for "fxaa") logs nothing.
+-// HDR output is not looked at here: the backend skips the effect per swap while HDR is active.
++// HDR output is not looked at here: the backend decides per swap (Direct3D 12 runs the effect on the HDR10
++// image, hdr_fxaa; Vulkan skips it while HDR is active).
+ void CommandProcessor::RefreshSwapPostEffectFromCvar() {
+   const std::string& name = REXCVAR_GET(swap_post_effect);
+   if (name == swap_post_effect_cvar_seen_) {
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index c30ca567..5d849016 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -102,6 +102,8 @@ REXCVAR_DECLARE(bool, hdr_trim);
+ // hdr_scene_fused and its development check (defined in graphics/command_processor.cpp).
+ REXCVAR_DECLARE(bool, hdr_scene_fused);
+ REXCVAR_DECLARE(int32_t, hdr_scene_fused_check);
++// FXAA on the HDR10 image (defined in graphics/command_processor.cpp).
++REXCVAR_DECLARE(bool, hdr_fxaa);
+ 
+ // LOCAL PATCH - MCLA (04a0): swap_direct_present (defined in d3d12/render_target_cache.cpp) and its sub-switches.
+ REXCVAR_DECLARE(bool, swap_direct_present);
+@@ -2961,7 +2963,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+ 
+         // LOCAL PATCH - MCLA (0600): swap_post_effect is live: this runs on the command processor's thread,
+         // where the cvar's change is taken over (and logged) before the effect is read. With HDR output
+-        // active the effect is skipped just below (use_hdr), whatever the cvar says.
++        // active the effect is set aside just below (use_hdr) and applied to the HDR10 image further down
++        // (hdr_fxaa), once it is known that frame generation isn't used.
+         RefreshSwapPostEffectFromCvar();
+         SwapPostEffect swap_post_effect = GetActualSwapPostEffect();
+         // HDR output: while the presenter's swap chain is HDR10, HDR10 code
+@@ -2973,13 +2976,14 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+                             frontbuffer_format != xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
+         ui::Presenter::SetGuestOutputHdrAvailable(hdr_possible);
+         bool use_hdr = hdr_state.active && hdr_possible;
++        const SwapPostEffect hdr_post_effect = swap_post_effect;
+         if (use_hdr) {
+           swap_post_effect = SwapPostEffect::kNone;
+         }
+         bool use_fxaa = swap_post_effect == SwapPostEffect::kFxaa ||
+                         swap_post_effect == SwapPostEffect::kFxaaExtreme;
+-        if (use_fxaa) {
+-          // Make sure the texture of the correct size is available for FXAA.
++        // Makes sure the texture of the correct size is available for FXAA; false if it can't be made.
++        auto ensure_fxaa_source_texture = [&]() -> bool {
+           if (fxaa_source_texture_) {
+             D3D12_RESOURCE_DESC fxaa_source_texture_desc = fxaa_source_texture_->GetDesc();
+             if (fxaa_source_texture_desc.Width != guest_output_width ||
+@@ -3011,10 +3015,14 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+                     &fxaa_source_texture_desc, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                     nullptr, IID_PPV_ARGS(&fxaa_source_texture_)))) {
+               REXGPU_ERROR("Failed to create the FXAA input texture");
+-              swap_post_effect = SwapPostEffect::kNone;
+-              use_fxaa = false;
++              return false;
+             }
+           }
++          return true;
++        };
++        if (use_fxaa && !ensure_fxaa_source_texture()) {
++          swap_post_effect = SwapPostEffect::kNone;
++          use_fxaa = false;
+         }
+ 
+         // This is according to D3D::InitializePresentationParameters from a
+@@ -3096,6 +3104,59 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+                               frame_generation_inputs->generation_width,
+                               frame_generation_inputs->generation_height);
+ 
++        // FXAA on the HDR10 image (hdr_fxaa): the refresher writes the code values and their luma to the FXAA source
++        // image (flag bit 16), and the FXAA pass after it writes the guest output image, as in SDR. Not with frame
++        // generation (its refresher has no such output and its compose writes the guest output itself), and not
++        // with the debug views and the test pattern, which are for measuring the code values as they are.
++        if (use_hdr) {
++          const bool hdr_fxaa_selected = hdr_post_effect == SwapPostEffect::kFxaa ||
++                                         hdr_post_effect == SwapPostEffect::kFxaaExtreme;
++          const char* hdr_fxaa_why_not = nullptr;
++          if (hdr_fxaa_selected) {
++            if (!REXCVAR_GET(hdr_fxaa)) {
++              hdr_fxaa_why_not = "hdr_fxaa is off";
++            } else if (use_frame_generation) {
++              hdr_fxaa_why_not = "frame generation is on";
++            } else if (hdr_state.debug_ui || hdr_state.test_pattern) {
++              hdr_fxaa_why_not = "a debug view or the test pattern is on";
++            } else if (!fxaa_root_signature_ || !fxaa_pipeline_ || !fxaa_extreme_pipeline_) {
++              hdr_fxaa_why_not = "the FXAA passes aren't available";
++            } else if (!ensure_fxaa_source_texture()) {
++              hdr_fxaa_why_not = "the FXAA source image couldn't be created";
++            }
++            if (!hdr_fxaa_why_not) {
++              swap_post_effect = hdr_post_effect;
++              use_fxaa = true;
++            }
++          }
++          // Said once for every change (a state that flips from frame to frame, such as frame generation
++          // on a frame without a scene, at most once a second).
++          const uint32_t hdr_fxaa_key = uint32_t(hdr_post_effect) | (use_fxaa ? 0x100u : 0u);
++          const uint64_t hdr_fxaa_now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
++          if ((hdr_fxaa_key != hdr_fxaa_noted_key_ || hdr_fxaa_why_not != hdr_fxaa_noted_why_not_) &&
++              (hdr_fxaa_noted_key_ == UINT32_MAX || hdr_fxaa_now_ms - hdr_fxaa_note_last_ms_ >= 1000)) {
++            hdr_fxaa_noted_key_ = hdr_fxaa_key;
++            hdr_fxaa_noted_why_not_ = hdr_fxaa_why_not;
++            hdr_fxaa_note_last_ms_ = hdr_fxaa_now_ms;
++            const char* hdr_fxaa_name = hdr_post_effect == SwapPostEffect::kFxaa ? "fxaa"
++                                        : hdr_post_effect == SwapPostEffect::kFxaaExtreme
++                                            ? "fxaa_extreme"
++                                            : "none";
++            if (use_fxaa) {
++              REXGPU_INFO("HDR: FXAA on the HDR10 image (swap_post_effect={})", hdr_fxaa_name);
++            } else if (hdr_fxaa_why_not) {
++              REXGPU_INFO("HDR: FXAA off on the HDR10 image (swap_post_effect={}: {})", hdr_fxaa_name,
++                          hdr_fxaa_why_not);
++            } else {
++              REXGPU_INFO("HDR: FXAA off on the HDR10 image (swap_post_effect={})", hdr_fxaa_name);
++            }
++          }
++        } else {
++          // Said again when HDR output comes back.
++          hdr_fxaa_noted_key_ = UINT32_MAX;
++          hdr_fxaa_noted_why_not_ = nullptr;
++        }
++
+         // hdr_scene_fused: the refresher makes the scene from the tone map draw's inputs, if the frame is put
+         // together from the front buffer and the underlay (the difference mask, or a frame without UI), and the
+         // textures the draw read are still what it read. Otherwise the frame has no HDR scene (the old pass
+@@ -3349,6 +3410,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+           HdrRefreshFlags(composite, hdr_state.debug_ui, hdr_refresh_constants.flags);
+           hdr_refresh_constants.flags[0] |=
+               uint32_t(hdr_state.sdr_pure_gamma_2_2) | (uint32_t(hdr_state.test_pattern) << 1);
++          if (use_fxaa) {
++            // FXAA on the HDR10 image: the destination (apply_gamma_dest, below) is the FXAA source image, and
++            // alpha is the code values' luma (never with frame generation: use_fxaa is off then).
++            hdr_refresh_constants.flags[0] |= 1u << 16;
++          }
+           if (use_frame_generation) {
+             // The compose of the generated frame: the same, its scene from the
+             // generated code values (bit 12).
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index b2a37c3b..98aeef15 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -56,8 +56,9 @@
+ // changes (CommandProcessor::RefreshSwapPostEffectFromCvar).
+ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU",
+                       "Swap post effect: none, fxaa, fxaa_extreme. Changes while playing (fxaa is the "
+-                      "game's picture smoothed by FXAA, fxaa_extreme the slower, stronger one). Skipped "
+-                      "while HDR output is active (the HDR picture is not run through FXAA)")
++                      "game's picture smoothed by FXAA, fxaa_extreme the slower, stronger one). With HDR "
++                      "output (Direct3D 12) it runs on the HDR10 image (hdr_fxaa; not with frame "
++                      "generation); with Vulkan it is skipped while HDR output is active")
+     .allowed({"none", "fxaa", "fxaa_extreme"})
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+diff --git a/src/graphics/shaders/bytecode/d3d12_5_1/hdr_refresh_cs.h b/src/graphics/shaders/bytecode/d3d12_5_1/hdr_refresh_cs.h
+index bbdd157a..7e180331 100644
+--- a/src/graphics/shaders/bytecode/d3d12_5_1/hdr_refresh_cs.h
++++ b/src/graphics/shaders/bytecode/d3d12_5_1/hdr_refresh_cs.h
+@@ -1,9 +1,9 @@
+ // Generated from hdr_refresh.cs.xesl with the xenia-project/xenia 0b2ffa3 shader
+ // sources (see patches/README.md). Not disassembled to keep the patch small.
+ const uint32_t hdr_refresh_cs[] = {
+-    0x43425844, 0xEEC13D6F, 0x976492DA, 0x56333EB9, 0xA06BC849, 0x00000001, 0x0000268C, 0x00000003,
++    0x43425844, 0x9922168D, 0x1494EA1F, 0x37C6D79E, 0x834965ED, 0x00000001, 0x000026C8, 0x00000003,
+     0x0000002C, 0x0000003C, 0x0000004C, 0x4E475349, 0x00000008, 0x00000000, 0x00000008, 0x4E47534F,
+-    0x00000008, 0x00000000, 0x00000008, 0x58454853, 0x00002638, 0x00050051, 0x0000098E, 0x0100086A,
++    0x00000008, 0x00000000, 0x00000008, 0x58454853, 0x00002674, 0x00050051, 0x0000099D, 0x0100086A,
+     0x07000059, 0x00308E46, 0x00000000, 0x00000000, 0x00000000, 0x00000002, 0x00000000, 0x07000858,
+     0x00307E46, 0x00000000, 0x00000000, 0x00000000, 0x00005555, 0x00000000, 0x07001858, 0x00307E46,
+     0x00000001, 0x00000001, 0x00000001, 0x00005555, 0x00000000, 0x07001858, 0x00307E46, 0x00000002,
+@@ -232,37 +232,37 @@ const uint32_t hdr_refresh_cs[] = {
+     0x00000041, 0x00000000, 0x0030800A, 0x00000000, 0x00000000, 0x00000001, 0x07000038, 0x00100012,
+     0x00000000, 0x0010000A, 0x00000000, 0x0010000A, 0x00000002, 0x09000032, 0x001000E2, 0x00000000,
+     0x00100E56, 0x00000002, 0x00100006, 0x00000000, 0x00100E56, 0x00000000, 0x01000015, 0x01000015,
+-    0x0C000001, 0x00100032, 0x00000001, 0x00308AA6, 0x00000000, 0x00000000, 0x00000000, 0x00004002,
+-    0x00000002, 0x00000800, 0x00000000, 0x00000000, 0x0304001F, 0x0010000A, 0x00000001, 0x04000056,
+-    0x00100052, 0x00000001, 0x00020106, 0x0A000000, 0x00100052, 0x00000001, 0x00100206, 0x00000001,
+-    0x00004002, 0x3F000000, 0x00000000, 0x3F000000, 0x00000000, 0x07000056, 0x00100032, 0x00000002,
+-    0x00308046, 0x00000000, 0x00000000, 0x00000000, 0x0700000E, 0x00100052, 0x00000001, 0x00100206,
+-    0x00000001, 0x00100106, 0x00000002, 0x07000031, 0x00100012, 0x00000000, 0x0010002A, 0x00000001,
+-    0x00004001, 0x3F000000, 0x09000032, 0x00100042, 0x00000001, 0x0010000A, 0x00000001, 0x00004001,
++    0x0C000001, 0x00100072, 0x00000001, 0x00308AA6, 0x00000000, 0x00000000, 0x00000000, 0x00004002,
++    0x00000002, 0x00000800, 0x00010000, 0x00000000, 0x0304001F, 0x0010000A, 0x00000001, 0x04000056,
++    0x00100092, 0x00000001, 0x00020406, 0x0A000000, 0x00100092, 0x00000001, 0x00100C06, 0x00000001,
++    0x00004002, 0x3F000000, 0x00000000, 0x00000000, 0x3F000000, 0x07000056, 0x00100032, 0x00000002,
++    0x00308046, 0x00000000, 0x00000000, 0x00000000, 0x0700000E, 0x00100092, 0x00000001, 0x00100C06,
++    0x00000001, 0x00100406, 0x00000002, 0x07000031, 0x00100012, 0x00000000, 0x0010003A, 0x00000001,
++    0x00004001, 0x3F000000, 0x09000032, 0x00100082, 0x00000001, 0x0010000A, 0x00000001, 0x00004001,
+     0x40000000, 0x00004001, 0xBF800000, 0x09000037, 0x00100012, 0x00000001, 0x0010000A, 0x00000000,
+-    0x0010000A, 0x00000001, 0x0010002A, 0x00000001, 0x07000038, 0x00100042, 0x00000001, 0x0010000A,
+-    0x00000001, 0x00004001, 0x41C00000, 0x05000041, 0x00100042, 0x00000001, 0x0010002A, 0x00000001,
+-    0x07000038, 0x00100042, 0x00000001, 0x0010002A, 0x00000001, 0x00004001, 0x3E800000, 0x05000019,
+-    0x00100042, 0x00000001, 0x0010002A, 0x00000001, 0x07000038, 0x00100042, 0x00000001, 0x0010002A,
++    0x0010000A, 0x00000001, 0x0010003A, 0x00000001, 0x07000038, 0x00100082, 0x00000001, 0x0010000A,
++    0x00000001, 0x00004001, 0x41C00000, 0x05000041, 0x00100082, 0x00000001, 0x0010003A, 0x00000001,
++    0x07000038, 0x00100082, 0x00000001, 0x0010003A, 0x00000001, 0x00004001, 0x3E800000, 0x05000019,
++    0x00100082, 0x00000001, 0x0010003A, 0x00000001, 0x07000038, 0x00100082, 0x00000001, 0x0010003A,
+     0x00000001, 0x00004001, 0x42C80000, 0x07000031, 0x00100012, 0x00000001, 0x0010000A, 0x00000001,
+     0x00004001, 0x00000000, 0x0B000037, 0x00100012, 0x00000001, 0x0010000A, 0x00000001, 0x0030801A,
+-    0x00000000, 0x00000000, 0x00000001, 0x0010002A, 0x00000001, 0x09000037, 0x001000E2, 0x00000000,
+-    0x00100006, 0x00000000, 0x00100AA6, 0x00000001, 0x00100006, 0x00000001, 0x0304001F, 0x0010000A,
++    0x00000000, 0x00000000, 0x00000001, 0x0010003A, 0x00000001, 0x09000037, 0x001000E2, 0x00000000,
++    0x00100006, 0x00000000, 0x00100FF6, 0x00000001, 0x00100006, 0x00000001, 0x0304001F, 0x0010000A,
+     0x00000000, 0x05000036, 0x00100012, 0x00000000, 0x00004001, 0x461C4000, 0x01000012, 0x07000036,
+     0x00100012, 0x00000000, 0x0030802A, 0x00000000, 0x00000000, 0x00000001, 0x01000015, 0x01000012,
+     0x07000036, 0x00100012, 0x00000000, 0x0030802A, 0x00000000, 0x00000000, 0x00000001, 0x01000015,
+     0x07000034, 0x00100012, 0x00000001, 0x0010003A, 0x00000000, 0x0010002A, 0x00000000, 0x07000034,
+-    0x00100012, 0x00000001, 0x0010001A, 0x00000000, 0x0010000A, 0x00000001, 0x07000031, 0x00100042,
+-    0x00000001, 0x0010000A, 0x00000000, 0x0010000A, 0x00000001, 0x09000031, 0x00100082, 0x00000001,
+-    0x0010000A, 0x00000000, 0x0030803A, 0x00000000, 0x00000000, 0x00000001, 0x07000001, 0x00100042,
+-    0x00000001, 0x0010003A, 0x00000001, 0x0010002A, 0x00000001, 0x0304001F, 0x0010002A, 0x00000001,
+-    0x0A000000, 0x00100042, 0x00000001, 0x8010000A, 0x00000041, 0x00000000, 0x0030803A, 0x00000000,
+-    0x00000000, 0x00000001, 0x08000000, 0x00100082, 0x00000001, 0x0010000A, 0x00000000, 0x8010000A,
+-    0x00000041, 0x00000001, 0x0700000E, 0x00100082, 0x00000001, 0x0010003A, 0x00000001, 0x0010002A,
+-    0x00000001, 0x07000038, 0x00100082, 0x00000001, 0x0010003A, 0x00000001, 0x00004001, 0x3FB8AA3B,
+-    0x05000019, 0x00100082, 0x00000001, 0x0010003A, 0x00000001, 0x08000000, 0x00100082, 0x00000001,
+-    0x8010003A, 0x00000041, 0x00000001, 0x00004001, 0x3F800000, 0x09000032, 0x00100012, 0x00000000,
+-    0x0010002A, 0x00000001, 0x0010003A, 0x00000001, 0x0010000A, 0x00000000, 0x0700000E, 0x00100012,
++    0x00100012, 0x00000001, 0x0010001A, 0x00000000, 0x0010000A, 0x00000001, 0x07000031, 0x00100082,
++    0x00000001, 0x0010000A, 0x00000000, 0x0010000A, 0x00000001, 0x09000031, 0x00100012, 0x00000002,
++    0x0010000A, 0x00000000, 0x0030803A, 0x00000000, 0x00000000, 0x00000001, 0x07000001, 0x00100082,
++    0x00000001, 0x0010003A, 0x00000001, 0x0010000A, 0x00000002, 0x0304001F, 0x0010003A, 0x00000001,
++    0x0A000000, 0x00100082, 0x00000001, 0x8010000A, 0x00000041, 0x00000000, 0x0030803A, 0x00000000,
++    0x00000000, 0x00000001, 0x08000000, 0x00100012, 0x00000002, 0x0010000A, 0x00000000, 0x8010000A,
++    0x00000041, 0x00000001, 0x0700000E, 0x00100012, 0x00000002, 0x0010000A, 0x00000002, 0x0010003A,
++    0x00000001, 0x07000038, 0x00100012, 0x00000002, 0x0010000A, 0x00000002, 0x00004001, 0x3FB8AA3B,
++    0x05000019, 0x00100012, 0x00000002, 0x0010000A, 0x00000002, 0x08000000, 0x00100012, 0x00000002,
++    0x8010000A, 0x00000041, 0x00000002, 0x00004001, 0x3F800000, 0x09000032, 0x00100012, 0x00000000,
++    0x0010003A, 0x00000001, 0x0010000A, 0x00000002, 0x0010000A, 0x00000000, 0x0700000E, 0x00100012,
+     0x00000000, 0x0010000A, 0x00000000, 0x0010000A, 0x00000001, 0x07000038, 0x001000E2, 0x00000000,
+     0x00100006, 0x00000000, 0x00100E56, 0x00000000, 0x01000015, 0x0A000010, 0x00100012, 0x00000002,
+     0x00100796, 0x00000000, 0x00004002, 0x3F209D8C, 0x3EA897C8, 0x3D3168F9, 0x00000000, 0x0A000010,
+@@ -272,42 +272,44 @@ const uint32_t hdr_refresh_cs[] = {
+     0x00004002, 0x38D1B717, 0x38D1B717, 0x38D1B717, 0x00000000, 0x0500002F, 0x00100072, 0x00000000,
+     0x00100246, 0x00000000, 0x0A000038, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x00004002,
+     0x3E232000, 0x3E232000, 0x3E232000, 0x00000000, 0x05000019, 0x00100072, 0x00000000, 0x00100246,
+-    0x00000000, 0x0F000032, 0x001000D2, 0x00000001, 0x00100906, 0x00000000, 0x00004002, 0x4196D000,
+-    0x00000000, 0x4196D000, 0x4196D000, 0x00004002, 0x3F560000, 0x00000000, 0x3F560000, 0x3F560000,
++    0x00000000, 0x0F000032, 0x00100072, 0x00000002, 0x00100246, 0x00000000, 0x00004002, 0x4196D000,
++    0x4196D000, 0x4196D000, 0x00000000, 0x00004002, 0x3F560000, 0x3F560000, 0x3F560000, 0x00000000,
+     0x0F000032, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x00004002, 0x41958000, 0x41958000,
+     0x41958000, 0x00000000, 0x00004002, 0x3F800000, 0x3F800000, 0x3F800000, 0x00000000, 0x0700000E,
+-    0x00100072, 0x00000000, 0x00100386, 0x00000001, 0x00100246, 0x00000000, 0x0500002F, 0x00100072,
+-    0x00000000, 0x00100246, 0x00000000, 0x0A000038, 0x001000D2, 0x00000001, 0x00100906, 0x00000000,
+-    0x00004002, 0x429DB000, 0x00000000, 0x429DB000, 0x429DB000, 0x05000019, 0x00100072, 0x00000002,
+-    0x00100386, 0x00000001, 0x0304001F, 0x0010001A, 0x00000001, 0x09000001, 0x00100082, 0x00000000,
++    0x00100072, 0x00000000, 0x00100246, 0x00000002, 0x00100246, 0x00000000, 0x0500002F, 0x00100072,
++    0x00000000, 0x00100246, 0x00000000, 0x0A000038, 0x00100072, 0x00000002, 0x00100246, 0x00000000,
++    0x00004002, 0x429DB000, 0x429DB000, 0x429DB000, 0x00000000, 0x05000019, 0x00100072, 0x00000002,
++    0x00100246, 0x00000002, 0x0304001F, 0x0010001A, 0x00000001, 0x09000001, 0x00100082, 0x00000000,
+     0x0030802A, 0x00000000, 0x00000000, 0x00000000, 0x00004001, 0x00000001, 0x0304001F, 0x0010003A,
+     0x00000000, 0x0A000038, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x00004002, 0x432D74CD,
+     0x432D74CD, 0x432D74CD, 0x00000000, 0x05000019, 0x00100072, 0x00000000, 0x00100246, 0x00000000,
+-    0x01000012, 0x0A000031, 0x00100072, 0x00000001, 0x00004002, 0x3D25AEE6, 0x3D25AEE6, 0x3D25AEE6,
+-    0x00000000, 0x00100246, 0x00000002, 0x0A000000, 0x00100072, 0x00000003, 0x00100246, 0x00000002,
++    0x01000012, 0x0A000031, 0x001000B2, 0x00000001, 0x00004002, 0x3D25AEE6, 0x3D25AEE6, 0x00000000,
++    0x3D25AEE6, 0x00100846, 0x00000002, 0x0A000000, 0x00100072, 0x00000003, 0x00100246, 0x00000002,
+     0x00004002, 0x3D6147AE, 0x3D6147AE, 0x3D6147AE, 0x00000000, 0x0A000038, 0x00100072, 0x00000003,
+     0x00100246, 0x00000003, 0x00004002, 0x3F72A76E, 0x3F72A76E, 0x3F72A76E, 0x00000000, 0x0500002F,
+     0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x0A000038, 0x00100072, 0x00000003, 0x00100246,
+     0x00000003, 0x00004002, 0x4019999A, 0x4019999A, 0x4019999A, 0x00000000, 0x05000019, 0x00100072,
+     0x00000003, 0x00100246, 0x00000003, 0x0A000038, 0x00100072, 0x00000004, 0x00100246, 0x00000002,
+     0x00004002, 0x3D9E8391, 0x3D9E8391, 0x3D9E8391, 0x00000000, 0x09000037, 0x00100072, 0x00000000,
+-    0x00100246, 0x00000001, 0x00100246, 0x00000003, 0x00100246, 0x00000004, 0x01000015, 0x09000038,
++    0x00100346, 0x00000001, 0x00100246, 0x00000003, 0x00100246, 0x00000004, 0x01000015, 0x09000038,
+     0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x00308006, 0x00000000, 0x00000000, 0x00000001,
+-    0x0A000010, 0x00100012, 0x00000001, 0x00100246, 0x00000000, 0x00004002, 0x3F209D8C, 0x3EA897C8,
+-    0x3D3168F9, 0x00000000, 0x0A000010, 0x00100022, 0x00000001, 0x00100246, 0x00000000, 0x00004002,
+-    0x3D8D82BA, 0x3F6B66F9, 0x3C3A27AF, 0x00000000, 0x0A000010, 0x00100042, 0x00000001, 0x00100246,
++    0x0A000010, 0x00100012, 0x00000003, 0x00100246, 0x00000000, 0x00004002, 0x3F209D8C, 0x3EA897C8,
++    0x3D3168F9, 0x00000000, 0x0A000010, 0x00100022, 0x00000003, 0x00100246, 0x00000000, 0x00004002,
++    0x3D8D82BA, 0x3F6B66F9, 0x3C3A27AF, 0x00000000, 0x0A000010, 0x00100042, 0x00000003, 0x00100246,
+     0x00000000, 0x00004002, 0x3C86466B, 0x3DB44029, 0x3F6545B7, 0x00000000, 0x0A002038, 0x00100072,
+-    0x00000000, 0x00100246, 0x00000001, 0x00004002, 0x38D1B717, 0x38D1B717, 0x38D1B717, 0x00000000,
++    0x00000000, 0x00100246, 0x00000003, 0x00004002, 0x38D1B717, 0x38D1B717, 0x38D1B717, 0x00000000,
+     0x0500002F, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x0A000038, 0x00100072, 0x00000000,
+     0x00100246, 0x00000000, 0x00004002, 0x3E232000, 0x3E232000, 0x3E232000, 0x00000000, 0x05000019,
+-    0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x0F000032, 0x00100072, 0x00000001, 0x00100246,
+-    0x00000000, 0x00004002, 0x4196D000, 0x4196D000, 0x4196D000, 0x00000000, 0x00004002, 0x3F560000,
+-    0x3F560000, 0x3F560000, 0x00000000, 0x0F000032, 0x00100072, 0x00000000, 0x00100246, 0x00000000,
++    0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x0F000032, 0x001000B2, 0x00000001, 0x00100846,
++    0x00000000, 0x00004002, 0x4196D000, 0x4196D000, 0x00000000, 0x4196D000, 0x00004002, 0x3F560000,
++    0x3F560000, 0x00000000, 0x3F560000, 0x0F000032, 0x00100072, 0x00000000, 0x00100246, 0x00000000,
+     0x00004002, 0x41958000, 0x41958000, 0x41958000, 0x00000000, 0x00004002, 0x3F800000, 0x3F800000,
+-    0x3F800000, 0x00000000, 0x0700000E, 0x00100072, 0x00000000, 0x00100246, 0x00000001, 0x00100246,
++    0x3F800000, 0x00000000, 0x0700000E, 0x00100072, 0x00000000, 0x00100346, 0x00000001, 0x00100246,
+     0x00000000, 0x0500002F, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x0A000038, 0x00100072,
+     0x00000000, 0x00100246, 0x00000000, 0x00004002, 0x429DB000, 0x429DB000, 0x429DB000, 0x00000000,
+-    0x05000019, 0x00100072, 0x00000002, 0x00100246, 0x00000000, 0x01000015, 0x05000036, 0x00100082,
+-    0x00000002, 0x00004001, 0x3F800000, 0x070000A4, 0x0021E0F2, 0x00000000, 0x00000000, 0x00020546,
+-    0x00100E46, 0x00000002, 0x0100003E,
++    0x05000019, 0x00100072, 0x00000002, 0x00100246, 0x00000000, 0x01000015, 0x0304001F, 0x0010002A,
++    0x00000001, 0x0A000010, 0x00100082, 0x00000002, 0x00100246, 0x00000002, 0x00004002, 0x3E991687,
++    0x3F1645A2, 0x3DE978D5, 0x00000000, 0x01000012, 0x05000036, 0x00100082, 0x00000002, 0x00004001,
++    0x3F800000, 0x01000015, 0x070000A4, 0x0021E0F2, 0x00000000, 0x00000000, 0x00020546, 0x00100E46,
++    0x00000002, 0x0100003E,
+ };
+diff --git a/src/graphics/shaders/bytecode/d3d12_5_1/hdr_refresh_fused_cs.h b/src/graphics/shaders/bytecode/d3d12_5_1/hdr_refresh_fused_cs.h
+index 3f119ec3..ebea387b 100644
+--- a/src/graphics/shaders/bytecode/d3d12_5_1/hdr_refresh_fused_cs.h
++++ b/src/graphics/shaders/bytecode/d3d12_5_1/hdr_refresh_fused_cs.h
+@@ -1,9 +1,9 @@
+ // Generated from hdr_refresh_fused.cs.xesl with the xenia-project/xenia 0b2ffa3 shader
+ // sources (see patches/README.md). Not disassembled to keep the patch small.
+ const uint32_t hdr_refresh_fused_cs[] = {
+-    0x43425844, 0x7A1D3606, 0x3AE86250, 0x846F97C7, 0x930B9468, 0x00000001, 0x000036BC, 0x00000003,
++    0x43425844, 0x02129170, 0x80FB14E4, 0x743877EF, 0x745E97C9, 0x00000001, 0x000036F8, 0x00000003,
+     0x0000002C, 0x0000003C, 0x0000004C, 0x4E475349, 0x00000008, 0x00000000, 0x00000008, 0x4E47534F,
+-    0x00000008, 0x00000000, 0x00000008, 0x58454853, 0x00003668, 0x00050051, 0x00000D9A, 0x0100086A,
++    0x00000008, 0x00000000, 0x00000008, 0x58454853, 0x000036A4, 0x00050051, 0x00000DA9, 0x0100086A,
+     0x07000059, 0x00308E46, 0x00000000, 0x00000000, 0x00000000, 0x00000008, 0x00000000, 0x07000858,
+     0x00307E46, 0x00000000, 0x00000000, 0x00000000, 0x00005555, 0x00000000, 0x07001858, 0x00307E46,
+     0x00000001, 0x00000001, 0x00000001, 0x00005555, 0x00000000, 0x07001858, 0x00307E46, 0x00000002,
+@@ -334,13 +334,13 @@ const uint32_t hdr_refresh_fused_cs[] = {
+     0x00100246, 0x00000004, 0x0A000038, 0x001000D2, 0x00000001, 0x00100E06, 0x00000001, 0x00004002,
+     0x3D9E8391, 0x00000000, 0x3D9E8391, 0x3D9E8391, 0x09000037, 0x00100072, 0x00000003, 0x00100246,
+     0x00000002, 0x00100246, 0x00000004, 0x00100386, 0x00000001, 0x01000015, 0x01000015, 0x0C000001,
+-    0x001000D2, 0x00000001, 0x00308AA6, 0x00000000, 0x00000000, 0x00000000, 0x00004002, 0x00000400,
+-    0x00000000, 0x00000002, 0x00000800, 0x0D000037, 0x00100082, 0x00000000, 0x0010000A, 0x00000001,
++    0x001000F2, 0x00000002, 0x00308AA6, 0x00000000, 0x00000000, 0x00000000, 0x00004002, 0x00000400,
++    0x00000002, 0x00000800, 0x00010000, 0x0D000037, 0x00100082, 0x00000000, 0x0010000A, 0x00000002,
+     0x0030800A, 0x00000000, 0x00000000, 0x00000001, 0x0030801A, 0x00000000, 0x00000000, 0x00000001,
+-    0x07000038, 0x00100072, 0x00000002, 0x00100FF6, 0x00000000, 0x00100246, 0x00000003, 0x09000039,
+-    0x00100012, 0x00000001, 0x0010003A, 0x00000000, 0x0030800A, 0x00000000, 0x00000000, 0x00000001,
+-    0x07000001, 0x00100012, 0x00000001, 0x0010000A, 0x00000001, 0x0010001A, 0x00000001, 0x0304001F,
+-    0x0010000A, 0x00000001, 0x05002036, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x0F000032,
++    0x07000038, 0x001000D2, 0x00000001, 0x00100FF6, 0x00000000, 0x00100906, 0x00000003, 0x09000039,
++    0x00100012, 0x00000002, 0x0010003A, 0x00000000, 0x0030800A, 0x00000000, 0x00000000, 0x00000001,
++    0x07000001, 0x00100022, 0x00000001, 0x0010001A, 0x00000001, 0x0010000A, 0x00000002, 0x0304001F,
++    0x0010001A, 0x00000001, 0x05002036, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x0F000032,
+     0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x00004002, 0x437F0000, 0x437F0000, 0x437F0000,
+     0x00000000, 0x00004002, 0x3F000000, 0x3F000000, 0x3F000000, 0x00000000, 0x0500001C, 0x00100072,
+     0x00000000, 0x00100246, 0x00000000, 0x0800002D, 0x00100012, 0x00000003, 0x00100006, 0x00000000,
+@@ -361,9 +361,9 @@ const uint32_t hdr_refresh_fused_cs[] = {
+     0x0A000038, 0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x00004002, 0x3D9E8391, 0x3D9E8391,
+     0x3D9E8391, 0x00000000, 0x09000037, 0x00100072, 0x00000000, 0x00100246, 0x00000004, 0x00100246,
+     0x00000005, 0x00100246, 0x00000003, 0x01000015, 0x0A000000, 0x00100082, 0x00000000, 0x8010003A,
+-    0x00000041, 0x00000000, 0x0030800A, 0x00000000, 0x00000000, 0x00000001, 0x09000032, 0x00100072,
+-    0x00000002, 0x00100246, 0x00000000, 0x00100FF6, 0x00000000, 0x00100246, 0x00000002, 0x01000015,
+-    0x0304001F, 0x0010002A, 0x00000001, 0x04000056, 0x00100032, 0x00000000, 0x00020046, 0x0A000000,
++    0x00000041, 0x00000000, 0x0030800A, 0x00000000, 0x00000000, 0x00000001, 0x09000032, 0x001000D2,
++    0x00000001, 0x00100906, 0x00000000, 0x00100FF6, 0x00000000, 0x00100E06, 0x00000001, 0x01000015,
++    0x0304001F, 0x0010001A, 0x00000002, 0x04000056, 0x00100032, 0x00000000, 0x00020046, 0x0A000000,
+     0x00100032, 0x00000000, 0x00100046, 0x00000000, 0x00004002, 0x3F000000, 0x3F000000, 0x00000000,
+     0x00000000, 0x07000056, 0x001000C2, 0x00000000, 0x00308406, 0x00000000, 0x00000000, 0x00000000,
+     0x0700000E, 0x00100032, 0x00000000, 0x00100046, 0x00000000, 0x00100AE6, 0x00000000, 0x07000031,
+@@ -376,13 +376,13 @@ const uint32_t hdr_refresh_fused_cs[] = {
+     0x07000038, 0x00100042, 0x00000000, 0x0010002A, 0x00000000, 0x00004001, 0x42C80000, 0x07000031,
+     0x00100012, 0x00000000, 0x0010000A, 0x00000000, 0x00004001, 0x00000000, 0x0B000037, 0x00100012,
+     0x00000000, 0x0010000A, 0x00000000, 0x0030801A, 0x00000000, 0x00000000, 0x00000001, 0x0010002A,
+-    0x00000000, 0x09000037, 0x00100072, 0x00000002, 0x00100556, 0x00000000, 0x00100AA6, 0x00000000,
++    0x00000000, 0x09000037, 0x001000D2, 0x00000001, 0x00100556, 0x00000000, 0x00100AA6, 0x00000000,
+     0x00100006, 0x00000000, 0x0304001F, 0x0010001A, 0x00000000, 0x05000036, 0x00100012, 0x00000000,
+     0x00004001, 0x461C4000, 0x01000012, 0x07000036, 0x00100012, 0x00000000, 0x0030802A, 0x00000000,
+     0x00000000, 0x00000001, 0x01000015, 0x01000012, 0x07000036, 0x00100012, 0x00000000, 0x0030802A,
+-    0x00000000, 0x00000000, 0x00000001, 0x01000015, 0x07000034, 0x00100022, 0x00000000, 0x0010002A,
+-    0x00000002, 0x0010001A, 0x00000002, 0x07000034, 0x00100022, 0x00000000, 0x0010001A, 0x00000000,
+-    0x0010000A, 0x00000002, 0x07000031, 0x00100042, 0x00000000, 0x0010000A, 0x00000000, 0x0010001A,
++    0x00000000, 0x00000000, 0x00000001, 0x01000015, 0x07000034, 0x00100022, 0x00000000, 0x0010003A,
++    0x00000001, 0x0010002A, 0x00000001, 0x07000034, 0x00100022, 0x00000000, 0x0010001A, 0x00000000,
++    0x0010000A, 0x00000001, 0x07000031, 0x00100042, 0x00000000, 0x0010000A, 0x00000000, 0x0010001A,
+     0x00000000, 0x09000031, 0x00100082, 0x00000000, 0x0010000A, 0x00000000, 0x0030803A, 0x00000000,
+     0x00000000, 0x00000001, 0x07000001, 0x00100042, 0x00000000, 0x0010003A, 0x00000000, 0x0010002A,
+     0x00000000, 0x0304001F, 0x0010002A, 0x00000000, 0x0A000000, 0x00100042, 0x00000000, 0x8010000A,
+@@ -393,11 +393,11 @@ const uint32_t hdr_refresh_fused_cs[] = {
+     0x00000000, 0x08000000, 0x00100082, 0x00000000, 0x8010003A, 0x00000041, 0x00000000, 0x00004001,
+     0x3F800000, 0x09000032, 0x00100012, 0x00000000, 0x0010002A, 0x00000000, 0x0010003A, 0x00000000,
+     0x0010000A, 0x00000000, 0x0700000E, 0x00100012, 0x00000000, 0x0010000A, 0x00000000, 0x0010001A,
+-    0x00000000, 0x07000038, 0x00100072, 0x00000002, 0x00100006, 0x00000000, 0x00100246, 0x00000002,
+-    0x01000015, 0x0A000010, 0x00100012, 0x00000000, 0x00100246, 0x00000002, 0x00004002, 0x3F209D8C,
+-    0x3EA897C8, 0x3D3168F9, 0x00000000, 0x0A000010, 0x00100022, 0x00000000, 0x00100246, 0x00000002,
++    0x00000000, 0x07000038, 0x001000D2, 0x00000001, 0x00100006, 0x00000000, 0x00100E06, 0x00000001,
++    0x01000015, 0x0A000010, 0x00100012, 0x00000000, 0x00100386, 0x00000001, 0x00004002, 0x3F209D8C,
++    0x3EA897C8, 0x3D3168F9, 0x00000000, 0x0A000010, 0x00100022, 0x00000000, 0x00100386, 0x00000001,
+     0x00004002, 0x3D8D82BA, 0x3F6B66F9, 0x3C3A27AF, 0x00000000, 0x0A000010, 0x00100042, 0x00000000,
+-    0x00100246, 0x00000002, 0x00004002, 0x3C86466B, 0x3DB44029, 0x3F6545B7, 0x00000000, 0x0A002038,
++    0x00100386, 0x00000001, 0x00004002, 0x3C86466B, 0x3DB44029, 0x3F6545B7, 0x00000000, 0x0A002038,
+     0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x00004002, 0x38D1B717, 0x38D1B717, 0x38D1B717,
+     0x00000000, 0x0500002F, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x0A000038, 0x00100072,
+     0x00000000, 0x00100246, 0x00000000, 0x00004002, 0x3E232000, 0x3E232000, 0x3E232000, 0x00000000,
+@@ -408,35 +408,37 @@ const uint32_t hdr_refresh_fused_cs[] = {
+     0x3F800000, 0x3F800000, 0x00000000, 0x0700000E, 0x00100072, 0x00000000, 0x00100246, 0x00000001,
+     0x00100246, 0x00000000, 0x0500002F, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x0A000038,
+     0x00100072, 0x00000001, 0x00100246, 0x00000000, 0x00004002, 0x429DB000, 0x429DB000, 0x429DB000,
+-    0x00000000, 0x05000019, 0x00100072, 0x00000002, 0x00100246, 0x00000001, 0x0304001F, 0x0010003A,
+-    0x00000001, 0x09000001, 0x00100082, 0x00000000, 0x0030802A, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x05000019, 0x00100072, 0x00000001, 0x00100246, 0x00000001, 0x0304001F, 0x0010002A,
++    0x00000002, 0x09000001, 0x00100082, 0x00000000, 0x0030802A, 0x00000000, 0x00000000, 0x00000000,
+     0x00004001, 0x00000001, 0x0304001F, 0x0010003A, 0x00000000, 0x0A000038, 0x00100072, 0x00000000,
+     0x00100246, 0x00000000, 0x00004002, 0x432D74CD, 0x432D74CD, 0x432D74CD, 0x00000000, 0x05000019,
+-    0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x01000012, 0x0A000031, 0x00100072, 0x00000001,
+-    0x00004002, 0x3D25AEE6, 0x3D25AEE6, 0x3D25AEE6, 0x00000000, 0x00100246, 0x00000002, 0x0A000000,
+-    0x00100072, 0x00000003, 0x00100246, 0x00000002, 0x00004002, 0x3D6147AE, 0x3D6147AE, 0x3D6147AE,
++    0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x01000012, 0x0A000031, 0x00100072, 0x00000002,
++    0x00004002, 0x3D25AEE6, 0x3D25AEE6, 0x3D25AEE6, 0x00000000, 0x00100246, 0x00000001, 0x0A000000,
++    0x00100072, 0x00000003, 0x00100246, 0x00000001, 0x00004002, 0x3D6147AE, 0x3D6147AE, 0x3D6147AE,
+     0x00000000, 0x0A000038, 0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x00004002, 0x3F72A76E,
+     0x3F72A76E, 0x3F72A76E, 0x00000000, 0x0500002F, 0x00100072, 0x00000003, 0x00100246, 0x00000003,
+     0x0A000038, 0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x00004002, 0x4019999A, 0x4019999A,
+     0x4019999A, 0x00000000, 0x05000019, 0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x0A000038,
+-    0x00100072, 0x00000004, 0x00100246, 0x00000002, 0x00004002, 0x3D9E8391, 0x3D9E8391, 0x3D9E8391,
+-    0x00000000, 0x09000037, 0x00100072, 0x00000000, 0x00100246, 0x00000001, 0x00100246, 0x00000003,
++    0x00100072, 0x00000004, 0x00100246, 0x00000001, 0x00004002, 0x3D9E8391, 0x3D9E8391, 0x3D9E8391,
++    0x00000000, 0x09000037, 0x00100072, 0x00000000, 0x00100246, 0x00000002, 0x00100246, 0x00000003,
+     0x00100246, 0x00000004, 0x01000015, 0x09000038, 0x00100072, 0x00000000, 0x00100246, 0x00000000,
+-    0x00308006, 0x00000000, 0x00000000, 0x00000001, 0x0A000010, 0x00100012, 0x00000001, 0x00100246,
++    0x00308006, 0x00000000, 0x00000000, 0x00000001, 0x0A000010, 0x00100012, 0x00000002, 0x00100246,
+     0x00000000, 0x00004002, 0x3F209D8C, 0x3EA897C8, 0x3D3168F9, 0x00000000, 0x0A000010, 0x00100022,
+-    0x00000001, 0x00100246, 0x00000000, 0x00004002, 0x3D8D82BA, 0x3F6B66F9, 0x3C3A27AF, 0x00000000,
+-    0x0A000010, 0x00100042, 0x00000001, 0x00100246, 0x00000000, 0x00004002, 0x3C86466B, 0x3DB44029,
+-    0x3F6545B7, 0x00000000, 0x0A002038, 0x00100072, 0x00000000, 0x00100246, 0x00000001, 0x00004002,
++    0x00000002, 0x00100246, 0x00000000, 0x00004002, 0x3D8D82BA, 0x3F6B66F9, 0x3C3A27AF, 0x00000000,
++    0x0A000010, 0x00100042, 0x00000002, 0x00100246, 0x00000000, 0x00004002, 0x3C86466B, 0x3DB44029,
++    0x3F6545B7, 0x00000000, 0x0A002038, 0x00100072, 0x00000000, 0x00100246, 0x00000002, 0x00004002,
+     0x38D1B717, 0x38D1B717, 0x38D1B717, 0x00000000, 0x0500002F, 0x00100072, 0x00000000, 0x00100246,
+     0x00000000, 0x0A000038, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x00004002, 0x3E232000,
+     0x3E232000, 0x3E232000, 0x00000000, 0x05000019, 0x00100072, 0x00000000, 0x00100246, 0x00000000,
+-    0x0F000032, 0x00100072, 0x00000001, 0x00100246, 0x00000000, 0x00004002, 0x4196D000, 0x4196D000,
++    0x0F000032, 0x00100072, 0x00000002, 0x00100246, 0x00000000, 0x00004002, 0x4196D000, 0x4196D000,
+     0x4196D000, 0x00000000, 0x00004002, 0x3F560000, 0x3F560000, 0x3F560000, 0x00000000, 0x0F000032,
+     0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x00004002, 0x41958000, 0x41958000, 0x41958000,
+     0x00000000, 0x00004002, 0x3F800000, 0x3F800000, 0x3F800000, 0x00000000, 0x0700000E, 0x00100072,
+-    0x00000000, 0x00100246, 0x00000001, 0x00100246, 0x00000000, 0x0500002F, 0x00100072, 0x00000000,
++    0x00000000, 0x00100246, 0x00000002, 0x00100246, 0x00000000, 0x0500002F, 0x00100072, 0x00000000,
+     0x00100246, 0x00000000, 0x0A000038, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x00004002,
+-    0x429DB000, 0x429DB000, 0x429DB000, 0x00000000, 0x05000019, 0x00100072, 0x00000002, 0x00100246,
+-    0x00000000, 0x01000015, 0x05000036, 0x00100082, 0x00000002, 0x00004001, 0x3F800000, 0x070000A4,
+-    0x0021E0F2, 0x00000000, 0x00000000, 0x00020546, 0x00100E46, 0x00000002, 0x0100003E,
++    0x429DB000, 0x429DB000, 0x429DB000, 0x00000000, 0x05000019, 0x00100072, 0x00000001, 0x00100246,
++    0x00000000, 0x01000015, 0x0304001F, 0x0010003A, 0x00000002, 0x0A000010, 0x00100082, 0x00000001,
++    0x00100246, 0x00000001, 0x00004002, 0x3E991687, 0x3F1645A2, 0x3DE978D5, 0x00000000, 0x01000012,
++    0x05000036, 0x00100082, 0x00000001, 0x00004001, 0x3F800000, 0x01000015, 0x070000A4, 0x0021E0F2,
++    0x00000000, 0x00000000, 0x00020546, 0x00100E46, 0x00000001, 0x0100003E,
+ };
+diff --git a/src/graphics/shaders/hdr_refresh.cs.xesl b/src/graphics/shaders/hdr_refresh.cs.xesl
+index ca0eba9f..3de54a16 100644
+--- a/src/graphics/shaders/hdr_refresh.cs.xesl
++++ b/src/graphics/shaders/hdr_refresh.cs.xesl
+@@ -31,6 +31,9 @@
+ // is written as the SDR refresher writes a frame (the display table at the
+ // nearest code); with bit 14, only the HUD-less image is written (the SDR
+ // refresher writes the frame itself).
++// FXAA (swap_post_effect, hdr_fxaa; not with frame generation): with flag bit 16
++// the code values go to the FXAA source image with their luma in alpha, and the
++// command processor's FXAA pass writes the guest output image from it.
+ // The fused scene (hdr_scene_fused, XE_HDR_REFRESH_FUSED, hdr_refresh_fused.cs.xesl,
+ // Direct3D 12 only): the frame is put together from the front buffer and the
+ // underlay alone (the difference with the underlay, or a frame without UI), and
+@@ -66,7 +69,12 @@ push_const_begin_xe(b0, space0)
+   //    bit 9: the HDR scene and the tone map's output are there;
+   //    bit 10: debug, the HDR scene encoded and shown like the game's frame;
+   //    bit 11: debug, the output's HDR10 code values shown as SDR grey levels
+-  //    (for measuring it from a capture).
++  //    (for measuring it from a capture);
++  //    bit 16: FXAA follows (hdr_fxaa; not with frame generation, whose variant
++  //    has no such code): the destination is the FXAA source image (RGBA, 16 bits
++  //    a channel) and alpha is the code values' luma, as the apply-gamma
++  //    FXAA-luma variants write it, instead of 1;
++  //    bits 12 to 15: frame generation (hdr_refresh_fg.cs.xesl, XE_HDR_REFRESH_FG).
+   // y: the light glows' gain (float).
+   uint2_xe xe_hdr_refresh_flags;
+   // x: SDR content white, y: paper white, z: roll-off start, w: peak (nits).
+@@ -457,5 +465,16 @@ entry_inputs_end_code_begin_compute_xe
+   dont_flatten_xe if ((flags & 2048u) != 0u) {
+     pq = XeHdrEncodePq(XeHdrSdrToLinear(pq, (flags & 1u) != 0u) * levels.x);
+   }
+-  image_store_2d_rgba_xe(xe_hdr_refresh_dest, pixel_index, float4_xe(pq, 1.0f));
++  float alpha = 1.0f;
++#ifndef XE_HDR_REFRESH_FG
++  dont_flatten_xe if ((flags & 65536u) != 0u) {
++    // FXAA on the HDR10 image (hdr_fxaa): its luma is in alpha, from the code
++    // values as the apply-gamma FXAA-luma variants (apply_gamma_table.xesli) take
++    // it from the gamma-mapped ones, in the same perceptual weights. PQ is a
++    // perceptual encoding like the gamma-mapped codes, and the values are 0 to 1
++    // (the weights add up to 1).
++    alpha = dot(pq, float3_xe(0.299f, 0.587f, 0.114f));
++  }
++#endif
++  image_store_2d_rgba_xe(xe_hdr_refresh_dest, pixel_index, float4_xe(pq, alpha));
+ entry_code_end_compute_xe
