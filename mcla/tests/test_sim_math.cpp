@@ -383,6 +383,263 @@ static void TestHold() {
   std::printf("hold test: 8 s spike -> %.0f s at 30 (adaptive, no governor) against %.0f s (shipped)\n", adaptive, shipped);
 }
 
+// ---- the governed hold (mcla_sim_pacer 2, LOCK60 A3) ----
+// A driver for HoldJudge on a made-up clock: 60 fps frames of 1/60 s; a frame is missed when its index is a multiple of
+// `miss_every` (0 = none, 1 = all). Holds are served the way the cpp does: the frames of a hold are not noted, the hold
+// ends after hold_s seconds, the judge gets EndHold(), the length memory (prev_hold_s, last end) feeds HoldSeconds.
+struct JudgeSim {
+  m::HoldJudge judge;
+  m::HoldRule rule;
+  int64_t now_ns = 1'000'000'000;
+  int64_t t0_ns = 1'000'000'000;
+  int64_t hold_until_ns = 0;
+  int64_t last_end_ns = 0;
+  int prev_hold_s = 0;
+  bool allowed = true;
+  std::vector<double> hold_start_s;  // seconds from the sim's start
+  std::vector<int> hold_len_s;
+  int deferred = 0, windows_judged = 0, high_windows = 0;
+  uint64_t frame_index = 0;
+  // One frame.
+  void Frame(bool menu, int miss_every) {
+    if (hold_until_ns != 0 && now_ns >= hold_until_ns) {
+      hold_until_ns = 0;
+      last_end_ns = now_ns;
+      judge.EndHold(now_ns, rule.grace_s);
+    }
+    const double since_end = last_end_ns ? double(now_ns - last_end_ns) / 1e9 : 1e9;
+    const m::HoldVerdict v = judge.Tick(now_ns, menu, hold_until_ns != 0, allowed, prev_hold_s, since_end, rule);
+    windows_judged += v.window_ended;
+    high_windows += v.high;
+    deferred += v.deferred;
+    if (v.start_hold) {
+      prev_hold_s = v.hold_s;
+      hold_until_ns = now_ns + int64_t(v.hold_s) * 1'000'000'000;
+      hold_start_s.push_back(double(now_ns - t0_ns) / 1e9);
+      hold_len_s.push_back(v.hold_s);
+    }
+    if (hold_until_ns == 0) {
+      ++frame_index;
+      judge.NoteStep(miss_every > 0 && frame_index % uint64_t(miss_every) == 0);
+    }
+    now_ns += 16'666'667;
+  }
+  void Run(double seconds, bool menu, int miss_every) {
+    const int64_t end = now_ns + int64_t(seconds * 1e9);
+    while (now_ns < end) Frame(menu, miss_every);
+  }
+  double Now() const { return double(now_ns - t0_ns) / 1e9; }
+};
+
+static void TestGovernedHold() {
+  // The bad runs: a drive that is fine, a pause menu that misses every frame for 12 s, the drive again: no hold at all.
+  {
+    JudgeSim s;
+    s.Run(60, false, 0);
+    s.Run(12, true, 1);
+    s.Run(60, false, 0);
+    CHECK(s.hold_start_s.empty() && s.deferred == 0, "menu 100 pct missed for 12 s: %zu holds", s.hold_start_s.size());
+    CHECK(s.high_windows == 0, "no high window in the menu (%d)", s.high_windows);
+    uint64_t menu = 0, grace = 0, hold = 0;
+    s.judge.TakeSkipped(&menu, &grace, &hold);
+    CHECK(menu >= 12 * 60 - 3 && menu <= 12 * 60 + 3 && hold == 0, "skipped menu frames %llu", (unsigned long long)menu);
+    CHECK(grace >= 4 * 60 - 3 && grace <= 4 * 60 + 3, "skipped grace frames after the menu %llu", (unsigned long long)grace);
+    s.judge.TakeSkipped(&menu, &grace, &hold);
+    CHECK(menu == 0 && grace == 0, "TakeSkipped clears");
+  }
+  // Even a very long menu (a load) at a bad frame rate never holds.
+  {
+    JudgeSim s;
+    s.Run(300, true, 2);
+    CHECK(s.hold_start_s.empty() && s.windows_judged == 0, "5 min of menu: %zu holds, %d windows", s.hold_start_s.size(),
+          s.windows_judged);
+  }
+  // Sustained overload in driving holds, after two consecutive high windows (2 s each), not one.
+  {
+    JudgeSim s;
+    s.Run(30, false, 1);
+    CHECK(!s.hold_start_s.empty(), "a drive that misses every frame holds");
+    if (!s.hold_start_s.empty()) {
+      CHECK(s.hold_start_s[0] > 3.9 && s.hold_start_s[0] < 4.2, "first hold after two 2 s windows (t = %.2f)", s.hold_start_s[0]);
+      CHECK(s.hold_len_s[0] == 6, "first hold 6 s (%d)", s.hold_len_s[0]);
+    }
+  }
+  {
+    JudgeSim s;
+    s.rule.windows = 1;
+    s.Run(10, false, 1);
+    CHECK(!s.hold_start_s.empty() && s.hold_start_s[0] > 1.9 && s.hold_start_s[0] < 2.2,
+          "windows 1: the first high window holds");
+  }
+  // One high window does not hold: a burst of 2 s, then clean, over and over.
+  {
+    JudgeSim s;
+    for (int i = 0; i < 10; ++i) {
+      s.Run(2, false, 1);  // about one high window
+      s.Run(2, false, 0);  // a clean one: the streak is gone
+    }
+    CHECK(s.hold_start_s.empty(), "isolated high windows: %zu holds", s.hold_start_s.size());
+    CHECK(s.high_windows >= 5, "the high windows were judged (%d)", s.high_windows);
+  }
+  // High, calm, high, high: only the last two in a row count.
+  {
+    JudgeSim s;
+    s.Run(2.05, false, 1);
+    s.Run(2.0, false, 0);
+    s.Run(2.0, false, 1);
+    CHECK(s.hold_start_s.empty(), "high, calm, high: no hold yet");
+    s.Run(2.0, false, 1);
+    CHECK(s.hold_start_s.size() == 1, "high, calm, high, high: a hold (%zu)", s.hold_start_s.size());
+  }
+  // The threshold: exactly miss_pct is not high (10 %: every 10th frame), above it is (every 9th = 11 %).
+  {
+    JudgeSim a, b;
+    a.Run(30, false, 10);
+    b.Run(30, false, 9);
+    CHECK(a.hold_start_s.empty() && a.high_windows == 0, "10 pct is not above 10 pct (%d high)", a.high_windows);
+    CHECK(!b.hold_start_s.empty(), "11 pct is high");
+  }
+  // Fewer than 30 frames in a window decide nothing: 10 fps, every frame missed.
+  {
+    m::HoldJudge j;
+    m::HoldRule rule;
+    int64_t t = 1'000'000'000;
+    int holds = 0, ended = 0;
+    for (int i = 0; i < 300; ++i) {
+      const m::HoldVerdict v = j.Tick(t, false, false, true, 0, 1e9, rule);
+      holds += v.start_hold;
+      ended += v.window_ended;
+      j.NoteStep(true);
+      t += 100'000'000;
+    }
+    CHECK(holds == 0 && ended > 5, "10 fps: windows of 20 frames never hold (%d holds, %d windows)", holds, ended);
+  }
+  // Grace after a hold: the overload goes on, the next hold is only judged grace_s later (the windows start after it).
+  {
+    JudgeSim s;
+    s.Run(60, false, 1);
+    CHECK(s.hold_start_s.size() >= 2, "a drive that always misses holds again (%zu)", s.hold_start_s.size());
+    if (s.hold_start_s.size() >= 2) {
+      // hold 1 starts at ~4.0 and lasts 6 s: ends ~10.0; grace 4 s; two windows of 2 s: the next hold at ~18.
+      const double gap = s.hold_start_s[1] - (s.hold_start_s[0] + s.hold_len_s[0]);
+      CHECK(gap > 7.9 && gap < 8.4, "second hold %.2f s after the first ended (grace 4 + 2 windows of 2)", gap);
+      CHECK(s.hold_len_s[1] == 12, "the second hold doubles: %d", s.hold_len_s[1]);
+    }
+  }
+  {
+    JudgeSim s;
+    s.rule.grace_s = 0;
+    s.Run(60, false, 1);
+    CHECK(s.hold_start_s.size() >= 2, "grace 0: two holds expected");
+    if (s.hold_start_s.size() >= 2) {
+      const double gap = s.hold_start_s[1] - (s.hold_start_s[0] + s.hold_len_s[0]);
+      CHECK(gap > 3.9 && gap < 4.4, "grace 0: the second hold %.2f s after the first ended", gap);
+    }
+  }
+  // Grace after a menu closes: 10 s of menu, then a drive that always misses: held after grace + 2 windows.
+  {
+    JudgeSim s;
+    s.Run(10, true, 1);
+    const double t_drive = s.Now();
+    s.Run(30, false, 1);
+    CHECK(!s.hold_start_s.empty(), "a drive after a menu holds when it keeps missing");
+    if (!s.hold_start_s.empty()) {
+      const double after = s.hold_start_s[0] - t_drive;
+      CHECK(after > 7.9 && after < 8.4, "hold %.2f s after the menu closed (grace 4 + 2 windows of 2)", after);
+    }
+  }
+  // A hold in force runs out normally, whatever the screen: a menu in the middle neither ends it nor extends it, and
+  // nothing is judged inside it.
+  {
+    JudgeSim s;
+    s.Run(5, false, 1);  // hold at ~4 s for 6 s (to ~10)
+    CHECK(s.hold_start_s.size() == 1 && s.hold_until_ns != 0, "the hold started");
+    s.Run(2, true, 1);  // a menu opens inside the hold
+    CHECK(s.hold_until_ns != 0 && s.hold_start_s.size() == 1, "still in force");
+    s.Run(10, true, 1);
+    CHECK(s.hold_until_ns == 0, "ran out");
+    CHECK(s.hold_start_s.size() == 1, "the menu started no hold (%zu)", s.hold_start_s.size());
+  }
+  // The governor has room (allowed = false): the due hold is deferred at each window, none starts; once the governor is
+  // at its last level the first high window holds (the streak was kept).
+  {
+    JudgeSim s;
+    s.allowed = false;
+    s.Run(20, false, 1);
+    CHECK(s.hold_start_s.empty(), "governor with room: no hold");
+    CHECK(s.deferred >= 7, "deferred at every window after the 2nd (%d)", s.deferred);
+    s.allowed = true;
+    s.Run(2.2, false, 1);
+    CHECK(s.hold_start_s.size() == 1, "the governor ran out of levels: held at the next high window (%zu)",
+          s.hold_start_s.size());
+  }
+  // A deferred window followed by a calm one clears the streak.
+  {
+    JudgeSim s;
+    s.allowed = false;
+    s.Run(4.1, false, 1);
+    CHECK(s.deferred >= 1, "deferred (%d)", s.deferred);
+    s.Run(2.1, false, 0);
+    s.allowed = true;
+    s.Run(2.1, false, 1);
+    CHECK(s.hold_start_s.empty(), "a calm window cleared the streak: one high window is not enough");
+  }
+  // mcla_sim_hold30_s = 0: never, not even deferred.
+  {
+    JudgeSim s;
+    s.rule.max_s = 0;
+    s.allowed = false;
+    s.Run(120, false, 1);
+    CHECK(s.hold_start_s.empty() && s.deferred == 0, "hold30_s 0: never holds (%zu), never defers (%d)", s.hold_start_s.size(),
+          s.deferred);
+    CHECK(s.high_windows > 10, "the windows are still judged (%d)", s.high_windows);
+  }
+  // The doubling: 6, 12, 24, 30, 30 for a drive that always misses (grace + windows put the next hold ~8 s after the
+  // previous one ended, inside calm_s 30), and back to 6 after a calm stretch.
+  {
+    JudgeSim s;
+    s.Run(300, false, 1);
+    CHECK(s.hold_len_s.size() >= 5, "five holds (%zu)", s.hold_len_s.size());
+    if (s.hold_len_s.size() >= 5) {
+      CHECK(s.hold_len_s[0] == 6 && s.hold_len_s[1] == 12 && s.hold_len_s[2] == 24 && s.hold_len_s[3] == 30 &&
+                s.hold_len_s[4] == 30,
+            "doubling %d %d %d %d %d", s.hold_len_s[0], s.hold_len_s[1], s.hold_len_s[2], s.hold_len_s[3], s.hold_len_s[4]);
+    }
+    const size_t before = s.hold_len_s.size();
+    while (s.hold_until_ns != 0) s.Frame(false, 0);  // the running hold ends
+    s.Run(40, false, 0);                             // a calm drive longer than calm_s
+    s.Run(20, false, 1);                             // the overload again
+    CHECK(s.hold_len_s.size() > before && s.hold_len_s[before] == 6, "after 40 s calm the hold is short again (%d)",
+          s.hold_len_s.size() > before ? s.hold_len_s[before] : -1);
+  }
+  // The direct verdict (one window result): the fields of HoldVerdict.
+  {
+    m::HoldJudge j;
+    m::HoldRule rule;
+    int64_t t = 1'000'000'000;
+    j.Tick(t, false, false, true, 0, 1e9, rule);  // starts the window
+    for (int i = 0; i < 120; ++i) j.NoteStep(i < 40);
+    t += 2'000'000'000;
+    m::HoldVerdict v = j.Tick(t, false, false, true, 0, 1e9, rule);
+    CHECK(v.window_ended && v.high && v.frames == 120 && v.missed == 40 && v.streak == 1 && !v.start_hold && !v.deferred,
+          "first high window: streak %d, no hold yet", v.streak);
+    for (int i = 0; i < 120; ++i) j.NoteStep(i < 40);
+    t += 2'000'000'000;
+    v = j.Tick(t, false, false, true, 0, 1e9, rule);
+    CHECK(v.start_hold && v.hold_s == 6 && v.streak == 2 && std::fabs(v.window_s - 2.0) < 1e-9, "second: hold %d s", v.hold_s);
+    for (int i = 0; i < 120; ++i) j.NoteStep(i < 40);
+    t += 2'000'000'000;
+    v = j.Tick(t, false, false, true, 6, 8.0, rule);
+    CHECK(!v.start_hold && v.streak == 1, "the streak starts over after a hold (%d)", v.streak);
+    for (int i = 0; i < 120; ++i) j.NoteStep(i < 40);
+    t += 2'000'000'000;
+    v = j.Tick(t, false, false, true, 6, 8.0, rule);
+    CHECK(v.start_hold && v.hold_s == 12, "back within calm_s: 12 s (%d)", v.hold_s);
+  }
+  std::printf("governed hold test: menus never judged, grace %d s, %d high windows in a row, deferred while the governor has room\n",
+              m::HoldRule{}.grace_s, m::HoldRule{}.windows);
+}
+
 // P1: the 120 fps grid (TIMING.md section 15). A cap above 60 quantises in 1/120 s; caps of 60 and below are
 // unchanged (the coarse functions are the same calls).
 static void Test120() {
@@ -488,6 +745,7 @@ int main() {
   TestRaceClock();
   TestUi();
   TestHold();
+  TestGovernedHold();
   std::printf("%d checks, %d failed\n", g_checks, g_failed);
   return g_failed ? 1 : 0;
 }

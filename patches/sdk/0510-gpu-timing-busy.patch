@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Wed, 25 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0510: gpu_timing: the exported frame time is the GPU's busy time (idle gaps between a frame's lists removed); VRS default table without scene levels
+
+Source: Ours, written for this SDK (stream LOCK60). Validated in game: runs lk-gov2, lk-val1
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: At a frame cap the GPU follows the CPU's submissions: the span from a frame's first to last timestamp is about the frame period
+  (run lk-gov1: ~16 ms whatever the load; the idle sat inside the scene phase). A timestamp now ends every list in the middle of a
+  frame (an idle mark) and starts the next one (resuming the segment); rexgpu_gpu_frame_us and the CSV's frame_us are the span
+  minus those gaps (CSV span_us keeps the span); the per-phase times exclude the gaps too. vrs_levels default: the two measured
+  levels only (post/composite; + translucent/pre).
+Bucket: REDO
+
+0510-gpu-timing-busy.patch (mcla-x86 LOCK60). lk-gov2: busy 11-12 ms at 1080p perf level 0 in normal driving at the 60 cap.
+
+---
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 4abba001..981d4d2d 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -1112,6 +1112,9 @@ class D3D12CommandProcessor : public CommandProcessor {
+   void GpuTimingSetSegment(uint32_t id);
+   // Adds what was recorded since the last call to the current segment's group.
+   void GpuTimingAttribute();
++  // A list in the middle of a timed frame ends (an idle mark) / the next one starts (resumes the current segment).
++  void GpuTimingSubmissionEnd();
++  void GpuTimingSubmissionBegin();
+   bool GpuTimingInit();
+   void GpuTimingShutdown();
+   // Reads the frames whose submissions are done.
+@@ -1134,6 +1137,9 @@ class D3D12CommandProcessor : public CommandProcessor {
+     static constexpr uint32_t kSlots = 64;  // timestamps per frame (the last one is the frame's end)
+     static constexpr uint32_t kGroups = 13;
+     static constexpr uint32_t kIdLead = 30, kIdTail = 31, kIdSwap = 32, kIdNone = 33;
++    // Only in Frame::segment: the GPU is idle from this timestamp (the end of a list in the middle of the frame) to the
++    // next one (the start of the next list), which resumes the segment then current. Busy time = span - idle.
++    static constexpr uint32_t kIdIdle = 34;
+     struct Frame {
+       enum State : uint8_t { kFree, kRecording, kPending };
+       State state = kFree;
+@@ -1178,6 +1184,7 @@ class D3D12CommandProcessor : public CommandProcessor {
+     double us_per_tick = 0.0;
+     bool have_last_start = false;
+     uint64_t last_start_ticks = 0;
++    bool in_gap = false;  // an idle mark was written at the end of the last list of the open frame
+   } gpu_timing_;
+   // Statistics, the CSV and the experiment cycle (defined in command_processor.cpp).
+   struct GpuTimingReport;
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 6988aa01..e2ab5a58 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -204,10 +204,10 @@ REXCVAR_DEFINE_INT32(vrs_level, 0, "GPU/VRS",
+ 
+ REXCVAR_DEFINE_STRING(
+     vrs_levels,
++    // Measured (run lk-vrs1, 1080p, 880M): level 1 -0.36..-0.43 ms (post), level 2 -0.56..-0.73 ms frame and no visible
++    // change; the scene at 2x1 / 2x2 was SLOWER (+0.2..+0.5 ms) and visibly blurred, so it is not a level.
+     "post=2x2,composite=2x2;"
+-    "post=2x2,composite=2x2,translucent=2x2,pre=2x2;"
+-    "post=2x2,composite=2x2,translucent=2x2,pre=2x2,scene=2x1;"
+-    "post=2x2,composite=2x2,translucent=2x2,pre=2x2,scene=2x2",
++    "post=2x2,composite=2x2,translucent=2x2,pre=2x2",
+     "GPU/VRS",
+     "The variable rate shading levels, separated by ';' (level 1 first), each a comma-separated list of group=rate. "
+     "Groups (the title's render phases, from its phase markers): pre (the phases below 0x800 except the shadows), "
+@@ -4965,6 +4965,8 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+     primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+     // LOCAL PATCH - MCLA (0500): vrs. A command list starts at the 1x1 shading rate.
+     vrs_.current = 0;
++    // LOCAL PATCH - MCLA (04f0): gpu_timing: a list in the middle of a frame resumes the segment after the idle gap.
++    GpuTimingSubmissionBegin();
+ 
+     render_target_cache_->BeginSubmission();
+ 
+@@ -5082,6 +5084,8 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     // frame's last list, after everything the frame recorded.
+     if (is_closing_frame) {
+       GpuTimingFrameEnd();
++    } else {
++      GpuTimingSubmissionEnd();  // the GPU may idle until the next list
+     }
+ 
+     ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
+@@ -7096,7 +7100,7 @@ std::string GpuTimingTrim(const std::string& text) {
+ }
+ 
+ std::string GpuTimingCsvHeader() {
+-  std::string header = "seq,cp_frame,guest_frame,t_ms,exp,vrs,frame_us,interval_us";  // 0500: vrs
++  std::string header = "seq,cp_frame,guest_frame,t_ms,exp,vrs,frame_us,interval_us,span_us";  // 0500: vrs
+   for (const char* name : kGpuTimingGroupNames) {
+     for (const char* field : {"us", "d", "v", "pso", "cbv", "rt", "res", "xfer", "tex", "bar", "exp", "vrs"}) {
+       header += fmt::format(",{}_{}", name, field);
+@@ -7264,6 +7268,7 @@ void D3D12CommandProcessor::GpuTimingFrameBegin() {
+   frame.segment[0] = uint8_t(g.cur_id);
+   g.group = GpuTimingGroupOfId(g.cur_id);
+   g.active = true;
++  g.in_gap = false;
+   g.slots = 1;
+   if (g.mode == 2) {
+     std::memset(g.counts, 0, sizeof(g.counts));
+@@ -7300,6 +7305,29 @@ void D3D12CommandProcessor::GpuTimingFrameEnd() {
+   g.last_ended = frame.seq;
+ }
+ 
++void D3D12CommandProcessor::GpuTimingSubmissionEnd() {
++  GpuTiming& g = gpu_timing_;
++  // Room for this mark, the resume mark and the frame's end.
++  if (!g.active || g.in_gap || g.slots + 3 >= GpuTiming::kSlots) {
++    return;
++  }
++  g.frames[g.ring].segment[g.slots] = uint8_t(GpuTiming::kIdIdle);
++  deferred_command_list_.D3DEndQuery(g.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, g.ring * GpuTiming::kSlots + g.slots);
++  ++g.slots;
++  g.in_gap = true;
++}
++
++void D3D12CommandProcessor::GpuTimingSubmissionBegin() {
++  GpuTiming& g = gpu_timing_;
++  if (!g.active || !g.in_gap) {
++    return;
++  }
++  g.in_gap = false;
++  g.frames[g.ring].segment[g.slots] = uint8_t(g.cur_id);
++  deferred_command_list_.D3DEndQuery(g.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, g.ring * GpuTiming::kSlots + g.slots);
++  ++g.slots;
++}
++
+ void D3D12CommandProcessor::GpuTimingAttribute() {
+   GpuTiming& g = gpu_timing_;
+   const DeferredCommandList::RecordedStats& now = deferred_command_list_.recorded_stats();
+@@ -7503,7 +7531,17 @@ void D3D12CommandProcessor::GpuTimingProcessFrame(const GpuTiming::Frame& frame,
+   if (end < start) {
+     return;
+   }
+-  const uint32_t frame_us = uint32_t(std::min(double(end - start) * g.us_per_tick + 0.5, 4e9));
++  // The span from the frame's first to its last timestamp, and the GPU idle between its lists inside it (the CP waits for
++  // the game: at a frame cap the GPU follows the CPU's submissions and the span is about the frame period). The busy time
++  // (span - idle) is what the frame costs the GPU: it is the exported value and the CSV's frame_us.
++  const uint32_t span_us = uint32_t(std::min(double(end - start) * g.us_per_tick + 0.5, 4e9));
++  double idle_ticks = 0.0;
++  for (uint32_t k = 0; k + 1 < frame.slots; ++k) {
++    if (frame.segment[k] == GpuTiming::kIdIdle && ticks[k + 1] > ticks[k]) {
++      idle_ticks += double(ticks[k + 1] - ticks[k]);
++    }
++  }
++  const uint32_t frame_us = uint32_t(std::max(0.0, double(span_us) - idle_ticks * g.us_per_tick));
+   uint32_t interval_us = 0;
+   if (g.have_last_start && start > g.last_start_ticks) {
+     interval_us = uint32_t(std::min(double(start - g.last_start_ticks) * g.us_per_tick + 0.5, 4e9));
+@@ -7525,6 +7563,9 @@ void D3D12CommandProcessor::GpuTimingProcessFrame(const GpuTiming::Frame& frame,
+   for (uint32_t k = 0; k + 1 < frame.slots; ++k) {
+     const float us = ticks[k + 1] > ticks[k] ? float(double(ticks[k + 1] - ticks[k]) * g.us_per_tick) : 0.0f;
+     const uint32_t id = frame.segment[k];
++    if (id == GpuTiming::kIdIdle) {
++      continue;  // not GPU work
++    }
+     group_us[GpuTimingGroupOfId(id)] += us;
+     if (id < 30) {
+       phase_us[id] += us;
+@@ -7565,6 +7606,7 @@ void D3D12CommandProcessor::GpuTimingProcessFrame(const GpuTiming::Frame& frame,
+   row += fmt::format("{},{},{},{:.1f},{},{},{},{}", frame.seq, frame.cp_frame, frame.guest_frame,
+                      std::chrono::duration<double, std::milli>(frame.end_time - r.csv_t0).count(),
+                      frame.experiment, frame.vrs_level, frame_us, interval_us);
++  row += fmt::format(",{}", span_us);
+   for (uint32_t group = 0; group < GpuTiming::kGroups; ++group) {
+     const uint32_t* c = frame.counts[group];
+     row += fmt::format(",{:.0f},{},{},{},{},{},{},{},{},{},{},{}", group_us[group], c[kGtDraws], c[kGtVerts],

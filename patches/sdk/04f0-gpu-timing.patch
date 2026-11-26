@@ -1,0 +1,1145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Wed, 25 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 04f0: gpu_timing: cheap per-phase GPU timestamps at the guest render markers, exported frame time, draw experiments, in-run cvar cycle
+
+Source: Ours, written for this SDK (stream LOCK60 A1/A2). Validated in game: runs lk-cm1 (cost model), lk-vrs1, lk-gov1/2, lk-val1
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: D3D12. Cvars (GPU/Timing): gpu_timing (0; 1 = timestamps at every guest render marker / phase cut, per-segment counters,
+  '[gpu-timing]' log every gpu_timing_log_s, optional per-frame CSV gpu_timing_csv), gpu_timing_export (true: with gpu_timing 0 only
+  the frame's start/end + list-boundary timestamps, one tiny resolve, no counters), gpu_draw_experiment (0; 1 zero-area scissor,
+  2 guest draw not recorded, 3 first primitive + zero scissor) with gpu_draw_experiment_phases (phase mask), gpu_experiment_cycle /
+  _period_ms / _start_s / _repeat (an in-run schedule of cvar assignments, switched at frame boundaries, frame-exact tagging).
+  Data exports of rexgpu-xenos.dll: rexgpu_gpu_frame_us, rexgpu_gpu_frame_seq, rexgpu_gpu_frame_lag (the game's governor reads
+  them) and rexgpu_vrs_level / rexgpu_vrs_levels (used by 0500). Experiments and full timing off by default = no change but the
+  export's timestamps.
+Bucket: REDO
+
+04f0-gpu-timing.patch (mcla-x86 LOCK60). 0510 changes the exported value to the GPU busy time (see there).
+
+---
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 1e5381fb..b3e43606 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -14,6 +14,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <condition_variable>
+ #include <deque>
+ #include <memory>
+@@ -96,6 +97,26 @@ class D3D12CommandProcessor : public CommandProcessor {
+   uint64_t GetCurrentFrame() const { return frame_current_; }
+   uint64_t GetCompletedFrame() const { return frame_completed_; }
+ 
++  // LOCAL PATCH - MCLA (04f0): gpu_timing. Per-segment counters of the work recorded (CP thread only: the command
++  // list is recorded there, by this class, the render target cache and the texture cache alike). The pipeline,
++  // root CBV, render target and barrier counts come from DeferredCommandList::recorded_stats at each cut instead.
++  enum GpuTimingCounter : uint32_t {
++    kGtDraws,  // guest draws recorded
++    kGtVerts,  // host vertices / indices of those (the count the guest draw has, also with the experiment 3)
++    kGtPso,    // pipeline state sets
++    kGtCbv,    // graphics root CBV sets
++    kGtRt,     // OMSetRenderTargets
++    kGtRes,    // resolves (IssueCopy)
++    kGtXfer,   // EDRAM ownership transfer draws
++    kGtTex,    // texture loads
++    kGtBar,    // ResourceBarrier batches
++    kGtExp,    // guest draws the draw experiment changed
++    kGtCounterCount,
++  };
++  void GpuTimingCount(GpuTimingCounter counter, uint32_t count = 1) {
++    gpu_timing_.counts[gpu_timing_.group][counter] += count;
++  }
++
+   // Returns true if the barrier has been inserted (the new state is different).
+   bool PushTransitionBarrier(ID3D12Resource* resource, D3D12_RESOURCE_STATES old_state,
+                              D3D12_RESOURCE_STATES new_state,
+@@ -1059,6 +1080,101 @@ class D3D12CommandProcessor : public CommandProcessor {
+ 
+   // Temporary storage for memexport stream constants used in the draw.
+   std::vector<draw_util::MemExportRange> memexport_ranges_;
++
++  // LOCAL PATCH - MCLA (04f0): gpu_timing, the GPU time of each frame cut at the title's phase markers, and the draw
++  // experiments (gpu_draw_experiment). The methods are at the end of command_processor.cpp.
++  //
++  // A frame is the work between two swaps. Its first work records a timestamp (slot 0), each marker that starts a new
++  // segment another, and the last work before the frame's last submission closes one more, followed by one
++  // ResolveQueryData of the frame's slots into a readback ring; the results are read when the submission that holds the
++  // resolve has completed, never waited for. The segment of slot k is segment[k] (a segment id, below), it ends at slot
++  // k+1. Segment ids: 0..29 the title's phase bits, kIdLead before the first marker, kIdTail after the render loop,
++  // kIdSwap in IssueSwap.
++  void OnGuestMarker(uint32_t kind, uint32_t value) override;
++  // BeginSubmission, when a frame opens: reads the experiment cvars, starts the frame's timestamps.
++  void GpuTimingFrameBegin();
++  // EndSubmission(is_swap), the last list of the frame: the end timestamp and the resolve.
++  void GpuTimingFrameEnd();
++  // IssueSwap, before its work: the experiment cycle, the swap segment.
++  void GpuTimingBeforeSwap();
++  void GpuTimingCycleTick();
++  // A new segment starts here (a timestamp if the frame is timed in full).
++  void GpuTimingSetSegment(uint32_t id);
++  // Adds what was recorded since the last call to the current segment's group.
++  void GpuTimingAttribute();
++  bool GpuTimingInit();
++  void GpuTimingShutdown();
++  // Reads the frames whose submissions are done.
++  void GpuTimingCollect();
++  void GpuTimingFlushCsv();
++  // The experiment (0: none) the guest draw about to be recorded gets.
++  uint32_t GpuTimingDrawExperiment(bool memexport_used);
++  void GpuTimingCountDraw(uint32_t host_count, uint32_t experiment) {
++    uint32_t* counts = gpu_timing_.counts[gpu_timing_.group];
++    ++counts[kGtDraws];
++    counts[kGtVerts] += host_count;
++    counts[kGtExp] += experiment != 0;
++  }
++  // Experiment 3: the first primitive only.
++  static uint32_t GpuTimingDrawVertexCount(uint32_t experiment, D3D_PRIMITIVE_TOPOLOGY topology,
++                                           uint32_t count);
++
++  struct GpuTiming {
++    static constexpr uint32_t kRing = 8;    // frames; more than kQueueFrames, so a slot is read before it is reused
++    static constexpr uint32_t kSlots = 64;  // timestamps per frame (the last one is the frame's end)
++    static constexpr uint32_t kGroups = 13;
++    static constexpr uint32_t kIdLead = 30, kIdTail = 31, kIdSwap = 32, kIdNone = 33;
++    struct Frame {
++      enum State : uint8_t { kFree, kRecording, kPending };
++      State state = kFree;
++      uint8_t mode = 0;  // 1: start and end only, 2: all
++      uint8_t draw_mode = 0;
++      uint8_t slots = 0;
++      uint64_t seq = 0;
++      uint64_t submission = 0;  // its readback is valid once this submission has completed
++      int32_t experiment = -1;
++      uint32_t cp_frame = 0;
++      uint32_t guest_frame = 0;
++      std::chrono::steady_clock::time_point end_time;
++      uint8_t segment[kSlots] = {};
++      uint32_t counts[kGroups][kGtCounterCount] = {};
++    };
++    // The frame being recorded.
++    uint8_t mode = 0;  // 0 off, 1 start and end only, 2 all (set at the start of the frame)
++    bool active = false;
++    uint32_t ring = 0;
++    uint32_t slots = 0;
++    uint32_t cur_id = kIdLead;  // the segment the commands being recorded belong to
++    uint32_t group = 0;         // its group, where the counters go
++    uint32_t counts[kGroups][kGtCounterCount] = {};
++    DeferredCommandList::RecordedStats snapshot;
++    // Latched at the start of the frame.
++    uint32_t draw_experiment = 0;
++    uint32_t draw_phases = 0xFFFFFFFFu;
++    uint32_t draw_now = 0;  // what the draw being recorded gets
++    std::string draw_phases_text;
++    int32_t experiment = -1;  // the experiment cycle's entry in force
++    bool first_swap_set = false;
++    std::chrono::steady_clock::time_point first_swap;
++    // The frames.
++    uint64_t seq = 0;          // frames started
++    uint64_t collect_seq = 0;  // the next one to read
++    uint64_t last_ended = 0;
++    Frame frames[kRing];
++    bool init_failed = false;
++    Microsoft::WRL::ComPtr<ID3D12QueryHeap> heap;
++    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
++    double us_per_tick = 0.0;
++    bool have_last_start = false;
++    uint64_t last_start_ticks = 0;
++  } gpu_timing_;
++  // Statistics, the CSV and the experiment cycle (defined in command_processor.cpp).
++  struct GpuTimingReport;
++  GpuTimingReport& GpuTimingGetReport();
++  void GpuTimingProcessFrame(const GpuTiming::Frame& frame, const uint64_t* ticks);
++  // Logs the statistics if gpu_timing_log_s seconds have passed (or `force`), and writes the CSV rows.
++  void GpuTimingMaybeLog(bool force);
++  std::unique_ptr<GpuTimingReport> gpu_timing_report_;
+ };
+ 
+ }  // namespace rex::graphics::d3d12
+diff --git a/include/rex/graphics/d3d12/deferred_command_list.h b/include/rex/graphics/d3d12/deferred_command_list.h
+index 7d4c1f1c..70fd8c18 100644
+--- a/include/rex/graphics/d3d12/deferred_command_list.h
++++ b/include/rex/graphics/d3d12/deferred_command_list.h
+@@ -86,6 +86,16 @@ class DeferredCommandList {
+   // CmdHoistPoint to its current end.
+   void ExtendHoistPoint(size_t hoist_point);
+ 
++  // LOCAL PATCH - MCLA (04f0): gpu_timing. How many of these commands were recorded, since the object was made (never
++  // reset, wraps): the command processor takes differences to attribute them to a segment of the frame.
++  struct RecordedStats {
++    uint32_t pipeline_sets = 0;
++    uint32_t graphics_root_cbvs = 0;
++    uint32_t render_target_sets = 0;
++    uint32_t barrier_batches = 0;
++  };
++  const RecordedStats& recorded_stats() const { return stats_; }
++
+   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
+                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,
+                                                   UINT8 stencil, UINT num_rects) {
+@@ -310,6 +320,7 @@ class DeferredCommandList {
+                              const D3D12_CPU_DESCRIPTOR_HANDLE* render_target_descriptors,
+                              BOOL rts_single_handle_to_descriptor_range,
+                              const D3D12_CPU_DESCRIPTOR_HANDLE* depth_stencil_descriptor) {
++    ++stats_.render_target_sets;  // LOCAL PATCH - MCLA (04f0): gpu_timing counters.
+     auto& args = *reinterpret_cast<D3DOMSetRenderTargetsArguments*>(
+         WriteCommand(Command::kD3DOMSetRenderTargets, sizeof(D3DOMSetRenderTargetsArguments)));
+     num_render_target_descriptors =
+@@ -336,6 +347,7 @@ class DeferredCommandList {
+     if (num_barriers == 0) {
+       return;
+     }
++    ++stats_.barrier_batches;  // LOCAL PATCH - MCLA (04f0): gpu_timing counters.
+     static_assert(alignof(D3D12_RESOURCE_BARRIER) <= alignof(uintmax_t));
+     const size_t header_size = ::rex::align(sizeof(UINT), alignof(D3D12_RESOURCE_BARRIER));
+     uint8_t* args = reinterpret_cast<uint8_t*>(WriteCommand(
+@@ -394,6 +406,7 @@ class DeferredCommandList {
+ 
+   void D3DSetGraphicsRootConstantBufferView(UINT root_parameter_index,
+                                             D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
++    ++stats_.graphics_root_cbvs;  // LOCAL PATCH - MCLA (04f0): gpu_timing counters.
+     auto& args = *reinterpret_cast<SetRootConstantBufferViewArguments*>(
+         WriteCommand(Command::kD3DSetGraphicsRootConstantBufferView,
+                      sizeof(SetRootConstantBufferViewArguments)));
+@@ -473,12 +486,14 @@ class DeferredCommandList {
+   }
+ 
+   void D3DSetPipelineState(ID3D12PipelineState* pipeline_state) {
++    ++stats_.pipeline_sets;  // LOCAL PATCH - MCLA (04f0): gpu_timing counters.
+     auto& arg = *reinterpret_cast<ID3D12PipelineState**>(
+         WriteCommand(Command::kD3DSetPipelineState, sizeof(ID3D12PipelineState*)));
+     arg = pipeline_state;
+   }
+ 
+   void SetPipelineStateHandle(void* pipeline_state_handle) {
++    ++stats_.pipeline_sets;  // LOCAL PATCH - MCLA (04f0): gpu_timing counters.
+     auto& arg =
+         *reinterpret_cast<void**>(WriteCommand(Command::kSetPipelineStateHandle, sizeof(void*)));
+     arg = pipeline_state_handle;
+@@ -752,6 +767,7 @@ class DeferredCommandList {
+   std::vector<uintmax_t> command_stream_;
+   std::vector<uintmax_t> hoisted_stream_;
+   std::vector<uintmax_t>* write_stream_ = &command_stream_;
++  RecordedStats stats_;  // LOCAL PATCH - MCLA (04f0)
+ };
+ 
+ }  // namespace rex::graphics::d3d12
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 15a5ec75..8567e17c 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -304,6 +304,32 @@ inline void NfsmwCpPublishEvent() {}
+ }  // namespace
+ #endif
+ 
++// LOCAL PATCH - MCLA (04f0): gpu-timing exports, C data symbols of rexgpu-xenos.dll (GetProcAddress gives the address of
++// each atomic). The D3D12 command processor (d3d12/command_processor.cpp, GpuTiming) publishes the GPU time of each
++// finished frame, a few frames after it was drawn, whenever gpu_timing is on or gpu_timing_export is (the default):
++//   rexgpu_gpu_frame_us   the last resolved frame's GPU time in microseconds (first work of the frame to its last,
++//                         the presenter's paint not included), stored with release order, before ...
++//   rexgpu_gpu_frame_seq  ... this counter is incremented (acquire it, then read the time)
++//   rexgpu_gpu_frame_lag  how many frames the command processor has finished since the published one was (0: the
++//                         newest finished frame)
++// The next two belong to a later patch (variable rate shading): the game writes the level it wants, the SDK the number
++// of levels it can do; defined here so the game can find them now.
++//   rexgpu_vrs_level      -1: not set
++//   rexgpu_vrs_levels     0: none
++#if REX_PLATFORM_WIN32
++extern "C" __declspec(dllexport) std::atomic<uint32_t> rexgpu_gpu_frame_us{0};
++extern "C" __declspec(dllexport) std::atomic<uint32_t> rexgpu_gpu_frame_seq{0};
++extern "C" __declspec(dllexport) std::atomic<uint32_t> rexgpu_gpu_frame_lag{0};
++extern "C" __declspec(dllexport) std::atomic<int32_t> rexgpu_vrs_level{-1};
++extern "C" __declspec(dllexport) std::atomic<int32_t> rexgpu_vrs_levels{0};
++#else
++extern "C" std::atomic<uint32_t> rexgpu_gpu_frame_us{0};
++extern "C" std::atomic<uint32_t> rexgpu_gpu_frame_seq{0};
++extern "C" std::atomic<uint32_t> rexgpu_gpu_frame_lag{0};
++extern "C" std::atomic<int32_t> rexgpu_vrs_level{-1};
++extern "C" std::atomic<int32_t> rexgpu_vrs_levels{0};
++#endif
++
+ // LOCAL PATCH - MCLA (0430): a WAIT_REG_MEM that sleeps (wait >= 0x100) is woken when the guest's vblank handler has
+ // run, not left to a Sleep(1 ms) poll. The title's swap gate is such a wait (memory == 0, wait 0x100): the guest's vblank
+ // handler releases it, and a poll at the host's 1-2 ms timer tick noticed the release 0-2 ms late, a different delay
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 9765abba..9178f0d9 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -12,7 +12,10 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <fstream>
+ #include <sstream>
+ #include <utility>
+ 
+@@ -114,8 +117,114 @@ REXCVAR_DEFINE_UINT32(swap_direct_present_check, 0, "GPU/D3D12",
+     .range(0, 100000)
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// LOCAL PATCH - MCLA (04f0): gpu-timing. The data symbols are defined (and exported) in graphics/command_processor.cpp.
++extern "C" std::atomic<uint32_t> rexgpu_gpu_frame_us;
++extern "C" std::atomic<uint32_t> rexgpu_gpu_frame_seq;
++extern "C" std::atomic<uint32_t> rexgpu_gpu_frame_lag;
++
++REXCVAR_DEFINE_INT32(gpu_timing, 0, "GPU/Timing",
++                     "GPU time of every frame, cut at the title's phase markers (guest markers 'REXM'): "
++                     "timestamps at the start of the frame, at each phase, and at the frame's end, read back a few "
++                     "frames later without waiting. 1 = on: logs the per-phase times and counters every "
++                     "gpu_timing_log_s seconds, writes gpu_timing_csv, publishes rexgpu_gpu_frame_us. 0 = off "
++                     "(but see gpu_timing_export)")
++    .range(0, 1)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(gpu_timing_export, true, "GPU/Timing",
++                    "With gpu_timing 0: still time each frame as a whole (two timestamps and one small resolve per "
++                    "frame) and publish it as the exported rexgpu_gpu_frame_us / _seq / _lag, for the title's "
++                    "frame-time governor. No counters, log or CSV. Off together with gpu_timing 0: no timestamps")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_INT32(gpu_timing_log_s, 5, "GPU/Timing",
++                     "With gpu_timing: seconds between the '[gpu-timing]' log lines (and the writes of "
++                     "gpu_timing_csv)")
++    .range(1, 3600)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_STRING(gpu_timing_csv, "", "GPU/Timing",
++                      "With gpu_timing: a file to write one row per timed frame to (the header first; the file is "
++                      "rewritten at the start of the run, rows are appended every gpu_timing_log_s seconds). "
++                      "Empty: no file")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_INT32(gpu_draw_experiment, 0, "GPU/Timing",
++                     "Development, for a cost model: changes every guest draw (not those of the emulation: transfers, "
++                     "clears, resolves, swap, passes; not those that export to memory or run in a host occlusion "
++                     "query), read at the start of each frame. 0 = normal. 1 = a scissor of no area (keeps the state, "
++                     "vertex and primitive work; removes rasterization, pixel shading and the ROP). 2 = the draw "
++                     "is not issued (all of its state is still recorded). 3 = only the first primitive, with the "
++                     "empty scissor (keeps the per-draw cost, removes nearly all vertex and pixel work)")
++    .range(0, 3)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_STRING(gpu_draw_experiment_phases, "0xFFFFFFFF", "GPU/Timing",
++                      "With gpu_draw_experiment: the phases it applies to, a mask of the title's phase bits (0x2 "
++                      "reflection, 0x4 and 0x8 environment map, 0x20..0x100 shadow cascades, 0x800.. the scene, 0x08000000 "
++                      "post, ...) as hex (0x...) or decimal; bit 30 is the part of the frame before the first phase "
++                      "marker, bit 31 the part after the render loop")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_STRING(gpu_experiment_cycle, "", "GPU/Timing",
++                      "Cycles settings inside one run: entries separated by ';', each a comma-separated list of "
++                      "cvar=value assignments applied together (any cvar, e.g. "
++                      "\"gpu_draw_experiment=0;gpu_draw_experiment=1;gpu_draw_experiment=0;gpu_draw_experiment=3\"), "
++                      "each for gpu_experiment_period_ms, starting gpu_experiment_start_s seconds after the first "
++                      "swap; switched at a swap. At most 16 entries. Empty: off. The gpu_timing log and CSV tell the "
++                      "frames of each entry apart")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_INT32(gpu_experiment_period_ms, 2000, "GPU/Timing",
++                     "With gpu_experiment_cycle: milliseconds each entry is in force")
++    .range(50, 600000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_INT32(gpu_experiment_start_s, 30, "GPU/Timing",
++                     "With gpu_experiment_cycle: seconds after the first swap before the first entry is applied")
++    .range(0, 86400)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(gpu_experiment_repeat, true, "GPU/Timing",
++                    "With gpu_experiment_cycle: go back to the first entry after the last (off: the last one stays)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics::d3d12 {
+ 
++// LOCAL PATCH - MCLA (04f0): gpu_timing's statistics, CSV rows and experiment cycle (see GpuTiming in the header).
++struct D3D12CommandProcessor::GpuTimingReport {
++  static constexpr uint32_t kMaxEntries = 16;
++  // The frames of one experiment entry in the current log interval (index 0: no entry in force).
++  struct Accumulator {
++    uint32_t frames = 0;
++    uint32_t draw_mode = 0;
++    std::vector<float> frame_ms;
++    std::vector<float> busy_percent;
++    std::vector<float> group_ms[GpuTiming::kGroups];
++    uint64_t counts[GpuTiming::kGroups][kGtCounterCount] = {};
++    void Clear() {
++      frames = 0;
++      frame_ms.clear();
++      busy_percent.clear();
++      for (auto& v : group_ms) {
++        v.clear();
++      }
++      std::memset(counts, 0, sizeof(counts));
++    }
++  } accumulators[kMaxEntries + 1];
++  std::chrono::steady_clock::time_point last_log;
++  bool last_log_set = false;
++  std::string csv;
++  std::string csv_path;
++  bool csv_started = false;
++  bool csv_t0_set = false;
++  std::chrono::steady_clock::time_point csv_t0;
++  // The experiment cycle: the text it was parsed from, and each entry's assignments.
++  std::string cycle_text;
++  std::vector<std::vector<std::pair<std::string, std::string>>> cycle_entries;
++  std::vector<std::string> cycle_labels;
++};
++
+ // Generated with `xb buildshaders`.
+ namespace shaders {
+ #include "../shaders/bytecode/d3d12_5_1/apply_gamma_pwl_cs.h"
+@@ -1986,6 +2095,7 @@ void D3D12CommandProcessor::ShutdownContext() {
+   ui::d3d12::util::ReleaseAndNull(msaa_line_guard_root_signature_);
+   InvalidateAllVertexBufferResidency();
+   ShutdownOcclusionQueryResources();
++  GpuTimingShutdown();  // LOCAL PATCH - MCLA (04f0)
+ 
+   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
+   readback_buffer_size_ = 0;
+@@ -2616,6 +2726,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   if (!pending_unscaled_copies_.empty()) {
+     FlushUnscaledResolveCopies();
+   }
++  // LOCAL PATCH - MCLA (04f0): gpu_timing: the swap segment starts here (and gpu_experiment_cycle switches, at the
++  // frame boundary).
++  GpuTimingBeforeSwap();
+ 
+   // Obtain the actual swap source texture size (resolution-scaled if it's a
+   // resolve destination, or not otherwise).
+@@ -3558,6 +3671,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   scissor.extent[0] *= draw_resolution_scale_x;
+   scissor.extent[1] *= draw_resolution_scale_y;
+ 
++  // LOCAL PATCH - MCLA (04f0): gpu_draw_experiment: what this guest draw gets (0: nothing); UpdateFixedFunctionState
++  // gives the experiments with a scissor an empty one.
++  const uint32_t draw_experiment = GpuTimingDrawExperiment(memexport_used);
++
+   // Update viewport, scissor, blend factor and stencil reference. FSR upscaling squeezes
+   // the scene's viewport and scissor into the corner of the render targets (the
+   // system constants stay those of the full-size viewport).
+@@ -3770,8 +3887,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     PERF_counter_add_batched(REXCVAR_GET(gpu_batch_perf_counters), kDrawCalls, 1);
+     PERF_counter_add_batched(REXCVAR_GET(gpu_batch_perf_counters), kVerticesProcessed,
+                            primitive_processing_result.host_draw_vertex_count);
+-    deferred_command_list_.D3DDrawInstanced(primitive_processing_result.host_draw_vertex_count, 1,
+-                                            0, 0);
++    // LOCAL PATCH - MCLA (04f0): gpu_timing counters, gpu_draw_experiment.
++    GpuTimingCountDraw(primitive_processing_result.host_draw_vertex_count, draw_experiment);
++    if (draw_experiment != 2) {
++      deferred_command_list_.D3DDrawInstanced(
++          GpuTimingDrawVertexCount(draw_experiment, primitive_topology,
++                                   primitive_processing_result.host_draw_vertex_count),
++          1, 0, 0);
++    }
+   } else {
+     D3D12_INDEX_BUFFER_VIEW index_buffer_view;
+     index_buffer_view.SizeInBytes = primitive_processing_result.host_draw_vertex_count;
+@@ -3831,8 +3954,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     PERF_counter_add_batched(REXCVAR_GET(gpu_batch_perf_counters), kDrawCalls, 1);
+     PERF_counter_add_batched(REXCVAR_GET(gpu_batch_perf_counters), kVerticesProcessed,
+                            primitive_processing_result.host_draw_vertex_count);
+-    deferred_command_list_.D3DDrawIndexedInstanced(
+-        primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
++    // LOCAL PATCH - MCLA (04f0): gpu_timing counters, gpu_draw_experiment.
++    GpuTimingCountDraw(primitive_processing_result.host_draw_vertex_count, draw_experiment);
++    if (draw_experiment != 2) {
++      deferred_command_list_.D3DDrawIndexedInstanced(
++          GpuTimingDrawVertexCount(draw_experiment, primitive_topology,
++                                   primitive_processing_result.host_draw_vertex_count),
++          1, 0, 0, 0);
++    }
+     if (scratch_index_buffer != nullptr) {
+       ReleaseScratchGPUBuffer(scratch_index_buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+     }
+@@ -4086,6 +4215,7 @@ bool D3D12CommandProcessor::IssueCopy() {
+   if (!BeginSubmission(true)) {
+     return false;
+   }
++  GpuTimingCount(kGtRes);  // LOCAL PATCH - MCLA (04f0)
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+   if (readback_mode == ReadbackResolveMode::kDisabled && !IsResolveReadbackSelective() &&
+       !IsUnscaledResolveCopyEnabled()) {
+@@ -4651,6 +4781,9 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+   primitive_processor_->CompletedSubmissionUpdated();
+ 
+   texture_cache_->CompletedSubmissionUpdated(submission_completed_);
++
++  // LOCAL PATCH - MCLA (04f0): gpu_timing: frames whose lists have completed.
++  GpuTimingCollect();
+ }
+ 
+ void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason) {
+@@ -4793,6 +4926,8 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+   }
+ 
+   if (is_opening_frame) {
++    // LOCAL PATCH - MCLA (04f0): gpu_timing: the frame's first timestamp, before any of its commands.
++    GpuTimingFrameBegin();
+     frame_open_ = true;
+     frame_async_pipeline_wait_us_ = 0;
+ 
+@@ -4892,6 +5027,12 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     // destroyed between frames.
+     SubmitBarriers();
+ 
++    // LOCAL PATCH - MCLA (04f0): gpu_timing: the frame's last timestamp, and the resolve of its timestamps, in the
++    // frame's last list, after everything the frame recorded.
++    if (is_closing_frame) {
++      GpuTimingFrameEnd();
++    }
++
+     ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
+ 
+     // Submit the deferred command list.
+@@ -4953,6 +5094,11 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+   }
+ 
+   if (is_closing_frame) {
++    // LOCAL PATCH - MCLA (04f0): a timed frame that got no end timestamp (no submission was open) is dropped.
++    if (gpu_timing_.active) {
++      gpu_timing_.active = false;
++      gpu_timing_.frames[gpu_timing_.ring].state = GpuTiming::Frame::kFree;
++    }
+     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
+       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
+     }
+@@ -5086,6 +5232,11 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
+   scissor_rect.top = LONG(scissor.offset[1]);
+   scissor_rect.right = LONG(scissor.offset[0] + scissor.extent[0]);
+   scissor_rect.bottom = LONG(scissor.offset[1] + scissor.extent[1]);
++  if (gpu_timing_.draw_now & 1) {
++    // LOCAL PATCH - MCLA (04f0): gpu_draw_experiment 1 and 3: no area. Through SetScissorRect like any other scissor,
++    // so its cache holds what is set and the next draw's own scissor is set again.
++    scissor_rect.left = scissor_rect.top = scissor_rect.right = scissor_rect.bottom = 0;
++  }
+   SetScissorRect(scissor_rect);
+ 
+   if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+@@ -6855,4 +7006,596 @@ void D3D12CommandProcessor::CompleteSwapDirectCheck(uint32_t width, uint32_t hei
+       differing_pixels ? fmt::format(", the first at {},{}", first_x, first_y) : std::string());
+ }
+ 
++// ---------------------------------------------------------------------------------------------------------------------
++// LOCAL PATCH - MCLA (04f0): gpu_timing and the draw experiments (see GpuTiming in the header).
++// ---------------------------------------------------------------------------------------------------------------------
++
++namespace {
++
++constexpr const char* kGpuTimingGroupNames[13] = {"lead", "refl", "env",     "shadow", "pre", "scene", "transl",
++                                                  "comp", "post", "tonemap", "ui",     "tail", "swap"};
++
++// The group of a segment id: lead, refl (0x2), env (0x4, 0x8), shadow (0x20..0x100), pre (the other bits below 0x800),
++// scene (0x800..0x80000), transl (0x100000..0x2000000), comp (0x04000000), post (0x08000000), tonemap (0x10000000),
++// ui (0x20000000), tail, swap.
++uint32_t GpuTimingGroupOfId(uint32_t id) {
++  static const uint8_t kGroupOfPhaseBit[30] = {4, 1, 2, 2, 4, 3, 3, 3, 3, 4, 4, 5, 5, 5, 5,
++                                               5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 7, 8, 9, 10};
++  if (id < 30) {
++    return kGroupOfPhaseBit[id];
++  }
++  return id == 30 ? 0 : (id == 31 ? 11 : 12);
++}
++
++float GpuTimingPercentile(std::vector<float>& values, double fraction) {
++  if (values.empty()) {
++    return 0.0f;
++  }
++  const size_t index = size_t(fraction * double(values.size() - 1) + 0.5);
++  std::nth_element(values.begin(), values.begin() + index, values.end());
++  return values[index];
++}
++
++std::string GpuTimingTrim(const std::string& text) {
++  const size_t first = text.find_first_not_of(" \t\r\n");
++  if (first == std::string::npos) {
++    return std::string();
++  }
++  return text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
++}
++
++std::string GpuTimingCsvHeader() {
++  std::string header = "seq,cp_frame,guest_frame,t_ms,exp,frame_us,interval_us";
++  for (const char* name : kGpuTimingGroupNames) {
++    for (const char* field : {"us", "d", "v", "pso", "cbv", "rt", "res", "xfer", "tex", "bar", "exp"}) {
++      header += fmt::format(",{}_{}", name, field);
++    }
++  }
++  for (uint32_t bit = 0; bit < 30; ++bit) {
++    header += fmt::format(",p{}_us", bit);
++  }
++  header += '\n';
++  return header;
++}
++
++}  // namespace
++
++bool D3D12CommandProcessor::GpuTimingInit() {
++  GpuTiming& g = gpu_timing_;
++  if (g.readback) {
++    return true;
++  }
++  if (g.init_failed) {
++    return false;
++  }
++  static_assert(GpuTiming::kRing > kQueueFrames, "a timing slot must be read before it is reused");
++  ID3D12Device* device = GetD3D12Provider().GetDevice();
++  UINT64 frequency = 0;
++  D3D12_QUERY_HEAP_DESC heap_desc = {D3D12_QUERY_HEAP_TYPE_TIMESTAMP, GpuTiming::kRing * GpuTiming::kSlots, 0};
++  D3D12_RESOURCE_DESC buffer_desc;
++  ui::d3d12::util::FillBufferResourceDesc(
++      buffer_desc, sizeof(uint64_t) * GpuTiming::kRing * GpuTiming::kSlots, D3D12_RESOURCE_FLAG_NONE);
++  if (!device || FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&g.heap))) ||
++      FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesReadback,
++                                             GetD3D12Provider().GetHeapFlagCreateNotZeroed(), &buffer_desc,
++                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++                                             IID_PPV_ARGS(&g.readback))) ||
++      FAILED(GetD3D12Provider().GetDirectQueue()->GetTimestampFrequency(&frequency)) || !frequency) {
++    g.heap.Reset();
++    g.readback.Reset();
++    g.init_failed = true;
++    REXGPU_WARN("gpu_timing: GPU timestamps are not available on this device or queue, the GPU timing is off");
++    return false;
++  }
++  g.us_per_tick = 1e6 / double(frequency);
++  REXGPU_INFO("gpu_timing: GPU timestamps at {:.1f} MHz", double(frequency) * 1e-6);
++  return true;
++}
++
++void D3D12CommandProcessor::GpuTimingShutdown() {
++  GpuTiming& g = gpu_timing_;
++  if (g.readback) {
++    GpuTimingCollect();
++    if (gpu_timing_report_) {
++      GpuTimingMaybeLog(true);
++    }
++  }
++  g.active = false;
++  for (GpuTiming::Frame& frame : g.frames) {
++    frame.state = GpuTiming::Frame::kFree;
++  }
++  g.collect_seq = g.seq;
++  g.heap.Reset();
++  g.readback.Reset();
++}
++
++D3D12CommandProcessor::GpuTimingReport& D3D12CommandProcessor::GpuTimingGetReport() {
++  if (!gpu_timing_report_) {
++    gpu_timing_report_ = std::make_unique<GpuTimingReport>();
++  }
++  return *gpu_timing_report_;
++}
++
++void D3D12CommandProcessor::OnGuestMarker(uint32_t kind, uint32_t value) {
++  CommandProcessor::OnGuestMarker(kind, value);
++  // The segment the marker starts. The named markers and the phase markers of the same phase bit are the same segment
++  // (the second finds the first one's segment current); a game that writes only the named ones is mapped to the bits.
++  uint32_t id = GpuTiming::kIdNone;
++  switch (GuestMarkerKind(kind)) {
++    case GuestMarkerKind::kFrameBegin:
++      id = GpuTiming::kIdLead;
++      break;
++    case GuestMarkerKind::kFrameEnd:
++    case GuestMarkerKind::kRenderEnd:
++      id = GpuTiming::kIdTail;
++      break;
++    case GuestMarkerKind::kSceneBegin:
++      id = 11;  // 0x800
++      break;
++    case GuestMarkerKind::kSceneTranslucent:
++      id = 20;  // 0x100000
++      break;
++    case GuestMarkerKind::kSceneComposite:
++      id = 26;  // 0x04000000
++      break;
++    case GuestMarkerKind::kSceneEnd:
++      id = 27;  // 0x08000000
++      break;
++    case GuestMarkerKind::kTonemapBegin:
++      id = 28;  // 0x10000000
++      break;
++    case GuestMarkerKind::kUIBegin:
++      id = 29;  // 0x20000000
++      break;
++    case GuestMarkerKind::kPhase: {
++      uint32_t bit;
++      if (value && !(value & (value - 1)) && rex::bit_scan_forward(value, &bit) && bit < 30) {
++        id = bit;
++      }
++    } break;
++    default:
++      break;
++  }
++  if (id == GpuTiming::kIdNone) {
++    return;
++  }
++  GpuTiming& g = gpu_timing_;
++  const bool full = REXCVAR_GET(gpu_timing) != 0;
++  if (id == g.cur_id && (!full || g.active)) {
++    return;
++  }
++  if (full) {
++    // The marker can be the first thing of the frame (or of its submission): the timestamp needs a list, and the frame
++    // its first timestamp before it.
++    BeginSubmission(true);
++  }
++  GpuTimingSetSegment(id);
++}
++
++void D3D12CommandProcessor::GpuTimingFrameBegin() {
++  GpuTiming& g = gpu_timing_;
++  // The draw experiment, for the whole frame.
++  g.draw_experiment = uint32_t(std::clamp(REXCVAR_GET(gpu_draw_experiment), 0, 3));
++  if (g.draw_experiment) {
++    const std::string& phases = REXCVAR_GET(gpu_draw_experiment_phases);
++    if (phases != g.draw_phases_text) {
++      g.draw_phases_text = phases;
++      char* end = nullptr;
++      const unsigned long long mask = std::strtoull(phases.c_str(), &end, 0);
++      g.draw_phases = end == phases.c_str() ? 0xFFFFFFFFu : uint32_t(mask);
++    }
++  }
++  // The swap segment of the previous frame is over (a game that writes no markers stays in the lead).
++  if (g.cur_id == GpuTiming::kIdSwap) {
++    g.cur_id = GpuTiming::kIdLead;
++    g.group = GpuTimingGroupOfId(g.cur_id);
++  }
++  // A timed frame that never ended is dropped.
++  if (g.active) {
++    g.active = false;
++    g.frames[g.ring].state = GpuTiming::Frame::kFree;
++  }
++  g.mode = REXCVAR_GET(gpu_timing) ? 2 : (REXCVAR_GET(gpu_timing_export) ? 1 : 0);
++  if (!g.mode || !GpuTimingInit()) {
++    g.mode = 0;
++    return;
++  }
++  // The frames done so far, so the ring slot this frame takes is free.
++  GpuTimingCollect();
++  g.ring = uint32_t(g.seq % GpuTiming::kRing);
++  GpuTiming::Frame& frame = g.frames[g.ring];
++  frame.state = GpuTiming::Frame::kRecording;
++  frame.mode = g.mode;
++  frame.draw_mode = uint8_t(g.draw_experiment);
++  frame.experiment = g.experiment;
++  frame.seq = g.seq++;
++  frame.segment[0] = uint8_t(g.cur_id);
++  g.group = GpuTimingGroupOfId(g.cur_id);
++  g.active = true;
++  g.slots = 1;
++  if (g.mode == 2) {
++    std::memset(g.counts, 0, sizeof(g.counts));
++    g.snapshot = deferred_command_list_.recorded_stats();
++  }
++  deferred_command_list_.D3DEndQuery(g.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, g.ring * GpuTiming::kSlots);
++}
++
++void D3D12CommandProcessor::GpuTimingFrameEnd() {
++  GpuTiming& g = gpu_timing_;
++  if (!g.active) {
++    return;
++  }
++  g.active = false;
++  GpuTiming::Frame& frame = g.frames[g.ring];
++  if (frame.state != GpuTiming::Frame::kRecording) {
++    return;
++  }
++  if (g.mode == 2) {
++    GpuTimingAttribute();
++    std::memcpy(frame.counts, g.counts, sizeof(frame.counts));
++  }
++  const uint32_t first = g.ring * GpuTiming::kSlots;
++  deferred_command_list_.D3DEndQuery(g.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, first + g.slots);
++  ++g.slots;
++  deferred_command_list_.D3DResolveQueryData(g.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, first, g.slots,
++                                             g.readback.Get(), uint64_t(first) * sizeof(uint64_t));
++  frame.slots = uint8_t(g.slots);
++  frame.submission = submission_current_;  // the list this goes into
++  frame.end_time = std::chrono::steady_clock::now();
++  frame.cp_frame = counter();
++  frame.guest_frame = guest_marker_frame_;
++  frame.state = GpuTiming::Frame::kPending;
++  g.last_ended = frame.seq;
++}
++
++void D3D12CommandProcessor::GpuTimingAttribute() {
++  GpuTiming& g = gpu_timing_;
++  const DeferredCommandList::RecordedStats& now = deferred_command_list_.recorded_stats();
++  uint32_t* counts = g.counts[g.group];
++  counts[kGtPso] += now.pipeline_sets - g.snapshot.pipeline_sets;
++  counts[kGtCbv] += now.graphics_root_cbvs - g.snapshot.graphics_root_cbvs;
++  counts[kGtRt] += now.render_target_sets - g.snapshot.render_target_sets;
++  counts[kGtBar] += now.barrier_batches - g.snapshot.barrier_batches;
++  g.snapshot = now;
++}
++
++void D3D12CommandProcessor::GpuTimingSetSegment(uint32_t id) {
++  GpuTiming& g = gpu_timing_;
++  if (id == g.cur_id) {
++    return;
++  }
++  g.cur_id = id;
++  if (g.active && g.mode == 2 && submission_open_) {
++    // The last slot is the frame's end; a frame that runs out of slots goes on in its last segment.
++    if (g.slots + 1 >= GpuTiming::kSlots) {
++      return;
++    }
++    GpuTimingAttribute();
++    g.frames[g.ring].segment[g.slots] = uint8_t(id);
++    deferred_command_list_.D3DEndQuery(g.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                       g.ring * GpuTiming::kSlots + g.slots);
++    ++g.slots;
++  }
++  g.group = GpuTimingGroupOfId(id);
++}
++
++void D3D12CommandProcessor::GpuTimingBeforeSwap() {
++  GpuTimingCycleTick();
++  GpuTimingSetSegment(GpuTiming::kIdSwap);
++}
++
++void D3D12CommandProcessor::GpuTimingCycleTick() {
++  GpuTiming& g = gpu_timing_;
++  const auto now = std::chrono::steady_clock::now();
++  if (!g.first_swap_set) {
++    g.first_swap_set = true;
++    g.first_swap = now;
++  }
++  const std::string& text = REXCVAR_GET(gpu_experiment_cycle);
++  if (text.empty()) {
++    g.experiment = -1;
++    return;
++  }
++  GpuTimingReport& r = GpuTimingGetReport();
++  if (text != r.cycle_text) {
++    r.cycle_text = text;
++    r.cycle_entries.clear();
++    r.cycle_labels.clear();
++    g.experiment = -1;
++    size_t entry_begin = 0;
++    while (entry_begin <= text.size()) {
++      size_t entry_end = text.find(';', entry_begin);
++      if (entry_end == std::string::npos) {
++        entry_end = text.size();
++      }
++      const std::string entry = GpuTimingTrim(text.substr(entry_begin, entry_end - entry_begin));
++      entry_begin = entry_end + 1;
++      if (entry.empty()) {
++        continue;
++      }
++      if (r.cycle_entries.size() >= GpuTimingReport::kMaxEntries) {
++        REXGPU_WARN("[gpu-exp] gpu_experiment_cycle: only the first {} entries are used",
++                    GpuTimingReport::kMaxEntries);
++        break;
++      }
++      std::vector<std::pair<std::string, std::string>> assignments;
++      size_t assignment_begin = 0;
++      while (assignment_begin <= entry.size()) {
++        size_t assignment_end = entry.find(',', assignment_begin);
++        if (assignment_end == std::string::npos) {
++          assignment_end = entry.size();
++        }
++        const std::string assignment =
++            GpuTimingTrim(entry.substr(assignment_begin, assignment_end - assignment_begin));
++        assignment_begin = assignment_end + 1;
++        const size_t equals = assignment.find('=');
++        if (equals == std::string::npos || equals == 0) {
++          if (!assignment.empty()) {
++            REXGPU_WARN("[gpu-exp] gpu_experiment_cycle: '{}' is not name=value, left out", assignment);
++          }
++          continue;
++        }
++        assignments.emplace_back(GpuTimingTrim(assignment.substr(0, equals)),
++                                 GpuTimingTrim(assignment.substr(equals + 1)));
++      }
++      r.cycle_entries.push_back(std::move(assignments));
++      r.cycle_labels.push_back(entry);
++    }
++  }
++  const int64_t elapsed_ms =
++      std::chrono::duration_cast<std::chrono::milliseconds>(now - g.first_swap).count();
++  const int64_t start_ms = int64_t(std::max(0, REXCVAR_GET(gpu_experiment_start_s))) * 1000;
++  int32_t index = -1;
++  if (elapsed_ms >= start_ms && !r.cycle_entries.empty()) {
++    const int64_t entry_count = int64_t(r.cycle_entries.size());
++    const int64_t steps = (elapsed_ms - start_ms) / std::max(1, REXCVAR_GET(gpu_experiment_period_ms));
++    index = int32_t(REXCVAR_GET(gpu_experiment_repeat) ? steps % entry_count
++                                                       : std::min(steps, entry_count - 1));
++  }
++  if (index == g.experiment) {
++    return;
++  }
++  g.experiment = index;
++  if (index < 0) {
++    return;
++  }
++  for (const auto& assignment : r.cycle_entries[index]) {
++    if (!rex::cvar::SetFlagByName(assignment.first, assignment.second)) {
++      REXGPU_WARN("[gpu-exp] entry {}: could not set {}={}", index, assignment.first, assignment.second);
++    }
++  }
++  REXGPU_INFO("[gpu-exp] entry {} at {:.1f} s: {}", index, double(elapsed_ms) * 1e-3, r.cycle_labels[index]);
++}
++
++uint32_t D3D12CommandProcessor::GpuTimingDrawExperiment(bool memexport_used) {
++  GpuTiming& g = gpu_timing_;
++  uint32_t experiment = g.draw_experiment;
++  // Not the swap segment (id 32); not draws that export to memory or count samples for the guest.
++  if (experiment && (memexport_used || active_occlusion_query_.valid || g.cur_id > 31 ||
++                     !((g.draw_phases >> g.cur_id) & 1))) {
++    experiment = 0;
++  }
++  g.draw_now = experiment;
++  return experiment;
++}
++
++uint32_t D3D12CommandProcessor::GpuTimingDrawVertexCount(uint32_t experiment,
++                                                        D3D_PRIMITIVE_TOPOLOGY topology,
++                                                        uint32_t count) {
++  if (experiment != 3) {
++    return count;
++  }
++  uint32_t first;
++  switch (topology) {
++    case D3D_PRIMITIVE_TOPOLOGY_POINTLIST:
++      first = 1;
++      break;
++    case D3D_PRIMITIVE_TOPOLOGY_LINELIST:
++    case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP:
++      first = 2;
++      break;
++    case D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ:
++      first = 4;
++      break;
++    default:
++      first = (topology >= D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST &&
++               topology <= D3D_PRIMITIVE_TOPOLOGY_32_CONTROL_POINT_PATCHLIST)
++                  ? uint32_t(topology) - uint32_t(D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST) + 1
++                  : 3;
++      break;
++  }
++  return std::min(count, first);
++}
++
++void D3D12CommandProcessor::GpuTimingCollect() {
++  GpuTiming& g = gpu_timing_;
++  if (!g.readback || g.collect_seq >= g.seq) {
++    return;
++  }
++  bool any = false;
++  while (g.collect_seq < g.seq) {
++    const uint32_t ring = uint32_t(g.collect_seq % GpuTiming::kRing);
++    GpuTiming::Frame& frame = g.frames[ring];
++    if (g.active && g.seq == g.collect_seq + 1) {
++      break;  // the frame being recorded
++    }
++    if (frame.seq != g.collect_seq || frame.state != GpuTiming::Frame::kPending) {
++      ++g.collect_seq;  // dropped
++      continue;
++    }
++    if (frame.submission > submission_completed_) {
++      break;
++    }
++    const uint64_t first_byte = uint64_t(ring) * GpuTiming::kSlots * sizeof(uint64_t);
++    const D3D12_RANGE read_range = {SIZE_T(first_byte), SIZE_T(first_byte + frame.slots * sizeof(uint64_t))};
++    void* mapping = nullptr;
++    if (SUCCEEDED(g.readback->Map(0, &read_range, &mapping))) {
++      uint64_t ticks[GpuTiming::kSlots];
++      std::memcpy(ticks, static_cast<const uint8_t*>(mapping) + first_byte, frame.slots * sizeof(uint64_t));
++      const D3D12_RANGE written_range = {0, 0};
++      g.readback->Unmap(0, &written_range);
++      GpuTimingProcessFrame(frame, ticks);
++      any = true;
++    }
++    frame.state = GpuTiming::Frame::kFree;
++    ++g.collect_seq;
++  }
++  if (any && gpu_timing_report_) {
++    GpuTimingMaybeLog(false);
++  }
++}
++
++void D3D12CommandProcessor::GpuTimingProcessFrame(const GpuTiming::Frame& frame, const uint64_t* ticks) {
++  GpuTiming& g = gpu_timing_;
++  const uint64_t start = ticks[0], end = ticks[frame.slots - 1];
++  if (end < start) {
++    return;
++  }
++  const uint32_t frame_us = uint32_t(std::min(double(end - start) * g.us_per_tick + 0.5, 4e9));
++  uint32_t interval_us = 0;
++  if (g.have_last_start && start > g.last_start_ticks) {
++    interval_us = uint32_t(std::min(double(start - g.last_start_ticks) * g.us_per_tick + 0.5, 4e9));
++  }
++  g.have_last_start = true;
++  g.last_start_ticks = start;
++
++  // The exports: the lag and the time first, then the counter the reader acquires.
++  rexgpu_gpu_frame_lag.store(uint32_t(g.last_ended - frame.seq), std::memory_order_relaxed);
++  rexgpu_gpu_frame_us.store(frame_us, std::memory_order_release);
++  rexgpu_gpu_frame_seq.fetch_add(1, std::memory_order_release);
++  if (frame.mode != 2) {
++    return;
++  }
++
++  // The segments, into the groups and the raw phase bits.
++  float group_us[GpuTiming::kGroups] = {};
++  float phase_us[30] = {};
++  for (uint32_t k = 0; k + 1 < frame.slots; ++k) {
++    const float us = ticks[k + 1] > ticks[k] ? float(double(ticks[k + 1] - ticks[k]) * g.us_per_tick) : 0.0f;
++    const uint32_t id = frame.segment[k];
++    group_us[GpuTimingGroupOfId(id)] += us;
++    if (id < 30) {
++      phase_us[id] += us;
++    }
++  }
++  GpuTimingReport& r = GpuTimingGetReport();
++  GpuTimingReport::Accumulator& acc =
++      r.accumulators[std::clamp<int32_t>(frame.experiment + 1, 0, GpuTimingReport::kMaxEntries)];
++  ++acc.frames;
++  acc.draw_mode = frame.draw_mode;
++  acc.frame_ms.push_back(float(frame_us) * 0.001f);
++  if (interval_us) {
++    acc.busy_percent.push_back(100.0f * float(frame_us) / float(interval_us));
++  }
++  for (uint32_t group = 0; group < GpuTiming::kGroups; ++group) {
++    acc.group_ms[group].push_back(group_us[group] * 0.001f);
++    for (uint32_t counter = 0; counter < kGtCounterCount; ++counter) {
++      acc.counts[group][counter] += frame.counts[group][counter];
++    }
++  }
++
++  const std::string& csv_path = REXCVAR_GET(gpu_timing_csv);
++  if (csv_path.empty()) {
++    return;
++  }
++  if (csv_path != r.csv_path) {
++    r.csv_path = csv_path;
++    r.csv_started = false;
++    r.csv_t0_set = false;
++    r.csv.clear();
++  }
++  if (!r.csv_t0_set) {
++    r.csv_t0_set = true;
++    r.csv_t0 = frame.end_time;
++  }
++  std::string& row = r.csv;
++  row += fmt::format("{},{},{},{:.1f},{},{},{}", frame.seq, frame.cp_frame, frame.guest_frame,
++                     std::chrono::duration<double, std::milli>(frame.end_time - r.csv_t0).count(),
++                     frame.experiment, frame_us, interval_us);
++  for (uint32_t group = 0; group < GpuTiming::kGroups; ++group) {
++    const uint32_t* c = frame.counts[group];
++    row += fmt::format(",{:.0f},{},{},{},{},{},{},{},{},{},{}", group_us[group], c[kGtDraws], c[kGtVerts],
++                       c[kGtPso], c[kGtCbv], c[kGtRt], c[kGtRes], c[kGtXfer], c[kGtTex], c[kGtBar], c[kGtExp]);
++  }
++  for (uint32_t bit = 0; bit < 30; ++bit) {
++    row += fmt::format(",{:.0f}", phase_us[bit]);
++  }
++  row += '\n';
++}
++
++void D3D12CommandProcessor::GpuTimingFlushCsv() {
++  if (!gpu_timing_report_ || gpu_timing_report_->csv.empty()) {
++    return;
++  }
++  GpuTimingReport& r = *gpu_timing_report_;
++  std::ofstream out(r.csv_path, std::ios::binary | (r.csv_started ? std::ios::app : std::ios::trunc));
++  if (!out) {
++    REXGPU_WARN("gpu_timing: cannot write {}", r.csv_path);
++  } else {
++    if (!r.csv_started) {
++      out << GpuTimingCsvHeader();
++    }
++    out << r.csv;
++  }
++  r.csv_started = true;
++  r.csv.clear();
++}
++
++void D3D12CommandProcessor::GpuTimingMaybeLog(bool force) {
++  GpuTimingReport& r = *gpu_timing_report_;
++  const auto now = std::chrono::steady_clock::now();
++  if (!r.last_log_set) {
++    r.last_log_set = true;
++    r.last_log = now;
++  }
++  const double seconds = std::chrono::duration<double>(now - r.last_log).count();
++  if (!force && seconds < double(std::max(1, REXCVAR_GET(gpu_timing_log_s)))) {
++    return;
++  }
++  r.last_log = now;
++  for (uint32_t entry = 0; entry <= GpuTimingReport::kMaxEntries; ++entry) {
++    GpuTimingReport::Accumulator& acc = r.accumulators[entry];
++    if (!acc.frames) {
++      continue;
++    }
++    const double frames = double(acc.frames);
++    auto group_text = [&](uint32_t group) {
++      const uint64_t* c = acc.counts[group];
++      bool counted = false;
++      for (uint32_t counter = 0; counter < kGtCounterCount; ++counter) {
++        counted |= c[counter] != 0;
++      }
++      const float p50 = GpuTimingPercentile(acc.group_ms[group], 0.5);
++      const float p95 = GpuTimingPercentile(acc.group_ms[group], 0.95);
++      if (!counted && p95 <= 0.0f) {
++        return std::string();
++      }
++      std::string text = fmt::format(
++          " | {} {:.2f}/{:.2f} d={:.0f} v={:.1f}k pso={:.0f} cbv={:.0f} rt={:.0f} res={:.0f} xfer={:.0f} "
++          "tex={:.0f} bar={:.0f}",
++          kGpuTimingGroupNames[group], p50, p95, double(c[kGtDraws]) / frames,
++          double(c[kGtVerts]) / frames * 1e-3, double(c[kGtPso]) / frames, double(c[kGtCbv]) / frames,
++          double(c[kGtRt]) / frames, double(c[kGtRes]) / frames, double(c[kGtXfer]) / frames,
++          double(c[kGtTex]) / frames, double(c[kGtBar]) / frames);
++      if (c[kGtExp]) {
++        text += fmt::format(" exp={:.0f}", double(c[kGtExp]) / frames);
++      }
++      return text;
++    };
++    std::string first = fmt::format(
++        "[gpu-timing] {:.1f} s, {} frames (exp {}, draw {}): frame p50 {:.2f} p95 {:.2f} ms, busy {:.0f} %", seconds,
++        acc.frames, entry ? std::to_string(entry - 1) : std::string("-"), acc.draw_mode,
++        GpuTimingPercentile(acc.frame_ms, 0.5), GpuTimingPercentile(acc.frame_ms, 0.95),
++        GpuTimingPercentile(acc.busy_percent, 0.5));
++    std::string second = "[gpu-timing]  ";
++    for (uint32_t group = 0; group < GpuTiming::kGroups; ++group) {
++      (group < 5 ? first : second) += group_text(group);
++    }
++    REXGPU_INFO("{}", first);
++    REXGPU_INFO("{}", second);
++    acc.Clear();
++  }
++  GpuTimingFlushCsv();
++}
++
+ }  // namespace rex::graphics::d3d12
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index 40df9b89..bb89d07c 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -5385,6 +5385,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+                 sizeof(transfer_stencil_bit) / sizeof(uint32_t), &transfer_stencil_bit, 0);
+           }
+           command_processor_.SetExternalPipeline(transfer_pipelines[j]);
++          // LOCAL PATCH - MCLA (04f0): gpu_timing counter.
++          command_processor_.GpuTimingCount(D3D12CommandProcessor::kGtXfer);
+           command_list.D3DDrawInstanced(transfer_vertex_count, 1, 0, 0);
+         }
+       }
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index e3865c8f..d4d034e0 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -2183,6 +2183,7 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+ 
+   // Submit the copy buffer population commands.
+ 
++  command_processor_.GpuTimingCount(D3D12CommandProcessor::kGtTex);  // LOCAL PATCH - MCLA (04f0): gpu_timing counter.
+   auto& cbuffer_pool = command_processor_.GetConstantBufferPool();
+   LoadConstants load_constants;
+   // 3 bits for each.

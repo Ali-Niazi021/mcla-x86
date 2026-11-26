@@ -249,4 +249,137 @@ inline int HoldSeconds(int prev_hold_s, double since_end_s, int min_s, int max_s
   return std::min(max_s, std::max(min_s, prev_hold_s * 2));
 }
 
+// ---- the governed hold (mcla_sim_pacer 2, LOCK60 A3) -------------------------------------------------
+//
+// Why. Every hold of the 4 bad 1080p bench runs began within ~1 s of `free-roam -> pause` (the pause menu is the heaviest
+// screen of the game for the GPU: 7 tiles at 4x MSAA, it misses ~100 % of its frames) or inside `loading`, and the 12 s
+// re-hold followed because the menu itself kept missing. A hold is for a drive the GPU cannot sustain at 60, so this
+// judge looks at driving only and wants the overload to last:
+//   * a menu (pause, loading, front end: ProfileMode() == 1) is never judged and resets the window; -1 (unknown) counts
+//     as driving, as before the screen was known;
+//   * grace_s seconds after a hold ends, and after a menu closes, nothing is judged (GPU clocks and queues settle);
+//   * a hold needs `windows` high windows IN A ROW (a window that is not high resets the count);
+//   * and only when the governor has nothing left to shed (`allowed`); otherwise the verdict is `deferred`.
+// Pure: time comes in as a number, so the tests drive it with a made-up clock. The caller owns the cvars (HoldRule),
+// the hold in force and its length memory (prev_hold_s / since_end_s), the log lines and the rate limit of `deferred`.
+
+struct HoldRule {
+  int window_s = 2;   // mcla_sim_miss_window_s: a decision window
+  int miss_pct = 10;  // mcla_sim_miss_pct: a window is high above this share of missed frames
+  int windows = 2;    // mcla_sim_hold_windows: consecutive high windows before a hold
+  int grace_s = 4;    // mcla_sim_hold_grace_s: nothing is judged this long after a hold or a menu
+  int min_s = 6;      // mcla_sim_hold30_min_s: the first hold
+  int max_s = 30;     // mcla_sim_hold30_s: the longest hold; 0 = never hold
+  int calm_s = 30;    // mcla_sim_calm_s: seconds after a hold before the next one starts short again
+};
+
+struct HoldVerdict {
+  bool window_ended = false;  // a decision window was judged by this call
+  bool high = false;          // ... and it was high
+  bool start_hold = false;    // start a hold of hold_s seconds now
+  int hold_s = 0;
+  bool deferred = false;      // a hold is due but the governor still has room: do not start
+  int streak = 0;             // consecutive high windows including this one
+  uint64_t frames = 0, missed = 0;  // the judged window
+  double window_s = 0.0;
+};
+
+struct HoldJudge {
+  // The decision window: the frames of the 60 step noted since window_start_ns.
+  bool started = false;
+  int64_t window_start_ns = 0;
+  uint64_t frames = 0, missed = 0;
+  int streak = 0;
+  int64_t grace_until_ns = 0;
+  bool was_menu = false;
+  // Engine frames not judged (one count a Tick), for the 5 s log line (TakeSkipped).
+  uint64_t skipped_menu = 0, skipped_grace = 0, skipped_hold = 0;
+
+  // One frame of the 60 step (the world step quantiser ran): `missed_step` = n >= 2 and not a resync.
+  void NoteStep(bool missed_step) {
+    ++frames;
+    if (missed_step) ++missed;
+  }
+  // Start a new window now (the counts of the old one are dropped).
+  void Restart(int64_t now_ns) {
+    started = true;
+    window_start_ns = now_ns;
+    frames = missed = 0;
+  }
+  // The hold in force ran out: grace_s seconds of nothing, then a fresh window.
+  void EndHold(int64_t now_ns, int grace_s) {
+    grace_until_ns = std::max(grace_until_ns, now_ns + int64_t(std::max(0, grace_s)) * 1'000'000'000);
+    streak = 0;
+    Restart(now_ns);
+  }
+  // The skipped-frame counts since the last call (and clears them).
+  void TakeSkipped(uint64_t* menu, uint64_t* grace, uint64_t* hold) {
+    *menu = skipped_menu;
+    *grace = skipped_grace;
+    *hold = skipped_hold;
+    skipped_menu = skipped_grace = skipped_hold = 0;
+  }
+
+  // Once per engine frame, before that frame's step is noted. `menu` = ProfileMode() == 1; `hold_active` = a hold (30 or
+  // the 120 -> 60 tier) is in force; `allowed` = mcla::gov::HoldAllowed(); `prev_hold_s` / `since_end_s` = the length of
+  // the previous hold and the seconds since it ended (1e9 = never), for HoldSeconds.
+  HoldVerdict Tick(int64_t now_ns, bool menu, bool hold_active, bool allowed, int prev_hold_s, double since_end_s,
+                   const HoldRule& rule) {
+    HoldVerdict v;
+    if (hold_active) {  // it runs out normally; its frames are not judged
+      ++skipped_hold;
+      streak = 0;
+      was_menu = menu;
+      Restart(now_ns);
+      return v;
+    }
+    if (menu) {  // a menu: never judged, and the window starts over when it closes
+      ++skipped_menu;
+      streak = 0;
+      was_menu = true;
+      Restart(now_ns);
+      return v;
+    }
+    if (was_menu) {  // a menu just closed
+      was_menu = false;
+      grace_until_ns = std::max(grace_until_ns, now_ns + int64_t(std::max(0, rule.grace_s)) * 1'000'000'000);
+    }
+    if (now_ns < grace_until_ns) {
+      ++skipped_grace;
+      streak = 0;
+      Restart(now_ns);
+      return v;
+    }
+    if (!started) {
+      Restart(now_ns);
+      return v;
+    }
+    const int64_t window_ns = int64_t(std::max(1, rule.window_s)) * 1'000'000'000;
+    if (now_ns - window_start_ns < window_ns) return v;
+    v.window_ended = true;
+    v.frames = frames;
+    v.missed = missed;
+    v.window_s = double(now_ns - window_start_ns) / 1e9;
+    Restart(now_ns);
+    // Fewer than 30 frames of the 60 step in a window decide nothing (and break a run of high windows).
+    v.high = v.frames >= 30 && v.missed * 100 > v.frames * uint64_t(std::max(0, rule.miss_pct));
+    if (!v.high) {
+      streak = 0;
+      return v;
+    }
+    const int need = std::max(1, rule.windows);
+    streak = std::min(streak + 1, need);
+    v.streak = streak;
+    if (streak < need || rule.max_s <= 0) return v;
+    if (!allowed) {
+      v.deferred = true;  // the streak stays: the first high window after the governor runs out of levels holds
+      return v;
+    }
+    v.hold_s = HoldSeconds(prev_hold_s, since_end_s, rule.min_s, rule.max_s, rule.calm_s);
+    v.start_hold = v.hold_s > 0;
+    if (v.start_hold) streak = 0;
+    return v;
+  }
+};
+
 }  // namespace mcla::sim::math

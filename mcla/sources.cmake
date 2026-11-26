@@ -49,6 +49,11 @@
 #   vis       mcla_vis_ab.cpp (no flag, no codegen entry; the hooks/*.cpp glob below picks it up): the in-run A/B scheduler,
 #             cvar mcla_vis_ab = 'SEC:CVARNAME:VALUE+...' changes cvars at given seconds of one run; mcla::vis::OnFrame() is
 #             called from mcla::gfxtune::OnFrame
+#
+# Not hooks, always compiled (no flag, no [[midasm_hook]] entry; the glob below picks them up): the shared state of a hook
+# group (mcla_t_common.cpp, mcla_ws_common.cpp, mcla_cpu_common.cpp, mcla_gfx_tune.cpp) and the LOCK60 GPU frame governor
+# mcla_gov.cpp (pure logic in mcla_gov_math.h, unit-tested in mcla/tests/test_gov.cpp), called once per engine frame from
+# mcla::sim::OnFrameStart; master switch cvar mcla_gov (off = the game as before).
 set(MCLA_HOOK_DEFINITIONS
     # core
     MCLA_HOOK_HEARTBEAT=1

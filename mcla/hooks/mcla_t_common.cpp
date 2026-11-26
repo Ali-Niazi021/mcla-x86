@@ -27,6 +27,8 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
+#include "mcla_game_state.h"
+#include "mcla_gov.h"
 #include "mcla_guest.h"
 #include "mcla_hooks.h"
 #include "mcla_t_common.h"
@@ -60,19 +62,29 @@ REXCVAR_DEFINE_INT32(mcla_sim_hold30_s, 30, "MCLA",
                      "MCLA timing: at a cap of 60, when more than 10% of the frames of a log window needed "
                      "n >= 2 the world holds a 30 fps cap for this many seconds (a steady 30 beats a 40-50 "
                      "judder). 0 = never");
-REXCVAR_DEFINE_INT32(mcla_sim_pacer, 1, "MCLA",
+REXCVAR_DEFINE_INT32(mcla_sim_pacer, 2, "MCLA",
                      "MCLA timing: the 60 -> 30 rule. 0 = shipped (more than 10% of a 5 s log window missed -> a "
                      "30 hold of mcla_sim_hold30_s). 1 = adaptive (TIMING.md 13): a short window "
                      "(mcla_sim_miss_window_s) with more than mcla_sim_miss_pct % missed drops to 30; the hold "
                      "starts at mcla_sim_hold30_min_s and doubles up to mcla_sim_hold30_s when the misses return "
-                     "within mcla_sim_calm_s of it ending");
-REXCVAR_DEFINE_INT32(mcla_sim_hold30_min_s, 6, "MCLA", "MCLA timing, mcla_sim_pacer 1: the first hold at 30, seconds");
-REXCVAR_DEFINE_INT32(mcla_sim_miss_window_s, 2, "MCLA", "MCLA timing, mcla_sim_pacer 1: the decision window, seconds");
+                     "within mcla_sim_calm_s of it ending. 2 = governed: as 1, but only a drive is judged (a menu, "
+                     "pause or load never is), not for mcla_sim_hold_grace_s after a hold or a menu, only after "
+                     "mcla_sim_hold_windows high windows in a row, and only once the GPU frame governor has shed "
+                     "everything it can (mcla::gov::HoldAllowed)");
+REXCVAR_DEFINE_INT32(mcla_sim_hold30_min_s, 6, "MCLA", "MCLA timing, mcla_sim_pacer 1 and 2: the first hold at 30, seconds");
+REXCVAR_DEFINE_INT32(mcla_sim_miss_window_s, 2, "MCLA", "MCLA timing, mcla_sim_pacer 1 and 2: the decision window, seconds");
 REXCVAR_DEFINE_INT32(mcla_sim_miss_pct, 10, "MCLA",
-                     "MCLA timing, mcla_sim_pacer 1: percent of a window's frames that must be missed to count as high "
+                     "MCLA timing, mcla_sim_pacer 1 and 2: percent of a window's frames that must be missed to count as high "
                      "(measured: GPU 20 ms = 12-16 %, 52-54 fps; 21.8 ms = 25 %, 48 fps; 10 % is about 55 fps)");
 REXCVAR_DEFINE_INT32(mcla_sim_calm_s, 30, "MCLA",
-                     "MCLA timing, mcla_sim_pacer 1: seconds at 60 after a hold before the next drop starts short again");
+                     "MCLA timing, mcla_sim_pacer 1 and 2: seconds at 60 after a hold before the next drop starts short "
+                     "again");
+REXCVAR_DEFINE_INT32(mcla_sim_hold_grace_s, 4, "MCLA",
+                     "MCLA timing, mcla_sim_pacer 2: seconds after a hold ends (and after a menu, pause or load closes) "
+                     "in which no decision window runs: the GPU clocks and queues settle first");
+REXCVAR_DEFINE_INT32(mcla_sim_hold_windows, 2, "MCLA",
+                     "MCLA timing, mcla_sim_pacer 2: a hold starts only after this many CONSECUTIVE high windows (each "
+                     "mcla_sim_miss_window_s seconds); a window that is not high starts the count over");
 REXCVAR_DEFINE_INT32(mcla_sim_log_s, 5, "MCLA",
                      "MCLA timing: seconds between the '[mcla-sim]' check lines (world time against real "
                      "time, n histogram, UI and race clock rates) with mcla_sim60");
@@ -145,6 +157,10 @@ uint64_t g_dec_frames = 0, g_dec_missed = 0;
 int g_prev_hold_s = 0;
 int64_t g_last_hold_end_ns = 0;
 uint64_t g_drops = 0;
+// The governed rule (mcla_sim_pacer 2, LOCK60 A3): the pure judge of mcla_t_sim_math.h; counters under g_mutex.
+math::HoldJudge g_judge;
+int64_t g_defer_log_ns = 0;            // the last "hold deferred" line (at most one in 10 s)
+std::atomic<int> g_last_n{0};          // NextStep's answer of the previous frame, for the GPU frame governor
 std::atomic<uint64_t> g_substep_fail{0};
 // P1 begin: the 120 -> 60 tier (a cap above 60 only). g_mutex for the rest; the flag is read by EffectiveCap.
 std::atomic<bool> g_tier60{false};
@@ -278,15 +294,22 @@ void Report(int64_t now_ns) {
   for (int k = 0; k < kSmoothKinds; ++k) {
     smooth_dt_total[k] = g_smooth_dt[k][0] + g_smooth_dt[k][1] + g_smooth_dt[k][2];
   }
+  // Pacer 2: the engine frames the hold rule did not look at in this window (a menu, the grace after one, a hold).
+  uint64_t not_judged_menu = 0, not_judged_grace = 0, not_judged_hold = 0;
+  g_judge.TakeSkipped(&not_judged_menu, &not_judged_grace, &not_judged_hold);
   REXLOG_INFO("[mcla-sim]   missed {} forced {} sleeps {} ({:.0f} ms) pace-resync {} substep-write-fail {}; "
               "smoothing calls (dt 1/30 : 1/60 : other, changed) cam-pos {}:{}:{} ({}) look-at {}:{}:{} ({}) "
-              "chassis {}:{}:{} ({}); countdown {} (unknown ctx {})",
+              "chassis {}:{}:{} ({}); countdown {} (unknown ctx {}){}",
               w.missed, w.forced, w.sleeps, w.slept_ms, w.pace_resyncs, g_substep_fail.load(),
               uint64_t(g_smooth_dt[0][0]), uint64_t(g_smooth_dt[0][1]), uint64_t(g_smooth_dt[0][2]),
               uint64_t(g_smooth_changed[0]), uint64_t(g_smooth_dt[1][0]), uint64_t(g_smooth_dt[1][1]),
               uint64_t(g_smooth_dt[1][2]), uint64_t(g_smooth_changed[1]), uint64_t(g_smooth_dt[2][0]),
               uint64_t(g_smooth_dt[2][1]), uint64_t(g_smooth_dt[2][2]), uint64_t(g_smooth_changed[2]),
-              cd_calls, cd_unknown);
+              cd_calls, cd_unknown,
+              REXCVAR_GET(mcla_sim_pacer) >= 2
+                  ? fmt::format("; not judged: menu {} grace {} hold {}", not_judged_menu, not_judged_grace,
+                                not_judged_hold)
+                  : std::string());
   (void)smooth_dt_total;
   // P1: the stutter counters of the window (game-thread frame to frame; bench.py and read_device_log.py read it).
   if (w.frame_times.count > 0) {
@@ -315,11 +338,85 @@ void Report(int64_t now_ns) {
   ResetWindow(now_ns);
 }
 
+// g_mutex held. The 120 -> 60 tier starts now, for tier_s seconds (pacers 1 and 2).
+void StartTier60(int64_t now_ns, int tier_s, double pct, double window_s) {
+  g_tier_prev_hold_s = tier_s;
+  g_tier60.store(true);
+  g_tier_until_ns = now_ns + int64_t(tier_s) * 1'000'000'000;
+  g_debt_ms = 0.0;
+  g_deadline_ns = 0;
+  ++g_tier_drops;
+  REXLOG_INFO("[mcla-sim] cap 120 -> 60 (missed {:.0f} % of {:.1f} s): 60 for {} s", pct, window_s, tier_s);
+}
+
+// g_mutex held. The 60 -> 30 hold starts now, for hold_s seconds (pacers 1 and 2).
+void StartHold30(int64_t now_ns, int hold_s, double pct, double window_s) {
+  g_prev_hold_s = hold_s;
+  g_hold30.store(true);
+  g_hold_until_ns = now_ns + int64_t(hold_s) * 1'000'000'000;
+  g_debt_ms = 0.0;
+  g_deadline_ns = 0;
+  ++g_drops;
+  REXLOG_INFO("[mcla-sim] cap 60 -> 30 (missed {:.0f} % of {:.1f} s): the world holds 30 for {} s", pct, window_s,
+              hold_s);
+}
+
+// g_mutex held. The governed rule (mcla_sim_pacer 2), from the pure judge (mcla::sim::math::HoldJudge): the same
+// windows as pacer 1, but only a drive is judged (`menu` = the screen classifier says menu, pause or loading: the window
+// starts over and nothing is counted; unknown counts as a drive), not in the grace after a hold or a menu, a hold needs
+// mcla_sim_hold_windows high windows in a row, and the 60 -> 30 hold needs the GPU frame governor to be out of levels
+// (mcla::gov::HoldAllowed; with it off that is always true). A hold already in force runs out normally.
+// The 120 -> 60 tier uses the same judge (menus, grace, windows in a row) but not the governor's gate: HoldAllowed is the
+// governor's word on the 60 -> 30 hold, and its budget is the 60 fps one. A tier start and a tier end open a grace like a
+// hold's end, so a drop from 120 to 60 is not followed by a 30 hold inside the settling time.
+void DecideGoverned(int64_t now_ns, bool menu) {
+  const bool fine = math::FineGrid(EffectiveCap());
+  // mcla_sim_hold30_s = 0 (never hold), a forced step and a world held at 30 by its cap (no 60 step to judge) never hold.
+  const bool can_hold = REXCVAR_GET(mcla_sim_force_n) == 0 && (fine || math::PeriodQuanta(SettingCap()) == 1);
+  math::HoldRule rule;
+  rule.window_s = REXCVAR_GET(mcla_sim_miss_window_s);
+  rule.miss_pct = REXCVAR_GET(mcla_sim_miss_pct);
+  rule.windows = REXCVAR_GET(mcla_sim_hold_windows);
+  rule.grace_s = REXCVAR_GET(mcla_sim_hold_grace_s);
+  rule.min_s = REXCVAR_GET(mcla_sim_hold30_min_s);
+  rule.max_s = can_hold ? REXCVAR_GET(mcla_sim_hold30_s) : 0;
+  rule.calm_s = REXCVAR_GET(mcla_sim_calm_s);
+  const int prev_hold_s = fine ? g_tier_prev_hold_s : g_prev_hold_s;
+  const int64_t last_end_ns = fine ? g_tier_end_ns : g_last_hold_end_ns;
+  const double since_end_s = last_end_ns ? double(now_ns - last_end_ns) / 1e9 : 1e9;
+  const bool allowed = fine || mcla::gov::HoldAllowed();
+  const math::HoldVerdict v = g_judge.Tick(now_ns, menu, g_hold30.load(), allowed, prev_hold_s, since_end_s, rule);
+  if (!v.window_ended) return;
+  const double pct = v.frames ? 100.0 * double(v.missed) / double(v.frames) : 0.0;
+  if (v.deferred) {
+    if (g_defer_log_ns == 0 || now_ns - g_defer_log_ns >= 10'000'000'000) {
+      g_defer_log_ns = now_ns;
+      REXLOG_INFO("[mcla-sim] hold deferred: governor at level {} (missed {:.0f} % of {:.1f} s)", mcla::gov::Level(), pct,
+                  v.window_s);
+    }
+    return;
+  }
+  if (!v.start_hold) return;
+  if (fine) {
+    StartTier60(now_ns, v.hold_s, pct, v.window_s);
+    g_judge.EndHold(now_ns, rule.grace_s);
+  } else {
+    StartHold30(now_ns, v.hold_s, pct, v.window_s);
+  }
+}
+
 // g_mutex held. The adaptive rule (mcla_sim_pacer 1): every mcla_sim_miss_window_s of real time, decide from the
 // frames of that window whether to drop to 30 (TIMING.md 13). A window with more than mcla_sim_miss_pct % of its
 // frames missed is high; a high window drops at once (no resolution governor on the PC to give room first).
-void DecideHold(int64_t now_ns) {
-  if (REXCVAR_GET(mcla_sim_pacer) == 0) return;
+// Pacer 2 is DecideGoverned above.
+void DecideHold(int64_t now_ns, bool menu) {
+  const int pacer = REXCVAR_GET(mcla_sim_pacer);
+  if (pacer == 0) return;
+  if (pacer >= 2) {
+    DecideGoverned(now_ns, menu);
+    return;
+  }
+  g_judge.started = false;  // the judge's window is stale if the cvar is switched back to 2 later
   const int64_t window_ns = int64_t(std::max(1, REXCVAR_GET(mcla_sim_miss_window_s))) * 1'000'000'000;
   if (g_dec_start_ns == 0 || g_hold30.load()) {
     g_dec_start_ns = now_ns;
@@ -342,13 +439,7 @@ void DecideHold(int64_t now_ns) {
     const double since_end = g_tier_end_ns ? double(now_ns - g_tier_end_ns) / 1e9 : 1e9;
     const int tier_s = math::HoldSeconds(g_tier_prev_hold_s, since_end, REXCVAR_GET(mcla_sim_hold30_min_s),
                                          std::max(1, max_hold), REXCVAR_GET(mcla_sim_calm_s));
-    g_tier_prev_hold_s = tier_s;
-    g_tier60.store(true);
-    g_tier_until_ns = now_ns + int64_t(tier_s) * 1'000'000'000;
-    g_debt_ms = 0.0;
-    g_deadline_ns = 0;
-    ++g_tier_drops;
-    REXLOG_INFO("[mcla-sim] cap 120 -> 60 (missed {:.0f} % of {:.1f} s): 60 for {} s", pct, window_s, tier_s);
+    StartTier60(now_ns, tier_s, pct, window_s);
     return;
   }
   // P1 end
@@ -357,14 +448,7 @@ void DecideHold(int64_t now_ns) {
   const int hold_s = math::HoldSeconds(g_prev_hold_s, since_end, REXCVAR_GET(mcla_sim_hold30_min_s), max_hold,
                                        REXCVAR_GET(mcla_sim_calm_s));
   if (hold_s <= 0) return;
-  g_prev_hold_s = hold_s;
-  g_hold30.store(true);
-  g_hold_until_ns = now_ns + int64_t(hold_s) * 1'000'000'000;
-  g_debt_ms = 0.0;
-  g_deadline_ns = 0;
-  ++g_drops;
-  REXLOG_INFO("[mcla-sim] cap 60 -> 30 (missed {:.0f} % of {:.1f} s): the world holds 30 for {} s", pct, window_s,
-              hold_s);
+  StartHold30(now_ns, hold_s, pct, window_s);
 }
 
 // ---- the pacer's sleep ---------------------------------------------------------------------------
@@ -508,6 +592,7 @@ int NextStep(int* substeps, int* quantum_hz) {
     if (period_q == 1) {
       ++g_dec_frames;
       if (n >= 2 && !resync) ++g_dec_missed;
+      g_judge.NoteStep(n >= 2 && !resync);
     }
   }
   const int subs = forced_substeps >= 1 && forced_substeps <= math::kMaxN ? forced_substeps : math::SubstepsFor(n, cap);
@@ -517,12 +602,18 @@ int NextStep(int* substeps, int* quantum_hz) {
   g_win.world_s += double(n) / double(math::QuantumHz(cap));
   if (substeps) *substeps = subs;
   if (quantum_hz) *quantum_hz = math::QuantumHz(cap);  // P1
+  // The GPU frame governor's missed-frames signal: 1 = on time for the cap in force (n = 2 is on time in a 30 hold, so it
+  // reads 1 there), >= 2 = late, from the same step the world takes.
+  g_last_n.store(n <= period_q ? 1 : n, std::memory_order_relaxed);
   return n;
 }
 
 void OnFrameStart(int64_t now_ns) {
   const bool on = Enabled();
   int64_t wake_ns = 0;  // the steady-clock time the pacer sleeps until (0 = no sleep this frame)
+  // The screen the player is on, before g_mutex (the classifier has its own lock): -1 unknown (counts as a drive), 0 a
+  // drive, 1 a menu, pause or load. Pacer 2 judges drives only; the governor sheds load only in a drive.
+  const int screen_mode = on ? mcla::gamestate::ProfileMode() : -1;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!on) {
@@ -543,6 +634,7 @@ void OnFrameStart(int64_t now_ns) {
       g_debt_ms = 0.0;
       g_last_period_q = 0;
       g_deadline_ns = 0;
+      g_judge = math::HoldJudge{};
       ResetWindow(now_ns);
       REXLOG_INFO("[mcla-sim] on: world step n/60 s (n = 1..4) with n substeps (above a 60 cap: n/120 s, n = 1..8, "
                   "ceil(n/2) substeps); cap {} (mcla_sim_cap {}, mcla_fps_cap {}), "
@@ -569,6 +661,7 @@ void OnFrameStart(int64_t now_ns) {
       g_deadline_ns = 0;
       g_dec_start_ns = now_ns;
       g_dec_frames = g_dec_missed = 0;
+      g_judge.EndHold(now_ns, REXCVAR_GET(mcla_sim_hold_grace_s));
       REXLOG_INFO("[mcla-sim] cap 60 -> 120 (tier over)");
     }
     if (g_hold30.load() && now_ns >= g_hold_until_ns) {
@@ -578,9 +671,10 @@ void OnFrameStart(int64_t now_ns) {
       g_last_hold_end_ns = now_ns;
       g_dec_start_ns = now_ns;
       g_dec_frames = g_dec_missed = 0;
+      g_judge.EndHold(now_ns, REXCVAR_GET(mcla_sim_hold_grace_s));  // pacer 2: nothing is judged while the clocks settle
       REXLOG_INFO("[mcla-sim] cap 30 -> {} (hold over)", SettingCap() > 0 ? SettingCap() : 60);
     }
-    DecideHold(now_ns);
+    DecideHold(now_ns, screen_mode == 1);
     const int log_s = std::max(1, REXCVAR_GET(mcla_sim_log_s));
     if (now_ns - g_win.start_ns >= int64_t(log_s) * 1'000'000'000) {
       Report(now_ns);
@@ -599,6 +693,8 @@ void OnFrameStart(int64_t now_ns) {
       g_deadline_ns = deadline;
     }
   }
+  // The GPU frame governor (mcla_gov.h): once per engine frame, outside g_mutex, before the pacer's sleep.
+  mcla::gov::OnFrame(now_ns, g_last_n.load(std::memory_order_relaxed), screen_mode != 1);
   if (wake_ns > 0) {
     SleepUntil(wake_ns);
   }
