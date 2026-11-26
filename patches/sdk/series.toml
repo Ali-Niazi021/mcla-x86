@@ -872,6 +872,24 @@ purpose = "D3D12/Vulkan: cvar tonemap_transfer_skip (default false): skip the fu
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0700-hdr-dump"
+source = "local"
+path = "patches/sdk/0700-hdr-dump.patch"
+sha256 = "2f97980ed74ff97d4c0f7765b4f4b734edffebe53541a3aea37d6fa2f497e6e3"
+purpose = "D3D12 presenter: cvars hdr_dump_dir / hdr_dump_at / hdr_dump_every_s (off by default): the presented back buffer (HDR10 R10G10B10A2 or SDR B8G8R8A8) is copied to a readback buffer and written as <dir>/hdr_<frame>_<t>s.dds + .json (the presenter's HDR levels and the display's DXGI levels) for tools/hdr/hdr_analyze.py. One-frame stall per dump; one atomic load per paint when off."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0710-hdr-fused-scene"
+source = "local"
+path = "patches/sdk/0710-hdr-fused-scene.patch"
+sha256 = "d1048c733e08c445cfa3cd778d99ea2693269be79cbb99dfd981de35f05185cd"
+purpose = "HDR at about SDR cost (D3D12): hdr_scene_fused (default true) computes Renan's HDR scene inside the swap's refresher from the tone map inputs captured at the tone map draw (texture-cache content serial guards them), UI by difference, refresher source from the front buffer's render target via 04a0; hdr_scene_fused_check=N proves it against the old passes (hdr3: 0 mismatches); hdr_trim (default true) and hdr_ui_mode (layer|diff) for the UI-layer path. hdr3: +0.1-0.3 ms GPU over SDR at 1080p vs +1.8 ms for the old path (hdr2). Additive texture-cache API: content serial, FindTexture, CaptureActiveTexture/UseCapturedTexture."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]

@@ -1,0 +1,2680 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Wed, 25 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0710: HDR at SDR cost on the 880M: the HDR scene computed inside the swap's refresher (hdr_scene_fused), UI by difference, refresher source straight from the front buffer's render target, trims of the UI-layer path (hdr_trim, hdr_ui_mode)
+
+Source: Ours, written for this SDK (stream HDR) on top of Renan Queiroz's rexglue-hdr-output / -hdr-ui-layer /
+  -hdr-scene-mcla (GPL-3, unchanged in the series; this patch changes their code paths) and our 04a0 (swap_direct_present).
+  The scene math is Renan's hdr_scene_mcla.cs.xesl moved into hdr_scene_mcla.xesli unchanged (its DXBC is byte-identical).
+  DXBC built with fxc 10.0.26100 (Renan's recipe, D3D12 only; Vulkan SPIR-V untouched: Vulkan keeps the old paths).
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: Renan's HDR (UI separated into a layer + an RGBA16F HDR scene image + a copy of the tone map output, all composed
+  in the swap's refresher) costs ~1.8 ms GPU per frame at 1080p on the Radeon 880M (bandwidth-bound; run hdr2: GPU busy
+  median 16.71 ms vs 14.93 SDR). This patch makes it ~0.1-0.3 ms (run hdr3: fused 13.41 ms vs SDR 13.13 median, +0.10 mean):
+  * hdr_scene_fused (bool, default true; D3D12): at the tone map draw nothing is drawn: its four inputs (FP16 scene, blur,
+    bloom, adapted luminance) and constants are captured (resource refs + SRV descs; a texture-cache content serial,
+    bumped by every load and dual-write resolve, proves at the swap that none was rewritten, else that frame keeps the
+    8-bit scene, logged). The refresher (new variant hdr_refresh_fused.cs) computes the HDR scene per pixel inline with the
+    same math and also the game's own 8-bit tone map result, which stands in for the tone map copy in the glow test.
+    The UI goes by difference against one pre-UI snapshot (composite 1). No FP16 scene image, no tone-map copy, no
+    UI-layer clear/copy/restore.
+  * hdr_scene_fused_check (int N, default 0): every Nth fused frame the old passes run too and a compute counts the
+    differences (readback, no stall): run hdr3, 84 checks: 0 scene mismatches (max rel 0), 0 tone map pixels off by more
+    than one code (8.7 % one code off, inside the glow test's 1.5/255 tolerance).
+  * The HDR refresher reads the front buffer from its host render target through 04a0's record instead of loading the
+    swap texture (counted in 04a0's 10 s line as "made from the render target").
+  * hdr_trim (bool, default true; D3D12): for the UI-layer path (hdr_scene_fused=false or Vulkan): skip the swap texture
+    load when the refresher does not read it, skip the UI-layer clear when one copy covers the output, alias the underlay
+    to its snapshot when the copy is a whole-output identity (run hdr2: -0.44 ms).
+  * hdr_ui_mode (layer | diff, default layer): the UI by difference without the fused scene.
+  Logs once per change: "HDR: scene fused into the refresher (...)", "HDR: trim (...)", "HDR: fused check #k: ...".
+  Off (hdr off): no new work. Also: the textures this path doesn't use are never created.
+Bucket: REDO
+
+Edits outside the HDR code (additive): TextureCache::Texture content serial + FindTexture
+(pipeline/texture/cache.h/.cpp), D3D12TextureCache::CaptureActiveTexture / UseCapturedTexture (d3d12/texture_cache.*).
+---
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index 2067c9dd..4be25a87 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -273,6 +273,18 @@ class CommandProcessor {
+     bool failed = false;      // separation ended for this frame
+     bool ui_layer_cleared = false;
+     uint64_t captured_area = 0;  // screen pixels copied to the textures
++    // hdr_trim and hdr_ui_mode, read at kUIBegin.
++    bool trim = false;  // the backend supports it, and the cvar is on
++    bool diff = false;  // hdr_ui_mode diff: failed from the start (nothing separated), silently
++    // kHdrTextureUnderlay isn't written: its content is that of
++    // kHdrTextureUnderlayRt (a copy of the whole output to itself was skipped),
++    // and the refresher reads that texture as the underlay. Cleared (by copying)
++    // before anything writes either texture again.
++    bool underlay_is_rt = false;
++    // What hdr_trim did this frame, for the log (HdrTrimWhy).
++    uint8_t trim_swap_load = 0;
++    uint8_t trim_layer_clear = 0;
++    uint8_t trim_underlay_copy = 0;
+     // The output size the textures were filled at (hdr_output_width_ then).
+     uint32_t width = 0;
+     uint32_t height = 0;
+@@ -282,6 +294,13 @@ class CommandProcessor {
+     // The output size they were filled at.
+     uint32_t scene_width = 0;
+     uint32_t scene_height = 0;
++    // hdr_scene_fused (HdrSceneFusedSupported): the tone map draw's inputs and constants were kept
++    // for the swap's refresher, which makes the HDR scene and the tone map's 8-bit output
++    // from them where the scene is visible, in place of kHdrTextureScene and kHdrTextureTonemap
++    // (which aren't this frame's, unless hdr_scene_fused_check made them too: then `scene` is set).
++    // The UI goes by difference then, whatever hdr_ui_mode says. scene_width and scene_height are
++    // the size of the output the inputs are read at.
++    bool scene_fused = false;
+     // Why there is no HDR scene this frame (HdrSceneCheck), and the shaders of
+     // the tone map phase's first colour draw, for the log.
+     uint32_t scene_check = 0;
+@@ -304,6 +323,39 @@ class CommandProcessor {
+   // For the refresher, at the guest output's size. Logs when it changes.
+   HdrComposite HdrGetComposite(uint32_t output_width, uint32_t output_height);
+   HdrComposite hdr_last_composite_ = HdrComposite::kWholeFrame;
++  // Whether the refresher (hdr_refresh.cs.xesl) reads the front buffer for a
++  // composite and hdr_debug_ui view (HdrRefreshFlags): the UI layer's composite
++  // doesn't, unless a debug view shows it.
++  bool HdrRefresherReadsFrontBuffer(HdrComposite composite, uint32_t debug_ui) const;
++  // hdr_trim: what was skipped, and why a thing wasn't (HdrFrame::trim_*).
++  enum HdrTrimWhy : uint8_t {
++    kHdrTrimNotReached,  // nothing to decide in this frame
++    kHdrTrimDone,        // skipped
++    kHdrTrimOff,         // hdr_trim is off
++    kHdrTrimNotLayer,    // the frame isn't put together from the UI layer
++    kHdrTrimDebugView,   // a debug view shows the front buffer
++    kHdrTrimFrameGeneration,  // frame generation is on for the frame
++    kHdrTrimSwapInfo,    // the swap's texture isn't a plain 8_8_8_8 one at 1x: it's loaded for its size
++    kHdrTrimNoLayerCopy,  // nothing is copied to the UI layer (no UI over the area)
++    kHdrTrimPartial,     // the copy doesn't cover the whole output
++    kHdrTrimFromTarget,  // skipped: the refresher reads the front buffer's host render target (swap_direct_present)
++    kHdrTrimCount,
++  };
++  // Logs the frame's trim when it changes from the last frame of the same kind
++  // (the composite).
++  void HdrLogTrim();
++  uint32_t hdr_last_trim_[4] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
++  // hdr_ui_mode: logs when it changes (0 layer, 1 difference by the setting, 2 difference for the
++  // fused scene).
++  uint32_t hdr_last_ui_mode_ = 0;
++  // Backends' trims (HdrTrimSupported): the refresher binds
++  // kHdrTextureUnderlayRt for the underlay if HdrFrame::underlay_is_rt, and
++  // skips the swap texture's load when HdrRefresherReadsFrontBuffer is false.
++  virtual bool HdrTrimSupported() const { return false; }
++  // hdr_scene_fused: whether the backend can keep the tone map draw's inputs for its refresher
++  // (HdrFrame::scene_fused) in place of making the scene image after the draw. The cvar and this.
++  virtual bool HdrSceneFusedSupported() const { return false; }
++  bool HdrSceneFusedWanted() const;
+   // The refresher's flags (hdr_refresh.cs.xesl), bits 3:10 and the glows' gain,
+   // for a composite and the hdr_debug_ui view.
+   void HdrRefreshFlags(HdrComposite composite, uint32_t debug_ui, uint32_t flags_out[2]) const;
+@@ -606,6 +658,13 @@ class CommandProcessor {
+   uint32_t HdrColorTargetKey(uint32_t rt_index) const;
+   bool HdrBeforeDraw();
+   void HdrBeforeResolve();
++  // The underlay of a resolved area from the snapshot (kHdrTextureUnderlayRt):
++  // a copy to kHdrTextureUnderlay, or with hdr_trim none for a copy of the whole
++  // output (HdrFrame::underlay_is_rt).
++  bool HdrCopyUnderlay(const HdrRect& rect, uint32_t dest_x, uint32_t dest_y);
++  // Makes kHdrTextureUnderlay what HdrFrame::underlay_is_rt stands for, before a
++  // write to either texture.
++  void HdrMaterializeUnderlay();
+   enum class HdrFailure {
+     kFormat,             // the UI's target isn't 8_8_8_8 at 1x or 4x
+     kBlend,              // a blend other than SrcAlpha or One / InvSrcAlpha
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 1e5381fb..97bdc448 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -726,6 +726,10 @@ class D3D12CommandProcessor : public CommandProcessor {
+   void HdrDrawResolutionScale(uint32_t& x, uint32_t& y) const override;
+   uint32_t HdrEdramTileCount() const override;
+   bool HdrHostRenderTargets() const override;
++  // hdr_trim: the refresher reads kHdrTextureUnderlayRt in place of kHdrTextureUnderlay
++  // (HdrFrame::underlay_is_rt), and the swap's front buffer isn't loaded when it reads the
++  // UI layer instead (IssueSwap).
++  bool HdrTrimSupported() const override { return true; }
+   void HdrReleaseTextures() override;
+   ID3D12Resource* HdrGetTexture(HdrTexture texture);
+   void HdrWriteTextureSRV(HdrTexture texture, D3D12_CPU_DESCRIPTOR_HANDLE handle);
+@@ -737,6 +741,70 @@ class D3D12CommandProcessor : public CommandProcessor {
+   Microsoft::WRL::ComPtr<ID3D12PipelineState> hdr_scene_pipeline_;
+   Microsoft::WRL::ComPtr<ID3D12Resource> hdr_textures_[kHdrTextureCount];
+ 
++  // hdr_scene_fused (hdr_refresh_fused.cs, hdr_refresh_fused_check.cs): in place of the pass above and the copy
++  // of the tone map draw's output, the draw's inputs are kept (HdrCaptureScene, no GPU work) and the swap's
++  // refresher makes the scene where it's visible, from them. HdrRefreshConstants, then the pass's constants.
++  struct HdrRefreshFusedConstants {
++    HdrRefreshConstants refresh;
++    HdrSceneConstants scene;
++  };
++  bool HdrSceneFusedSupported() const override { return hdr_refresh_fused_pipeline_ != nullptr; }
++  Microsoft::WRL::ComPtr<ID3D12RootSignature> hdr_refresh_fused_root_signature_;
++  Microsoft::WRL::ComPtr<ID3D12PipelineState> hdr_refresh_fused_pipeline_;
++  // The same and three tables more: the old pass's image (t7) and the tone map's output copy (t8), and the
++  // counts (u1) of hdr_scene_fused_check.
++  Microsoft::WRL::ComPtr<ID3D12RootSignature> hdr_refresh_fused_check_root_signature_;
++  Microsoft::WRL::ComPtr<ID3D12PipelineState> hdr_refresh_fused_check_pipeline_;
++  // What the tone map draw read, until the swap (the scene, motion blur, bloom, adapted luminance) and its
++  // constants. The textures' resources are held; the swap checks that the cache's textures are still these,
++  // with the data they had (D3D12TextureCache::UseCapturedTexture).
++  struct HdrFusedScene {
++    bool valid = false;
++    // One of hdr_scene_fused_check's frames: the old pass and the copy were made too.
++    bool check = false;
++    D3D12TextureCache::HdrTextureCapture textures[4];
++    HdrSceneConstants constants = {};
++  };
++  HdrFusedScene hdr_fused_;
++  // After the tone map draw: keeps its inputs (the frame's HdrFrame::scene_fused); false, with the reason
++  // logged when it changes, if they can't be (the old pass is run then).
++  bool HdrCaptureScene(const D3D12Shader& vertex_shader, const D3D12Shader& pixel_shader);
++  // At the swap, for a refresher that can use them: whether the captured textures are still what the draw read
++  // (their barriers are pushed); why_not_out is a string literal if not.
++  bool HdrUseFusedScene(const char*& why_not_out);
++  // Logs the fused scene's state when it changes: why_not (a string literal) if it isn't used, else what the
++  // captured textures are (signature: of their formats and sizes). A state that flips often is logged at most
++  // once in 2 s, with the number of changes left out.
++  void HdrNoteFusedScene(const char* why_not, uint64_t signature);
++  bool hdr_fused_noted_ = false;
++  const char* hdr_fused_noted_why_ = nullptr;
++  uint64_t hdr_fused_noted_signature_ = 0;
++  uint64_t hdr_fused_note_last_ms_ = 0;
++  uint32_t hdr_fused_note_suppressed_ = 0;
++  // hdr_scene_fused_check: the counts of the pixels the fused scene differs at (a buffer the check refresher
++  // writes, copied to a readback buffer in the swap's submission, read once that has completed).
++  bool HdrEnsureFusedCheckBuffers();
++  void HdrRecordFusedCheck(const HdrRefreshFusedConstants& constants,
++                           const ui::d3d12::util::DescriptorCpuGpuHandlePair* descriptors,
++                           const ui::d3d12::util::DescriptorCpuGpuHandlePair& destination,
++                           const ui::d3d12::util::DescriptorCpuGpuHandlePair& source,
++                           const ui::d3d12::util::DescriptorCpuGpuHandlePair& ramp,
++                           uint32_t group_count_x, uint32_t group_count_y);
++  void HdrCollectFusedCheck();
++  uint64_t hdr_fused_check_counter_ = 0;
++  uint64_t hdr_fused_check_number_ = 0;
++  Microsoft::WRL::ComPtr<ID3D12Resource> hdr_fused_check_counts_;
++  Microsoft::WRL::ComPtr<ID3D12Resource> hdr_fused_check_zero_;
++  Microsoft::WRL::ComPtr<ID3D12Resource> hdr_fused_check_readback_[2];
++  struct HdrFusedCheckPending {
++    bool pending = false;
++    uint64_t submission = 0;
++    uint64_t number = 0;
++    uint64_t pixels = 0;
++  };
++  HdrFusedCheckPending hdr_fused_check_pending_[2];
++  uint32_t hdr_fused_check_next_slot_ = 0;
++
+   // Temporal anti-aliasing (rexglue-temporal-aa.patch, d3d12/temporal_aa.cpp):
+   // before the anti-aliasing draw, after its textures were requested, the
+   // motion vectors (taa_motion_vectors_mcla.cs: a constant buffer, and t0, t1
+diff --git a/include/rex/graphics/d3d12/texture_cache.h b/include/rex/graphics/d3d12/texture_cache.h
+index d9183437..764dfec5 100644
+--- a/include/rex/graphics/d3d12/texture_cache.h
++++ b/include/rex/graphics/d3d12/texture_cache.h
+@@ -270,6 +270,31 @@ class D3D12TextureCache final : public TextureCache {
+   };
+   bool GetSwapTextureInfo(SwapTextureInfo& info_out, const char*& why_not_out);
+ 
++  // LOCAL PATCH - MCLA (hdr_scene_fused): what a draw's texture binding read, kept past the draw (the tone map
++  // draw's inputs are read again, by the swap's refresher). The resource is held; the view is made again with the
++  // same description (CaptureActiveTexture mirrors what WriteActiveTextureBindfulSRV binds for a plain 2D
++  // texture). UseCapturedTexture says whether the texture is still the cache's, with the data it had.
++  struct HdrTextureCapture {
++    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
++    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
++    TextureKey key;
++    const void* texture = nullptr;
++    uint32_t content_serial = 0;
++    // For logging.
++    xenos::TextureFormat format = xenos::TextureFormat::k_8_8_8_8;
++    uint32_t width = 0;
++    uint32_t height = 0;
++  };
++  // Only a plain 2D texture. False, with why_not_out (a string literal), if the binding isn't one the
++  // refresher can read again.
++  bool CaptureActiveTexture(const D3D12Shader::TextureBinding& host_shader_binding,
++                            HdrTextureCapture& capture_out, const char*& why_not_out);
++  // True if the capture's texture is still in the cache, is the same one (its resource, too), and its data was
++  // not written since (a load, or a resolve that wrote it): then it's marked as used (it isn't destroyed while
++  // the submission is on the GPU) and transitioned to the state the capture's view reads it in (the barrier is
++  // pushed, not submitted).
++  bool UseCapturedTexture(const HdrTextureCapture& capture);
++
+  protected:
+   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
+   bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index 8afe26ab..36e3e0f6 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -235,6 +235,11 @@ class TextureCache {
+     static constexpr uint32_t kOutdatedBitBase = UINT32_C(1) << 0;
+     static constexpr uint32_t kOutdatedBitMips = UINT32_C(1) << 1;
+     uint32_t outdated_mask() const { return outdated_mask_.load(std::memory_order_acquire); }
++    // LOCAL PATCH - MCLA (hdr_scene_fused): changes every time the texture's data is made up to date
++    // (a load from the memory, or a write by a resolve along with the memory: MakeUpToDateAndWatch), so
++    // that a user that keeps the texture past the draw it was requested for can tell whether what it
++    // read is still there.
++    uint32_t content_serial() const { return content_serial_.load(std::memory_order_acquire); }
+ 
+     bool base_outdated(const std::unique_lock<std::recursive_mutex>& global_lock) const {
+       return base_outdated_;
+@@ -288,6 +293,7 @@ class TextureCache {
+     // Whether the recent mip data needs reloading from the memory.
+     bool mips_outdated_ = false;
+     std::atomic<uint32_t> outdated_mask_{0};
++    std::atomic<uint32_t> content_serial_{0};
+     // Watch handles for the memory ranges.
+     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
+     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
+@@ -559,6 +565,12 @@ class TextureCache {
+   // create the texture - if it's nullptr, occasionally a recreation attempt
+   // should be made.
+   Texture* FindOrCreateTexture(TextureKey key);
++  // LOCAL PATCH - MCLA (hdr_scene_fused): the texture of the cache with this key, if there is one
++  // (nothing is created). The thread of the command processor only, like textures_.
++  Texture* FindTexture(const TextureKey& key) const {
++    auto it = textures_.find(key);
++    return it != textures_.end() ? it->second.get() : nullptr;
++  }
+ 
+   // resolve_dual_write (Direct3D 12): the textures of the cache (the ones in its usage list) that
+   // have resolved_unscaled in their keys and the base at the page, in no particular order, up to
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 15a5ec75..6b29e6fb 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -87,6 +87,36 @@ REXCVAR_DEFINE_DOUBLE(mcla_hdr_knee, 0.6, "GPU",
+                       "HDR output: where the HDR curve leaves the game's, in its linear units "
+                       "(1 = its white)")
+     .range(0.1, 0.95);
++REXCVAR_DEFINE_BOOL(hdr_trim, true, "GPU",
++                    "HDR output: skip the copies and clears of a frame that the picture doesn't "
++                    "depend on (the swap's front buffer load when the refresher reads the UI layer "
++                    "instead, the UI layer's clear when its first copy covers the whole output, the "
++                    "underlay's copy when the refresher can read the snapshot itself); about 180 "
++                    "MB of memory traffic a frame at 1080p. Off: every copy is made as before");
++REXCVAR_DEFINE_BOOL(hdr_scene_fused, true, "GPU",
++                    "HDR output (Direct3D 12): the swap's refresher makes the HDR scene itself, where "
++                    "it's visible, from the tone map draw's own inputs (kept from the draw), instead "
++                    "of a pass after the draw that writes a 16-bit float image of the scene and a copy "
++                    "of the draw's output (and the UI goes by difference with the front buffer, as with "
++                    "hdr_ui_mode diff). Saves about 58 MB of memory traffic a frame at 1080p and two "
++                    "passes; the picture is the same (hdr_scene_fused_check proves it). Off, or with "
++                    "frame generation, or when the inputs changed before the swap: the passes as "
++                    "before");
++REXCVAR_DEFINE_INT32(hdr_scene_fused_check, 0, "GPU",
++                     "Development: every this many frames (0: never) in which the fused scene is "
++                     "used, the old scene pass and the copy of the tone map's output are made too and "
++                     "the refresher's own scene is compared with them at every pixel (counted on the "
++                     "GPU, read back a few frames later, no stall): the log says 'HDR: fused check #k: "
++                     "tone map mismatches M of N px (max d), scene mismatches S (max rel r)'")
++    .range(0, 100000);
++REXCVAR_DEFINE_STRING(hdr_ui_mode, "layer", "GPU",
++                      "HDR output: how the game's UI is told from its scene: layer (the UI is "
++                      "collected in a separate target and composited over the HDR scene) or diff "
++                      "(the cheaper way: the front buffer is the UI where it differs from the "
++                      "scene's snapshot taken before the UI's first blended draw; the UI's edges "
++                      "and its blended areas that look like the scene are less exact, and frame "
++                      "generation isn't used)")
++    .allowed({"layer", "diff"});
+ 
+ REXCVAR_DEFINE_UINT32(gpu_memory_log_ms, 0, "GPU",
+                       "Every this many milliseconds, log the video memory the process uses and its "
+@@ -1629,6 +1659,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+   ui::LowLatency::OnRenderSwapDone();
+   HdrLogSceneCheck();
++  HdrLogTrim();
+   hdr_frame_ = HdrFrame();
+   TaaEndFrame();
+   // The HDR textures (about 200 MB at 3x) aren't kept while HDR output stays
+@@ -1682,6 +1713,30 @@ void CommandProcessor::OnGuestMarker(uint32_t kind, [[maybe_unused]] uint32_t va
+         hdr_frame_.ui_target = HdrColorTargetKey(0);
+         hdr_frame_.width = hdr_output_width_;
+         hdr_frame_.height = hdr_output_height_;
++        hdr_frame_.trim = HdrTrimSupported() && REXCVAR_GET(hdr_trim);
++        const bool ui_diff_setting =
++            rex::cvar::GetFlagByName("hdr_ui_mode") == "diff";  // locked: may be set at run time
++        // The fused scene's refresher puts the frame together from the front buffer and the
++        // underlay: the UI goes by difference.
++        hdr_frame_.diff = ui_diff_setting || hdr_frame_.scene_fused;
++        if (hdr_frame_.diff) {
++          // The UI by difference: the separation is never started. The frame
++          // takes the failure's way (the underlay snapshot at the first blended
++          // draw of the UI, the front buffer against it in the refresher), but
++          // it's the setting, not a failure: not logged as one.
++          hdr_frame_.failed = true;
++        }
++        const uint32_t ui_mode = !hdr_frame_.diff ? 0 : (ui_diff_setting ? 1 : 2);
++        if (ui_mode != hdr_last_ui_mode_) {
++          hdr_last_ui_mode_ = ui_mode;
++          if (ui_mode == 1) {
++            REXGPU_INFO("HDR: UI by difference (hdr_ui_mode=diff)");
++          } else if (ui_mode == 2) {
++            REXGPU_INFO("HDR: UI by difference (the fused scene, hdr_scene_fused)");
++          } else {
++            REXGPU_INFO("HDR: UI as a layer (hdr_ui_mode=layer)");
++          }
++        }
+       }
+       break;
+     default:
+@@ -1693,9 +1748,10 @@ CommandProcessor::HdrComposite CommandProcessor::HdrGetComposite(uint32_t output
+                                                                  uint32_t output_height) {
+   // The HDR scene only at the size it was made at (the output's size changed
+   // since: the refresher would read past its textures).
+-  if (hdr_frame_.scene &&
++  if ((hdr_frame_.scene || hdr_frame_.scene_fused) &&
+       (hdr_frame_.scene_width != output_width || hdr_frame_.scene_height != output_height)) {
+     hdr_frame_.scene = false;
++    hdr_frame_.scene_fused = false;
+   }
+   HdrComposite composite = HdrComposite::kWholeFrame;
+   if (hdr_frame_.ui && hdr_frame_.width == output_width && hdr_frame_.height == output_height &&
+@@ -1737,12 +1793,84 @@ void CommandProcessor::HdrRefreshFlags(HdrComposite composite, uint32_t debug_ui
+   }
+   uint32_t flags = (uint32_t(debug_ui == 1) << 5) | (uint32_t(debug_ui == 7) << 10) |
+                    (uint32_t(debug_ui == 8) << 11);
+-  if (hdr_frame_.scene && composite != HdrComposite::kWholeFrame) {
++  // (The fused scene's refresher has no HdrComposite::kLayer or debug view that reads the images:
++  // those frames aren't fused.)
++  if ((hdr_frame_.scene || hdr_frame_.scene_fused) && composite != HdrComposite::kWholeFrame) {
+     flags |= 1u << 9;
+   }
+   flags_out[0] = flags | (composite == HdrComposite::kScene ? 1u << 8 : uint32_t(composite) << 3);
+ }
+ 
++bool CommandProcessor::HdrRefresherReadsFrontBuffer(HdrComposite composite,
++                                                    uint32_t debug_ui) const {
++  // As HdrRefreshFlags sets the flags and hdr_refresh.cs.xesl reads xe_hdr_refresh_source:
++  // the debug view that shows the front buffer (hdr_debug_ui 6) and the game's own frame
++  // (2) read it; the other debug views read the UI layer, the underlay or the other
++  // textures; of the composites only the UI layer's (2) doesn't read it.
++  if (debug_ui >= 3 && debug_ui <= 6) {
++    return debug_ui == 6;
++  }
++  if (debug_ui == 2) {
++    return true;
++  }
++  return composite != HdrComposite::kLayer;
++}
++
++bool CommandProcessor::HdrSceneFusedWanted() const {
++  return REXCVAR_GET(hdr_scene_fused) && HdrSceneFusedSupported();
++}
++
++void CommandProcessor::HdrLogTrim() {
++  // Only the frames the backend's refresher decided the swap texture's load of (HDR output
++  // used), by the kind of frame.
++  if (!hdr_frame_.trim_swap_load) {
++    return;
++  }
++  uint32_t kind = uint32_t(hdr_last_composite_);
++  uint32_t state = uint32_t(hdr_frame_.trim_swap_load) |
++                   (uint32_t(hdr_frame_.trim_layer_clear) << 8) |
++                   (uint32_t(hdr_frame_.trim_underlay_copy) << 16);
++  if (kind >= std::size(hdr_last_trim_) || hdr_last_trim_[kind] == state) {
++    return;
++  }
++  hdr_last_trim_[kind] = state;
++  static const char* const kReasons[] = {
++      "",
++      "",
++      "hdr_trim is off",
++      "the frame isn't put together from the UI layer",
++      "a debug view shows the front buffer",
++      "frame generation is on",
++      "the swap's texture isn't a plain 8_8_8_8 one at 1x, so it's loaded to know its size",
++      "no UI over the area, nothing is copied to the UI layer",
++      "the copy doesn't cover the whole output",
++      ""};
++  static_assert(std::size(kReasons) == size_t(kHdrTrimCount));
++  static const char* const kCuts[] = {"swap texture load", "UI layer clear", "underlay copy"};
++  static const char* const kFrames[] = {"the front buffer as SDR", "the difference mask",
++                                        "the UI layer", "the front buffer as the scene"};
++  const uint8_t whys[] = {hdr_frame_.trim_swap_load, hdr_frame_.trim_layer_clear,
++                          hdr_frame_.trim_underlay_copy};
++  std::string text;
++  for (size_t i = 0; i < std::size(whys); ++i) {
++    if (whys[i] == kHdrTrimNotReached || whys[i] >= kHdrTrimCount) {
++      continue;
++    }
++    if (!text.empty()) {
++      text += ", ";
++    }
++    text += kCuts[i];
++    if (whys[i] == kHdrTrimDone) {
++      text += " skipped";
++    } else if (whys[i] == kHdrTrimFromTarget) {
++      text += " skipped (the refresher reads the front buffer's render target)";
++    } else {
++      text += std::string(" not skipped (") + kReasons[whys[i]] + ")";
++    }
++  }
++  REXGPU_INFO("HDR: trim (frames put together from {}): {}", kFrames[kind], text);
++}
++
+ namespace {
+ // MCLA's tone map draw (hdr_scene_mcla.cs.xesl): its shaders, and its texture
+ // fetch constants as the pass was written against them (2D textures, the
+@@ -2148,6 +2276,9 @@ void CommandProcessor::HdrRenderTargetsReady() {
+   // The underlay and the clear cover what the output can show.
+   uint32_t key = hdr_frame_.ui_target;
+   HdrRect rect = {0, 0, hdr_output_width_, hdr_output_height_};
++  // The snapshot overwrites kHdrTextureUnderlayRt: the underlay that stands for it is made
++  // before (a tiled pass's later tile, or a second resolve of the whole output).
++  HdrMaterializeUnderlay();
+   hdr_frame_.snapshot = HdrCopyFromColorTarget(key, kHdrTextureUnderlayRt, rect, 0, 0);
+   if (pending == HdrPending::kStart) {
+     if (hdr_frame_.snapshot && HdrClearColorTarget(key, rect)) {
+@@ -2242,24 +2373,46 @@ void CommandProcessor::HdrBeforeResolve() {
+     hdr_frame_.snapshot = false;
+     return;
+   }
+-  if (!hdr_frame_.ui_layer_cleared) {
++  // The UI layer is cleared once, before the first copy to it (not by difference: the
++  // layer isn't used then). With hdr_trim not when that copy covers all of the texture
++  // (its output size at 0, 0): it's overwritten, and cleared after all if that copy fails.
++  bool layer_clear_skipped = false;
++  if (!hdr_frame_.ui_layer_cleared && !hdr_frame_.diff) {
+     hdr_frame_.ui_layer_cleared = true;
+-    if (!HdrClearTexture(kHdrTextureUiLayer)) {
++    if (HdrTrimSupported()) {
++      HdrTrimWhy why = kHdrTrimDone;
++      if (!hdr_frame_.trim) {
++        why = kHdrTrimOff;
++      } else if (!hdr_frame_.started) {
++        why = kHdrTrimNoLayerCopy;
++      } else if (dest_x || dest_y || rect.width != hdr_output_width_ ||
++                 rect.height != hdr_output_height_) {
++        why = kHdrTrimPartial;
++      }
++      hdr_frame_.trim_layer_clear = why;
++      layer_clear_skipped = why == kHdrTrimDone;
++    }
++    if (!layer_clear_skipped && !HdrClearTexture(kHdrTextureUiLayer)) {
+       HdrFail(HdrFailure::kTexture);
+     }
+   }
+   bool copied;
+   if (hdr_frame_.started) {
+     // The UI, the underlay, and the target put back for the resolve.
+-    copied = HdrCopyFromColorTarget(key, kHdrTextureUiLayer, rect, dest_x, dest_y) &&
+-             HdrCopyTexture(kHdrTextureUnderlayRt, kHdrTextureUnderlay, rect, dest_x, dest_y);
++    copied = HdrCopyFromColorTarget(key, kHdrTextureUiLayer, rect, dest_x, dest_y);
++    if (!copied && layer_clear_skipped && !HdrClearTexture(kHdrTextureUiLayer)) {
++      HdrFail(HdrFailure::kTexture);
++    }
++    copied = copied && HdrCopyUnderlay(rect, dest_x, dest_y);
+     if (!HdrRestoreColorTarget(key, {0, 0, hdr_output_width_, hdr_output_height_})) {
+       HdrFail(HdrFailure::kRestore);
+     }
+   } else if (hdr_frame_.snapshot) {
+-    copied = HdrCopyTexture(kHdrTextureUnderlayRt, kHdrTextureUnderlay, rect, dest_x, dest_y);
++    copied = HdrCopyUnderlay(rect, dest_x, dest_y);
+   } else {
+-    // No UI over this area.
++    // No UI over this area. kHdrTextureUnderlay is written, so the one that stands for
++    // the snapshot is made first.
++    HdrMaterializeUnderlay();
+     copied = HdrCopyFromColorTarget(key, kHdrTextureUnderlay, rect, dest_x, dest_y);
+   }
+   if (copied) {
+@@ -2269,6 +2422,48 @@ void CommandProcessor::HdrBeforeResolve() {
+   hdr_frame_.snapshot = false;
+ }
+ 
++bool CommandProcessor::HdrCopyUnderlay(const HdrRect& rect, uint32_t dest_x, uint32_t dest_y) {
++  if (HdrTrimSupported()) {
++    // hdr_trim: the copy of the whole output to the same place (the snapshot is the
++    // output's size) would only make a second copy of the snapshot: the refresher reads
++    // the snapshot as the underlay instead. The snapshot isn't written again before the
++    // refresher reads it (HdrMaterializeUnderlay, before the next one).
++    HdrTrimWhy why = kHdrTrimDone;
++    if (!hdr_frame_.trim) {
++      why = kHdrTrimOff;
++    } else if (rect.x || rect.y || dest_x || dest_y || rect.width != hdr_output_width_ ||
++               rect.height != hdr_output_height_) {
++      why = kHdrTrimPartial;
++    }
++    // One copy that isn't skipped is what the log tells.
++    if (hdr_frame_.trim_underlay_copy == kHdrTrimNotReached ||
++        hdr_frame_.trim_underlay_copy == kHdrTrimDone) {
++      hdr_frame_.trim_underlay_copy = why;
++    }
++    if (why == kHdrTrimDone) {
++      hdr_frame_.underlay_is_rt = true;
++      return true;
++    }
++  }
++  // A part of the underlay written over the one that stands for the snapshot's.
++  HdrMaterializeUnderlay();
++  return HdrCopyTexture(kHdrTextureUnderlayRt, kHdrTextureUnderlay, rect, dest_x, dest_y);
++}
++
++void CommandProcessor::HdrMaterializeUnderlay() {
++  if (!hdr_frame_.underlay_is_rt) {
++    return;
++  }
++  hdr_frame_.underlay_is_rt = false;
++  // What the skipped copy would have made, before kHdrTextureUnderlayRt changes.
++  if (!HdrCopyTexture(kHdrTextureUnderlayRt, kHdrTextureUnderlay,
++                      {0, 0, hdr_output_width_, hdr_output_height_}, 0, 0)) {
++    // As if the copy at the resolve had failed: that area isn't captured.
++    uint64_t area = uint64_t(hdr_output_width_) * hdr_output_height_;
++    hdr_frame_.captured_area -= std::min(hdr_frame_.captured_area, area);
++  }
++}
++
+ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader,
+                                                           uint32_t packet, uint32_t count) {
+   // indirect buffer dispatch
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 9765abba..8fb0aa84 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -93,6 +93,11 @@ REXCVAR_DEFINE_BOOL(d3d12_hoist_shared_memory_uploads_stats, false, "GPU/D3D12",
+ 
+ REXCVAR_DECLARE(bool, gpu_regwrite_bulk);
+ REXCVAR_DECLARE(bool, gpu_batch_perf_counters);
++// HDR output's trims (defined in graphics/command_processor.cpp).
++REXCVAR_DECLARE(bool, hdr_trim);
++// hdr_scene_fused and its development check (defined in graphics/command_processor.cpp).
++REXCVAR_DECLARE(bool, hdr_scene_fused);
++REXCVAR_DECLARE(int32_t, hdr_scene_fused_check);
+ 
+ // LOCAL PATCH - MCLA (04a0): swap_direct_present (defined in d3d12/render_target_cache.cpp) and its sub-switches.
+ REXCVAR_DECLARE(bool, swap_direct_present);
+@@ -125,6 +130,8 @@ namespace shaders {
+ #include "../shaders/bytecode/d3d12_5_1/hdr_refresh_cs.h"
+ #include "../shaders/bytecode/d3d12_5_1/fg_hudless_downscale_cs.h"
+ #include "../shaders/bytecode/d3d12_5_1/hdr_refresh_fg_cs.h"
++#include "../shaders/bytecode/d3d12_5_1/hdr_refresh_fused_cs.h"
++#include "../shaders/bytecode/d3d12_5_1/hdr_refresh_fused_check_cs.h"
+ #include "../shaders/bytecode/d3d12_5_1/hdr_scene_mcla_cs.h"
+ #include "../shaders/bytecode/d3d12_5_1/fxaa_cs.h"
+ #include "../shaders/bytecode/d3d12_5_1/fxaa_extreme_cs.h"
+@@ -1553,6 +1560,57 @@ bool D3D12CommandProcessor::SetupContext() {
+       REXGPU_ERROR("Failed to create the HDR scene pipeline");
+     }
+   }
++  // hdr_scene_fused: hdr_refresh.cs's bindings with HdrRefreshFusedConstants, then a table each for the underlay
++  // (t2) and the tone map draw's scene, motion blur, bloom and adapted luminance (t3-t6); the check's also for
++  // the old pass's image (t7), the tone map's output copy (t8) and the counts (u1).
++  if (hdr_refresh_root_signature_) {
++    for (uint32_t check = 0; check < 2; ++check) {
++      const uint32_t table_count = check ? 8 : 5;
++      D3D12_ROOT_PARAMETER fused_root_parameters[UINT(ApplyGammaRootParameter::kCount) + 8];
++      std::memcpy(fused_root_parameters, apply_gamma_root_parameters,
++                  sizeof(apply_gamma_root_parameters));
++      fused_root_parameters[UINT(ApplyGammaRootParameter::kConstants)].Constants.Num32BitValues =
++          sizeof(HdrRefreshFusedConstants) / sizeof(uint32_t);
++      D3D12_DESCRIPTOR_RANGE fused_root_descriptor_ranges[8];
++      for (uint32_t i = 0; i < table_count; ++i) {
++        const bool counts = check && i == 7;
++        fused_root_descriptor_ranges[i] = apply_gamma_root_descriptor_range_source;
++        fused_root_descriptor_ranges[i].RangeType =
++            counts ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++        fused_root_descriptor_ranges[i].BaseShaderRegister = counts ? 1 : 2 + i;
++        fused_root_parameters[UINT(ApplyGammaRootParameter::kCount) + i] =
++            apply_gamma_root_parameters[UINT(ApplyGammaRootParameter::kSource)];
++        fused_root_parameters[UINT(ApplyGammaRootParameter::kCount) + i]
++            .DescriptorTable.pDescriptorRanges = &fused_root_descriptor_ranges[i];
++      }
++      D3D12_ROOT_SIGNATURE_DESC fused_root_signature_desc = apply_gamma_root_signature_desc;
++      fused_root_signature_desc.NumParameters = UINT(ApplyGammaRootParameter::kCount) + table_count;
++      fused_root_signature_desc.pParameters = fused_root_parameters;
++      Microsoft::WRL::ComPtr<ID3D12RootSignature>& fused_root_signature =
++          check ? hdr_refresh_fused_check_root_signature_ : hdr_refresh_fused_root_signature_;
++      Microsoft::WRL::ComPtr<ID3D12PipelineState>& fused_pipeline =
++          check ? hdr_refresh_fused_check_pipeline_ : hdr_refresh_fused_pipeline_;
++      *(fused_root_signature.ReleaseAndGetAddressOf()) =
++          ui::d3d12::util::CreateRootSignature(provider, fused_root_signature_desc);
++      if (fused_root_signature) {
++        *(fused_pipeline.ReleaseAndGetAddressOf()) =
++            check ? ui::d3d12::util::CreateComputePipeline(
++                        device, shaders::hdr_refresh_fused_check_cs,
++                        sizeof(shaders::hdr_refresh_fused_check_cs), fused_root_signature.Get())
++                  : ui::d3d12::util::CreateComputePipeline(
++                        device, shaders::hdr_refresh_fused_cs, sizeof(shaders::hdr_refresh_fused_cs),
++                        fused_root_signature.Get());
++      }
++      if (!fused_pipeline) {
++        REXGPU_ERROR("Failed to create the fused HDR scene {}pipeline ({})",
++                     check ? "check " : "",
++                     check ? "hdr_scene_fused_check isn't used" : "hdr_scene_fused isn't used");
++        if (!check) {
++          break;
++        }
++      }
++    }
++  }
+ 
+   // Initialize compute pipelines for post-processing anti-aliasing.
+   D3D12_ROOT_PARAMETER fxaa_root_parameters[UINT(FxaaRootParameter::kCount)];
+@@ -1972,6 +2030,7 @@ void D3D12CommandProcessor::ShutdownSubmissionThread() {
+ 
+ void D3D12CommandProcessor::ShutdownContext() {
+   AwaitAllQueueOperationsCompletion();
++  hdr_fused_ = HdrFusedScene();
+   TaaRelease();
+   TaaCollectRetired(true);
+   ShutdownSubmissionThread();
+@@ -2613,6 +2672,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+     REXGPU_ERROR("IssueSwap: BeginSubmission failed");
+     return;
+   }
++  // hdr_scene_fused_check: the counts of an earlier frame, if its submission has completed.
++  HdrCollectFusedCheck();
+   if (!pending_unscaled_copies_.empty()) {
+     FlushUnscaledResolveCopies();
+   }
+@@ -2627,19 +2688,40 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   // loaded from the resolved memory (see D3D12RenderTargetCache::NoteSwapDirectResolve).
+   SwapDirect swap_direct;
+   PrepareSwapDirect(swap_direct);
+-  ID3D12Resource* swap_texture_resource;
++  // hdr_trim: with HDR output the refresher doesn't read the front buffer when the frame is
++  // put together from the UI layer, which is known in the refresher below (the composite, the
++  // debug view, frame generation). So that the load can wait for it, the picture's format and
++  // size come from the fetch constant (as in swap_direct_present, whose in-place swap waits
++  // too), if it describes a plain texture at 1x. The refresher loads it unless it doesn't
++  // read it.
++  const bool hdr_trim = REXCVAR_GET(hdr_trim);
++  D3D12TextureCache::SwapTextureInfo hdr_trim_info;
++  bool swap_load_waits = swap_direct.in_place;
++  if (!swap_load_waits && hdr_refresh_pipeline_ && ui::Presenter::IsHdrOutputActive() &&
++      hdr_trim) {
++    const char* hdr_trim_why_not;
++    swap_load_waits = texture_cache_->GetSwapTextureInfo(hdr_trim_info, hdr_trim_why_not);
++  }
++  const D3D12TextureCache::SwapTextureInfo& swap_load_info =
++      swap_direct.in_place ? swap_direct.texture_info : hdr_trim_info;
++  ID3D12Resource* swap_texture_resource = nullptr;
+   if (swap_direct.in_place) {
+     swap_texture_srv_desc = swap_direct.srv_desc;
+     frontbuffer_format = swap_direct.texture_info.format;
+     frontbuffer_width_unscaled = swap_direct.texture_info.width;
+     frontbuffer_height_unscaled = swap_direct.texture_info.height;
+     swap_texture_resource = swap_direct.source.resource;
++  } else if (swap_load_waits) {
++    swap_texture_srv_desc = {};
++    frontbuffer_format = hdr_trim_info.format;
++    frontbuffer_width_unscaled = hdr_trim_info.width;
++    frontbuffer_height_unscaled = hdr_trim_info.height;
+   } else {
+     swap_texture_resource =
+         texture_cache_->RequestSwapTexture(swap_texture_srv_desc, frontbuffer_format,
+                                            &frontbuffer_width_unscaled, &frontbuffer_height_unscaled);
+   }
+-  if (!swap_texture_resource) {
++  if (!swap_texture_resource && !swap_load_waits) {
+     // Dump texture fetch constant 0 for debugging
+     const auto& regs = *register_file_;
+     auto fetch = regs.GetTextureFetch(0);
+@@ -2648,11 +2730,15 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+         fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
+     return;
+   }
+-  D3D12_RESOURCE_DESC swap_texture_desc = swap_texture_resource->GetDesc();
+-  if (swap_direct.in_place) {
+-    // The render target is bigger than the picture: the picture is its top-left corner.
+-    swap_texture_desc.Width = swap_direct.texture_info.width;
+-    swap_texture_desc.Height = swap_direct.texture_info.height;
++  D3D12_RESOURCE_DESC swap_texture_desc = {};
++  if (swap_texture_resource) {
++    swap_texture_desc = swap_texture_resource->GetDesc();
++  }
++  if (swap_load_waits) {
++    // The render target is bigger than the picture: the picture is its top-left corner. Not
++    // loaded: the texture's size is the fetch constant's (no resolution scaling).
++    swap_texture_desc.Width = swap_load_info.width;
++    swap_texture_desc.Height = swap_load_info.height;
+   }
+   // The swap gamma / FXAA pass samples source texels by pixel index, but swap
+   // textures may be allocation-padded. Prefer the active frontbuffer region
+@@ -2716,7 +2802,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   presenter->RefreshGuestOutput(
+       guest_output_width, guest_output_height, display_width, display_height,
+       [this, &swap_texture_srv_desc, &swap_direct, frontbuffer_format, swap_texture_resource,
+-       guest_output_width,
++       swap_load_waits, hdr_trim, guest_output_width,
+        guest_output_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+         const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+         ID3D12Device* device = provider.GetDevice();
+@@ -2854,13 +2940,80 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+                               frame_generation_inputs->generation_width,
+                               frame_generation_inputs->generation_height);
+ 
++        // hdr_scene_fused: the refresher makes the scene from the tone map draw's inputs, if the frame is put
++        // together from the front buffer and the underlay (the difference mask, or a frame without UI), and the
++        // textures the draw read are still what it read. Otherwise the frame has no HDR scene (the old pass
++        // wasn't made).
++        bool use_fused = false;
++        if (hdr_frame_.scene_fused) {
++          const char* fused_why_not = nullptr;
++          if (!use_hdr) {
++            fused_why_not = "the swap isn't HDR output now";
++          } else if (use_frame_generation) {
++            fused_why_not = "frame generation is on";
++          } else if (hdr_composite != HdrComposite::kMask && hdr_composite != HdrComposite::kScene) {
++            fused_why_not =
++                "the frame isn't put together from the difference mask or as a scene (the UI "
++                "couldn't be told by difference)";
++          } else if (hdr_state.debug_ui >= 2 && hdr_state.debug_ui <= 6) {
++            fused_why_not = "a debug view (hdr_debug_ui) that shows other textures";
++          } else {
++            HdrUseFusedScene(fused_why_not);
++          }
++          if (fused_why_not) {
++            hdr_frame_.scene_fused = false;
++            HdrNoteFusedScene(fused_why_not, 0);
++          } else {
++            use_fused = true;
++          }
++        }
++        // One of hdr_scene_fused_check's frames: the old pass and the copy were made, and a place for the counts
++        // is free.
++        const bool hdr_fused_check_frame =
++            use_fused && hdr_fused_.check && hdr_frame_.scene && hdr_refresh_fused_check_pipeline_ &&
++            !hdr_fused_check_pending_[hdr_fused_check_next_slot_].pending &&
++            HdrEnsureFusedCheckBuffers();
++
+         // LOCAL PATCH - MCLA (04a0): swap_direct_present: where the apply-gamma pass (or the presenter's paint) reads the
+         // picture from. HDR output and frame generation read the swap texture too, so they need it loaded.
+         auto& d3d12_context =
+             static_cast<ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context);
+         const bool swap_direct_usable = swap_direct.possible && !use_hdr && !use_frame_generation;
++        // hdr_trim: the frame put together from the UI layer doesn't read the front buffer
++        // (HdrRefresherReadsFrontBuffer; not with frame generation, which has its own
++        // refresher), so its load is skipped (the UI layer's view takes its place in the
++        // refresher's bindings). It was left for here (swap_load_waits) if the fetch constant
++        // describes a plain texture; else the texture is loaded already.
++        bool hdr_skip_swap_load = false;
++        if (use_hdr) {
++          HdrTrimWhy why = kHdrTrimDone;
++          if (!hdr_trim) {
++            why = kHdrTrimOff;
++          } else if (use_frame_generation) {
++            why = kHdrTrimFrameGeneration;
++          } else if (hdr_composite != HdrComposite::kLayer) {
++            why = kHdrTrimNotLayer;
++          } else if (HdrRefresherReadsFrontBuffer(hdr_composite, hdr_state.debug_ui)) {
++            why = kHdrTrimDebugView;
++          } else if (!swap_load_waits) {
++            why = kHdrTrimSwapInfo;
++          }
++          hdr_frame_.trim_swap_load = why;
++          hdr_skip_swap_load = why == kHdrTrimDone;
++        }
++        // swap_direct_present for the HDR refresher: where it reads the front buffer (the difference with the
++        // underlay, a frame without UI, a debug view), it reads the host render target the front buffer was
++        // resolved from, as the apply-gamma pass does, instead of the loaded texture (the render target's view
++        // has the swap's component mapping composed into it, so the refresher's own swap flag isn't set). Not for
++        // frame generation, which keeps the loaded texture.
++        const bool hdr_swap_direct = use_hdr && !use_frame_generation && swap_direct.possible &&
++                                     swap_direct.in_place && !hdr_skip_swap_load;
++        if (hdr_swap_direct) {
++          hdr_frame_.trim_swap_load = kHdrTrimFromTarget;
++        }
+         ID3D12Resource* swap_source_resource = swap_texture_resource;
+-        if (swap_direct.in_place && !swap_direct_usable) {
++        if (swap_load_waits && !(swap_direct.in_place && swap_direct_usable) &&
++            !hdr_skip_swap_load && !hdr_swap_direct) {
+           D3D12_SHADER_RESOURCE_VIEW_DESC swap_texture_load_srv_desc;
+           xenos::TextureFormat swap_texture_load_format;
+           swap_source_resource = texture_cache_->RequestSwapTexture(swap_texture_load_srv_desc,
+@@ -2933,13 +3086,14 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+         // underlay and the UI layer (adjacent, one table); for frame
+         // generation, the HUD-less image.
+         // One request, so that a bindful heap switch can't separate them.
+-        ui::d3d12::util::DescriptorCpuGpuHandlePair apply_gamma_descriptors[8];
++        ui::d3d12::util::DescriptorCpuGpuHandlePair apply_gamma_descriptors[12];
+         ui::d3d12::util::DescriptorCpuGpuHandlePair apply_gamma_descriptor_gamma_ramp;
+         uint32_t apply_gamma_descriptor_count = bindless_resources_used_ ? 2 : 3;
+         const ui::d3d12::util::DescriptorCpuGpuHandlePair* hdr_layer_descriptors =
+             apply_gamma_descriptors + apply_gamma_descriptor_count;
+         if (!RequestOneUseSingleViewDescriptors(
+-                apply_gamma_descriptor_count + (use_hdr ? 4 : 0) +
++                apply_gamma_descriptor_count +
++                    (use_hdr ? (use_fused ? (hdr_fused_check_frame ? 8 : 5) : 4) : 0) +
+                     (use_frame_generation ? (use_hdr ? 1 : 5) : 0) + (swap_direct_check ? 2 : 0),
+                 apply_gamma_descriptors)) {
+           return false;
+@@ -2983,28 +3137,53 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+         device->CreateUnorderedAccessView(apply_gamma_dest, nullptr, &apply_gamma_dest_uav_desc,
+                                           apply_gamma_descriptors[0].first);
+ 
+-        device->CreateShaderResourceView(swap_source_resource, &swap_texture_srv_desc,
+-                                         apply_gamma_descriptors[1].first);
++        if (hdr_skip_swap_load) {
++          // The refresher doesn't read it: any valid view of a texture in a state it can be
++          // read in does for the root signature's table. The UI layer's, which it reads too.
++          HdrWriteTextureSRV(kHdrTextureUiLayer, apply_gamma_descriptors[1].first);
++        } else {
++          device->CreateShaderResourceView(swap_source_resource, &swap_texture_srv_desc,
++                                           apply_gamma_descriptors[1].first);
++        }
+ 
+-        if (swap_direct_read) {
++        if (swap_direct_read || hdr_swap_direct) {
+           render_target_cache_->UseSwapDirectSource(swap_direct.source, swap_read_state);
+         }
+         PushTransitionBarrier(gamma_ramp_buffer_.Get(), gamma_ramp_buffer_state_, swap_read_state);
+         gamma_ramp_buffer_state_ = swap_read_state;
+ 
++        HdrRefreshFusedConstants hdr_fused_constants = {};
+         if (use_hdr) {
+           // The UI layer and its underlay, if this frame has them at the
+           // output's size.
+           HdrComposite composite = hdr_composite;
+           deferred_command_list_.D3DSetComputeRootSignature(
+-              use_frame_generation ? hdr_refresh_fg_root_signature_.Get()
+-                                   : hdr_refresh_root_signature_.Get());
+-          static constexpr HdrTexture kRefreshTextures[] = {
+-              kHdrTextureUnderlay, kHdrTextureUiLayer, kHdrTextureScene, kHdrTextureTonemap};
+-          for (uint32_t i = 0; i < 4; ++i) {
+-            HdrWriteTextureSRV(kRefreshTextures[i], hdr_layer_descriptors[i].first);
++              use_fused ? hdr_refresh_fused_root_signature_.Get()
++                        : (use_frame_generation ? hdr_refresh_fg_root_signature_.Get()
++                                                : hdr_refresh_root_signature_.Get()));
++          // hdr_trim: the underlay is the snapshot of the UI's target if the copy of it to
++          // kHdrTextureUnderlay was skipped (both are in kHdrTextureState).
++          const HdrTexture kRefreshTextures[] = {
++              hdr_frame_.underlay_is_rt ? kHdrTextureUnderlayRt : kHdrTextureUnderlay,
++              kHdrTextureUiLayer, kHdrTextureScene, kHdrTextureTonemap};
++          if (use_fused) {
++            // The underlay, then the draw's scene, motion blur, bloom and adapted luminance, as the draw read them.
++            HdrWriteTextureSRV(kRefreshTextures[0], hdr_layer_descriptors[0].first);
+             deferred_command_list_.D3DSetComputeRootDescriptorTable(
+-                UINT(ApplyGammaRootParameter::kCount) + i, hdr_layer_descriptors[i].second);
++                UINT(ApplyGammaRootParameter::kCount), hdr_layer_descriptors[0].second);
++            for (uint32_t i = 0; i < 4; ++i) {
++              const D3D12TextureCache::HdrTextureCapture& capture = hdr_fused_.textures[i];
++              device->CreateShaderResourceView(capture.resource.Get(), &capture.srv_desc,
++                                               hdr_layer_descriptors[1 + i].first);
++              deferred_command_list_.D3DSetComputeRootDescriptorTable(
++                  UINT(ApplyGammaRootParameter::kCount) + 1 + i, hdr_layer_descriptors[1 + i].second);
++            }
++          } else {
++            for (uint32_t i = 0; i < 4; ++i) {
++              HdrWriteTextureSRV(kRefreshTextures[i], hdr_layer_descriptors[i].first);
++              deferred_command_list_.D3DSetComputeRootDescriptorTable(
++                  UINT(ApplyGammaRootParameter::kCount) + i, hdr_layer_descriptors[i].second);
++            }
+           }
+           HdrRefreshConstants hdr_refresh_constants = {
+               {guest_output_width, guest_output_height},
+@@ -3038,9 +3217,16 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+             PushTransitionBarrier(fg_hudless_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+           }
+-          deferred_command_list_.D3DSetComputeRoot32BitConstants(
+-              UINT(ApplyGammaRootParameter::kConstants),
+-              sizeof(hdr_refresh_constants) / sizeof(uint32_t), &hdr_refresh_constants, 0);
++          if (use_fused) {
++            hdr_fused_constants = {hdr_refresh_constants, hdr_fused_.constants};
++            deferred_command_list_.D3DSetComputeRoot32BitConstants(
++                UINT(ApplyGammaRootParameter::kConstants),
++                sizeof(hdr_fused_constants) / sizeof(uint32_t), &hdr_fused_constants, 0);
++          } else {
++            deferred_command_list_.D3DSetComputeRoot32BitConstants(
++                UINT(ApplyGammaRootParameter::kConstants),
++                sizeof(hdr_refresh_constants) / sizeof(uint32_t), &hdr_refresh_constants, 0);
++          }
+           context.SetHdr({true, hdr_state.sdr_white_nits, hdr_state.sdr_pure_gamma_2_2});
+         } else {
+           deferred_command_list_.D3DSetComputeRootSignature(apply_gamma_root_signature_.Get());
+@@ -3059,8 +3245,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+             UINT(ApplyGammaRootParameter::kRamp), apply_gamma_descriptor_gamma_ramp.second);
+         ID3D12PipelineState* apply_gamma_pipeline;
+         if (use_hdr) {
+-          apply_gamma_pipeline = use_frame_generation ? hdr_refresh_fg_pipeline_.Get()
+-                                                      : hdr_refresh_pipeline_.Get();
++          apply_gamma_pipeline = use_fused ? hdr_refresh_fused_pipeline_.Get()
++                                           : (use_frame_generation ? hdr_refresh_fg_pipeline_.Get()
++                                                                   : hdr_refresh_pipeline_.Get());
+         } else if (use_pwl_gamma_ramp) {
+           apply_gamma_pipeline = use_fxaa ? apply_gamma_pwl_fxaa_luma_pipeline_.Get()
+                                           : apply_gamma_pwl_pipeline_.Get();
+@@ -3073,13 +3260,21 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+         uint32_t group_count_x = (guest_output_width + 15) / 16;
+         uint32_t group_count_y = (guest_output_height + 7) / 8;
+         deferred_command_list_.D3DDispatch(group_count_x, group_count_y, 1);
++        if (hdr_fused_check_frame) {
++          // hdr_scene_fused_check: the same inputs against the old pass's image and the tone map's output copy
++          // (the guest output image is still in the UAV state; it isn't written).
++          HdrRecordFusedCheck(hdr_fused_constants, hdr_layer_descriptors, apply_gamma_descriptors[0],
++                              apply_gamma_descriptors[1], apply_gamma_descriptor_gamma_ramp,
++                              group_count_x, group_count_y);
++        }
+         if (use_frame_generation && !use_hdr) {
+           // SDR: the frame as without generation (above), then the HUD-less
+           // image from hdr_refresh_fg.cs alone (bits 13 to 15), with the same
+           // destination bound (not written).
+           deferred_command_list_.D3DSetComputeRootSignature(hdr_refresh_fg_root_signature_.Get());
+-          static constexpr HdrTexture kRefreshTextures[] = {
+-              kHdrTextureUnderlay, kHdrTextureUiLayer, kHdrTextureScene, kHdrTextureTonemap};
++          const HdrTexture kRefreshTextures[] = {
++              hdr_frame_.underlay_is_rt ? kHdrTextureUnderlayRt : kHdrTextureUnderlay,
++              kHdrTextureUiLayer, kHdrTextureScene, kHdrTextureTonemap};
+           for (uint32_t i = 0; i < 4; ++i) {
+             HdrWriteTextureSRV(kRefreshTextures[i], hdr_layer_descriptors[i].first);
+             deferred_command_list_.D3DSetComputeRootDescriptorTable(
+@@ -3245,7 +3440,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+         if (swap_check_recorded) {
+           CompleteSwapDirectCheck(guest_output_width, guest_output_height);
+         }
+-        if (swap_direct_read) {
++        if (swap_direct_read || hdr_swap_direct) {
++          // (The HDR refresher's reads of the render target count here, without the paint's fusing.)
+           NoteSwapDirect(nullptr, true, false);
+         } else if (swap_direct.possible) {
+           NoteSwapDirect(swap_direct.check ? "a check swap, made from the loaded texture"
+@@ -3258,6 +3454,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   // End the frame even if did not present for any reason (the image refresher
+   // was not called), to prevent leaking per-frame resources.
+   EndSubmission(true);
++  // The textures the tone map draw read aren't held longer than its frame.
++  hdr_fused_ = HdrFusedScene();
+ }
+ 
+ void D3D12CommandProcessor::PrepareForWait() {
+@@ -3874,8 +4072,23 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   // HDR scene: after the tone map draw.
+   if (hdr_scene_pending_) {
+     hdr_scene_pending_ = false;
+-    if (pixel_shader && HdrRenderScene(*vertex_shader, *pixel_shader)) {
+-      HdrSceneRendered();
++    if (pixel_shader) {
++      // hdr_scene_fused: the draw's inputs are kept for the swap's refresher, no pass and no copy here
++      // (on every hdr_scene_fused_check'th frame the old ones are made too, to compare with).
++      const bool fused_wanted = HdrSceneFusedWanted();
++      if (!fused_wanted) {
++        HdrNoteFusedScene(REXCVAR_GET(hdr_scene_fused) ? "the fused refresher isn't available"
++                                                       : "hdr_scene_fused is off",
++                          0);
++      }
++      const bool fused = fused_wanted && HdrCaptureScene(*vertex_shader, *pixel_shader);
++      if (!fused || hdr_fused_.check) {
++        if (HdrRenderScene(*vertex_shader, *pixel_shader)) {
++          HdrSceneRendered();
++        } else {
++          hdr_fused_.check = false;
++        }
++      }
+     }
+   }
+ 
+@@ -6855,4 +7068,260 @@ void D3D12CommandProcessor::CompleteSwapDirectCheck(uint32_t width, uint32_t hei
+       differing_pixels ? fmt::format(", the first at {},{}", first_x, first_y) : std::string());
+ }
+ 
++// hdr_scene_fused (hdr_refresh_fused.cs, see CommandProcessor::HdrSceneFusedWanted and hdr_scene_mcla.xesli).
++
++bool D3D12CommandProcessor::HdrCaptureScene(const D3D12Shader& vertex_shader,
++                                            const D3D12Shader& pixel_shader) {
++  // The tone map draw has just been recorded (its textures were requested for it, and are in the cache's
++  // bindings now). Nothing is recorded here: what the pass after the draw would bind is kept for the swap.
++  hdr_fused_ = HdrFusedScene();
++  hdr_frame_.scene_fused = false;
++  const char* why_not = nullptr;
++  uint32_t failed_input = 0;
++  if (!hdr_refresh_fused_pipeline_) {
++    why_not = "the refresher's fused pipeline couldn't be made";
++  } else if (rex::cvar::GetFlagByName("frame_generation") != "off") {
++    // The generated frames' compose and the HUD-less image read the scene as images.
++    why_not = "frame generation is on";
++  }
++  const D3D12Shader::TextureBinding* bindings[4] = {};
++  for (uint32_t i = 0; i < 4 && !why_not; ++i) {
++    // The scene, blur and bloom are the pixel shader's fetches, the adapted luminance the vertex shader's.
++    for (const D3D12Shader::TextureBinding& binding :
++         (i < 3 ? pixel_shader : vertex_shader).GetTextureBindingsAfterTranslation()) {
++      if (binding.fetch_constant == kHdrSceneFetchConstants[i] &&
++          binding.dimension == xenos::FetchOpDimension::k2D) {
++        bindings[i] = &binding;
++      }
++    }
++    if (!bindings[i]) {
++      why_not = "a texture of the tone map draw isn't a plain 2D binding of its shader";
++      failed_input = i + 1;
++    }
++  }
++  uint64_t signature = 1469598103934665603ull;
++  for (uint32_t i = 0; i < 4 && !why_not; ++i) {
++    if (!texture_cache_->CaptureActiveTexture(*bindings[i], hdr_fused_.textures[i], why_not)) {
++      failed_input = i + 1;
++      break;
++    }
++    why_not = nullptr;
++    const D3D12TextureCache::HdrTextureCapture& capture = hdr_fused_.textures[i];
++    signature = (signature ^ (uint64_t(capture.format) | (uint64_t(capture.width) << 8) |
++                              (uint64_t(capture.height) << 24))) *
++                1099511628211ull;
++  }
++  if (why_not) {
++    hdr_fused_ = HdrFusedScene();
++    HdrNoteFusedScene(why_not, failed_input);
++    return false;
++  }
++  hdr_fused_.valid = true;
++  hdr_fused_.constants = hdr_scene_constants_;
++  // hdr_scene_fused_check: every Nth frame the old pass and the copy are made too.
++  const int32_t check_interval = REXCVAR_GET(hdr_scene_fused_check);
++  hdr_fused_.check = check_interval > 0 && hdr_refresh_fused_check_pipeline_ &&
++                     (++hdr_fused_check_counter_ % uint64_t(check_interval)) == 0;
++  hdr_frame_.scene_fused = true;
++  hdr_frame_.scene_width = hdr_output_width_;
++  hdr_frame_.scene_height = hdr_output_height_;
++  HdrNoteFusedScene(nullptr, signature);
++  return true;
++}
++
++bool D3D12CommandProcessor::HdrUseFusedScene(const char*& why_not_out) {
++  // The textures are the cache's, with the data the draw read: nothing wrote them (a texture load, or a resolve
++  // that wrote one along with the memory) between the draw and now, and none was destroyed. They go to the
++  // state the refresher reads them in, and are marked as used by this submission.
++  if (!hdr_fused_.valid) {
++    why_not_out = "the tone map draw's inputs weren't kept";
++    return false;
++  }
++  for (const D3D12TextureCache::HdrTextureCapture& capture : hdr_fused_.textures) {
++    if (!texture_cache_->UseCapturedTexture(capture)) {
++      why_not_out =
++          "a texture the tone map draw read was replaced or rewritten before the swap";
++      return false;
++    }
++  }
++  return true;
++}
++
++void D3D12CommandProcessor::HdrNoteFusedScene(const char* why_not, uint64_t signature) {
++  if (hdr_fused_noted_ && hdr_fused_noted_why_ == why_not && hdr_fused_noted_signature_ == signature) {
++    return;
++  }
++  const bool first = !hdr_fused_noted_;
++  hdr_fused_noted_ = true;
++  hdr_fused_noted_why_ = why_not;
++  hdr_fused_noted_signature_ = signature;
++  const uint64_t now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
++  if (!first && now_ms - hdr_fused_note_last_ms_ < 2000) {
++    ++hdr_fused_note_suppressed_;
++    return;
++  }
++  hdr_fused_note_last_ms_ = now_ms;
++  const std::string suppressed =
++      hdr_fused_note_suppressed_ ? fmt::format(" ({} changes in the last 2 s not logged)",
++                                               hdr_fused_note_suppressed_)
++                                 : std::string();
++  hdr_fused_note_suppressed_ = 0;
++  if (why_not) {
++    REXGPU_INFO(
++        "HDR: scene not fused into the refresher: {}{}; the pass after the tone map draw makes the scene as "
++        "before{}",
++        why_not, signature ? fmt::format(" (input {})", signature) : std::string(), suppressed);
++    return;
++  }
++  static const char* const kNames[4] = {"scene", "blur", "bloom", "luminance"};
++  std::string inputs;
++  for (uint32_t i = 0; i < 4; ++i) {
++    const D3D12TextureCache::HdrTextureCapture& capture = hdr_fused_.textures[i];
++    inputs += fmt::format("{}{} {}x{} {}", i ? ", " : "", kNames[i], capture.width, capture.height,
++                          FormatInfo::Get(capture.format)->name);
++  }
++  REXGPU_INFO(
++      "HDR: scene fused into the refresher (tone map inputs captured: {}); no scene image or copy of the "
++      "tone map's output is made, the UI goes by difference{}{}",
++      inputs, hdr_fused_.check ? " (a check frame)" : "", suppressed);
++}
++
++bool D3D12CommandProcessor::HdrEnsureFusedCheckBuffers() {
++  if (hdr_fused_check_counts_) {
++    return true;
++  }
++  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
++  ID3D12Device* device = provider.GetDevice();
++  D3D12_RESOURCE_DESC counts_desc, plain_desc;
++  ui::d3d12::util::FillBufferResourceDesc(counts_desc, 256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
++  ui::d3d12::util::FillBufferResourceDesc(plain_desc, 256, D3D12_RESOURCE_FLAG_NONE);
++  if (FAILED(device->CreateCommittedResource(
++          &ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &counts_desc,
++          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&hdr_fused_check_counts_))) ||
++      FAILED(device->CreateCommittedResource(
++          &ui::d3d12::util::kHeapPropertiesUpload, D3D12_HEAP_FLAG_NONE, &plain_desc,
++          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&hdr_fused_check_zero_))) ||
++      FAILED(device->CreateCommittedResource(
++          &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &plain_desc,
++          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&hdr_fused_check_readback_[0]))) ||
++      FAILED(device->CreateCommittedResource(
++          &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &plain_desc,
++          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&hdr_fused_check_readback_[1])))) {
++    static bool logged = false;
++    if (!logged) {
++      logged = true;
++      REXGPU_ERROR("hdr_scene_fused_check: failed to create the buffers of the counts");
++    }
++    hdr_fused_check_counts_.Reset();
++    hdr_fused_check_zero_.Reset();
++    hdr_fused_check_readback_[0].Reset();
++    hdr_fused_check_readback_[1].Reset();
++    return false;
++  }
++  void* zero_mapping = nullptr;
++  const D3D12_RANGE no_read = {0, 0};
++  if (SUCCEEDED(hdr_fused_check_zero_->Map(0, &no_read, &zero_mapping))) {
++    std::memset(zero_mapping, 0, 256);
++    hdr_fused_check_zero_->Unmap(0, nullptr);
++  }
++  return true;
++}
++
++void D3D12CommandProcessor::HdrRecordFusedCheck(
++    const HdrRefreshFusedConstants& constants,
++    const ui::d3d12::util::DescriptorCpuGpuHandlePair* descriptors,
++    const ui::d3d12::util::DescriptorCpuGpuHandlePair& destination,
++    const ui::d3d12::util::DescriptorCpuGpuHandlePair& source,
++    const ui::d3d12::util::DescriptorCpuGpuHandlePair& ramp, uint32_t group_count_x,
++    uint32_t group_count_y) {
++  // descriptors: the underlay (0), the tone map draw's four textures (1 to 4), then for the check the old pass's
++  // image (5), the tone map's output copy (6) and the counts (7).
++  ID3D12Device* device = GetD3D12Provider().GetDevice();
++  const uint32_t slot = hdr_fused_check_next_slot_;
++  HdrWriteTextureSRV(kHdrTextureScene, descriptors[5].first);
++  HdrWriteTextureSRV(kHdrTextureTonemap, descriptors[6].first);
++  D3D12_UNORDERED_ACCESS_VIEW_DESC counts_uav_desc = {};
++  counts_uav_desc.Format = DXGI_FORMAT_R32_TYPELESS;
++  counts_uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
++  counts_uav_desc.Buffer.FirstElement = 0;
++  counts_uav_desc.Buffer.NumElements = 8;
++  counts_uav_desc.Buffer.StructureByteStride = 0;
++  counts_uav_desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
++  device->CreateUnorderedAccessView(hdr_fused_check_counts_.Get(), nullptr, &counts_uav_desc,
++                                    descriptors[7].first);
++
++  // The counts to zero (the buffer rests in the UAV state).
++  PushTransitionBarrier(hdr_fused_check_counts_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                        D3D12_RESOURCE_STATE_COPY_DEST);
++  SubmitBarriers();
++  deferred_command_list_.D3DCopyBufferRegion(hdr_fused_check_counts_.Get(), 0,
++                                             hdr_fused_check_zero_.Get(), 0, 32);
++  PushTransitionBarrier(hdr_fused_check_counts_.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
++                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++
++  // The check refresher: the refresher's bindings with the three tables more.
++  deferred_command_list_.D3DSetComputeRootSignature(hdr_refresh_fused_check_root_signature_.Get());
++  deferred_command_list_.D3DSetComputeRoot32BitConstants(
++      UINT(ApplyGammaRootParameter::kConstants), sizeof(constants) / sizeof(uint32_t), &constants,
++      0);
++  deferred_command_list_.D3DSetComputeRootDescriptorTable(
++      UINT(ApplyGammaRootParameter::kDestination), destination.second);
++  deferred_command_list_.D3DSetComputeRootDescriptorTable(UINT(ApplyGammaRootParameter::kSource),
++                                                          source.second);
++  deferred_command_list_.D3DSetComputeRootDescriptorTable(UINT(ApplyGammaRootParameter::kRamp),
++                                                          ramp.second);
++  for (uint32_t i = 0; i < 8; ++i) {
++    deferred_command_list_.D3DSetComputeRootDescriptorTable(
++        UINT(ApplyGammaRootParameter::kCount) + i, descriptors[i].second);
++  }
++  SetExternalPipeline(hdr_refresh_fused_check_pipeline_.Get());
++  SubmitBarriers();
++  deferred_command_list_.D3DDispatch(group_count_x, group_count_y, 1);
++
++  // The counts to the readback buffer; read when this submission has completed (HdrCollectFusedCheck).
++  PushTransitionBarrier(hdr_fused_check_counts_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                        D3D12_RESOURCE_STATE_COPY_SOURCE);
++  SubmitBarriers();
++  deferred_command_list_.D3DCopyBufferRegion(hdr_fused_check_readback_[slot].Get(), 0,
++                                             hdr_fused_check_counts_.Get(), 0, 32);
++  PushTransitionBarrier(hdr_fused_check_counts_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
++                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++  HdrFusedCheckPending& pending = hdr_fused_check_pending_[slot];
++  pending.pending = true;
++  pending.submission = submission_current_;
++  pending.number = ++hdr_fused_check_number_;
++  pending.pixels = uint64_t(constants.refresh.size[0]) * constants.refresh.size[1];
++  hdr_fused_check_next_slot_ = (slot + 1) & 1;
++}
++
++void D3D12CommandProcessor::HdrCollectFusedCheck() {
++  for (HdrFusedCheckPending& pending : hdr_fused_check_pending_) {
++    if (!pending.pending || submission_completed_ < pending.submission) {
++      continue;
++    }
++    pending.pending = false;
++    ID3D12Resource* readback = hdr_fused_check_readback_[&pending - hdr_fused_check_pending_].Get();
++    uint32_t counts[8] = {};
++    const D3D12_RANGE read_range = {0, sizeof(counts)};
++    void* mapping = nullptr;
++    if (!readback || FAILED(readback->Map(0, &read_range, &mapping))) {
++      REXGPU_ERROR("hdr_scene_fused_check: failed to map the counts");
++      continue;
++    }
++    std::memcpy(counts, mapping, sizeof(counts));
++    const D3D12_RANGE written_range = {0, 0};
++    readback->Unmap(0, &written_range);
++    // The counts: 0 pixels whose tone map output is off by more than a code, 1 the largest difference in codes
++    // among them, 2 pixels whose scene is off by more than 0.5%, 3 the largest relative difference among them
++    // (float), 4 pixels one code off.
++    float max_relative;
++    std::memcpy(&max_relative, &counts[3], sizeof(float));
++    REXGPU_INFO(
++        "HDR: fused check #{}: tonemap mismatches {} of {} px (max d {}/255), scene mismatches {} "
++        "(max rel {:.4f}); {} px are one code off in the tone map's output (not counted as "
++        "mismatches)",
++        pending.number, counts[0], pending.pixels, counts[1], counts[2], max_relative, counts[4]);
++  }
++}
++
+ }  // namespace rex::graphics::d3d12
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index e3865c8f..9387991e 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -859,6 +859,98 @@ ID3D12Resource* D3D12TextureCache::GetActiveTextureResource(uint32_t fetch_const
+   return static_cast<D3D12Texture*>(binding->texture)->resource();
+ }
+ 
++bool D3D12TextureCache::CaptureActiveTexture(
++    const D3D12Shader::TextureBinding& host_shader_binding, HdrTextureCapture& capture_out,
++    const char*& why_not_out) {
++  // LOCAL PATCH - MCLA (hdr_scene_fused). The texture and the view are the ones
++  // WriteActiveTextureBindfulSRV / GetActiveTextureBindlessSRVIndex hand to the draw (UpdateTextureBindingsImpl
++  // makes the descriptor with FindOrCreateTextureDescriptor for the binding's own dimension, the host swizzle
++  // and the signedness the shader binding asks for), for a plain 2D texture.
++  const TextureBinding* binding = GetValidTextureBinding(host_shader_binding.fetch_constant);
++  if (!binding) {
++    why_not_out = "no texture is bound";
++    return false;
++  }
++  if (!AreDimensionsCompatible(host_shader_binding.dimension, binding->key.dimension) ||
++      binding->key.dimension != xenos::DataDimension::k2DOrStacked ||
++      host_shader_binding.dimension != xenos::FetchOpDimension::k2D) {
++    why_not_out = "the binding isn't a plain 2D texture";
++    return false;
++  }
++  const bool is_signed = host_shader_binding.is_signed;
++  Texture* texture;
++  if (is_signed) {
++    if (!texture_util::IsAnySignSigned(binding->swizzled_signs)) {
++      why_not_out = "the fetch isn't signed as the shader asks";
++      return false;
++    }
++    texture = IsSignedVersionSeparateForFormat(binding->key) ? binding->texture_signed
++                                                             : binding->texture;
++  } else {
++    if (!texture_util::IsAnySignNotSigned(binding->swizzled_signs)) {
++      why_not_out = "the fetch isn't unsigned as the shader asks";
++      return false;
++    }
++    texture = binding->texture;
++  }
++  if (!texture) {
++    why_not_out = "the texture isn't there";
++    return false;
++  }
++  D3D12Texture* d3d12_texture = static_cast<D3D12Texture*>(texture);
++  const TextureKey texture_key = d3d12_texture->key();
++  if (IsSignedVersionSeparateForFormat(texture_key) &&
++      texture_key.signed_separate != uint32_t(is_signed)) {
++    why_not_out = "not the version with the needed signedness";
++    return false;
++  }
++  D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
++  desc.Format = is_signed ? host_formats_[uint32_t(texture_key.format)].dxgi_format_signed
++                          : GetDXGIUnormFormat(texture_key);
++  if (desc.Format == DXGI_FORMAT_UNKNOWN || texture_key.dimension == xenos::DataDimension::k3D) {
++    why_not_out = "the format has no view";
++    return false;
++  }
++  desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
++  desc.Shader4ComponentMapping =
++      binding->host_swizzle | D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
++  desc.Texture2DArray.MostDetailedMip = 0;
++  desc.Texture2DArray.MipLevels = texture_key.mip_max_level + 1;
++  desc.Texture2DArray.FirstArraySlice = 0;
++  desc.Texture2DArray.ArraySize = texture_key.GetDepthOrArraySize();
++  desc.Texture2DArray.PlaneSlice = 0;
++  desc.Texture2DArray.ResourceMinLODClamp = 0.0f;
++  capture_out.resource = d3d12_texture->resource();
++  capture_out.srv_desc = desc;
++  capture_out.key = texture_key;
++  capture_out.texture = d3d12_texture;
++  capture_out.content_serial = d3d12_texture->content_serial();
++  capture_out.format = texture_key.format;
++  capture_out.width = texture_key.GetWidth();
++  capture_out.height = texture_key.GetHeight();
++  return true;
++}
++
++bool D3D12TextureCache::UseCapturedTexture(const HdrTextureCapture& capture) {
++  // LOCAL PATCH - MCLA (hdr_scene_fused).
++  Texture* texture = FindTexture(capture.key);
++  if (!texture || texture != capture.texture) {
++    return false;
++  }
++  D3D12Texture* d3d12_texture = static_cast<D3D12Texture*>(texture);
++  if (d3d12_texture->resource() != capture.resource.Get() ||
++      d3d12_texture->content_serial() != capture.content_serial) {
++    return false;
++  }
++  // Referenced by the command list, so not destroyed before it's done.
++  d3d12_texture->MarkAsUsed();
++  constexpr D3D12_RESOURCE_STATES kSrvState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
++                                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++  command_processor_.PushTransitionBarrier(d3d12_texture->resource(),
++                                           d3d12_texture->SetResourceState(kSrvState), kSrvState);
++  return true;
++}
++
+ void D3D12TextureCache::TransitionActiveTexture(uint32_t fetch_constant_index,
+                                                 D3D12_RESOURCE_STATES new_state) {
+   const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 549acbe9..e99cc6a7 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -799,6 +799,10 @@ TextureCache::Texture::~Texture() {
+ void TextureCache::Texture::MakeUpToDateAndWatch(
+     const std::unique_lock<std::recursive_mutex>& global_lock) {
+   SharedMemory& shared_memory = texture_cache().shared_memory();
++  if (base_outdated_ || mips_outdated_) {
++    // LOCAL PATCH - MCLA (hdr_scene_fused): the data is (re)written.
++    content_serial_.fetch_add(1, std::memory_order_release);
++  }
+   if (base_outdated_) {
+     assert_not_zero(GetGuestBaseSize());
+     base_outdated_ = false;
+diff --git a/src/graphics/shaders/bytecode/d3d12_5_1/hdr_refresh_fused_check_cs.h b/src/graphics/shaders/bytecode/d3d12_5_1/hdr_refresh_fused_check_cs.h
+new file mode 100644
+index 00000000..e5e0dfc7
+--- /dev/null
++++ b/src/graphics/shaders/bytecode/d3d12_5_1/hdr_refresh_fused_check_cs.h
+@@ -0,0 +1,219 @@
++// Generated from hdr_refresh_fused_check.cs.xesl with the xenia-project/xenia 0b2ffa3 shader
++// sources (see patches/README.md). Not disassembled to keep the patch small.
++const uint32_t hdr_refresh_fused_check_cs[] = {
++    0x43425844, 0x6FA7BEA9, 0x9339F25C, 0x8538D206, 0x3EF37BEE, 0x00000001, 0x00001AD0, 0x00000003,
++    0x0000002C, 0x0000003C, 0x0000004C, 0x4E475349, 0x00000008, 0x00000000, 0x00000008, 0x4E47534F,
++    0x00000008, 0x00000000, 0x00000008, 0x58454853, 0x00001A7C, 0x00050051, 0x0000069F, 0x0100086A,
++    0x07000059, 0x00308E46, 0x00000000, 0x00000000, 0x00000000, 0x00000008, 0x00000000, 0x07004058,
++    0x00307E46, 0x00000000, 0x00000003, 0x00000003, 0x00005555, 0x00000000, 0x07004058, 0x00307E46,
++    0x00000001, 0x00000004, 0x00000004, 0x00005555, 0x00000000, 0x07004058, 0x00307E46, 0x00000002,
++    0x00000005, 0x00000005, 0x00005555, 0x00000000, 0x07004058, 0x00307E46, 0x00000003, 0x00000006,
++    0x00000006, 0x00005555, 0x00000000, 0x07001858, 0x00307E46, 0x00000004, 0x00000007, 0x00000007,
++    0x00005555, 0x00000000, 0x07001858, 0x00307E46, 0x00000005, 0x00000008, 0x00000008, 0x00005555,
++    0x00000000, 0x0600009D, 0x0031EE46, 0x00000000, 0x00000001, 0x00000001, 0x00000000, 0x0200005F,
++    0x00020032, 0x02000068, 0x00000008, 0x0400009B, 0x00000010, 0x00000008, 0x00000001, 0x08000050,
++    0x00100032, 0x00000000, 0x00020046, 0x00308046, 0x00000000, 0x00000000, 0x00000000, 0x0700003C,
++    0x00100012, 0x00000000, 0x0010001A, 0x00000000, 0x0010000A, 0x00000000, 0x0304001F, 0x0010000A,
++    0x00000000, 0x0100003E, 0x01000015, 0x04000056, 0x00100032, 0x00000000, 0x00020046, 0x0A000000,
++    0x00100032, 0x00000000, 0x00100046, 0x00000000, 0x00004002, 0x3F000000, 0x3F000000, 0x00000000,
++    0x00000000, 0x0A000000, 0x00100032, 0x00000000, 0x00100046, 0x00000000, 0x80308046, 0x00000041,
++    0x00000000, 0x00000000, 0x00000003, 0x07000056, 0x001000C2, 0x00000000, 0x00308406, 0x00000000,
++    0x00000000, 0x00000002, 0x0700000E, 0x00100032, 0x00000000, 0x00100046, 0x00000000, 0x00100AE6,
++    0x00000000, 0x0800103D, 0x001000C2, 0x00000000, 0x00004001, 0x00000000, 0x002074E6, 0x00000000,
++    0x00000003, 0x0800103D, 0x00100032, 0x00000001, 0x00004001, 0x00000000, 0x00207E46, 0x00000001,
++    0x00000004, 0x0800103D, 0x001000C2, 0x00000001, 0x00004001, 0x00000000, 0x002074E6, 0x00000002,
++    0x00000005, 0x0800103D, 0x00100032, 0x00000002, 0x00004001, 0x00000000, 0x00207E46, 0x00000003,
++    0x00000006, 0x05000056, 0x001000C2, 0x00000002, 0x00100EA6, 0x00000000, 0x0C000032, 0x001000C2,
++    0x00000002, 0x00100406, 0x00000000, 0x00100EA6, 0x00000002, 0x00004002, 0x00000000, 0x00000000,
++    0x3B000000, 0x3B000000, 0x05000041, 0x001000C2, 0x00000002, 0x00100EA6, 0x00000002, 0x0500001B,
++    0x001000C2, 0x00000002, 0x00100EA6, 0x00000002, 0x0A00001E, 0x001000C2, 0x00000000, 0x00100EA6,
++    0x00000000, 0x00004002, 0x00000000, 0x00000000, 0xFFFFFFFF, 0xFFFFFFFF, 0x0A000024, 0x001000C2,
++    0x00000002, 0x00100EA6, 0x00000002, 0x00004002, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x07000025, 0x00100032, 0x00000003, 0x00100AE6, 0x00000000, 0x00100AE6, 0x00000002, 0x08000036,
++    0x001000C2, 0x00000003, 0x00004002, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x0800002D,
++    0x00100072, 0x00000003, 0x00100E46, 0x00000003, 0x00207E46, 0x00000000, 0x00000003, 0x05000056,
++    0x001000C2, 0x00000000, 0x00100406, 0x00000001, 0x0C000032, 0x001000C2, 0x00000000, 0x00100406,
++    0x00000000, 0x00100EA6, 0x00000000, 0x00004002, 0x00000000, 0x00000000, 0xBF000000, 0xBF000000,
++    0x05000041, 0x001000C2, 0x00000002, 0x00100EA6, 0x00000000, 0x08000000, 0x001000C2, 0x00000000,
++    0x00100EA6, 0x00000000, 0x80100EA6, 0x00000041, 0x00000002, 0x0A00001E, 0x00100032, 0x00000001,
++    0x00100046, 0x00000001, 0x00004002, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0x00000000, 0x0500001B,
++    0x001000C2, 0x00000002, 0x00100EA6, 0x00000002, 0x0A000024, 0x00100032, 0x00000004, 0x00100AE6,
++    0x00000002, 0x00004002, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x07000025, 0x00100032,
++    0x00000004, 0x00100046, 0x00000001, 0x00100046, 0x00000004, 0x0A00001E, 0x001000C2, 0x00000002,
++    0x00100EA6, 0x00000002, 0x00004002, 0x00000000, 0x00000000, 0x00000001, 0x00000001, 0x0A000024,
++    0x001000C2, 0x00000002, 0x00100EA6, 0x00000002, 0x00004002, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x07000025, 0x00100032, 0x00000005, 0x00100046, 0x00000001, 0x00100AE6, 0x00000002,
++    0x05000036, 0x00100042, 0x00000004, 0x00004001, 0x00000000, 0x0800002D, 0x001000F2, 0x00000006,
++    0x00100A46, 0x00000004, 0x00207E46, 0x00000001, 0x00000004, 0x05000036, 0x001000C2, 0x00000005,
++    0x00100956, 0x00000004, 0x0800002D, 0x001000F2, 0x00000007, 0x00100F86, 0x00000005, 0x00207E46,
++    0x00000001, 0x00000004, 0x08000000, 0x001000F2, 0x00000007, 0x80100E46, 0x00000041, 0x00000006,
++    0x00100E46, 0x00000007, 0x09000032, 0x001000F2, 0x00000006, 0x00100E46, 0x00000007, 0x00100AA6,
++    0x00000000, 0x00100E46, 0x00000006, 0x05000036, 0x00100082, 0x00000004, 0x0010001A, 0x00000005,
++    0x0800002D, 0x001000F2, 0x00000004, 0x00100AC6, 0x00000004, 0x00207E46, 0x00000001, 0x00000004,
++    0x0800002D, 0x001000F2, 0x00000005, 0x00100F46, 0x00000005, 0x00207E46, 0x00000001, 0x00000004,
++    0x08000000, 0x001000F2, 0x00000005, 0x80100E46, 0x00000041, 0x00000004, 0x00100E46, 0x00000005,
++    0x09000032, 0x001000F2, 0x00000004, 0x00100E46, 0x00000005, 0x00100AA6, 0x00000000, 0x00100E46,
++    0x00000004, 0x08000000, 0x001000F2, 0x00000004, 0x80100E46, 0x00000041, 0x00000006, 0x00100E46,
++    0x00000004, 0x09000032, 0x001000F2, 0x00000004, 0x00100E46, 0x00000004, 0x00100FF6, 0x00000000,
++    0x00100E46, 0x00000006, 0x05000056, 0x001000C2, 0x00000000, 0x00100EA6, 0x00000001, 0x0C000032,
++    0x00100032, 0x00000000, 0x00100046, 0x00000000, 0x00100AE6, 0x00000000, 0x00004002, 0xBF000000,
++    0xBF000000, 0x00000000, 0x00000000, 0x05000041, 0x001000C2, 0x00000000, 0x00100406, 0x00000000,
++    0x08000000, 0x00100032, 0x00000000, 0x80100AE6, 0x00000041, 0x00000000, 0x00100046, 0x00000000,
++    0x0A00001E, 0x00100032, 0x00000001, 0x00100AE6, 0x00000001, 0x00004002, 0xFFFFFFFF, 0xFFFFFFFF,
++    0x00000000, 0x00000000, 0x0500001B, 0x001000C2, 0x00000000, 0x00100EA6, 0x00000000, 0x0A000024,
++    0x001000C2, 0x00000001, 0x00100EA6, 0x00000000, 0x00004002, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x07000025, 0x00100032, 0x00000005, 0x00100046, 0x00000001, 0x00100AE6, 0x00000001,
++    0x0A00001E, 0x001000C2, 0x00000000, 0x00100EA6, 0x00000000, 0x00004002, 0x00000000, 0x00000000,
++    0x00000001, 0x00000001, 0x0A000024, 0x001000C2, 0x00000000, 0x00100EA6, 0x00000000, 0x00004002,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x07000025, 0x00100032, 0x00000001, 0x00100046,
++    0x00000001, 0x00100AE6, 0x00000000, 0x05000036, 0x00100042, 0x00000005, 0x00004001, 0x00000000,
++    0x0800002D, 0x00100072, 0x00000006, 0x00100A46, 0x00000005, 0x00207E46, 0x00000002, 0x00000005,
++    0x05000036, 0x001000C2, 0x00000001, 0x00100956, 0x00000005, 0x0800002D, 0x00100072, 0x00000007,
++    0x00100F86, 0x00000001, 0x00207E46, 0x00000002, 0x00000005, 0x08000000, 0x00100072, 0x00000007,
++    0x80100246, 0x00000041, 0x00000006, 0x00100246, 0x00000007, 0x09000032, 0x00100072, 0x00000006,
++    0x00100246, 0x00000007, 0x00100006, 0x00000000, 0x00100246, 0x00000006, 0x05000036, 0x00100082,
++    0x00000005, 0x0010001A, 0x00000001, 0x0800002D, 0x00100072, 0x00000005, 0x00100AC6, 0x00000005,
++    0x00207E46, 0x00000002, 0x00000005, 0x0800002D, 0x00100072, 0x00000001, 0x00100F46, 0x00000001,
++    0x00207E46, 0x00000002, 0x00000005, 0x08000000, 0x00100072, 0x00000001, 0x80100246, 0x00000041,
++    0x00000005, 0x00100246, 0x00000001, 0x09000032, 0x001000D2, 0x00000000, 0x00100906, 0x00000001,
++    0x00100006, 0x00000000, 0x00100906, 0x00000005, 0x08000000, 0x001000D2, 0x00000000, 0x80100906,
++    0x00000041, 0x00000006, 0x00100E06, 0x00000000, 0x09000032, 0x00100072, 0x00000000, 0x00100386,
++    0x00000000, 0x00100556, 0x00000000, 0x00100246, 0x00000006, 0x09002038, 0x00100082, 0x00000000,
++    0x0010003A, 0x00000004, 0x0030803A, 0x00000000, 0x00000000, 0x00000004, 0x08000000, 0x00100072,
++    0x00000001, 0x80100246, 0x00000041, 0x00000003, 0x00100246, 0x00000004, 0x09000032, 0x00100072,
++    0x00000001, 0x00100FF6, 0x00000000, 0x00100246, 0x00000001, 0x00100246, 0x00000003, 0x0A000010,
++    0x00100082, 0x00000000, 0x00100246, 0x00000001, 0x00004002, 0x3F039E6B, 0x3EA5D378, 0x3E243676,
++    0x00000000, 0x0A000010, 0x00100082, 0x00000001, 0x00100246, 0x00000001, 0x00004002, 0x3E87B6FE,
++    0x3F2B9475, 0x3D834275, 0x00000000, 0x0A000010, 0x00100012, 0x00000001, 0x00100246, 0x00000001,
++    0x00004002, 0x3F4DA693, 0x3F8EF790, 0x3F88D10F, 0x00000000, 0x07000018, 0x00100022, 0x00000001,
++    0x0010000A, 0x00000001, 0x00004001, 0x00000000, 0x0B000037, 0x00100012, 0x00000001, 0x0010001A,
++    0x00000001, 0x0030802A, 0x00000000, 0x00000000, 0x00000004, 0x0010000A, 0x00000001, 0x0700000E,
++    0x00100082, 0x00000000, 0x0010003A, 0x00000000, 0x0010000A, 0x00000001, 0x0700000E, 0x00100012,
++    0x00000001, 0x0010003A, 0x00000001, 0x0010000A, 0x00000001, 0x0A000055, 0x00100032, 0x00000002,
++    0x00100046, 0x00000002, 0x00004002, 0x00000001, 0x00000001, 0x00000000, 0x00000000, 0x08000036,
++    0x001000C2, 0x00000002, 0x00004002, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x0800002D,
++    0x00100022, 0x00000001, 0x00100E46, 0x00000002, 0x00207E16, 0x00000003, 0x00000006, 0x09000034,
++    0x00100022, 0x00000001, 0x0010001A, 0x00000001, 0x0030800A, 0x00000000, 0x00000000, 0x00000005,
++    0x09000033, 0x00100022, 0x00000001, 0x0010001A, 0x00000001, 0x0030801A, 0x00000000, 0x00000000,
++    0x00000005, 0x09000038, 0x00100042, 0x00000001, 0x0010003A, 0x00000001, 0x0030800A, 0x00000000,
++    0x00000000, 0x00000004, 0x09000000, 0x00100022, 0x00000001, 0x0010001A, 0x00000001, 0x0030802A,
++    0x00000000, 0x00000000, 0x00000004, 0x0700000E, 0x00100022, 0x00000001, 0x0010002A, 0x00000001,
++    0x0010001A, 0x00000001, 0x07000001, 0x00100042, 0x00000001, 0x0010001A, 0x00000001, 0x00004001,
++    0x7FFFFFFF, 0x07000050, 0x00100042, 0x00000001, 0x00004001, 0x7F800000, 0x0010002A, 0x00000001,
++    0x07000034, 0x00100022, 0x00000001, 0x0010001A, 0x00000001, 0x00004001, 0x00000000, 0x07000033,
++    0x00100022, 0x00000001, 0x0010001A, 0x00000001, 0x00004001, 0x5D5E0B6B, 0x07000001, 0x00100022,
++    0x00000001, 0x0010001A, 0x00000001, 0x0010002A, 0x00000001, 0x0900000E, 0x00100042, 0x00000001,
++    0x0010001A, 0x00000001, 0x0030801A, 0x00000000, 0x00000000, 0x00000004, 0x0A000000, 0x001000C2,
++    0x00000001, 0x001006A6, 0x00000001, 0x00004002, 0x00000000, 0x00000000, 0x3F800000, 0x3F800000,
++    0x07000038, 0x00100042, 0x00000001, 0x0010002A, 0x00000001, 0x0010001A, 0x00000001, 0x0700000E,
++    0x00100022, 0x00000002, 0x0010002A, 0x00000001, 0x0010003A, 0x00000001, 0x09000020, 0x00100042,
++    0x00000001, 0x0030802A, 0x00000000, 0x00000000, 0x00000002, 0x00004001, 0x00000000, 0x09000031,
++    0x00100082, 0x00000001, 0x0030801A, 0x00000000, 0x00000000, 0x00000007, 0x0010001A, 0x00000001,
++    0x07000001, 0x00100042, 0x00000001, 0x0010003A, 0x00000001, 0x0010002A, 0x00000001, 0x0304001F,
++    0x0010002A, 0x00000001, 0x0A000000, 0x00100042, 0x00000001, 0x8030800A, 0x00000041, 0x00000000,
++    0x00000000, 0x00000007, 0x00004001, 0x3F800000, 0x07000038, 0x00100042, 0x00000001, 0x0010002A,
++    0x00000001, 0x00004001, 0x3F800347, 0x09000031, 0x00100042, 0x00000001, 0x0010002A, 0x00000001,
++    0x0030803A, 0x00000000, 0x00000000, 0x00000007, 0x0304001F, 0x0010002A, 0x00000001, 0x0A000000,
++    0x00100042, 0x00000001, 0x0010001A, 0x00000001, 0x8030801A, 0x00000041, 0x00000000, 0x00000000,
++    0x00000007, 0x0A000038, 0x00100042, 0x00000001, 0x8010002A, 0x00000041, 0x00000001, 0x0030802A,
++    0x00000000, 0x00000000, 0x00000007, 0x0900000E, 0x00100042, 0x00000001, 0x0010002A, 0x00000001,
++    0x0030803A, 0x00000000, 0x00000000, 0x00000007, 0x07000038, 0x00100042, 0x00000001, 0x0010002A,
++    0x00000001, 0x00004001, 0x3FB8AA3B, 0x05000019, 0x00100042, 0x00000001, 0x0010002A, 0x00000001,
++    0x08000000, 0x00100042, 0x00000001, 0x8010002A, 0x00000041, 0x00000001, 0x00004001, 0x3F800000,
++    0x0D000032, 0x00100042, 0x00000001, 0x0030803A, 0x00000000, 0x00000000, 0x00000007, 0x0010002A,
++    0x00000001, 0x0030800A, 0x00000000, 0x00000000, 0x00000007, 0x0700004B, 0x00100082, 0x00000001,
++    0x0030801A, 0x00000000, 0x00000000, 0x00000004, 0x07000031, 0x00100022, 0x00000001, 0x0010001A,
++    0x00000001, 0x0010003A, 0x00000001, 0x07000034, 0x00100082, 0x00000001, 0x0010001A, 0x00000002,
++    0x0010002A, 0x00000001, 0x09000037, 0x00100022, 0x00000003, 0x0010001A, 0x00000001, 0x0010003A,
++    0x00000001, 0x0010002A, 0x00000001, 0x01000012, 0x07000033, 0x00100022, 0x00000003, 0x0010001A,
++    0x00000002, 0x00004001, 0x3F800000, 0x01000015, 0x01000012, 0x05000036, 0x00100022, 0x00000003,
++    0x0010001A, 0x00000002, 0x01000015, 0x07000018, 0x00100022, 0x00000001, 0x0010000A, 0x00000001,
++    0x00004001, 0x00000000, 0x0B000037, 0x00100012, 0x00000001, 0x0010001A, 0x00000001, 0x0030802A,
++    0x00000000, 0x00000000, 0x00000004, 0x0010000A, 0x00000001, 0x07000038, 0x00100022, 0x00000001,
++    0x0010003A, 0x00000000, 0x0010001A, 0x00000002, 0x0700000E, 0x00100012, 0x00000002, 0x0010001A,
++    0x00000001, 0x0010000A, 0x00000001, 0x08000000, 0x00100022, 0x00000001, 0x8010003A, 0x00000041,
++    0x00000000, 0x00004001, 0x3F800000, 0x08000000, 0x00100022, 0x00000001, 0x8010000A, 0x00000041,
++    0x00000001, 0x0010001A, 0x00000001, 0x07000038, 0x00100042, 0x00000001, 0x0010001A, 0x00000001,
++    0x0010001A, 0x00000002, 0x0700000E, 0x00100042, 0x00000002, 0x0010002A, 0x00000001, 0x0010000A,
++    0x00000001, 0x0A000010, 0x00100012, 0x00000004, 0x00100246, 0x00000002, 0x00004002, 0x40242A99,
++    0xBF954FDF, 0xBECC154D, 0x00000000, 0x0A000010, 0x00100022, 0x00000004, 0x00100246, 0x00000002,
++    0x00004002, 0xBF82C711, 0x3FFD2546, 0x3D33D07D, 0x00000000, 0x0A000010, 0x00100042, 0x00000004,
++    0x00100246, 0x00000002, 0x00004002, 0x3D9A36E3, 0xBE82339C, 0x3F9837B5, 0x00000000, 0x07000000,
++    0x00100072, 0x00000002, 0x00100246, 0x00000000, 0x00100246, 0x00000004, 0x0A000010, 0x00100042,
++    0x00000001, 0x00100246, 0x00000002, 0x00004002, 0x3E59999A, 0x3F372474, 0x3D93A92A, 0x00000000,
++    0x08000000, 0x00100072, 0x00000002, 0x80100AA6, 0x00000041, 0x00000001, 0x00100246, 0x00000002,
++    0x0B000032, 0x00100072, 0x00000002, 0x00100246, 0x00000002, 0x00308AA6, 0x00000000, 0x00000000,
++    0x00000005, 0x00100AA6, 0x00000001, 0x09000038, 0x00100072, 0x00000002, 0x00100246, 0x00000002,
++    0x00308246, 0x00000000, 0x00000000, 0x00000006, 0x0F000032, 0x00100072, 0x00000002, 0x00100246,
++    0x00000002, 0x00004002, 0x40000000, 0x40000000, 0x40000000, 0x00000000, 0x00004002, 0xBF000000,
++    0xBF000000, 0xBF000000, 0x00000000, 0x0E000032, 0x00100072, 0x00000002, 0x00100246, 0x00000002,
++    0x00308FF6, 0x00000000, 0x00000000, 0x00000005, 0x00004002, 0x3F000000, 0x3F000000, 0x3F000000,
++    0x00000000, 0x0A000001, 0x00100072, 0x00000004, 0x00100246, 0x00000002, 0x00004002, 0x7FFFFFFF,
++    0x7FFFFFFF, 0x7FFFFFFF, 0x00000000, 0x0A000050, 0x00100072, 0x00000004, 0x00004002, 0x7F800000,
++    0x7F800000, 0x7F800000, 0x00000000, 0x00100246, 0x00000004, 0x07000001, 0x00100072, 0x00000002,
++    0x00100246, 0x00000002, 0x00100246, 0x00000004, 0x0A000034, 0x00100072, 0x00000002, 0x00100246,
++    0x00000002, 0x00004002, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x0A000033, 0x00100072,
++    0x00000002, 0x00100246, 0x00000002, 0x00004002, 0x477FE000, 0x477FE000, 0x477FE000, 0x00000000,
++    0x07000038, 0x00100082, 0x00000000, 0x0010003A, 0x00000000, 0x0010001A, 0x00000003, 0x0700000E,
++    0x00100012, 0x00000003, 0x0010003A, 0x00000000, 0x0010000A, 0x00000001, 0x07000038, 0x00100082,
++    0x00000000, 0x0010001A, 0x00000001, 0x0010001A, 0x00000003, 0x0700000E, 0x00100042, 0x00000003,
++    0x0010003A, 0x00000000, 0x0010000A, 0x00000001, 0x0A000010, 0x00100012, 0x00000001, 0x00100246,
++    0x00000003, 0x00004002, 0x40242A99, 0xBF954FDF, 0xBECC154D, 0x00000000, 0x0A000010, 0x00100022,
++    0x00000001, 0x00100246, 0x00000003, 0x00004002, 0xBF82C711, 0x3FFD2546, 0x3D33D07D, 0x00000000,
++    0x0A000010, 0x00100042, 0x00000001, 0x00100246, 0x00000003, 0x00004002, 0x3D9A36E3, 0xBE82339C,
++    0x3F9837B5, 0x00000000, 0x0B000032, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x00308FF6,
++    0x00000000, 0x00000000, 0x00000006, 0x00100246, 0x00000001, 0x0A000010, 0x00100082, 0x00000000,
++    0x00100246, 0x00000000, 0x00004002, 0x3E59999A, 0x3F372474, 0x3D93A92A, 0x00000000, 0x08000000,
++    0x00100072, 0x00000000, 0x80100FF6, 0x00000041, 0x00000000, 0x00100246, 0x00000000, 0x0B000032,
++    0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x00308AA6, 0x00000000, 0x00000000, 0x00000005,
++    0x00100FF6, 0x00000000, 0x09000038, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x00308246,
++    0x00000000, 0x00000000, 0x00000006, 0x0F000032, 0x00100072, 0x00000000, 0x00100246, 0x00000000,
++    0x00004002, 0x40000000, 0x40000000, 0x40000000, 0x00000000, 0x00004002, 0xBF000000, 0xBF000000,
++    0xBF000000, 0x00000000, 0x0E000032, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x00308FF6,
++    0x00000000, 0x00000000, 0x00000005, 0x00004002, 0x3F000000, 0x3F000000, 0x3F000000, 0x00000000,
++    0x0A000001, 0x00100072, 0x00000001, 0x00100246, 0x00000000, 0x00004002, 0x7FFFFFFF, 0x7FFFFFFF,
++    0x7FFFFFFF, 0x00000000, 0x0A000050, 0x00100072, 0x00000001, 0x00004002, 0x7F800000, 0x7F800000,
++    0x7F800000, 0x00000000, 0x00100246, 0x00000001, 0x07000001, 0x00100072, 0x00000000, 0x00100246,
++    0x00000000, 0x00100246, 0x00000001, 0x0A000034, 0x00100072, 0x00000000, 0x00100246, 0x00000000,
++    0x00004002, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x0A000033, 0x00100072, 0x00000000,
++    0x00100246, 0x00000000, 0x00004002, 0x477FE000, 0x477FE000, 0x477FE000, 0x00000000, 0x0A000031,
++    0x00100072, 0x00000001, 0x00004002, 0x3B473ABD, 0x3B473ABD, 0x3B473ABD, 0x00000000, 0x00100246,
++    0x00000002, 0x0500002F, 0x00100072, 0x00000003, 0x00100246, 0x00000002, 0x0A000038, 0x00100072,
++    0x00000003, 0x00100246, 0x00000003, 0x00004002, 0x3EE8BA2F, 0x3EE8BA2F, 0x3EE8BA2F, 0x00000000,
++    0x05000019, 0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x0F000032, 0x00100072, 0x00000003,
++    0x00100246, 0x00000003, 0x00004002, 0x3F870A3D, 0x3F870A3D, 0x3F870A3D, 0x00000000, 0x00004002,
++    0xBD6147AE, 0xBD6147AE, 0xBD6147AE, 0x00000000, 0x0A000038, 0x00100072, 0x00000002, 0x00100246,
++    0x00000002, 0x00004002, 0x414EB852, 0x414EB852, 0x414EB852, 0x00000000, 0x09002037, 0x00100072,
++    0x00000001, 0x00100246, 0x00000001, 0x00100246, 0x00000003, 0x00100246, 0x00000002, 0x0F000032,
++    0x00100072, 0x00000001, 0x00100246, 0x00000001, 0x00004002, 0x437F0000, 0x437F0000, 0x437F0000,
++    0x00000000, 0x00004002, 0x3F000000, 0x3F000000, 0x3F000000, 0x00000000, 0x05000041, 0x00100072,
++    0x00000001, 0x00100246, 0x00000001, 0x0A000000, 0x00100072, 0x00000001, 0x00100246, 0x00000001,
++    0x00004002, 0x3F000000, 0x3F000000, 0x3F000000, 0x00000000, 0x0500001C, 0x00100072, 0x00000001,
++    0x00100246, 0x00000001, 0x04000036, 0x00100032, 0x00000002, 0x00020046, 0x08000036, 0x001000C2,
++    0x00000002, 0x00004002, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x0800002D, 0x00100072,
++    0x00000003, 0x00100F46, 0x00000002, 0x00207E46, 0x00000005, 0x00000008, 0x0F000032, 0x00100072,
++    0x00000003, 0x00100246, 0x00000003, 0x00004002, 0x437F0000, 0x437F0000, 0x437F0000, 0x00000000,
++    0x00004002, 0x3F000000, 0x3F000000, 0x3F000000, 0x00000000, 0x0500001C, 0x00100072, 0x00000003,
++    0x00100246, 0x00000003, 0x07000053, 0x00100072, 0x00000004, 0x00100246, 0x00000001, 0x00100246,
++    0x00000003, 0x07000054, 0x00100072, 0x00000001, 0x00100246, 0x00000001, 0x00100246, 0x00000003,
++    0x0800001E, 0x00100072, 0x00000001, 0x80100246, 0x00000041, 0x00000001, 0x00100246, 0x00000004,
++    0x07000053, 0x00100082, 0x00000000, 0x0010002A, 0x00000001, 0x0010001A, 0x00000001, 0x07000053,
++    0x00100082, 0x00000000, 0x0010003A, 0x00000000, 0x0010000A, 0x00000001, 0x0800002D, 0x00100072,
++    0x00000001, 0x00100E46, 0x00000002, 0x00207E46, 0x00000004, 0x00000007, 0x08000000, 0x00100072,
++    0x00000000, 0x00100246, 0x00000000, 0x80100246, 0x00000041, 0x00000001, 0x0B000034, 0x00100072,
++    0x00000001, 0x80100246, 0x00000081, 0x00000001, 0x00004002, 0x38D1B717, 0x38D1B717, 0x38D1B717,
++    0x00000000, 0x0800000E, 0x00100072, 0x00000000, 0x80100246, 0x00000081, 0x00000000, 0x00100246,
++    0x00000001, 0x07000034, 0x00100022, 0x00000000, 0x0010002A, 0x00000000, 0x0010001A, 0x00000000,
++    0x07000034, 0x00100012, 0x00000000, 0x0010001A, 0x00000000, 0x0010000A, 0x00000000, 0x07000020,
++    0x00100022, 0x00000000, 0x0010003A, 0x00000000, 0x00004001, 0x00000001, 0x0304001F, 0x0010001A,
++    0x00000000, 0x0A0000B4, 0x00100012, 0x00000001, 0x0021E000, 0x00000000, 0x00000001, 0x00004001,
++    0x00000010, 0x00004001, 0x00000001, 0x01000012, 0x0700004F, 0x00100022, 0x00000000, 0x00004001,
++    0x00000001, 0x0010003A, 0x00000000, 0x0304001F, 0x0010001A, 0x00000000, 0x0A0000B4, 0x00100012,
++    0x00000001, 0x0021E000, 0x00000000, 0x00000001, 0x00004001, 0x00000000, 0x00004001, 0x00000001,
++    0x0A0000BC, 0x00100012, 0x00000001, 0x0021E000, 0x00000000, 0x00000001, 0x00004001, 0x00000004,
++    0x0010003A, 0x00000000, 0x01000015, 0x01000015, 0x07000031, 0x00100022, 0x00000000, 0x00004001,
++    0x3BA3D70A, 0x0010000A, 0x00000000, 0x0304001F, 0x0010001A, 0x00000000, 0x0A0000B4, 0x00100012,
++    0x00000001, 0x0021E000, 0x00000000, 0x00000001, 0x00004001, 0x00000008, 0x00004001, 0x00000001,
++    0x0A0000BC, 0x00100012, 0x00000000, 0x0021E000, 0x00000000, 0x00000001, 0x00004001, 0x0000000C,
++    0x0010000A, 0x00000000, 0x01000015, 0x0100003E,
++};
+diff --git a/src/graphics/shaders/bytecode/d3d12_5_1/hdr_refresh_fused_cs.h b/src/graphics/shaders/bytecode/d3d12_5_1/hdr_refresh_fused_cs.h
+new file mode 100644
+index 00000000..3f119ec3
+--- /dev/null
++++ b/src/graphics/shaders/bytecode/d3d12_5_1/hdr_refresh_fused_cs.h
+@@ -0,0 +1,442 @@
++// Generated from hdr_refresh_fused.cs.xesl with the xenia-project/xenia 0b2ffa3 shader
++// sources (see patches/README.md). Not disassembled to keep the patch small.
++const uint32_t hdr_refresh_fused_cs[] = {
++    0x43425844, 0x7A1D3606, 0x3AE86250, 0x846F97C7, 0x930B9468, 0x00000001, 0x000036BC, 0x00000003,
++    0x0000002C, 0x0000003C, 0x0000004C, 0x4E475349, 0x00000008, 0x00000000, 0x00000008, 0x4E47534F,
++    0x00000008, 0x00000000, 0x00000008, 0x58454853, 0x00003668, 0x00050051, 0x00000D9A, 0x0100086A,
++    0x07000059, 0x00308E46, 0x00000000, 0x00000000, 0x00000000, 0x00000008, 0x00000000, 0x07000858,
++    0x00307E46, 0x00000000, 0x00000000, 0x00000000, 0x00005555, 0x00000000, 0x07001858, 0x00307E46,
++    0x00000001, 0x00000001, 0x00000001, 0x00005555, 0x00000000, 0x07001858, 0x00307E46, 0x00000002,
++    0x00000002, 0x00000002, 0x00005555, 0x00000000, 0x07004058, 0x00307E46, 0x00000003, 0x00000003,
++    0x00000003, 0x00005555, 0x00000000, 0x07004058, 0x00307E46, 0x00000004, 0x00000004, 0x00000004,
++    0x00005555, 0x00000000, 0x07004058, 0x00307E46, 0x00000005, 0x00000005, 0x00000005, 0x00005555,
++    0x00000000, 0x07004058, 0x00307E46, 0x00000006, 0x00000006, 0x00000006, 0x00005555, 0x00000000,
++    0x0700189C, 0x0031EE46, 0x00000000, 0x00000000, 0x00000000, 0x00001111, 0x00000000, 0x0200005F,
++    0x00020032, 0x02000068, 0x0000000A, 0x0400009B, 0x00000010, 0x00000008, 0x00000001, 0x08000050,
++    0x00100032, 0x00000000, 0x00020046, 0x00308046, 0x00000000, 0x00000000, 0x00000000, 0x0700003C,
++    0x00100012, 0x00000000, 0x0010001A, 0x00000000, 0x0010000A, 0x00000000, 0x0304001F, 0x0010000A,
++    0x00000000, 0x0100003E, 0x01000015, 0x0B00008A, 0x00100012, 0x00000000, 0x00004001, 0x00000002,
++    0x00004001, 0x00000003, 0x0030802A, 0x00000000, 0x00000000, 0x00000000, 0x0C000001, 0x001000F2,
++    0x00000001, 0x00308AA6, 0x00000000, 0x00000000, 0x00000000, 0x00004002, 0x00000004, 0x00000100,
++    0x00000020, 0x00000200, 0x04000036, 0x00100032, 0x00000002, 0x00020046, 0x08000036, 0x001000C2,
++    0x00000002, 0x00004002, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x0800002D, 0x001000E2,
++    0x00000000, 0x00100F46, 0x00000002, 0x00207936, 0x00000001, 0x00000001, 0x09000037, 0x001000E2,
++    0x00000000, 0x00100006, 0x00000001, 0x001006F6, 0x00000000, 0x00100E56, 0x00000000, 0x07000020,
++    0x00100012, 0x00000000, 0x0010000A, 0x00000000, 0x00004001, 0x00000001, 0x0304001F, 0x0010000A,
++    0x00000000, 0x0800002D, 0x00100072, 0x00000002, 0x00100E46, 0x00000002, 0x00207E46, 0x00000002,
++    0x00000002, 0x08000000, 0x00100072, 0x00000003, 0x00100796, 0x00000000, 0x80100246, 0x00000041,
++    0x00000002, 0x0B000031, 0x00100072, 0x00000003, 0x00004002, 0x3B008081, 0x3B008081, 0x3B008081,
++    0x00000000, 0x80100246, 0x00000081, 0x00000003, 0x0700003C, 0x00100082, 0x00000002, 0x0010001A,
++    0x00000003, 0x0010000A, 0x00000003, 0x0700003C, 0x00100082, 0x00000002, 0x0010002A, 0x00000003,
++    0x0010003A, 0x00000002, 0x0600004F, 0x00100012, 0x00000003, 0x00004001, 0x00000000, 0x0002001A,
++    0x0900001E, 0x00100072, 0x00000004, 0x00020146, 0x00004002, 0x00000000, 0xFFFFFFFF, 0x00000001,
++    0x00000000, 0x05000036, 0x00100082, 0x00000004, 0x00004001, 0x00000000, 0x0800002D, 0x001000E2,
++    0x00000003, 0x00100F46, 0x00000004, 0x00207936, 0x00000001, 0x00000001, 0x09000037, 0x001000E2,
++    0x00000003, 0x00100006, 0x00000001, 0x001006F6, 0x00000003, 0x00100E56, 0x00000003, 0x0800002D,
++    0x001000B2, 0x00000004, 0x00100F46, 0x00000004, 0x00207B46, 0x00000002, 0x00000002, 0x08000000,
++    0x001000E2, 0x00000003, 0x00100E56, 0x00000003, 0x80100D06, 0x00000041, 0x00000004, 0x0B000031,
++    0x001000E2, 0x00000003, 0x00004002, 0x00000000, 0x3B008081, 0x3B008081, 0x3B008081, 0x80100E56,
++    0x00000081, 0x00000003, 0x0700003C, 0x00100022, 0x00000003, 0x0010002A, 0x00000003, 0x0010001A,
++    0x00000003, 0x0700003C, 0x00100022, 0x00000003, 0x0010003A, 0x00000003, 0x0010001A, 0x00000003,
++    0x07000001, 0x00100012, 0x00000003, 0x0010001A, 0x00000003, 0x0010000A, 0x00000003, 0x0900004F,
++    0x00100022, 0x00000003, 0x0010002A, 0x00000004, 0x0030801A, 0x00000000, 0x00000000, 0x00000000,
++    0x0900001E, 0x00100032, 0x00000004, 0x00020046, 0x00004002, 0x00000000, 0x00000001, 0x00000000,
++    0x00000000, 0x08000036, 0x001000C2, 0x00000004, 0x00004002, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x0800002D, 0x00100072, 0x00000005, 0x00100F46, 0x00000004, 0x00207E46, 0x00000001,
++    0x00000001, 0x09000037, 0x00100072, 0x00000005, 0x00100006, 0x00000001, 0x00100866, 0x00000005,
++    0x00100246, 0x00000005, 0x0800002D, 0x00100072, 0x00000004, 0x00100E46, 0x00000004, 0x00207E46,
++    0x00000002, 0x00000002, 0x08000000, 0x00100072, 0x00000004, 0x80100246, 0x00000041, 0x00000004,
++    0x00100246, 0x00000005, 0x0B000031, 0x00100072, 0x00000004, 0x00004002, 0x3B008081, 0x3B008081,
++    0x3B008081, 0x00000000, 0x80100246, 0x00000081, 0x00000004, 0x0700003C, 0x00100012, 0x00000001,
++    0x0010001A, 0x00000004, 0x0010000A, 0x00000004, 0x0700003C, 0x00100012, 0x00000001, 0x0010002A,
++    0x00000004, 0x0010000A, 0x00000001, 0x07000001, 0x00100012, 0x00000001, 0x0010000A, 0x00000001,
++    0x0010001A, 0x00000003, 0x0700003C, 0x00100012, 0x00000001, 0x0010000A, 0x00000001, 0x0010000A,
++    0x00000003, 0x07000001, 0x00100022, 0x00000001, 0x0010000A, 0x00000001, 0x0010003A, 0x00000002,
++    0x01000012, 0x07000020, 0x00100022, 0x00000001, 0x0010001A, 0x00000001, 0x00004001, 0x00000000,
++    0x05000036, 0x00100072, 0x00000002, 0x00100796, 0x00000000, 0x01000015, 0x0A000027, 0x00100092,
++    0x00000001, 0x00100EA6, 0x00000001, 0x00004002, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x07000001, 0x00100012, 0x00000000, 0x0010000A, 0x00000000, 0x0010000A, 0x00000001, 0x0C000037,
++    0x00100072, 0x00000000, 0x00100006, 0x00000000, 0x00004002, 0x3F800000, 0x00000000, 0x3F800000,
++    0x00000000, 0x00100796, 0x00000000, 0x07000001, 0x00100072, 0x00000000, 0x00100246, 0x00000000,
++    0x00100556, 0x00000001, 0x07000020, 0x00100082, 0x00000000, 0x0010001A, 0x00000001, 0x00004001,
++    0x00000000, 0x07000001, 0x00100082, 0x00000000, 0x0010003A, 0x00000001, 0x0010003A, 0x00000000,
++    0x0304001F, 0x0010003A, 0x00000000, 0x04000056, 0x00100092, 0x00000001, 0x00020406, 0x0A000000,
++    0x00100092, 0x00000001, 0x00100C06, 0x00000001, 0x00004002, 0x3F000000, 0x00000000, 0x00000000,
++    0x3F000000, 0x0A000000, 0x00100092, 0x00000001, 0x00100C06, 0x00000001, 0x80308406, 0x00000041,
++    0x00000000, 0x00000000, 0x00000003, 0x07000056, 0x00100032, 0x00000003, 0x00308046, 0x00000000,
++    0x00000000, 0x00000002, 0x0700000E, 0x00100092, 0x00000001, 0x00100C06, 0x00000001, 0x00100406,
++    0x00000003, 0x0800103D, 0x00100032, 0x00000003, 0x00004001, 0x00000000, 0x00207E46, 0x00000003,
++    0x00000003, 0x0800103D, 0x001000C2, 0x00000003, 0x00004001, 0x00000000, 0x002074E6, 0x00000004,
++    0x00000004, 0x0800103D, 0x00100032, 0x00000004, 0x00004001, 0x00000000, 0x00207E46, 0x00000005,
++    0x00000005, 0x0800103D, 0x001000C2, 0x00000004, 0x00004001, 0x00000000, 0x002074E6, 0x00000006,
++    0x00000006, 0x05000056, 0x00100032, 0x00000005, 0x00100046, 0x00000003, 0x0C000032, 0x00100032,
++    0x00000005, 0x001000C6, 0x00000001, 0x00100046, 0x00000005, 0x00004002, 0x3B000000, 0x3B000000,
++    0x00000000, 0x00000000, 0x05000041, 0x00100032, 0x00000005, 0x00100046, 0x00000005, 0x0500001B,
++    0x00100032, 0x00000005, 0x00100046, 0x00000005, 0x0A00001E, 0x00100032, 0x00000003, 0x00100046,
++    0x00000003, 0x00004002, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0x00000000, 0x0A000024, 0x00100032,
++    0x00000005, 0x00100046, 0x00000005, 0x00004002, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x07000025, 0x00100032, 0x00000005, 0x00100046, 0x00000003, 0x00100046, 0x00000005, 0x08000036,
++    0x001000C2, 0x00000005, 0x00004002, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x0800002D,
++    0x00100072, 0x00000005, 0x00100E46, 0x00000005, 0x00207E46, 0x00000003, 0x00000003, 0x05000056,
++    0x00100032, 0x00000003, 0x00100AE6, 0x00000003, 0x0C000032, 0x00100032, 0x00000003, 0x001000C6,
++    0x00000001, 0x00100046, 0x00000003, 0x00004002, 0xBF000000, 0xBF000000, 0x00000000, 0x00000000,
++    0x05000041, 0x00100032, 0x00000006, 0x00100046, 0x00000003, 0x08000000, 0x00100032, 0x00000003,
++    0x00100046, 0x00000003, 0x80100046, 0x00000041, 0x00000006, 0x0A00001E, 0x001000C2, 0x00000003,
++    0x00100EA6, 0x00000003, 0x00004002, 0x00000000, 0x00000000, 0xFFFFFFFF, 0xFFFFFFFF, 0x0500001B,
++    0x00100032, 0x00000006, 0x00100046, 0x00000006, 0x0A000024, 0x001000C2, 0x00000006, 0x00100406,
++    0x00000006, 0x00004002, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x07000025, 0x00100032,
++    0x00000007, 0x00100AE6, 0x00000003, 0x00100AE6, 0x00000006, 0x0A00001E, 0x00100032, 0x00000006,
++    0x00100046, 0x00000006, 0x00004002, 0x00000001, 0x00000001, 0x00000000, 0x00000000, 0x0A000024,
++    0x00100032, 0x00000006, 0x00100046, 0x00000006, 0x00004002, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x07000025, 0x00100032, 0x00000006, 0x00100AE6, 0x00000003, 0x00100046, 0x00000006,
++    0x05000036, 0x00100042, 0x00000007, 0x00004001, 0x00000000, 0x0800002D, 0x001000F2, 0x00000008,
++    0x00100A46, 0x00000007, 0x00207E46, 0x00000004, 0x00000004, 0x05000036, 0x001000C2, 0x00000006,
++    0x00100956, 0x00000007, 0x0800002D, 0x001000F2, 0x00000009, 0x00100F86, 0x00000006, 0x00207E46,
++    0x00000004, 0x00000004, 0x08000000, 0x001000F2, 0x00000009, 0x80100E46, 0x00000041, 0x00000008,
++    0x00100E46, 0x00000009, 0x09000032, 0x001000F2, 0x00000008, 0x00100E46, 0x00000009, 0x00100006,
++    0x00000003, 0x00100E46, 0x00000008, 0x05000036, 0x00100082, 0x00000007, 0x0010001A, 0x00000006,
++    0x0800002D, 0x001000F2, 0x00000007, 0x00100AC6, 0x00000007, 0x00207E46, 0x00000004, 0x00000004,
++    0x0800002D, 0x001000F2, 0x00000006, 0x00100F46, 0x00000006, 0x00207E46, 0x00000004, 0x00000004,
++    0x08000000, 0x001000F2, 0x00000006, 0x80100E46, 0x00000041, 0x00000007, 0x00100E46, 0x00000006,
++    0x09000032, 0x001000F2, 0x00000006, 0x00100E46, 0x00000006, 0x00100006, 0x00000003, 0x00100E46,
++    0x00000007, 0x08000000, 0x001000F2, 0x00000006, 0x80100E46, 0x00000041, 0x00000008, 0x00100E46,
++    0x00000006, 0x09000032, 0x001000F2, 0x00000003, 0x00100E46, 0x00000006, 0x00100556, 0x00000003,
++    0x00100E46, 0x00000008, 0x05000056, 0x00100032, 0x00000006, 0x00100046, 0x00000004, 0x0C000032,
++    0x00100092, 0x00000001, 0x00100C06, 0x00000001, 0x00100406, 0x00000006, 0x00004002, 0xBF000000,
++    0x00000000, 0x00000000, 0xBF000000, 0x05000041, 0x00100032, 0x00000006, 0x001000C6, 0x00000001,
++    0x08000000, 0x00100092, 0x00000001, 0x00100C06, 0x00000001, 0x80100406, 0x00000041, 0x00000006,
++    0x0A00001E, 0x00100032, 0x00000004, 0x00100046, 0x00000004, 0x00004002, 0xFFFFFFFF, 0xFFFFFFFF,
++    0x00000000, 0x00000000, 0x0500001B, 0x00100032, 0x00000006, 0x00100046, 0x00000006, 0x0A000024,
++    0x001000C2, 0x00000006, 0x00100406, 0x00000006, 0x00004002, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x07000025, 0x00100032, 0x00000007, 0x00100046, 0x00000004, 0x00100AE6, 0x00000006,
++    0x0A00001E, 0x00100032, 0x00000006, 0x00100046, 0x00000006, 0x00004002, 0x00000001, 0x00000001,
++    0x00000000, 0x00000000, 0x0A000024, 0x00100032, 0x00000006, 0x00100046, 0x00000006, 0x00004002,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x07000025, 0x00100032, 0x00000006, 0x00100046,
++    0x00000004, 0x00100046, 0x00000006, 0x05000036, 0x00100042, 0x00000007, 0x00004001, 0x00000000,
++    0x0800002D, 0x00100072, 0x00000008, 0x00100A46, 0x00000007, 0x00207E46, 0x00000005, 0x00000005,
++    0x05000036, 0x001000C2, 0x00000006, 0x00100956, 0x00000007, 0x0800002D, 0x00100072, 0x00000009,
++    0x00100F86, 0x00000006, 0x00207E46, 0x00000005, 0x00000005, 0x08000000, 0x00100072, 0x00000009,
++    0x80100246, 0x00000041, 0x00000008, 0x00100246, 0x00000009, 0x09000032, 0x00100072, 0x00000008,
++    0x00100246, 0x00000009, 0x00100006, 0x00000001, 0x00100246, 0x00000008, 0x05000036, 0x00100082,
++    0x00000007, 0x0010001A, 0x00000006, 0x0800002D, 0x00100072, 0x00000007, 0x00100AC6, 0x00000007,
++    0x00207E46, 0x00000005, 0x00000005, 0x0800002D, 0x00100072, 0x00000006, 0x00100F46, 0x00000006,
++    0x00207E46, 0x00000005, 0x00000005, 0x08000000, 0x00100072, 0x00000006, 0x80100246, 0x00000041,
++    0x00000007, 0x00100246, 0x00000006, 0x09000032, 0x00100072, 0x00000006, 0x00100246, 0x00000006,
++    0x00100006, 0x00000001, 0x00100246, 0x00000007, 0x08000000, 0x00100072, 0x00000006, 0x80100246,
++    0x00000041, 0x00000008, 0x00100246, 0x00000006, 0x09000032, 0x00100072, 0x00000006, 0x00100246,
++    0x00000006, 0x00100FF6, 0x00000001, 0x00100246, 0x00000008, 0x09002038, 0x00100082, 0x00000000,
++    0x0010003A, 0x00000003, 0x0030803A, 0x00000000, 0x00000000, 0x00000004, 0x08000000, 0x00100072,
++    0x00000003, 0x80100246, 0x00000041, 0x00000005, 0x00100246, 0x00000003, 0x09000032, 0x00100072,
++    0x00000003, 0x00100FF6, 0x00000000, 0x00100246, 0x00000003, 0x00100246, 0x00000005, 0x0A000010,
++    0x00100082, 0x00000000, 0x00100246, 0x00000003, 0x00004002, 0x3F039E6B, 0x3EA5D378, 0x3E243676,
++    0x00000000, 0x0A000010, 0x00100012, 0x00000001, 0x00100246, 0x00000003, 0x00004002, 0x3E87B6FE,
++    0x3F2B9475, 0x3D834275, 0x00000000, 0x0A000010, 0x00100082, 0x00000001, 0x00100246, 0x00000003,
++    0x00004002, 0x3F4DA693, 0x3F8EF790, 0x3F88D10F, 0x00000000, 0x07000018, 0x00100082, 0x00000002,
++    0x0010003A, 0x00000001, 0x00004001, 0x00000000, 0x0B000037, 0x00100082, 0x00000001, 0x0010003A,
++    0x00000002, 0x0030802A, 0x00000000, 0x00000000, 0x00000004, 0x0010003A, 0x00000001, 0x0700000E,
++    0x00100082, 0x00000000, 0x0010003A, 0x00000000, 0x0010003A, 0x00000001, 0x0700000E, 0x00100082,
++    0x00000001, 0x0010000A, 0x00000001, 0x0010003A, 0x00000001, 0x0A000055, 0x00100032, 0x00000003,
++    0x00100AE6, 0x00000004, 0x00004002, 0x00000001, 0x00000001, 0x00000000, 0x00000000, 0x08000036,
++    0x001000C2, 0x00000003, 0x00004002, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x0800002D,
++    0x00100082, 0x00000002, 0x00100E46, 0x00000003, 0x00207396, 0x00000006, 0x00000006, 0x09000034,
++    0x00100082, 0x00000002, 0x0010003A, 0x00000002, 0x0030800A, 0x00000000, 0x00000000, 0x00000005,
++    0x09000033, 0x00100082, 0x00000002, 0x0010003A, 0x00000002, 0x0030801A, 0x00000000, 0x00000000,
++    0x00000005, 0x09000038, 0x00100012, 0x00000001, 0x0010000A, 0x00000001, 0x0030800A, 0x00000000,
++    0x00000000, 0x00000004, 0x09000000, 0x00100082, 0x00000002, 0x0010003A, 0x00000002, 0x0030802A,
++    0x00000000, 0x00000000, 0x00000004, 0x0700000E, 0x00100012, 0x00000001, 0x0010000A, 0x00000001,
++    0x0010003A, 0x00000002, 0x07000001, 0x00100082, 0x00000002, 0x0010000A, 0x00000001, 0x00004001,
++    0x7FFFFFFF, 0x07000050, 0x00100082, 0x00000002, 0x00004001, 0x7F800000, 0x0010003A, 0x00000002,
++    0x07000034, 0x00100012, 0x00000001, 0x0010000A, 0x00000001, 0x00004001, 0x00000000, 0x07000033,
++    0x00100012, 0x00000001, 0x0010000A, 0x00000001, 0x00004001, 0x5D5E0B6B, 0x07000001, 0x00100012,
++    0x00000001, 0x0010000A, 0x00000001, 0x0010003A, 0x00000002, 0x0900000E, 0x00100082, 0x00000002,
++    0x0010000A, 0x00000001, 0x0030801A, 0x00000000, 0x00000000, 0x00000004, 0x07000000, 0x00100082,
++    0x00000002, 0x0010003A, 0x00000002, 0x00004001, 0x3F800000, 0x07000038, 0x00100082, 0x00000002,
++    0x0010000A, 0x00000001, 0x0010003A, 0x00000002, 0x07000000, 0x00100012, 0x00000003, 0x0010000A,
++    0x00000001, 0x00004001, 0x3F800000, 0x0700000E, 0x00100022, 0x00000003, 0x0010003A, 0x00000002,
++    0x0010000A, 0x00000003, 0x09000020, 0x00100082, 0x00000002, 0x0030802A, 0x00000000, 0x00000000,
++    0x00000002, 0x00004001, 0x00000000, 0x09000031, 0x00100082, 0x00000003, 0x0030801A, 0x00000000,
++    0x00000000, 0x00000007, 0x0010000A, 0x00000001, 0x07000001, 0x00100082, 0x00000002, 0x0010003A,
++    0x00000002, 0x0010003A, 0x00000003, 0x0304001F, 0x0010003A, 0x00000002, 0x0A000000, 0x00100082,
++    0x00000002, 0x8030800A, 0x00000041, 0x00000000, 0x00000000, 0x00000007, 0x00004001, 0x3F800000,
++    0x07000038, 0x00100082, 0x00000002, 0x0010003A, 0x00000002, 0x00004001, 0x3F800347, 0x09000031,
++    0x00100082, 0x00000002, 0x0010003A, 0x00000002, 0x0030803A, 0x00000000, 0x00000000, 0x00000007,
++    0x0304001F, 0x0010003A, 0x00000002, 0x0A000000, 0x00100082, 0x00000002, 0x0010000A, 0x00000001,
++    0x8030801A, 0x00000041, 0x00000000, 0x00000000, 0x00000007, 0x0A000038, 0x00100082, 0x00000002,
++    0x8010003A, 0x00000041, 0x00000002, 0x0030802A, 0x00000000, 0x00000000, 0x00000007, 0x0900000E,
++    0x00100082, 0x00000002, 0x0010003A, 0x00000002, 0x0030803A, 0x00000000, 0x00000000, 0x00000007,
++    0x07000038, 0x00100082, 0x00000002, 0x0010003A, 0x00000002, 0x00004001, 0x3FB8AA3B, 0x05000019,
++    0x00100082, 0x00000002, 0x0010003A, 0x00000002, 0x08000000, 0x00100082, 0x00000002, 0x8010003A,
++    0x00000041, 0x00000002, 0x00004001, 0x3F800000, 0x0D000032, 0x00100082, 0x00000002, 0x0030803A,
++    0x00000000, 0x00000000, 0x00000007, 0x0010003A, 0x00000002, 0x0030800A, 0x00000000, 0x00000000,
++    0x00000007, 0x0700004B, 0x00100082, 0x00000003, 0x0030801A, 0x00000000, 0x00000000, 0x00000004,
++    0x07000031, 0x00100012, 0x00000001, 0x0010000A, 0x00000001, 0x0010003A, 0x00000003, 0x07000034,
++    0x00100082, 0x00000003, 0x0010001A, 0x00000003, 0x0010003A, 0x00000002, 0x09000037, 0x00100022,
++    0x00000004, 0x0010000A, 0x00000001, 0x0010003A, 0x00000003, 0x0010003A, 0x00000002, 0x01000012,
++    0x07000033, 0x00100022, 0x00000004, 0x0010001A, 0x00000003, 0x00004001, 0x3F800000, 0x01000015,
++    0x01000012, 0x05000036, 0x00100022, 0x00000004, 0x0010001A, 0x00000003, 0x01000015, 0x07000018,
++    0x00100012, 0x00000001, 0x0010003A, 0x00000001, 0x00004001, 0x00000000, 0x0B000037, 0x00100012,
++    0x00000001, 0x0010000A, 0x00000001, 0x0030802A, 0x00000000, 0x00000000, 0x00000004, 0x0010003A,
++    0x00000001, 0x07000038, 0x00100082, 0x00000001, 0x0010003A, 0x00000000, 0x0010001A, 0x00000003,
++    0x0700000E, 0x00100012, 0x00000003, 0x0010003A, 0x00000001, 0x0010000A, 0x00000001, 0x08000000,
++    0x00100082, 0x00000001, 0x8010003A, 0x00000041, 0x00000000, 0x00004001, 0x3F800000, 0x08000000,
++    0x00100082, 0x00000001, 0x8010000A, 0x00000041, 0x00000001, 0x0010003A, 0x00000001, 0x07000038,
++    0x00100082, 0x00000002, 0x0010003A, 0x00000001, 0x0010001A, 0x00000003, 0x0700000E, 0x00100042,
++    0x00000003, 0x0010003A, 0x00000002, 0x0010000A, 0x00000001, 0x0A000010, 0x00100012, 0x00000005,
++    0x00100246, 0x00000003, 0x00004002, 0x40242A99, 0xBF954FDF, 0xBECC154D, 0x00000000, 0x0A000010,
++    0x00100022, 0x00000005, 0x00100246, 0x00000003, 0x00004002, 0xBF82C711, 0x3FFD2546, 0x3D33D07D,
++    0x00000000, 0x0A000010, 0x00100042, 0x00000005, 0x00100246, 0x00000003, 0x00004002, 0x3D9A36E3,
++    0xBE82339C, 0x3F9837B5, 0x00000000, 0x07000000, 0x00100072, 0x00000003, 0x00100246, 0x00000006,
++    0x00100246, 0x00000005, 0x0A000010, 0x00100082, 0x00000002, 0x00100246, 0x00000003, 0x00004002,
++    0x3E59999A, 0x3F372474, 0x3D93A92A, 0x00000000, 0x08000000, 0x00100072, 0x00000003, 0x80100FF6,
++    0x00000041, 0x00000002, 0x00100246, 0x00000003, 0x0B000032, 0x00100072, 0x00000003, 0x00100246,
++    0x00000003, 0x00308AA6, 0x00000000, 0x00000000, 0x00000005, 0x00100FF6, 0x00000002, 0x09000038,
++    0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x00308246, 0x00000000, 0x00000000, 0x00000006,
++    0x0F000032, 0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x00004002, 0x40000000, 0x40000000,
++    0x40000000, 0x00000000, 0x00004002, 0xBF000000, 0xBF000000, 0xBF000000, 0x00000000, 0x0E000032,
++    0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x00308FF6, 0x00000000, 0x00000000, 0x00000005,
++    0x00004002, 0x3F000000, 0x3F000000, 0x3F000000, 0x00000000, 0x0A000001, 0x00100072, 0x00000005,
++    0x00100246, 0x00000003, 0x00004002, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x00000000, 0x0A000050,
++    0x00100072, 0x00000005, 0x00004002, 0x7F800000, 0x7F800000, 0x7F800000, 0x00000000, 0x00100246,
++    0x00000005, 0x07000001, 0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x00100246, 0x00000005,
++    0x0A000034, 0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x00004002, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x0A000033, 0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x00004002,
++    0x477FE000, 0x477FE000, 0x477FE000, 0x00000000, 0x07000038, 0x00100082, 0x00000000, 0x0010003A,
++    0x00000000, 0x0010001A, 0x00000004, 0x0700000E, 0x00100012, 0x00000004, 0x0010003A, 0x00000000,
++    0x0010000A, 0x00000001, 0x07000038, 0x00100082, 0x00000000, 0x0010003A, 0x00000001, 0x0010001A,
++    0x00000004, 0x0700000E, 0x00100042, 0x00000004, 0x0010003A, 0x00000000, 0x0010000A, 0x00000001,
++    0x0A000010, 0x00100012, 0x00000005, 0x00100246, 0x00000004, 0x00004002, 0x40242A99, 0xBF954FDF,
++    0xBECC154D, 0x00000000, 0x0A000010, 0x00100022, 0x00000005, 0x00100246, 0x00000004, 0x00004002,
++    0xBF82C711, 0x3FFD2546, 0x3D33D07D, 0x00000000, 0x0A000010, 0x00100042, 0x00000005, 0x00100246,
++    0x00000004, 0x00004002, 0x3D9A36E3, 0xBE82339C, 0x3F9837B5, 0x00000000, 0x0B000032, 0x00100072,
++    0x00000004, 0x00100246, 0x00000006, 0x00308FF6, 0x00000000, 0x00000000, 0x00000006, 0x00100246,
++    0x00000005, 0x0A000010, 0x00100082, 0x00000000, 0x00100246, 0x00000004, 0x00004002, 0x3E59999A,
++    0x3F372474, 0x3D93A92A, 0x00000000, 0x08000000, 0x00100072, 0x00000004, 0x80100FF6, 0x00000041,
++    0x00000000, 0x00100246, 0x00000004, 0x0B000032, 0x00100072, 0x00000004, 0x00100246, 0x00000004,
++    0x00308AA6, 0x00000000, 0x00000000, 0x00000005, 0x00100FF6, 0x00000000, 0x09000038, 0x00100072,
++    0x00000004, 0x00100246, 0x00000004, 0x00308246, 0x00000000, 0x00000000, 0x00000006, 0x0F000032,
++    0x00100072, 0x00000004, 0x00100246, 0x00000004, 0x00004002, 0x40000000, 0x40000000, 0x40000000,
++    0x00000000, 0x00004002, 0xBF000000, 0xBF000000, 0xBF000000, 0x00000000, 0x0E000032, 0x00100072,
++    0x00000004, 0x00100246, 0x00000004, 0x00308FF6, 0x00000000, 0x00000000, 0x00000005, 0x00004002,
++    0x3F000000, 0x3F000000, 0x3F000000, 0x00000000, 0x0A000001, 0x00100072, 0x00000005, 0x00100246,
++    0x00000004, 0x00004002, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x00000000, 0x0A000050, 0x00100072,
++    0x00000005, 0x00004002, 0x7F800000, 0x7F800000, 0x7F800000, 0x00000000, 0x00100246, 0x00000005,
++    0x07000001, 0x00100072, 0x00000004, 0x00100246, 0x00000004, 0x00100246, 0x00000005, 0x0A000034,
++    0x00100072, 0x00000004, 0x00100246, 0x00000004, 0x00004002, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x0A000033, 0x00100072, 0x00000004, 0x00100246, 0x00000004, 0x00004002, 0x477FE000,
++    0x477FE000, 0x477FE000, 0x00000000, 0x0A000031, 0x00100072, 0x00000005, 0x00004002, 0x3B473ABD,
++    0x3B473ABD, 0x3B473ABD, 0x00000000, 0x00100246, 0x00000003, 0x0500002F, 0x00100072, 0x00000006,
++    0x00100246, 0x00000003, 0x0A000038, 0x00100072, 0x00000006, 0x00100246, 0x00000006, 0x00004002,
++    0x3EE8BA2F, 0x3EE8BA2F, 0x3EE8BA2F, 0x00000000, 0x05000019, 0x00100072, 0x00000006, 0x00100246,
++    0x00000006, 0x0F000032, 0x00100072, 0x00000006, 0x00100246, 0x00000006, 0x00004002, 0x3F870A3D,
++    0x3F870A3D, 0x3F870A3D, 0x00000000, 0x00004002, 0xBD6147AE, 0xBD6147AE, 0xBD6147AE, 0x00000000,
++    0x0A000038, 0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x00004002, 0x414EB852, 0x414EB852,
++    0x414EB852, 0x00000000, 0x09002037, 0x00100072, 0x00000003, 0x00100246, 0x00000005, 0x00100246,
++    0x00000006, 0x00100246, 0x00000003, 0x0F000032, 0x00100072, 0x00000003, 0x00100246, 0x00000003,
++    0x00004002, 0x437F0000, 0x437F0000, 0x437F0000, 0x00000000, 0x00004002, 0x3F000000, 0x3F000000,
++    0x3F000000, 0x00000000, 0x05000041, 0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x0F000032,
++    0x00100072, 0x00000005, 0x00100246, 0x00000003, 0x00004002, 0x3B808081, 0x3B808081, 0x3B808081,
++    0x00000000, 0x00004002, 0xBBC0C0C1, 0xBBC0C0C1, 0xBBC0C0C1, 0x00000000, 0x0700001D, 0x00100072,
++    0x00000005, 0x00100246, 0x00000002, 0x00100246, 0x00000005, 0x07000001, 0x00100082, 0x00000000,
++    0x0010001A, 0x00000005, 0x0010000A, 0x00000005, 0x07000001, 0x00100082, 0x00000000, 0x0010002A,
++    0x00000005, 0x0010003A, 0x00000000, 0x0304001F, 0x0010003A, 0x00000000, 0x0D000032, 0x00100072,
++    0x00000005, 0x80100246, 0x00000041, 0x00000003, 0x00004002, 0x3B808081, 0x3B808081, 0x3B808081,
++    0x00000000, 0x00100246, 0x00000002, 0x0A000031, 0x00100072, 0x00000005, 0x00004002, 0x3BC0C0C1,
++    0x3BC0C0C1, 0x3BC0C0C1, 0x00000000, 0x00100246, 0x00000005, 0x0A000031, 0x00100072, 0x00000006,
++    0x00004002, 0x3D20E0B6, 0x3D20E0B6, 0x3D20E0B6, 0x00000000, 0x00100246, 0x00000002, 0x0A000000,
++    0x00100072, 0x00000007, 0x00100246, 0x00000002, 0x00004002, 0x3D6147AE, 0x3D6147AE, 0x3D6147AE,
++    0x00000000, 0x0A000038, 0x00100072, 0x00000007, 0x00100246, 0x00000007, 0x00004002, 0x3F72A76E,
++    0x3F72A76E, 0x3F72A76E, 0x00000000, 0x0500002F, 0x00100072, 0x00000007, 0x00100246, 0x00000007,
++    0x0A000038, 0x00100072, 0x00000007, 0x00100246, 0x00000007, 0x00004002, 0x400CCCCD, 0x400CCCCD,
++    0x400CCCCD, 0x00000000, 0x05000019, 0x00100072, 0x00000007, 0x00100246, 0x00000007, 0x0A000038,
++    0x00100072, 0x00000008, 0x00100246, 0x00000002, 0x00004002, 0x3D9E8391, 0x3D9E8391, 0x3D9E8391,
++    0x00000000, 0x09000037, 0x00100072, 0x00000006, 0x00100246, 0x00000006, 0x00100246, 0x00000007,
++    0x00100246, 0x00000008, 0x0A000031, 0x00100072, 0x00000007, 0x00004002, 0x41203FD5, 0x41203FD5,
++    0x41203FD5, 0x00000000, 0x00100246, 0x00000003, 0x0F000032, 0x00100072, 0x00000008, 0x00100246,
++    0x00000003, 0x00004002, 0x3B808081, 0x3B808081, 0x3B808081, 0x00000000, 0x00004002, 0x3D6147AE,
++    0x3D6147AE, 0x3D6147AE, 0x00000000, 0x0A000038, 0x00100072, 0x00000008, 0x00100246, 0x00000008,
++    0x00004002, 0x3F72A76E, 0x3F72A76E, 0x3F72A76E, 0x00000000, 0x0500002F, 0x00100072, 0x00000008,
++    0x00100246, 0x00000008, 0x0A000038, 0x00100072, 0x00000008, 0x00100246, 0x00000008, 0x00004002,
++    0x400CCCCD, 0x400CCCCD, 0x400CCCCD, 0x00000000, 0x05000019, 0x00100072, 0x00000008, 0x00100246,
++    0x00000008, 0x0A000038, 0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x00004002, 0x399F22B4,
++    0x399F22B4, 0x399F22B4, 0x00000000, 0x09000037, 0x00100072, 0x00000003, 0x00100246, 0x00000007,
++    0x00100246, 0x00000008, 0x00100246, 0x00000003, 0x08000000, 0x00100072, 0x00000003, 0x80100246,
++    0x00000041, 0x00000003, 0x00100246, 0x00000006, 0x07000001, 0x00100072, 0x00000003, 0x00100246,
++    0x00000003, 0x00100246, 0x00000005, 0x0B000032, 0x00100072, 0x00000003, 0x00100246, 0x00000003,
++    0x00308FF6, 0x00000000, 0x00000000, 0x00000000, 0x00100246, 0x00000004, 0x0A000034, 0x00100072,
++    0x00000003, 0x00100246, 0x00000003, 0x00004002, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x0A000031, 0x00100072, 0x00000004, 0x00004002, 0x3B473ABD, 0x3B473ABD, 0x3B473ABD, 0x00000000,
++    0x00100246, 0x00000003, 0x0500002F, 0x00100072, 0x00000005, 0x00100246, 0x00000003, 0x0A000038,
++    0x00100072, 0x00000005, 0x00100246, 0x00000005, 0x00004002, 0x3EE8BA2F, 0x3EE8BA2F, 0x3EE8BA2F,
++    0x00000000, 0x05000019, 0x00100072, 0x00000005, 0x00100246, 0x00000005, 0x0F000032, 0x00100072,
++    0x00000005, 0x00100246, 0x00000005, 0x00004002, 0x3F870A3D, 0x3F870A3D, 0x3F870A3D, 0x00000000,
++    0x00004002, 0xBD6147AE, 0xBD6147AE, 0xBD6147AE, 0x00000000, 0x0A000038, 0x00100072, 0x00000003,
++    0x00100246, 0x00000003, 0x00004002, 0x414EB852, 0x414EB852, 0x414EB852, 0x00000000, 0x09000037,
++    0x00100072, 0x00000002, 0x00100246, 0x00000004, 0x00100246, 0x00000005, 0x00100246, 0x00000003,
++    0x09000001, 0x00100082, 0x00000000, 0x0030802A, 0x00000000, 0x00000000, 0x00000000, 0x00004001,
++    0x00000400, 0x07000020, 0x00100082, 0x00000000, 0x0010003A, 0x00000000, 0x00004001, 0x00000000,
++    0x01000012, 0x0304001F, 0x0010002A, 0x00000001, 0x08000036, 0x00100072, 0x00000002, 0x00004002,
++    0x00000000, 0x3F800000, 0x3F800000, 0x00000000, 0x01000015, 0x05000036, 0x00100082, 0x00000000,
++    0x00004001, 0x00000000, 0x01000015, 0x01000012, 0x05000036, 0x00100082, 0x00000000, 0x00004001,
++    0x00000000, 0x01000015, 0x09000037, 0x00100012, 0x00000001, 0x0010001A, 0x00000001, 0x00004001,
++    0x00000000, 0x00004001, 0x3F800000, 0x09000032, 0x001000D2, 0x00000001, 0x00100906, 0x00000002,
++    0x00100006, 0x00000001, 0x00100906, 0x00000000, 0x0304001F, 0x0010003A, 0x00000000, 0x0A000034,
++    0x00100072, 0x00000002, 0x00100386, 0x00000001, 0x00004002, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x0A000038, 0x00100072, 0x00000002, 0x00100246, 0x00000002, 0x00004002, 0x437F0000,
++    0x437F0000, 0x437F0000, 0x00000000, 0x0A000001, 0x00100072, 0x00000003, 0x00100246, 0x00000002,
++    0x00004002, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x00000000, 0x0A000050, 0x00100072, 0x00000003,
++    0x00004002, 0x7F800000, 0x7F800000, 0x7F800000, 0x00000000, 0x00100246, 0x00000003, 0x07000001,
++    0x00100072, 0x00000002, 0x00100246, 0x00000002, 0x00100246, 0x00000003, 0x05000041, 0x00100072,
++    0x00000003, 0x00100246, 0x00000002, 0x0A000033, 0x00100072, 0x00000003, 0x00100246, 0x00000003,
++    0x00004002, 0x437E0000, 0x437E0000, 0x437E0000, 0x00000000, 0x0500001C, 0x00100072, 0x00000003,
++    0x00100246, 0x00000003, 0x0800002D, 0x00100012, 0x00000004, 0x00100006, 0x00000003, 0x00207D26,
++    0x00000000, 0x00000000, 0x0800002D, 0x00100022, 0x00000004, 0x00100556, 0x00000003, 0x00207E46,
++    0x00000000, 0x00000000, 0x0800002D, 0x00100042, 0x00000004, 0x00100AA6, 0x00000003, 0x00207C96,
++    0x00000000, 0x00000000, 0x0A00001E, 0x00100072, 0x00000005, 0x00100246, 0x00000003, 0x00004002,
++    0x00000001, 0x00000001, 0x00000001, 0x00000000, 0x0800002D, 0x00100012, 0x00000006, 0x00100006,
++    0x00000005, 0x00207D26, 0x00000000, 0x00000000, 0x0800002D, 0x00100022, 0x00000006, 0x00100556,
++    0x00000005, 0x00207E46, 0x00000000, 0x00000000, 0x0800002D, 0x00100042, 0x00000006, 0x00100AA6,
++    0x00000005, 0x00207C96, 0x00000000, 0x00000000, 0x08000000, 0x00100072, 0x00000005, 0x80100246,
++    0x00000041, 0x00000004, 0x00100246, 0x00000006, 0x05000056, 0x00100072, 0x00000003, 0x00100246,
++    0x00000003, 0x08000000, 0x00100072, 0x00000002, 0x00100246, 0x00000002, 0x80100246, 0x00000041,
++    0x00000003, 0x09000032, 0x00100072, 0x00000002, 0x00100246, 0x00000005, 0x00100246, 0x00000002,
++    0x00100246, 0x00000004, 0x09000001, 0x00100082, 0x00000000, 0x0030802A, 0x00000000, 0x00000000,
++    0x00000000, 0x00004001, 0x00000001, 0x0A000034, 0x00100072, 0x00000002, 0x00100246, 0x00000002,
++    0x00004002, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x0304001F, 0x0010003A, 0x00000000,
++    0x0500002F, 0x00100072, 0x00000003, 0x00100246, 0x00000002, 0x0A000038, 0x00100072, 0x00000003,
++    0x00100246, 0x00000003, 0x00004002, 0x400CCCCD, 0x400CCCCD, 0x400CCCCD, 0x00000000, 0x05000019,
++    0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x01000012, 0x0A000031, 0x00100072, 0x00000004,
++    0x00004002, 0x3D25AEE6, 0x3D25AEE6, 0x3D25AEE6, 0x00000000, 0x00100246, 0x00000002, 0x0A000000,
++    0x00100072, 0x00000005, 0x00100246, 0x00000002, 0x00004002, 0x3D6147AE, 0x3D6147AE, 0x3D6147AE,
++    0x00000000, 0x0A000038, 0x00100072, 0x00000005, 0x00100246, 0x00000005, 0x00004002, 0x3F72A76E,
++    0x3F72A76E, 0x3F72A76E, 0x00000000, 0x0500002F, 0x00100072, 0x00000005, 0x00100246, 0x00000005,
++    0x0A000038, 0x00100072, 0x00000005, 0x00100246, 0x00000005, 0x00004002, 0x4019999A, 0x4019999A,
++    0x4019999A, 0x00000000, 0x05000019, 0x00100072, 0x00000005, 0x00100246, 0x00000005, 0x0A000038,
++    0x00100072, 0x00000002, 0x00100246, 0x00000002, 0x00004002, 0x3D9E8391, 0x3D9E8391, 0x3D9E8391,
++    0x00000000, 0x09000037, 0x00100072, 0x00000003, 0x00100246, 0x00000004, 0x00100246, 0x00000005,
++    0x00100246, 0x00000002, 0x01000015, 0x01000012, 0x05002036, 0x001000D2, 0x00000001, 0x00100E06,
++    0x00000001, 0x0F000032, 0x001000D2, 0x00000001, 0x00100E06, 0x00000001, 0x00004002, 0x437F0000,
++    0x00000000, 0x437F0000, 0x437F0000, 0x00004002, 0x3F000000, 0x00000000, 0x3F000000, 0x3F000000,
++    0x0500001C, 0x001000D2, 0x00000001, 0x00100E06, 0x00000001, 0x0800002D, 0x00100012, 0x00000002,
++    0x00100006, 0x00000001, 0x00207D26, 0x00000000, 0x00000000, 0x0800002D, 0x00100022, 0x00000002,
++    0x00100AA6, 0x00000001, 0x00207E46, 0x00000000, 0x00000000, 0x0800002D, 0x00100042, 0x00000002,
++    0x00100FF6, 0x00000001, 0x00207C96, 0x00000000, 0x00000000, 0x09000001, 0x00100082, 0x00000000,
++    0x0030802A, 0x00000000, 0x00000000, 0x00000000, 0x00004001, 0x00000001, 0x0A000034, 0x001000D2,
++    0x00000001, 0x00100906, 0x00000002, 0x00004002, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x0304001F, 0x0010003A, 0x00000000, 0x0500002F, 0x00100072, 0x00000002, 0x00100386, 0x00000001,
++    0x0A000038, 0x00100072, 0x00000002, 0x00100246, 0x00000002, 0x00004002, 0x400CCCCD, 0x400CCCCD,
++    0x400CCCCD, 0x00000000, 0x05000019, 0x00100072, 0x00000003, 0x00100246, 0x00000002, 0x01000012,
++    0x0A000031, 0x00100072, 0x00000002, 0x00004002, 0x3D25AEE6, 0x3D25AEE6, 0x3D25AEE6, 0x00000000,
++    0x00100386, 0x00000001, 0x0A000000, 0x00100072, 0x00000004, 0x00100386, 0x00000001, 0x00004002,
++    0x3D6147AE, 0x3D6147AE, 0x3D6147AE, 0x00000000, 0x0A000038, 0x00100072, 0x00000004, 0x00100246,
++    0x00000004, 0x00004002, 0x3F72A76E, 0x3F72A76E, 0x3F72A76E, 0x00000000, 0x0500002F, 0x00100072,
++    0x00000004, 0x00100246, 0x00000004, 0x0A000038, 0x00100072, 0x00000004, 0x00100246, 0x00000004,
++    0x00004002, 0x4019999A, 0x4019999A, 0x4019999A, 0x00000000, 0x05000019, 0x00100072, 0x00000004,
++    0x00100246, 0x00000004, 0x0A000038, 0x001000D2, 0x00000001, 0x00100E06, 0x00000001, 0x00004002,
++    0x3D9E8391, 0x00000000, 0x3D9E8391, 0x3D9E8391, 0x09000037, 0x00100072, 0x00000003, 0x00100246,
++    0x00000002, 0x00100246, 0x00000004, 0x00100386, 0x00000001, 0x01000015, 0x01000015, 0x0C000001,
++    0x001000D2, 0x00000001, 0x00308AA6, 0x00000000, 0x00000000, 0x00000000, 0x00004002, 0x00000400,
++    0x00000000, 0x00000002, 0x00000800, 0x0D000037, 0x00100082, 0x00000000, 0x0010000A, 0x00000001,
++    0x0030800A, 0x00000000, 0x00000000, 0x00000001, 0x0030801A, 0x00000000, 0x00000000, 0x00000001,
++    0x07000038, 0x00100072, 0x00000002, 0x00100FF6, 0x00000000, 0x00100246, 0x00000003, 0x09000039,
++    0x00100012, 0x00000001, 0x0010003A, 0x00000000, 0x0030800A, 0x00000000, 0x00000000, 0x00000001,
++    0x07000001, 0x00100012, 0x00000001, 0x0010000A, 0x00000001, 0x0010001A, 0x00000001, 0x0304001F,
++    0x0010000A, 0x00000001, 0x05002036, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x0F000032,
++    0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x00004002, 0x437F0000, 0x437F0000, 0x437F0000,
++    0x00000000, 0x00004002, 0x3F000000, 0x3F000000, 0x3F000000, 0x00000000, 0x0500001C, 0x00100072,
++    0x00000000, 0x00100246, 0x00000000, 0x0800002D, 0x00100012, 0x00000003, 0x00100006, 0x00000000,
++    0x00207D26, 0x00000000, 0x00000000, 0x0800002D, 0x00100022, 0x00000003, 0x00100556, 0x00000000,
++    0x00207E46, 0x00000000, 0x00000000, 0x0800002D, 0x00100042, 0x00000003, 0x00100AA6, 0x00000000,
++    0x00207C96, 0x00000000, 0x00000000, 0x09000001, 0x00100012, 0x00000000, 0x0030802A, 0x00000000,
++    0x00000000, 0x00000000, 0x00004001, 0x00000001, 0x0A000034, 0x00100072, 0x00000003, 0x00100246,
++    0x00000003, 0x00004002, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x0304001F, 0x0010000A,
++    0x00000000, 0x0500002F, 0x00100072, 0x00000000, 0x00100246, 0x00000003, 0x0A000038, 0x00100072,
++    0x00000000, 0x00100246, 0x00000000, 0x00004002, 0x400CCCCD, 0x400CCCCD, 0x400CCCCD, 0x00000000,
++    0x05000019, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x01000012, 0x0A000031, 0x00100072,
++    0x00000004, 0x00004002, 0x3D25AEE6, 0x3D25AEE6, 0x3D25AEE6, 0x00000000, 0x00100246, 0x00000003,
++    0x0A000000, 0x00100072, 0x00000005, 0x00100246, 0x00000003, 0x00004002, 0x3D6147AE, 0x3D6147AE,
++    0x3D6147AE, 0x00000000, 0x0A000038, 0x00100072, 0x00000005, 0x00100246, 0x00000005, 0x00004002,
++    0x3F72A76E, 0x3F72A76E, 0x3F72A76E, 0x00000000, 0x0500002F, 0x00100072, 0x00000005, 0x00100246,
++    0x00000005, 0x0A000038, 0x00100072, 0x00000005, 0x00100246, 0x00000005, 0x00004002, 0x4019999A,
++    0x4019999A, 0x4019999A, 0x00000000, 0x05000019, 0x00100072, 0x00000005, 0x00100246, 0x00000005,
++    0x0A000038, 0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x00004002, 0x3D9E8391, 0x3D9E8391,
++    0x3D9E8391, 0x00000000, 0x09000037, 0x00100072, 0x00000000, 0x00100246, 0x00000004, 0x00100246,
++    0x00000005, 0x00100246, 0x00000003, 0x01000015, 0x0A000000, 0x00100082, 0x00000000, 0x8010003A,
++    0x00000041, 0x00000000, 0x0030800A, 0x00000000, 0x00000000, 0x00000001, 0x09000032, 0x00100072,
++    0x00000002, 0x00100246, 0x00000000, 0x00100FF6, 0x00000000, 0x00100246, 0x00000002, 0x01000015,
++    0x0304001F, 0x0010002A, 0x00000001, 0x04000056, 0x00100032, 0x00000000, 0x00020046, 0x0A000000,
++    0x00100032, 0x00000000, 0x00100046, 0x00000000, 0x00004002, 0x3F000000, 0x3F000000, 0x00000000,
++    0x00000000, 0x07000056, 0x001000C2, 0x00000000, 0x00308406, 0x00000000, 0x00000000, 0x00000000,
++    0x0700000E, 0x00100032, 0x00000000, 0x00100046, 0x00000000, 0x00100AE6, 0x00000000, 0x07000031,
++    0x00100022, 0x00000000, 0x0010001A, 0x00000000, 0x00004001, 0x3F000000, 0x09000032, 0x00100042,
++    0x00000000, 0x0010000A, 0x00000000, 0x00004001, 0x40000000, 0x00004001, 0xBF800000, 0x09000037,
++    0x00100012, 0x00000000, 0x0010001A, 0x00000000, 0x0010000A, 0x00000000, 0x0010002A, 0x00000000,
++    0x07000038, 0x00100042, 0x00000000, 0x0010000A, 0x00000000, 0x00004001, 0x41C00000, 0x05000041,
++    0x00100042, 0x00000000, 0x0010002A, 0x00000000, 0x07000038, 0x00100042, 0x00000000, 0x0010002A,
++    0x00000000, 0x00004001, 0x3E800000, 0x05000019, 0x00100042, 0x00000000, 0x0010002A, 0x00000000,
++    0x07000038, 0x00100042, 0x00000000, 0x0010002A, 0x00000000, 0x00004001, 0x42C80000, 0x07000031,
++    0x00100012, 0x00000000, 0x0010000A, 0x00000000, 0x00004001, 0x00000000, 0x0B000037, 0x00100012,
++    0x00000000, 0x0010000A, 0x00000000, 0x0030801A, 0x00000000, 0x00000000, 0x00000001, 0x0010002A,
++    0x00000000, 0x09000037, 0x00100072, 0x00000002, 0x00100556, 0x00000000, 0x00100AA6, 0x00000000,
++    0x00100006, 0x00000000, 0x0304001F, 0x0010001A, 0x00000000, 0x05000036, 0x00100012, 0x00000000,
++    0x00004001, 0x461C4000, 0x01000012, 0x07000036, 0x00100012, 0x00000000, 0x0030802A, 0x00000000,
++    0x00000000, 0x00000001, 0x01000015, 0x01000012, 0x07000036, 0x00100012, 0x00000000, 0x0030802A,
++    0x00000000, 0x00000000, 0x00000001, 0x01000015, 0x07000034, 0x00100022, 0x00000000, 0x0010002A,
++    0x00000002, 0x0010001A, 0x00000002, 0x07000034, 0x00100022, 0x00000000, 0x0010001A, 0x00000000,
++    0x0010000A, 0x00000002, 0x07000031, 0x00100042, 0x00000000, 0x0010000A, 0x00000000, 0x0010001A,
++    0x00000000, 0x09000031, 0x00100082, 0x00000000, 0x0010000A, 0x00000000, 0x0030803A, 0x00000000,
++    0x00000000, 0x00000001, 0x07000001, 0x00100042, 0x00000000, 0x0010003A, 0x00000000, 0x0010002A,
++    0x00000000, 0x0304001F, 0x0010002A, 0x00000000, 0x0A000000, 0x00100042, 0x00000000, 0x8010000A,
++    0x00000041, 0x00000000, 0x0030803A, 0x00000000, 0x00000000, 0x00000001, 0x08000000, 0x00100082,
++    0x00000000, 0x8010001A, 0x00000041, 0x00000000, 0x0010000A, 0x00000000, 0x0700000E, 0x00100082,
++    0x00000000, 0x0010003A, 0x00000000, 0x0010002A, 0x00000000, 0x07000038, 0x00100082, 0x00000000,
++    0x0010003A, 0x00000000, 0x00004001, 0x3FB8AA3B, 0x05000019, 0x00100082, 0x00000000, 0x0010003A,
++    0x00000000, 0x08000000, 0x00100082, 0x00000000, 0x8010003A, 0x00000041, 0x00000000, 0x00004001,
++    0x3F800000, 0x09000032, 0x00100012, 0x00000000, 0x0010002A, 0x00000000, 0x0010003A, 0x00000000,
++    0x0010000A, 0x00000000, 0x0700000E, 0x00100012, 0x00000000, 0x0010000A, 0x00000000, 0x0010001A,
++    0x00000000, 0x07000038, 0x00100072, 0x00000002, 0x00100006, 0x00000000, 0x00100246, 0x00000002,
++    0x01000015, 0x0A000010, 0x00100012, 0x00000000, 0x00100246, 0x00000002, 0x00004002, 0x3F209D8C,
++    0x3EA897C8, 0x3D3168F9, 0x00000000, 0x0A000010, 0x00100022, 0x00000000, 0x00100246, 0x00000002,
++    0x00004002, 0x3D8D82BA, 0x3F6B66F9, 0x3C3A27AF, 0x00000000, 0x0A000010, 0x00100042, 0x00000000,
++    0x00100246, 0x00000002, 0x00004002, 0x3C86466B, 0x3DB44029, 0x3F6545B7, 0x00000000, 0x0A002038,
++    0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x00004002, 0x38D1B717, 0x38D1B717, 0x38D1B717,
++    0x00000000, 0x0500002F, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x0A000038, 0x00100072,
++    0x00000000, 0x00100246, 0x00000000, 0x00004002, 0x3E232000, 0x3E232000, 0x3E232000, 0x00000000,
++    0x05000019, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x0F000032, 0x00100072, 0x00000001,
++    0x00100246, 0x00000000, 0x00004002, 0x4196D000, 0x4196D000, 0x4196D000, 0x00000000, 0x00004002,
++    0x3F560000, 0x3F560000, 0x3F560000, 0x00000000, 0x0F000032, 0x00100072, 0x00000000, 0x00100246,
++    0x00000000, 0x00004002, 0x41958000, 0x41958000, 0x41958000, 0x00000000, 0x00004002, 0x3F800000,
++    0x3F800000, 0x3F800000, 0x00000000, 0x0700000E, 0x00100072, 0x00000000, 0x00100246, 0x00000001,
++    0x00100246, 0x00000000, 0x0500002F, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x0A000038,
++    0x00100072, 0x00000001, 0x00100246, 0x00000000, 0x00004002, 0x429DB000, 0x429DB000, 0x429DB000,
++    0x00000000, 0x05000019, 0x00100072, 0x00000002, 0x00100246, 0x00000001, 0x0304001F, 0x0010003A,
++    0x00000001, 0x09000001, 0x00100082, 0x00000000, 0x0030802A, 0x00000000, 0x00000000, 0x00000000,
++    0x00004001, 0x00000001, 0x0304001F, 0x0010003A, 0x00000000, 0x0A000038, 0x00100072, 0x00000000,
++    0x00100246, 0x00000000, 0x00004002, 0x432D74CD, 0x432D74CD, 0x432D74CD, 0x00000000, 0x05000019,
++    0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x01000012, 0x0A000031, 0x00100072, 0x00000001,
++    0x00004002, 0x3D25AEE6, 0x3D25AEE6, 0x3D25AEE6, 0x00000000, 0x00100246, 0x00000002, 0x0A000000,
++    0x00100072, 0x00000003, 0x00100246, 0x00000002, 0x00004002, 0x3D6147AE, 0x3D6147AE, 0x3D6147AE,
++    0x00000000, 0x0A000038, 0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x00004002, 0x3F72A76E,
++    0x3F72A76E, 0x3F72A76E, 0x00000000, 0x0500002F, 0x00100072, 0x00000003, 0x00100246, 0x00000003,
++    0x0A000038, 0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x00004002, 0x4019999A, 0x4019999A,
++    0x4019999A, 0x00000000, 0x05000019, 0x00100072, 0x00000003, 0x00100246, 0x00000003, 0x0A000038,
++    0x00100072, 0x00000004, 0x00100246, 0x00000002, 0x00004002, 0x3D9E8391, 0x3D9E8391, 0x3D9E8391,
++    0x00000000, 0x09000037, 0x00100072, 0x00000000, 0x00100246, 0x00000001, 0x00100246, 0x00000003,
++    0x00100246, 0x00000004, 0x01000015, 0x09000038, 0x00100072, 0x00000000, 0x00100246, 0x00000000,
++    0x00308006, 0x00000000, 0x00000000, 0x00000001, 0x0A000010, 0x00100012, 0x00000001, 0x00100246,
++    0x00000000, 0x00004002, 0x3F209D8C, 0x3EA897C8, 0x3D3168F9, 0x00000000, 0x0A000010, 0x00100022,
++    0x00000001, 0x00100246, 0x00000000, 0x00004002, 0x3D8D82BA, 0x3F6B66F9, 0x3C3A27AF, 0x00000000,
++    0x0A000010, 0x00100042, 0x00000001, 0x00100246, 0x00000000, 0x00004002, 0x3C86466B, 0x3DB44029,
++    0x3F6545B7, 0x00000000, 0x0A002038, 0x00100072, 0x00000000, 0x00100246, 0x00000001, 0x00004002,
++    0x38D1B717, 0x38D1B717, 0x38D1B717, 0x00000000, 0x0500002F, 0x00100072, 0x00000000, 0x00100246,
++    0x00000000, 0x0A000038, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x00004002, 0x3E232000,
++    0x3E232000, 0x3E232000, 0x00000000, 0x05000019, 0x00100072, 0x00000000, 0x00100246, 0x00000000,
++    0x0F000032, 0x00100072, 0x00000001, 0x00100246, 0x00000000, 0x00004002, 0x4196D000, 0x4196D000,
++    0x4196D000, 0x00000000, 0x00004002, 0x3F560000, 0x3F560000, 0x3F560000, 0x00000000, 0x0F000032,
++    0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x00004002, 0x41958000, 0x41958000, 0x41958000,
++    0x00000000, 0x00004002, 0x3F800000, 0x3F800000, 0x3F800000, 0x00000000, 0x0700000E, 0x00100072,
++    0x00000000, 0x00100246, 0x00000001, 0x00100246, 0x00000000, 0x0500002F, 0x00100072, 0x00000000,
++    0x00100246, 0x00000000, 0x0A000038, 0x00100072, 0x00000000, 0x00100246, 0x00000000, 0x00004002,
++    0x429DB000, 0x429DB000, 0x429DB000, 0x00000000, 0x05000019, 0x00100072, 0x00000002, 0x00100246,
++    0x00000000, 0x01000015, 0x05000036, 0x00100082, 0x00000002, 0x00004001, 0x3F800000, 0x070000A4,
++    0x0021E0F2, 0x00000000, 0x00000000, 0x00020546, 0x00100E46, 0x00000002, 0x0100003E,
++};
+diff --git a/src/graphics/shaders/hdr_refresh.cs.xesl b/src/graphics/shaders/hdr_refresh.cs.xesl
+index 5d8873f1..ca0eba9f 100644
+--- a/src/graphics/shaders/hdr_refresh.cs.xesl
++++ b/src/graphics/shaders/hdr_refresh.cs.xesl
+@@ -31,9 +31,26 @@
+ // is written as the SDR refresher writes a frame (the display table at the
+ // nearest code); with bit 14, only the HUD-less image is written (the SDR
+ // refresher writes the frame itself).
++// The fused scene (hdr_scene_fused, XE_HDR_REFRESH_FUSED, hdr_refresh_fused.cs.xesl,
++// Direct3D 12 only): the frame is put together from the front buffer and the
++// underlay alone (the difference with the underlay, or a frame without UI), and
++// the HDR scene isn't read from an image the tone map draw's pass made: where the
++// scene is visible, the refresher runs the pass itself (hdr_scene_mcla.xesli: the
++// same math the pass runs, so they can't drift apart) from the textures the tone
++// map draw read (t3 to t6, kept from the draw), together with the game's own tone
++// map result for the pixel (its curve, encoded and quantised to the 8-bit
++// picture the draw made), which stands for the tone map's output image that the
++// light the game added after the draw is told from. The constants of the pass
++// follow the refresher's. With XE_HDR_REFRESH_FUSED_CHECK (hdr_scene_fused_check)
++// the pass is only run against the old pass's FP16 image (t7) and the copy of the
++// tone map's output (t8) for every pixel, counting the pixels that differ to u1.
+ 
+ #include "../../ui/shaders/xesl.xesli"
+ #include "../../ui/shaders/hdr_output.xesli"
++#ifdef XE_HDR_REFRESH_FUSED
++  #define XE_HDR_SCENE_GAME_OUTPUT
++  #include "hdr_scene_mcla.xesli"
++#endif
+ 
+ push_const_begin_xe(b0, space0)
+   uint2_xe xe_hdr_refresh_size;
+@@ -54,6 +71,16 @@ push_const_begin_xe(b0, space0)
+   uint2_xe xe_hdr_refresh_flags;
+   // x: SDR content white, y: paper white, z: roll-off start, w: peak (nits).
+   float4_xe xe_hdr_refresh_levels;
++#ifdef XE_HDR_REFRESH_FUSED
++  // The scene pass's constants (hdr_scene_mcla.xesli; the command processor's
++  // HdrSceneConstants), the tone map draw's.
++  uint4_xe xe_hdr_scene_size_mode;
++  float4_xe xe_hdr_scene_pixel_offset;
++  float4_xe xe_hdr_scene_curve;
++  float4_xe xe_hdr_scene_grade;
++  float4_xe xe_hdr_scene_balance;
++  float4_xe xe_hdr_scene_shoulder;
++#endif
+ push_const_end_xe
+ 
+ #ifdef XE_HDR_REFRESH_FG
+@@ -120,6 +147,14 @@ float3_xe XeHdrRefreshGameDecode(float3_xe code) {
+                    code * (1.0f / 12.92f));
+ }
+ 
++#ifdef XE_HDR_REFRESH_FUSED
++// The 8-bit picture the tone map draw writes (UNORM8: clamped, rounded) from its
++// result in the game's linear units, as a texture fetch gives it back (code / 255).
++float3_xe XeHdrRefreshTonemapSdr(float3_xe game_linear) {
++  return floor(saturate_xe(XeHdrRefreshGameEncode(game_linear)) * 255.0f + 0.5f) / 255.0f;
++}
++#endif
++
+ entry_bindings_begin_compute_xe
+   push_const_binding_xe(buffer(0))
+   entry_binding_next_xe
+@@ -134,6 +169,35 @@ entry_bindings_begin_compute_xe
+   entry_binding_next_xe
+   texture_xe(texture_2d_xe, xe_hdr_refresh_underlay, set=3, binding=0, t2,
+              space0, texture(3))
++#ifdef XE_HDR_REFRESH_FUSED
++  // The tone map draw's textures: the scene (fetch 0), motion blur (1), bloom (2)
++  // and the adapted luminance (vertex fetch 16).
++  entry_binding_next_xe
++  texture_xe(XeHdrSceneTexture, xe_hdr_scene_source, set=3, binding=1, t3, space0,
++             texture(4))
++  entry_binding_next_xe
++  texture_xe(XeHdrSceneTexture, xe_hdr_scene_blur, set=3, binding=2, t4, space0,
++             texture(5))
++  entry_binding_next_xe
++  texture_xe(XeHdrSceneTexture, xe_hdr_scene_bloom, set=3, binding=3, t5, space0,
++             texture(6))
++  entry_binding_next_xe
++  texture_xe(XeHdrSceneTexture, xe_hdr_scene_luminance, set=3, binding=4, t6,
++             space0, texture(7))
++  #ifdef XE_HDR_REFRESH_FUSED_CHECK
++  entry_binding_next_xe
++  texture_xe(texture_2d_xe, xe_hdr_check_scene, set=3, binding=5, t7, space0,
++             texture(8))
++  entry_binding_next_xe
++  texture_xe(texture_2d_xe, xe_hdr_check_tonemap, set=3, binding=6, t8, space0,
++             texture(9))
++    #if SHADING_LANGUAGE_HLSL_XE
++  RWByteAddressBuffer xe_hdr_check_counts : register(u1, space0);
++    #else
++      #error The fused check is Direct3D 12 only.
++    #endif
++  #endif
++#else
+   entry_binding_next_xe
+   texture_xe(texture_2d_xe, xe_hdr_refresh_ui_layer, set=3, binding=1, t3,
+              space0, texture(4))
+@@ -143,6 +207,7 @@ entry_bindings_begin_compute_xe
+   entry_binding_next_xe
+   texture_xe(texture_2d_xe, xe_hdr_refresh_tonemap, set=3, binding=3, t5,
+              space0, texture(6))
++#endif
+ #ifdef XE_HDR_REFRESH_FG
+   entry_binding_next_xe
+   image_wo_xe(image_2d_xe, image_format_rgba16f_xe, xe_hdr_refresh_hudless,
+@@ -163,7 +228,48 @@ entry_inputs_end_code_begin_compute_xe
+   float4_xe levels = push_const_xe(xe_hdr_refresh_levels);
+   float3_xe magenta = float3_xe(1.0f, 0.0f, 1.0f);
+ 
++#ifdef XE_HDR_REFRESH_FUSED_CHECK
++  // hdr_scene_fused_check: the scene and the tone map's 8-bit output made here
++  // from the draw's inputs, against what the draw's own pass and copy made, at
++  // every pixel (the output isn't written). Counts, in bytes of u1: 0 the pixels
++  // whose 8-bit output differs by more than 1 code in a channel, 4 the largest
++  // difference in codes among them, 8 the pixels whose scene differs by more than
++  // 0.5% in a channel (relative to the old value, at least 1e-4), 12 the largest
++  // relative difference among them (float bits), 16 the pixels that are one code
++  // off in a channel (not counted as differing).
++  {
++    float3_xe check_game;
++    float3_xe check_scene = XeHdrSceneColor(
++        pixel_index, push_const_xe(xe_hdr_scene_size_mode),
++        push_const_xe(xe_hdr_scene_pixel_offset), push_const_xe(xe_hdr_scene_curve),
++        push_const_xe(xe_hdr_scene_grade), push_const_xe(xe_hdr_scene_balance),
++        push_const_xe(xe_hdr_scene_shoulder), xe_hdr_scene_source, xe_hdr_scene_blur,
++        xe_hdr_scene_bloom, xe_hdr_scene_luminance, check_game);
++    uint3_xe code_fused = uint3_xe(XeHdrRefreshTonemapSdr(check_game) * 255.0f + 0.5f);
++    uint3_xe code_old =
++        uint3_xe(texel_fetch_2d_xe(xe_hdr_check_tonemap, pixel, 0).rgb * 255.0f + 0.5f);
++    uint3_xe code_delta = max(code_fused, code_old) - min(code_fused, code_old);
++    uint max_code_delta = max(code_delta.r, max(code_delta.g, code_delta.b));
++    float3_xe old_scene = texel_fetch_2d_xe(xe_hdr_check_scene, pixel, 0).rgb;
++    float3_xe relative = abs(check_scene - old_scene) / max(abs(old_scene), XeHdrSplat(1.0e-4f));
++    float max_relative = max(relative.r, max(relative.g, relative.b));
++    uint previous;
++    if (max_code_delta == 1u) {
++      xe_hdr_check_counts.InterlockedAdd(16u, 1u, previous);
++    } else if (max_code_delta > 1u) {
++      xe_hdr_check_counts.InterlockedAdd(0u, 1u, previous);
++      xe_hdr_check_counts.InterlockedMax(4u, max_code_delta, previous);
++    }
++    if (max_relative > 0.005f) {
++      xe_hdr_check_counts.InterlockedAdd(8u, 1u, previous);
++      xe_hdr_check_counts.InterlockedMax(12u, float_bits_to_uint_xe(max_relative), previous);
++    }
++    return;
++  }
++#endif
++
+   float3_xe nits;
++#ifndef XE_HDR_REFRESH_FUSED
+   dont_flatten_xe if (composite == 3u) {
+     // Debug: a texture's values shown as SDR codes: the UI layer's colour, its
+     // alpha, the underlay or the front buffer (bits 6:7).
+@@ -174,12 +280,15 @@ entry_inputs_end_code_begin_compute_xe
+       texel.rgb = XeHdrRefreshSource(pixel, flags);
+     }
+     nits = XeHdrSdrToLinear(shown == 1u ? texel.aaa : texel.rgb, (flags & 1u) != 0u) * levels.x;
+-  } else {
++  } else
++#endif
++  {
+     // The UI (premultiplied code values, coverage in alpha) and the 8-bit
+     // picture of the scene under it.
+     float3_xe ui_code;
+     float ui_alpha;
+     float3_xe scene_sdr;
++#ifndef XE_HDR_REFRESH_FUSED
+     dont_flatten_xe if (composite == 2u) {
+       float4_xe ui = texel_fetch_2d_xe(xe_hdr_refresh_ui_layer, pixel, 0);
+ #ifdef XE_HDR_REFRESH_FG
+@@ -210,7 +319,9 @@ entry_inputs_end_code_begin_compute_xe
+       ui_alpha = ui.a;
+       ui_code = (flags & 32u) != 0u ? magenta * ui.a : ui.rgb;
+       scene_sdr = texel_fetch_2d_xe(xe_hdr_refresh_underlay, pixel, 0).rgb;
+-    } else {
++    } else
++#endif
++    {
+       float3_xe source = XeHdrRefreshSource(pixel, flags);
+       // In the fallback, the UI is where the front buffer differs from the
+       // underlay, and so does it in the row above or below: single rows that
+@@ -244,14 +355,30 @@ entry_inputs_end_code_begin_compute_xe
+ #endif
+     dont_flatten_xe if (ui_alpha < 1.0f && (flags & 512u) != 0u) {
+       float tonemap_tolerance = 1.5f / 255.0f;
++#ifdef XE_HDR_REFRESH_FUSED
++      // The scene and the tone map's 8-bit output, here, from the draw's inputs.
++      float3_xe game_scene;
++      float3_xe hdr_scene = XeHdrSceneColor(
++          pixel_index, push_const_xe(xe_hdr_scene_size_mode),
++          push_const_xe(xe_hdr_scene_pixel_offset), push_const_xe(xe_hdr_scene_curve),
++          push_const_xe(xe_hdr_scene_grade), push_const_xe(xe_hdr_scene_balance),
++          push_const_xe(xe_hdr_scene_shoulder), xe_hdr_scene_source, xe_hdr_scene_blur,
++          xe_hdr_scene_bloom, xe_hdr_scene_luminance, game_scene);
++      float3_xe tonemap = XeHdrRefreshTonemapSdr(game_scene);
++#else
+       float3_xe tonemap = texel_fetch_2d_xe(xe_hdr_refresh_tonemap, pixel, 0).rgb;
++#endif
+       dont_flatten_xe if (all(greater_than_equal_xe(scene_sdr, tonemap - tonemap_tolerance))) {
+         float3_xe glow = select_xe(
+             greater_than_xe(scene_sdr - tonemap, XeHdrSplat(tonemap_tolerance)),
+             XeHdrRefreshGameDecode(scene_sdr) - XeHdrRefreshGameDecode(tonemap),
+             XeHdrSplat(0.0f));
+         scene_code = XeHdrRefreshGameEncode(
++#ifdef XE_HDR_REFRESH_FUSED
++            hdr_scene +
++#else
+             texel_fetch_2d_xe(xe_hdr_refresh_scene, pixel, 0).rgb +
++#endif
+             glow * uint_bits_to_float_xe(push_const_xe(xe_hdr_refresh_flags).y));
+         scene_hdr = (flags & 1024u) == 0u;
+       } else dont_flatten_xe if ((flags & 32u) != 0u) {
+diff --git a/src/graphics/shaders/hdr_refresh_fused.cs.xesl b/src/graphics/shaders/hdr_refresh_fused.cs.xesl
+new file mode 100644
+index 00000000..1d6f711d
+--- /dev/null
++++ b/src/graphics/shaders/hdr_refresh_fused.cs.xesl
+@@ -0,0 +1,8 @@
++// HDR output (hdr_scene_fused): hdr_refresh.cs.xesl with the HDR scene made in
++// the refresher from the tone map draw's own textures (t3 to t6), in place of
++// the FP16 image and the tone map's output copy of the draw's pass, and the
++// frame put together from the front buffer and the underlay alone (flag bits 3:4
++// 1, the difference, or bit 8, a frame without UI; no UI layer). Direct3D 12.
++
++#define XE_HDR_REFRESH_FUSED
++#include "hdr_refresh.cs.xesl"
+diff --git a/src/graphics/shaders/hdr_refresh_fused_check.cs.xesl b/src/graphics/shaders/hdr_refresh_fused_check.cs.xesl
+new file mode 100644
+index 00000000..6027296d
+--- /dev/null
++++ b/src/graphics/shaders/hdr_refresh_fused_check.cs.xesl
+@@ -0,0 +1,7 @@
++// HDR output (hdr_scene_fused_check): the fused refresher's scene math against
++// the old pass's FP16 image (t7) and copy of the tone map's output (t8), every
++// pixel, counted into u1 (see hdr_refresh.cs.xesl). Direct3D 12.
++
++#define XE_HDR_REFRESH_FUSED
++#define XE_HDR_REFRESH_FUSED_CHECK
++#include "hdr_refresh.cs.xesl"
+diff --git a/src/graphics/shaders/hdr_scene_mcla.cs.xesl b/src/graphics/shaders/hdr_scene_mcla.cs.xesl
+index 49b252ae..ab003a19 100644
+--- a/src/graphics/shaders/hdr_scene_mcla.cs.xesl
++++ b/src/graphics/shaders/hdr_scene_mcla.cs.xesl
+@@ -2,28 +2,19 @@
+ // map (guest pixel shader E5EBEFAE4D165CBA) again, run after the game's draw
+ // from the same textures and constants, with the scene in the game's linear
+ // units (its output before the 1/2.2 encode, 1 = its white) written to an FP16
+-// image instead of 8-bit code values. Up to the knee the curve is the game's
+-// (Reinhard extended on luminance, chromaticity kept through xy); above it an
+-// exponential shoulder with the same value there approaches the peak, never
+-// under the game's curve up to its white (with a peak at or below the game's
+-// white, the game's curve clipped at its white). Bloom, saturation, colour
+-// balance and contrast follow in the game's order, so the grade is the game's.
+-// Mode 1 is the game's curve alone, for checking the pass against the game's
+-// own output. NaN (from a guest texture or constant) doesn't reach the
+-// output.
++// image instead of 8-bit code values. The math is in hdr_scene_mcla.xesli (also
++// run per pixel by the swap's refresher with hdr_scene_fused): up to the knee
++// the curve is the game's (Reinhard extended on luminance, chromaticity kept
++// through xy); above it an exponential shoulder with the same value there
++// approaches the peak, never under the game's curve up to its white (with a
++// peak at or below the game's white, the game's curve clipped at its white).
++// Bloom, saturation, colour balance and contrast follow in the game's order, so
++// the grade is the game's. Mode 1 is the game's curve alone, for checking the
++// pass against the game's own output. NaN (from a guest texture or constant)
++// doesn't reach the output.
+ 
+ #include "../../ui/shaders/xesl.xesli"
+-
+-// The texture caches bind 2D textures as 2D arrays (layer 0 here).
+-#if SHADING_LANGUAGE_GLSL_XE
+-  #define XeHdrSceneTexture texture2DArray
+-  #define XeHdrSceneFetch(texture_name, position) \
+-      texelFetch(texture_name, int3_xe(position, 0), 0)
+-#else
+-  #define XeHdrSceneTexture Texture2DArray<float4_xe>
+-  #define XeHdrSceneFetch(texture_name, position) \
+-      ((texture_name).Load(int4_xe(position, 0, 0)))
+-#endif
++#include "hdr_scene_mcla.xesli"
+ 
+ push_const_begin_xe(b0, space0)
+   // x, y: the output's size; z: 1 = the game's curve, no shoulder.
+@@ -44,9 +35,6 @@ push_const_begin_xe(b0, space0)
+   float4_xe xe_hdr_scene_shoulder;
+ push_const_end_xe
+ 
+-// Not NaN, by the bits (a compiler may fold x == x).
+-#define XeHdrSceneNotNan(value) ((float_bits_to_uint_xe(value) & 0x7FFFFFFFu) <= 0x7F800000u)
+-
+ #define LOCAL_SIZE_X_XE 16
+ #define LOCAL_SIZE_Y_XE 8
+ #define LOCAL_SIZE_Z_XE 1
+@@ -79,117 +67,10 @@ entry_inputs_end_code_begin_compute_xe
+   if (any(greater_than_equal_xe(pixel_index, size_mode.xy))) {
+     return;
+   }
+-  float4_xe curve = push_const_xe(xe_hdr_scene_curve);
+-  float4_xe grade = push_const_xe(xe_hdr_scene_grade);
+-  float4_xe balance = push_const_xe(xe_hdr_scene_balance);
+-  float4_xe shoulder = push_const_xe(xe_hdr_scene_shoulder);
+-  // Where the game's draw samples for this pixel, with its pixel offset.
+-  float2_xe uv = (float2_xe(pixel_index) + 0.5f - push_const_xe(xe_hdr_scene_pixel_offset).xy) /
+-                 float2_xe(size_mode.xy);
+-
+-  // The inputs' sizes (scaled with the resolution like the output).
+-  uint2_xe scene_size, blur_size, bloom_size, luminance_size;
+-#if SHADING_LANGUAGE_GLSL_XE
+-  scene_size = uint2_xe(textureSize(xe_hdr_scene_source, 0).xy);
+-  blur_size = uint2_xe(textureSize(xe_hdr_scene_blur, 0).xy);
+-  bloom_size = uint2_xe(textureSize(xe_hdr_scene_bloom, 0).xy);
+-  luminance_size = uint2_xe(textureSize(xe_hdr_scene_luminance, 0).xy);
+-#else
+-  uint layers;
+-  xe_hdr_scene_source.GetDimensions(scene_size.x, scene_size.y, layers);
+-  xe_hdr_scene_blur.GetDimensions(blur_size.x, blur_size.y, layers);
+-  xe_hdr_scene_bloom.GetDimensions(bloom_size.x, bloom_size.y, layers);
+-  xe_hdr_scene_luminance.GetDimensions(luminance_size.x, luminance_size.y, layers);
+-#endif
+-
+-  // Point-sampled as the game does (its draw samples on texel edges: a little
+-  // past them, as the texture unit's fixed-point coordinates mostly round),
+-  // bilinear for the smaller blur and bloom.
+-  float3_xe scene = XeHdrSceneFetch(
+-      xe_hdr_scene_source,
+-      clamp(int2_xe(floor(uv * float2_xe(scene_size) + (1.0f / 512.0f))), int2_xe(0, 0),
+-            int2_xe(scene_size) - 1)).rgb;
+-  float4_xe blur, bloom4;
+-  {
+-    float2_xe position = uv * float2_xe(blur_size) - 0.5f;
+-    float2_xe weight = position - floor(position);
+-    int2_xe last = int2_xe(blur_size) - 1;
+-    int2_xe p0 = clamp(int2_xe(floor(position)), int2_xe(0, 0), last);
+-    int2_xe p1 = clamp(int2_xe(floor(position)) + 1, int2_xe(0, 0), last);
+-    float4_xe top = XeHdrSceneFetch(xe_hdr_scene_blur, p0);
+-    top += (XeHdrSceneFetch(xe_hdr_scene_blur, int2_xe(p1.x, p0.y)) - top) * weight.x;
+-    float4_xe bottom = XeHdrSceneFetch(xe_hdr_scene_blur, int2_xe(p0.x, p1.y));
+-    bottom += (XeHdrSceneFetch(xe_hdr_scene_blur, p1) - bottom) * weight.x;
+-    blur = top + (bottom - top) * weight.y;
+-  }
+-  {
+-    float2_xe position = uv * float2_xe(bloom_size) - 0.5f;
+-    float2_xe weight = position - floor(position);
+-    int2_xe last = int2_xe(bloom_size) - 1;
+-    int2_xe p0 = clamp(int2_xe(floor(position)), int2_xe(0, 0), last);
+-    int2_xe p1 = clamp(int2_xe(floor(position)) + 1, int2_xe(0, 0), last);
+-    float4_xe top = XeHdrSceneFetch(xe_hdr_scene_bloom, p0);
+-    top += (XeHdrSceneFetch(xe_hdr_scene_bloom, int2_xe(p1.x, p0.y)) - top) * weight.x;
+-    float4_xe bottom = XeHdrSceneFetch(xe_hdr_scene_bloom, int2_xe(p0.x, p1.y));
+-    bottom += (XeHdrSceneFetch(xe_hdr_scene_bloom, p1) - bottom) * weight.x;
+-    bloom4 = top + (bottom - top) * weight.y;
+-  }
+-
+-  // Motion blur and depth of field: lerp(scene, blur, sat(scale x blur.a)).
+-  float3_xe c = scene + saturate_xe(blur.a * curve.w) * (blur.rgb - scene);
+-
+-  // RGB -> XYZ (the DirectX SDK matrix the game uses), then x, y and Y.
+-  float big_x = dot(c, float3_xe(0.514136f, 0.323879f, 0.160364f));
+-  float big_y = dot(c, float3_xe(0.265068f, 0.670234f, 0.0640916f));
+-  float big_s = dot(c, float3_xe(0.803323f, 1.11693f, 1.06888f));
+-  big_s = select_xe(big_s == 0.0f, curve.z, big_s);
+-  float chroma_x = big_x / big_s;
+-  float chroma_y = big_y / big_s;
+-  // The adapted luminance, 1x1 for the game (at a scaled resolution, its
+-  // middle texel is the one the game's vertex shader reads).
+-  float adapted = clamp(XeHdrSceneFetch(xe_hdr_scene_luminance, int2_xe(luminance_size / 2u)).r,
+-                        grade.x, grade.y);
+-  // Not negative (the curve divides by 1 + Ls), not NaN, and finite (the
+-  // shoulder and the clip take any size).
+-  float ls = big_y * curve.x / (adapted + curve.z);
+-  ls = XeHdrSceneNotNan(ls) ? clamp(ls, 0.0f, 1.0e18f) : 0.0f;
+-
+-  // Reinhard extended, then the shoulder above the knee: never under the
+-  // game's curve up to its white (Ls = sqrt(W)); with no room above white,
+-  // the game's curve clipped at it.
+-  float ld = ls * (1.0f + ls / curve.y) / (1.0f + ls);
+-  dont_flatten_xe
+-  if (size_mode.z == 0u && ls > shoulder.y) {
+-    dont_flatten_xe
+-    if (shoulder.w > (1.0f - shoulder.x) * 1.0001f) {
+-      float shoulder_ld = shoulder.x + shoulder.w * (1.0f - exp2(-(ls - shoulder.y) * shoulder.z /
+-                                                                 shoulder.w * 1.44269504f));
+-      ld = ls < sqrt(curve.y) ? max(shoulder_ld, ld) : shoulder_ld;
+-    } else {
+-      ld = min(ld, 1.0f);
+-    }
+-  }
+-
+-  // Back to RGB through x and y.
+-  float chroma_y_guarded = select_xe(chroma_y == 0.0f, curve.z, chroma_y);
+-  float3_xe xyz = float3_xe(ld * chroma_x / chroma_y_guarded, ld,
+-                            ld * (1.0f - chroma_x - chroma_y_guarded) / chroma_y_guarded);
+-  float3_xe rgb = float3_xe(dot(xyz, float3_xe(2.5651f, -1.1665f, -0.3986f)),
+-                            dot(xyz, float3_xe(-1.0217f, 1.9777f, 0.0439f)),
+-                            dot(xyz, float3_xe(0.0753f, -0.2543f, 1.1892f)));
+-
+-  // Bloom after the curve, then saturation around Rec.709 luma, colour
+-  // balance and contrast.
+-  rgb += bloom4.rgb * balance.w;
+-  float luma = dot(rgb, float3_xe(0.2125f, 0.7154f, 0.0721f));
+-  rgb = (rgb - luma) * grade.z + luma;
+-  rgb = (2.0f * rgb * balance.xyz - 0.5f) * grade.w + 0.5f;
+-
+-  // Not NaN, and in FP16's range.
+-  rgb = float3_xe(XeHdrSceneNotNan(rgb.r) ? rgb.r : 0.0f, XeHdrSceneNotNan(rgb.g) ? rgb.g : 0.0f,
+-                  XeHdrSceneNotNan(rgb.b) ? rgb.b : 0.0f);
+-  image_store_2d_rgba_xe(xe_hdr_scene_dest, pixel_index,
+-                         float4_xe(clamp(rgb, float3_xe(0.0f, 0.0f, 0.0f),
+-                                         float3_xe(65504.0f, 65504.0f, 65504.0f)),
+-                                   1.0f));
++  float3_xe rgb = XeHdrSceneColor(
++      pixel_index, size_mode, push_const_xe(xe_hdr_scene_pixel_offset),
++      push_const_xe(xe_hdr_scene_curve), push_const_xe(xe_hdr_scene_grade),
++      push_const_xe(xe_hdr_scene_balance), push_const_xe(xe_hdr_scene_shoulder),
++      xe_hdr_scene_source, xe_hdr_scene_blur, xe_hdr_scene_bloom, xe_hdr_scene_luminance);
++  image_store_2d_rgba_xe(xe_hdr_scene_dest, pixel_index, float4_xe(rgb, 1.0f));
+ entry_code_end_compute_xe
+diff --git a/src/graphics/shaders/hdr_scene_mcla.xesli b/src/graphics/shaders/hdr_scene_mcla.xesli
+new file mode 100644
+index 00000000..80254244
+--- /dev/null
++++ b/src/graphics/shaders/hdr_scene_mcla.xesli
+@@ -0,0 +1,189 @@
++// HDR output (rexglue-hdr-scene-mcla.patch, hdr_scene_fused): Midnight Club: Los
++// Angeles's tone map (guest pixel shader E5EBEFAE4D165CBA) again, from the same
++// textures and constants, with the scene in the game's linear units (its output
++// before the 1/2.2 encode, 1 = its white). The math lives here once, for the two
++// places that run it, so that they can't drift apart:
++// - hdr_scene_mcla.cs.xesl: a compute pass after the tone map draw that writes
++//   the scene to an FP16 image;
++// - hdr_refresh.cs.xesl, XE_HDR_REFRESH_FUSED (hdr_scene_fused): the swap's
++//   refresher runs it per pixel, from the textures the tone map draw read.
++// Up to the knee the curve is the game's (Reinhard extended on luminance,
++// chromaticity kept through xy); above it an exponential shoulder with the same
++// value there approaches the peak, never under the game's curve up to its white
++// (with a peak at or below the game's white, the game's curve clipped at its
++// white). Bloom, saturation, colour balance and contrast follow in the game's
++// order, so the grade is the game's. Mode 1 (size_mode.z) is the game's curve
++// alone, for checking the pass against the game's own output. NaN (from a guest
++// texture or constant) doesn't reach the output.
++//
++// With XE_HDR_SCENE_GAME_OUTPUT defined before the include, XeHdrSceneColor also
++// gives the game's own result (its curve, its bloom weight 1: what the tone map
++// draw writes before its 8-bit encode), which the fused refresher encodes and
++// quantises to the 8-bit picture the draw made.
++//
++// Include after xesl.xesli. The constants (the HdrSceneConstants of the command
++// processor) are passed in by the including shader.
++
++#ifndef XE_HDR_SCENE_MCLA_XESLI_
++#define XE_HDR_SCENE_MCLA_XESLI_
++
++// The texture caches bind 2D textures as 2D arrays (layer 0 here).
++#if SHADING_LANGUAGE_GLSL_XE
++  #define XeHdrSceneTexture texture2DArray
++  #define XeHdrSceneFetch(texture_name, position) \
++      texelFetch(texture_name, int3_xe(position, 0), 0)
++#else
++  #define XeHdrSceneTexture Texture2DArray<float4_xe>
++  #define XeHdrSceneFetch(texture_name, position) \
++      ((texture_name).Load(int4_xe(position, 0, 0)))
++#endif
++
++// Not NaN, by the bits (a compiler may fold x == x).
++#define XeHdrSceneNotNan(value) ((float_bits_to_uint_xe(value) & 0x7FFFFFFFu) <= 0x7F800000u)
++
++// Back to RGB through x and y from the curve's output ld, then bloom after the
++// curve, saturation around Rec.709 luma, colour balance and contrast; not NaN,
++// and in FP16's range.
++float3_xe XeHdrSceneGrade(float ld, float chroma_x, float chroma_y_guarded, float3_xe bloom,
++                          float bloom_gain, float4_xe grade, float3_xe balance_color) {
++  float3_xe xyz = float3_xe(ld * chroma_x / chroma_y_guarded, ld,
++                            ld * (1.0f - chroma_x - chroma_y_guarded) / chroma_y_guarded);
++  float3_xe rgb = float3_xe(dot(xyz, float3_xe(2.5651f, -1.1665f, -0.3986f)),
++                            dot(xyz, float3_xe(-1.0217f, 1.9777f, 0.0439f)),
++                            dot(xyz, float3_xe(0.0753f, -0.2543f, 1.1892f)));
++
++  rgb += bloom * bloom_gain;
++  float luma = dot(rgb, float3_xe(0.2125f, 0.7154f, 0.0721f));
++  rgb = (rgb - luma) * grade.z + luma;
++  rgb = (2.0f * rgb * balance_color - 0.5f) * grade.w + 0.5f;
++
++  // Not NaN, and in FP16's range.
++  rgb = float3_xe(XeHdrSceneNotNan(rgb.r) ? rgb.r : 0.0f, XeHdrSceneNotNan(rgb.g) ? rgb.g : 0.0f,
++                  XeHdrSceneNotNan(rgb.b) ? rgb.b : 0.0f);
++  return clamp(rgb, float3_xe(0.0f, 0.0f, 0.0f), float3_xe(65504.0f, 65504.0f, 65504.0f));
++}
++
++// The scene at an output pixel, in the game's linear units. size_mode: x, y the
++// output's size, z 1 = the game's curve, no shoulder; pixel_offset.xy the
++// half-pixel offset of the game's draw, in pixels; curve: key (c64.z), white
++// squared (c65.x), epsilon (c255.w), blur weight scale (c252.w); grade: adapted
++// luminance clamp (vertex shader c64.x, c65.x), saturation (c67.x), contrast
++// (c69.x); balance: colour balance (c68.xyz), bloom gain; shoulder: knee (the
++// game's linear units), Ls at the knee, the shoulder's slope there (the
++// highlights setting, and at least what reaches the game's white at its white),
++// peak - knee (at most 1 - knee: no shoulder).
++// The game's fetches 0 (the scene, 16_16_16_16 float, shader units), 1 (motion
++// blur colour and weight), 2 (bloom) and the vertex shader's 16 (the adapted
++// luminance, 1x1) are the four textures.
++#ifdef XE_HDR_SCENE_GAME_OUTPUT
++  #define XE_HDR_SCENE_GAME_PARAMETER , out float3_xe game_rgb
++#else
++  #define XE_HDR_SCENE_GAME_PARAMETER
++#endif
++float3_xe XeHdrSceneColor(uint2_xe pixel_index, uint4_xe size_mode, float4_xe pixel_offset,
++                          float4_xe curve, float4_xe grade, float4_xe balance,
++                          float4_xe shoulder, XeHdrSceneTexture scene_texture,
++                          XeHdrSceneTexture blur_texture,
++                          XeHdrSceneTexture bloom_texture,
++                          XeHdrSceneTexture luminance_texture XE_HDR_SCENE_GAME_PARAMETER) {
++  // Where the game's draw samples for this pixel, with its pixel offset.
++  float2_xe uv = (float2_xe(pixel_index) + 0.5f - pixel_offset.xy) / float2_xe(size_mode.xy);
++
++  // The inputs' sizes (scaled with the resolution like the output).
++  uint2_xe scene_size, blur_size, bloom_size, luminance_size;
++#if SHADING_LANGUAGE_GLSL_XE
++  scene_size = uint2_xe(textureSize(scene_texture, 0).xy);
++  blur_size = uint2_xe(textureSize(blur_texture, 0).xy);
++  bloom_size = uint2_xe(textureSize(bloom_texture, 0).xy);
++  luminance_size = uint2_xe(textureSize(luminance_texture, 0).xy);
++#else
++  uint layers;
++  scene_texture.GetDimensions(scene_size.x, scene_size.y, layers);
++  blur_texture.GetDimensions(blur_size.x, blur_size.y, layers);
++  bloom_texture.GetDimensions(bloom_size.x, bloom_size.y, layers);
++  luminance_texture.GetDimensions(luminance_size.x, luminance_size.y, layers);
++#endif
++
++  // Point-sampled as the game does (its draw samples on texel edges: a little
++  // past them, as the texture unit's fixed-point coordinates mostly round),
++  // bilinear for the smaller blur and bloom.
++  float3_xe scene = XeHdrSceneFetch(
++      scene_texture,
++      clamp(int2_xe(floor(uv * float2_xe(scene_size) + (1.0f / 512.0f))), int2_xe(0, 0),
++            int2_xe(scene_size) - 1)).rgb;
++  float4_xe blur, bloom4;
++  {
++    float2_xe position = uv * float2_xe(blur_size) - 0.5f;
++    float2_xe weight = position - floor(position);
++    int2_xe last = int2_xe(blur_size) - 1;
++    int2_xe p0 = clamp(int2_xe(floor(position)), int2_xe(0, 0), last);
++    int2_xe p1 = clamp(int2_xe(floor(position)) + 1, int2_xe(0, 0), last);
++    float4_xe top = XeHdrSceneFetch(blur_texture, p0);
++    top += (XeHdrSceneFetch(blur_texture, int2_xe(p1.x, p0.y)) - top) * weight.x;
++    float4_xe bottom = XeHdrSceneFetch(blur_texture, int2_xe(p0.x, p1.y));
++    bottom += (XeHdrSceneFetch(blur_texture, p1) - bottom) * weight.x;
++    blur = top + (bottom - top) * weight.y;
++  }
++  {
++    float2_xe position = uv * float2_xe(bloom_size) - 0.5f;
++    float2_xe weight = position - floor(position);
++    int2_xe last = int2_xe(bloom_size) - 1;
++    int2_xe p0 = clamp(int2_xe(floor(position)), int2_xe(0, 0), last);
++    int2_xe p1 = clamp(int2_xe(floor(position)) + 1, int2_xe(0, 0), last);
++    float4_xe top = XeHdrSceneFetch(bloom_texture, p0);
++    top += (XeHdrSceneFetch(bloom_texture, int2_xe(p1.x, p0.y)) - top) * weight.x;
++    float4_xe bottom = XeHdrSceneFetch(bloom_texture, int2_xe(p0.x, p1.y));
++    bottom += (XeHdrSceneFetch(bloom_texture, p1) - bottom) * weight.x;
++    bloom4 = top + (bottom - top) * weight.y;
++  }
++
++  // Motion blur and depth of field: lerp(scene, blur, sat(scale x blur.a)).
++  float3_xe c = scene + saturate_xe(blur.a * curve.w) * (blur.rgb - scene);
++
++  // RGB -> XYZ (the DirectX SDK matrix the game uses), then x, y and Y.
++  float big_x = dot(c, float3_xe(0.514136f, 0.323879f, 0.160364f));
++  float big_y = dot(c, float3_xe(0.265068f, 0.670234f, 0.0640916f));
++  float big_s = dot(c, float3_xe(0.803323f, 1.11693f, 1.06888f));
++  big_s = select_xe(big_s == 0.0f, curve.z, big_s);
++  float chroma_x = big_x / big_s;
++  float chroma_y = big_y / big_s;
++  // The adapted luminance, 1x1 for the game (at a scaled resolution, its
++  // middle texel is the one the game's vertex shader reads).
++  float adapted = clamp(XeHdrSceneFetch(luminance_texture, int2_xe(luminance_size / 2u)).r,
++                        grade.x, grade.y);
++  // Not negative (the curve divides by 1 + Ls), not NaN, and finite (the
++  // shoulder and the clip take any size).
++  float ls = big_y * curve.x / (adapted + curve.z);
++  ls = XeHdrSceneNotNan(ls) ? clamp(ls, 0.0f, 1.0e18f) : 0.0f;
++
++  // Reinhard extended, then the shoulder above the knee: never under the
++  // game's curve up to its white (Ls = sqrt(W)); with no room above white,
++  // the game's curve clipped at it.
++  float ld = ls * (1.0f + ls / curve.y) / (1.0f + ls);
++#ifdef XE_HDR_SCENE_GAME_OUTPUT
++  float ld_game = ld;
++#endif
++  dont_flatten_xe
++  if (size_mode.z == 0u && ls > shoulder.y) {
++    dont_flatten_xe
++    if (shoulder.w > (1.0f - shoulder.x) * 1.0001f) {
++      float shoulder_ld = shoulder.x + shoulder.w * (1.0f - exp2(-(ls - shoulder.y) * shoulder.z /
++                                                                 shoulder.w * 1.44269504f));
++      ld = ls < sqrt(curve.y) ? max(shoulder_ld, ld) : shoulder_ld;
++    } else {
++      ld = min(ld, 1.0f);
++    }
++  }
++
++  // Back to RGB through x and y, and the grade.
++  float chroma_y_guarded = select_xe(chroma_y == 0.0f, curve.z, chroma_y);
++#ifdef XE_HDR_SCENE_GAME_OUTPUT
++  // What the game's draw writes (before its encode): its curve and its bloom.
++  game_rgb = XeHdrSceneGrade(ld_game, chroma_x, chroma_y_guarded, bloom4.rgb, 1.0f, grade,
++                             balance.xyz);
++#endif
++  return XeHdrSceneGrade(ld, chroma_x, chroma_y_guarded, bloom4.rgb, balance.w, grade,
++                         balance.xyz);
++}
++
++#endif  // XE_HDR_SCENE_MCLA_XESLI_
