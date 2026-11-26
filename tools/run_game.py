@@ -4,8 +4,10 @@
     python tools/run_game.py --flow <name> [--fixture <name>] [--seconds N] [--api d3d12|vulkan] [--cvar k=v]...
                              [--screenshot-every S] [--run-id ID] [--config RelWithDebInfo|Release] [--exe PATH]
                              [--no-lock] [--stop-on-reach] [--expect STATE] [--topmost]
+                             [--schedule SPEC]... [--window-pos POS] [--behind | --no-behind]
                              [--work W] [--game G] [--lock-timeout S]
-    python tools/run_game.py --flow <name> --check-flow
+    python tools/run_game.py --flow <name> --check-flow [--schedule SPEC]...
+    python tools/run_game.py --selftest-burn
     python tools/run_game.py --summarize <run-id | run dir | log file> [--expect STATE]
 
   --flow NAME      a pad script: tools/flows/<NAME>.txt, or a path to a script file. Format of the host's --input-file
@@ -30,6 +32,21 @@
   --audio          keep the game's sound (default: the run is muted with --audio_mute=true).
   --activate       let the game window take the keyboard focus (default: it is shown without activation, so whoever is
                    working on the machine keeps typing where they were; the scripted pad needs no focus).
+  --window-pos POS where the game window goes, `--mcla_window_pos=POS` (a host cvar): bottom-right | bottom-left | top-right |
+                   top-left | X,Y (pixels, may be negative) | "" (the SDK default, centred: no argument is passed).
+                   Default bottom-right, but "" with --topmost or --activate (a window that is meant to be seen).
+  --behind / --no-behind   `--mcla_window_behind=true` (a host cvar): after the window is shown it is put in the z-order just
+                   behind the current foreground window, without activating it. Default on, off with --topmost / --activate.
+                   (Both are only the defaults of build_args: a `--cvar mcla_window_pos=...` / `mcla_window_behind=...` of the
+                   caller replaces them like any other key run_game sets.) Quietness, in all: audio muted (--audio_mute), the
+                   process starts with SW_SHOWNOACTIVATE, the environment of the game gets SDL_WINDOW_ACTIVATE_WHEN_SHOWN=0
+                   (SDL3 reads its hints from the environment; it keeps SDL's own ShowWindow from activating the window;
+                   left alone with --activate), and the window is placed out of the way (bottom-right, behind).
+  --schedule SPEC  a timed schedule added to the run (repeatable); SPEC is a file (a path, or a name in tools/flows/schedules/,
+                   e.g. `ab_example`; same grammar as a flow, '#' comments, only the four step kinds below) or an inline
+                   `;`-separated string (`58:set mcla_fps_cap=0;70:burn 4;80:burn 0`; a '#' starts a comment as in a file).
+                   Validated like the flow, then appended to the run's flow.txt (the host reads that file), so any flow carries an
+                   A/B schedule without a copy. Steps may also sit in the flow file itself.
   --stop-on-reach  stop (after 5 s for the log to flush) as soon as the expected state is reached.
   --expect STATE   override the flow's `# expect:` header (none|title|menu|free-roam).
   --config C       build config of $WORK/build/bin/<C>/mcla.exe (default RelWithDebInfo). --exe PATH overrides.
@@ -39,6 +56,25 @@
   --work W / --game G   $WORK (default env MCLA_WORK, else C:/Users/Ali/Development/mcla-x86-work) and $GAME
                    (env MCLA_GAME, else C:/Users/Ali/Development/dumps/mcla-x360; the game files are in $GAME/game).
 
+Schedule steps (the host's SchedStep, src/host/input_script.h; tools/segments.py cuts a run at them)
+  <seconds>:set <cvar>=<value>   the host changes a run-time cvar then. cvar [A-Za-z0-9_]+ (not burn / burnmem / mark); value
+                                 non-empty without whitespace, ';' or '#', passed on verbatim; one pair per step.
+  <seconds>:burn <n>             n CPU (ALU) spinner processes, 0..32 (0 = stop them). EXECUTED HERE; the host only logs it.
+  <seconds>:burnmem <n>          n memory-bandwidth spinner processes, 0..32, executed here.
+  <seconds>:mark <label>         a named marker, label [A-Za-z0-9_.-]{1,40}.
+  The keyword is the first word after the colon (case-insensitive); no /hold and no '+' on these steps. The host logs
+  `[mcla-sched] t=<s> set <name>=<value> ok now=<value>` (or FAILED (rejected)), `... burn <n>` / `burnmem <n>` / `mark <label>` and
+  `segment <k>: <label>` (k from 0 = the initial state; label = every key the schedule touches as sorted key=value).
+  Spinners (burn / burnmem): child processes `python -I -S -c <code> <run_game pid>`, CREATE_NO_WINDOW, no stdio, normal priority,
+  in the game's job object (they die with the run however it ends) and killed explicitly on every way out of the run (timeout,
+  stop-on-reach, the process exited, interrupted). ALU spinner = a tight integer loop; memory spinner = two 64 MiB bytearrays copied
+  into each other (memcpy bandwidth). A spinner exits by itself within ~0.1-1 s when its parent run_game process is gone. At a
+  step's time (the script clock = process start; the loop wakes for it, plus the spawn time of its processes) the number of live
+  spinners of that kind is set (more are started, extra ones killed); none exists before the game starts or after it ends. Printed when the counts change:
+  `[run_game] burn: t=<s> cpu=<n> mem=<n>`; summary.json burn_events [[t, kind, n]...] has every executed step.
+  `--selftest-burn` runs the spinner logic without a game (2 ALU + 1 memory spinner for 2 s in a private job, then checks they are
+  gone, and that an orphaned spinner ends by itself).
+
 What a run does
   1. Takes the heavy lock (tools/heavy_lock.py, FIFO; re-entrant under `heavy_lock.py -- python tools/run_game.py ...`).
   2. Makes $WORK/runs/<id>/ (id default r<yyyymmdd-HHMMSS>-<flow>) with user/ (fresh, plus the fixture), shots/,
@@ -46,7 +82,8 @@ What a run does
   3. Launches mcla.exe with, in this order:
          --game_data_root=$GAME/game --user_data_root=$WORK/runs/<id>/user --cache_root=$WORK/user/cache
          --log_file=$WORK/runs/<id>/mcla.log --log_level=info --fullscreen=false --mcla_gpu_backend=<api>
-         --input-file=$WORK/runs/<id>/flow.txt   [--<cvar>=<v> ...]
+         --input-file=$WORK/runs/<id>/flow.txt   [--audio_mute=true] [--mcla_window_pos=<pos>] [--mcla_window_behind=true]
+         [--<cvar>=<v> ...]
      (cache_root is shared between runs so the shader/pipeline storage survives the fresh user dirs.) The process runs
      in a Windows job object, so the whole tree dies with this script however it ends.
   4. Tails the log live and prints the notable lines (first engine frame, reached states, [mcla-mode] changes,
@@ -82,7 +119,8 @@ Definitions (log lines; the file log pattern is `[Y-m-d H:M:S.mmm] [level] [cate
   (when summarising a bare log).
 
 summary.json keys: run_id, state (running|done), flow, flow_file, fixture, fixture_copied {files, bytes}, api, config,
-  exe, args, seconds, started, ended, elapsed_s, ended_by (timeout|stop-on-reach|exited|interrupted), exit_code (only
+  exe, args, window_pos, window_behind, schedule (the --schedule specs), schedule_steps (every schedule step of the run: the
+  flow's and --schedule's, as written, sorted by time), burn_events [[t, kind, n]...], seconds, started, ended, elapsed_s, ended_by (timeout|stop-on-reach|exited|interrupted), exit_code (only
   when the process exited by itself), exit_status, pid, expected, reached, expect_met, ok, fatal, fatal_log (events),
   fatal_lines, fatal_process, unregistered, hang_alarms, heartbeat_last, heartbeat_last_s, heartbeat_gap_s,
   heartbeat_lines, heartbeat_frames_last, t_title, t_menu, t_free_roam (seconds since process start), mode_changes
@@ -101,6 +139,7 @@ import argparse
 import contextlib
 import datetime
 import json
+import math
 import os
 import re
 import shutil
@@ -115,6 +154,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 HERE = Path(__file__).resolve().parent
 FLOWS_DIR = HERE / "flows"
+SCHEDULES_DIR = FLOWS_DIR / "schedules"    # schedule fragments for --schedule: not flows, so kept out of flows/*.txt
 
 if str(HERE) not in sys.path:  # tools/ is on sys.path when run as a script; this lets `import run_game` find heavy_lock
     sys.path.insert(0, str(HERE))
@@ -419,9 +459,62 @@ _BUTTONS = frozenset(("a", "b", "x", "y", "start", "back", "lb", "rb", "l3", "r3
 _RE_HEADER = re.compile(r"^\s*#\s*(expect|seconds|fixture)\s*:\s*(\S+)\s*$")
 
 
-def parse_flow(text: str) -> List[Tuple[float, int, str]]:
-    """Validate a flow file like the host's parser does. Returns [(at_s, hold_ms, step text)]; raises Fail."""
-    steps: List[Tuple[float, int, str]] = []
+# Schedule steps (the host's SchedStep, src/host/input_script.h): `<seconds>:set <cvar>=<value>`, `<seconds>:burn <n>`,
+# `<seconds>:burnmem <n>`, `<seconds>:mark <label>`. The first word after the colon (case-insensitive) tells them from a
+# pad step (no button is called set, burn, burnmem or mark).
+SCHED_KINDS = ("set", "burn", "burnmem", "mark")
+BURN_MAX = 32
+_SCHED_RESERVED = ("burn", "burnmem", "mark")      # segment-label keys: not usable as a cvar name
+_RE_SCHED_NAME = re.compile(r"[A-Za-z0-9_]+")
+_RE_SCHED_COUNT = re.compile(r"[0-9]{1,2}")
+_RE_SCHED_LABEL = re.compile(r"[A-Za-z0-9_.-]{1,40}")
+
+# A schedule step: (at_s, kind, name, value_or_n, text). set: name = cvar, value = the value (verbatim string);
+# burn / burnmem: name = "", value = n (int 0..32); mark: name = label, value = None. text = the step as written.
+SchedStep = Tuple[float, str, str, Union[str, int, None], str]
+
+
+def _parse_time(t_text: str, where: str) -> float:
+    try:
+        at = float(t_text)
+    except ValueError:
+        at = -1.0
+    if not math.isfinite(at) or at < 0:
+        raise Fail("%s: bad time '%s'" % (where, t_text))
+    return at
+
+
+def _parse_sched_body(kw: str, rest: str, where: str) -> Tuple[str, Union[str, int, None]]:
+    """What follows the keyword of a schedule step (the host's ParseSchedBody): (name, value_or_n)."""
+    if kw == "set":
+        name, eq, value = rest.partition("=")
+        if not eq:
+            raise Fail("%s: set needs <cvar>=<value>" % where)
+        if any(c.isspace() for c in rest):
+            raise Fail("%s: set takes exactly one <cvar>=<value>, without spaces ('%s')" % (where, rest))
+        if not _RE_SCHED_NAME.fullmatch(name):
+            raise Fail("%s: bad cvar name '%s' (letters, digits, _)" % (where, name))
+        if name in _SCHED_RESERVED:
+            raise Fail("%s: '%s' cannot be set from a schedule (it is a segment label key)" % (where, name))
+        if not value:
+            raise Fail("%s: empty value for cvar '%s'" % (where, name))
+        if ";" in value or "#" in value:
+            raise Fail("%s: the value '%s' of cvar '%s' has a ';' or '#'" % (where, value, name))
+        return name, value
+    if kw in ("burn", "burnmem"):
+        n = int(rest) if _RE_SCHED_COUNT.fullmatch(rest) else -1
+        if not 0 <= n <= BURN_MAX:
+            raise Fail("%s: %s needs a count 0..%d, got '%s'" % (where, kw, BURN_MAX, rest))
+        return "", n
+    if not _RE_SCHED_LABEL.fullmatch(rest):
+        raise Fail("%s: bad mark label '%s' (1..40 of A-Z a-z 0-9 _ . -)" % (where, rest))
+    return rest, None
+
+
+def _parse_steps(text: str) -> Tuple[List[Tuple[float, int, str]], List[SchedStep]]:
+    """Validate a script like the host's parser does: (pad steps, schedule steps), both in file order; raises Fail."""
+    pad: List[Tuple[float, int, str]] = []
+    sched: List[SchedStep] = []
     for lineno, line in enumerate(text.replace("\r\n", "\n").split("\n"), 1):
         body = line.split("#", 1)[0].strip()
         for raw in body.split(";"):
@@ -432,12 +525,13 @@ def parse_flow(text: str) -> List[Tuple[float, int, str]]:
             if ":" not in s:
                 raise Fail("%s: no <seconds>: prefix" % where)
             t_text, buttons = (p.strip() for p in s.split(":", 1))
-            try:
-                at = float(t_text)
-            except ValueError:
-                at = -1.0
-            if at < 0:
-                raise Fail("%s: bad time '%s'" % (where, t_text))
+            at = _parse_time(t_text, where)
+            words = buttons.split(None, 1)
+            kw = words[0].lower() if words else ""
+            if kw in SCHED_KINDS:
+                name, value = _parse_sched_body(kw, words[1].strip() if len(words) > 1 else "", where)
+                sched.append((at, kw, name, value, s))
+                continue
             hold = 200
             if "/" in buttons:
                 buttons, h_text = (p.strip() for p in buttons.split("/", 1))
@@ -456,9 +550,70 @@ def parse_flow(text: str) -> List[Tuple[float, int, str]]:
                         raise Fail("%s: bad analog '%s' (only rt/lt take =<0..1>)" % (where, tok))
                 elif name not in _BUTTONS:
                     raise Fail("%s: unknown button '%s'" % (where, tok))
-            steps.append((at, hold, s))
-    return steps
+            pad.append((at, hold, s))
+    return pad, sched
 
+
+def parse_flow(text: str) -> List[Tuple[float, int, str]]:
+    """Validate a flow file like the host's parser does. Returns the PAD steps [(at_s, hold_ms, step text)]; raises Fail.
+    Schedule steps (set / burn / burnmem / mark) are validated too but not returned: see parse_schedule."""
+    return _parse_steps(text)[0]
+
+
+def parse_schedule(text: str) -> List[SchedStep]:
+    """The schedule steps of a flow / script text, [(at_s, kind, name, value_or_n, text)], stable-sorted by time (file
+    order for equal times, as the host does); pad steps are validated but not returned. Raises Fail."""
+    return sorted(_parse_steps(text)[1], key=lambda st: st[0])
+
+
+def parse_script(text: str) -> Tuple[List[Tuple[float, int, str]], List[SchedStep]]:
+    """(pad steps, schedule steps sorted by time) of a flow text, validated once."""
+    pad, sched = _parse_steps(text)
+    return pad, sorted(sched, key=lambda st: st[0])
+
+
+def _is_inline_schedule(spec: str) -> bool:
+    """Inline steps hold a `<seconds>:` prefix; a spec without one, or one that starts like a drive path (`C:/x`), is a file."""
+    return ":" in spec and re.match(r"\s*[A-Za-z]:[\\/]", spec) is None
+
+
+def load_schedule(specs: Sequence[str]) -> Tuple[List[SchedStep], List[str]]:
+    """The steps of `--schedule` specs. A spec is a file (a path, or a name in tools/flows/schedules/; same grammar, '#'
+    comments) or an inline string of ';'-separated steps (`58:set a=0;70:burn 4`; a '#' starts a comment as in a file).
+    Only schedule steps are allowed (pad steps belong in the flow). Returns (steps sorted by time, lines to append to the
+    run's flow.txt: a `# --schedule` comment per spec, then its steps verbatim). Raises Fail."""
+    steps: List[SchedStep] = []
+    lines: List[str] = []
+    for spec in specs:
+        label = spec
+        p = Path(spec)
+        try:
+            is_file = bool(spec.strip()) and p.is_file()
+        except OSError:                      # e.g. a name with characters a path cannot hold
+            is_file = False
+        if is_file:
+            text, label = p.read_text(encoding="utf-8"), p.as_posix()
+        elif _is_inline_schedule(spec):
+            text = spec
+        else:
+            cand = SCHEDULES_DIR / (spec if spec.endswith(".txt") else spec + ".txt")
+            if spec.strip() and re.fullmatch(r"[A-Za-z0-9_.-]+", spec) and cand.is_file():
+                text, label = cand.read_text(encoding="utf-8"), cand.as_posix()
+            else:
+                have = sorted(f.stem for f in SCHEDULES_DIR.glob("*.txt")) if SCHEDULES_DIR.is_dir() else []
+                raise Fail("--schedule '%s' is neither a file nor inline steps (`<seconds>:set k=v;<seconds>:burn 4`); "
+                           "schedules in %s: %s" % (spec, SCHEDULES_DIR.as_posix(), ", ".join(have) or "none"))
+        pad, sched = _parse_steps(text)
+        if pad:
+            raise Fail("--schedule '%s': pad step '%s' (a schedule takes only set / burn / burnmem / mark steps; "
+                       "pad steps belong in the flow)" % (label, pad[0][2]))
+        if not sched:
+            raise Fail("--schedule '%s' has no steps" % label)
+        lines.append("# --schedule %s" % (label if len(label) <= 160 else label[:157] + "..."))
+        lines.extend(st[4] for st in sched)
+        steps.extend(sched)
+    steps.sort(key=lambda st: st[0])
+    return steps, lines
 
 def flow_header(text: str) -> Dict[str, str]:
     """`# expect: menu`, `# seconds: 180`, `# fixture: after_intro` (first occurrence of each)."""
@@ -565,6 +720,9 @@ def _winapi():
     sig(k32.TerminateJobObject, wintypes.BOOL, HANDLE, wintypes.UINT)
     sig(k32.OpenProcess, HANDLE, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
     sig(k32.CloseHandle, wintypes.BOOL, HANDLE)
+    sig(k32.GetExitCodeProcess, wintypes.BOOL, HANDLE, ctypes.POINTER(wintypes.DWORD))
+    sig(k32.GetProcessTimes, wintypes.BOOL, HANDLE, ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME))
     sig(k32.SetThreadExecutionState, wintypes.DWORD, wintypes.DWORD)
     sig(u32.EnumWindows, wintypes.BOOL, ns.WNDENUMPROC, wintypes.LPARAM)
     sig(u32.GetWindowThreadProcessId, wintypes.DWORD, wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
@@ -661,6 +819,252 @@ def keep_awake(on: bool) -> None:
     calling thread, and ES_CONTINUOUS alone (back to normal) when `on` is false."""
     if os.name == "nt":
         _winapi().k32.SetThreadExecutionState(0x80000000 | 0x00000002 | 0x00000001 if on else 0x80000000)
+
+
+# ================================================================================================================
+# Load spinners (`burn` / `burnmem` schedule steps): child processes that eat CPU or memory bandwidth during a run
+# ================================================================================================================
+
+# The code of a spinner; argv[1] is the pid of the run_game process. The spinner exits by itself when that process is gone
+# (OpenProcess(SYNCHRONIZE) + WaitForSingleObject(h, 0): signalled = ended), so it cannot outlive its run whatever happens.
+_SPIN_PRELUDE = (
+    "import sys\n"
+    "ppid = int(sys.argv[1])\n"
+    "h = None\n"
+    "try:\n"
+    "    import ctypes\n"
+    "    k = ctypes.windll.kernel32\n"
+    "    k.OpenProcess.restype = ctypes.c_void_p\n"
+    "    k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]\n"
+    "    k.WaitForSingleObject.restype = ctypes.c_uint32\n"
+    "    k.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]\n"
+    "    h = k.OpenProcess(0x00100000, 0, ppid)\n"                  # SYNCHRONIZE
+    "except Exception:\n"
+    "    pass\n"
+    "if not h:\n"
+    "    sys.exit(0)\n"                                             # no parent to watch (already gone): do not run
+    "def gone():\n"
+    "    return k.WaitForSingleObject(h, 0) != 0x102\n"             # anything but WAIT_TIMEOUT
+)
+SPINNER_CODE = {
+    # ALU: a tight integer loop; the parent check runs every 2**20 iterations (~0.1 s).
+    "burn": _SPIN_PRELUDE
+            + "def main():\n"
+              "    x = 0\n"
+              "    while True:\n"
+              "        for _ in range(1 << 20):\n"
+              "            x = (x * 1103515245 + 12345) & 0xFFFFFFFF\n"
+              "        if gone():\n"
+              "            return\n"
+              "main()\n",
+    # Memory bandwidth: two 64 MiB buffers (well beyond any cache; both written first so every page is really mapped),
+    # copied into each other for ever (a slice assignment between two bytearrays of one size is a memcpy).
+    "burnmem": _SPIN_PRELUDE
+               + "a = bytearray(b'\\xa5') * (64 << 20)\n"
+                 "b = bytearray(a)\n"
+                 "while True:\n"
+                 "    b[:] = a\n"
+                 "    a[:] = b\n"
+                 "    if gone():\n"
+                 "        break\n",
+}
+_SPIN_LABEL = {"burn": "cpu", "burnmem": "mem"}
+_CREATE_NO_WINDOW = 0x08000000
+
+
+def spawn_spinner(kind: str, parent_pid: int) -> "subprocess.Popen":
+    """One spinner process (`python -I -S -c CODE <parent_pid>`): no window, no stdio, normal priority."""
+    return subprocess.Popen([sys.executable, "-I", "-S", "-c", SPINNER_CODE[kind], str(parent_pid)],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            creationflags=_CREATE_NO_WINDOW)
+
+
+class Spinners:
+    """The spinner processes of one run: `cpu` (kind `burn`) and `mem` (kind `burnmem`) counts, set by schedule steps.
+
+    Every spinner is added to `job` (the game's job object: they die with the run whatever happens) and killed explicitly by
+    kill_all(), which the run calls on every exit path. None exists before the game is started: the object is made empty and
+    only apply()/set() start processes. `started` (time.monotonic() at the game start) turns apply()'s time into seconds."""
+
+    def __init__(self, job: Optional[Job] = None, started: Optional[float] = None, parent_pid: Optional[int] = None,
+                 quiet: bool = False) -> None:
+        self.job = job
+        self.started = time.monotonic() if started is None else started
+        self.parent_pid = os.getpid() if parent_pid is None else parent_pid
+        self.quiet = quiet
+        self.procs: Dict[str, List["subprocess.Popen"]] = {"burn": [], "burnmem": []}
+        self.events: List[List] = []             # [[t, kind, n], ...] one per executed step
+        self.start_failures = 0
+        self.died_early = 0
+        self.killed_at_end = 0                   # spinners still running when kill_all() ended the run
+        self._warned_job = False
+
+    # ------------------------------------------------------------------ state
+    def _reap(self) -> None:
+        """Drop spinners that ended on their own (a crash; they never end otherwise while the run is alive)."""
+        for kind, lst in self.procs.items():
+            alive = [p for p in lst if p.poll() is None]
+            self.died_early += len(lst) - len(alive)
+            self.procs[kind] = alive
+
+    def counts(self) -> Dict[str, int]:
+        self._reap()
+        return {kind: len(lst) for kind, lst in self.procs.items()}
+
+    def pids(self) -> List[int]:
+        return [p.pid for lst in self.procs.values() for p in lst]
+
+    # ------------------------------------------------------------------ changes
+    def set(self, kind: str, n: int) -> None:
+        """Make exactly n live spinners of this kind: start more, or kill the extra ones (the newest first)."""
+        self._reap()
+        lst = self.procs[kind]
+        while len(lst) < n:
+            try:
+                p = spawn_spinner(kind, self.parent_pid)
+            except OSError as e:
+                self.start_failures += 1
+                say("warning: cannot start a %s spinner: %s" % (kind, e))
+                break
+            lst.append(p)
+            if self.job is not None and not self.job.add(p) and not self._warned_job:
+                self._warned_job = True
+                say("warning: a spinner could not be put in the job object (it still ends with this process and the "
+                    "run's kill)")
+        extra = lst[n:]
+        del lst[n:]
+        _kill_procs(extra)
+
+    def apply(self, kind: str, n: int, t: Optional[float] = None) -> None:
+        """Run one `burn` / `burnmem` step: set the count, record the event, print `burn: t=<s> cpu=<n> mem=<n>`."""
+        if t is None:
+            t = time.monotonic() - self.started
+        before = self.counts()
+        self.set(kind, n)
+        self.events.append([round(t, 2), kind, n])
+        after = self.counts()
+        if after != before and not self.quiet:
+            say("burn: t=%.1f cpu=%d mem=%d" % (t, after["burn"], after["burnmem"]))
+
+    def kill_all(self) -> int:
+        """Kill every spinner and wait for them; returns how many are still alive afterwards (0 in the normal case)."""
+        self._reap()
+        victims = [p for lst in self.procs.values() for p in lst]
+        self.killed_at_end += len(victims)
+        for lst in self.procs.values():
+            lst.clear()
+        _kill_procs(victims)
+        return sum(1 for p in victims if p.poll() is None)
+
+
+def _kill_procs(procs: Sequence["subprocess.Popen"]) -> None:
+    for p in procs:
+        try:
+            p.kill()
+        except OSError:
+            pass
+    for p in procs:
+        try:
+            p.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+
+def _process_alive(pid: int) -> bool:
+    """True while a process with this pid exists and has not exited (ctypes; used by the spinner self-test)."""
+    w = _winapi()
+    h = w.k32.OpenProcess(0x1000, False, pid)         # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    try:
+        code = w.wintypes.DWORD()
+        if not w.k32.GetExitCodeProcess(h, w.ctypes.byref(code)):
+            return False
+        return code.value == 259                       # STILL_ACTIVE
+    finally:
+        w.k32.CloseHandle(h)
+
+
+def _process_cpu_s(pid: int) -> Optional[float]:
+    """Kernel + user CPU seconds of a process (GetProcessTimes), None when it cannot be opened."""
+    w = _winapi()
+    h = w.k32.OpenProcess(0x1000, False, pid)
+    if not h:
+        return None
+    try:
+        ft = [w.wintypes.FILETIME() for _ in range(4)]
+        if not w.k32.GetProcessTimes(h, *(w.ctypes.byref(f) for f in ft)):
+            return None
+        return sum(((f.dwHighDateTime << 32) | f.dwLowDateTime) for f in ft[2:4]) / 1e7
+    finally:
+        w.k32.CloseHandle(h)
+
+
+def spinner_selftest(cpu: int = 2, mem: int = 1, seconds: float = 2.0) -> int:
+    """No game: start `cpu` ALU + `mem` memory spinners in a private job object for `seconds` s, check they live, burn CPU and
+    are in the job, kill them, check they are gone; then check that a spinner whose parent process dies ends by itself.
+    Only processes started here are touched. Returns 0 when every check passes."""
+    if os.name != "nt":
+        print("spinner self-test: Windows only")
+        return EXIT_SETUP
+    ok = True
+
+    def check(cond: bool, what: str) -> None:
+        nonlocal ok
+        ok = ok and cond
+        print("  %-4s %s" % ("ok" if cond else "FAIL", what), flush=True)
+
+    job = Job()
+    check(bool(job.handle), "job object created")
+    sp = Spinners(job)
+    try:
+        sp.apply("burn", cpu)
+        sp.apply("burnmem", mem)
+        pids = sp.pids()
+        check(len(pids) == cpu + mem, "%d spinner processes started (%s)" % (len(pids), pids))
+        cpu0 = {p: _process_cpu_s(p) for p in pids}
+        time.sleep(seconds)
+        check(all(_process_alive(p) for p in pids), "all alive after %.1f s" % seconds)
+        in_job = set(job.pids())
+        check(all(p in in_job for p in pids), "all in the job object (job pids %s)" % sorted(in_job))
+        used = {p: (_process_cpu_s(p) or 0.0) - (cpu0[p] or 0.0) for p in pids}
+        # A busy machine (other builds running) gives a spinner less than a whole core: the bar is only "clearly not idle".
+        check(all(used[p.pid] > 0.25 * seconds for p in sp.procs["burn"]),
+              "ALU spinners used %s CPU s in %.1f s" % ([round(used[p.pid], 2) for p in sp.procs["burn"]], seconds))
+        check(all(used[p.pid] > 0.25 * seconds for p in sp.procs["burnmem"]),
+              "memory spinners used %s CPU s in %.1f s" % ([round(used[p.pid], 2) for p in sp.procs["burnmem"]], seconds))
+        sp.apply("burn", 1)
+        check(sp.counts() == {"burn": 1, "burnmem": mem}, "burn 1 leaves %s" % sp.counts())
+        sp.apply("burn", 0)
+        check(sp.counts() == {"burn": 0, "burnmem": mem}, "burn 0 stops the ALU spinners: %s" % sp.counts())
+    finally:
+        left = sp.kill_all()
+    time.sleep(0.2)
+    check(left == 0 and not any(_process_alive(p) for p in pids), "all killed; none alive")
+    check(sp.counts() == {"burn": 0, "burnmem": 0}, "counts back to zero")
+    job.terminate()
+    job.close()
+
+    # A spinner without its parent: a helper process starts one for its own pid and exits; the spinner must end by itself.
+    helper = ("import os, sys, time\nsys.path.insert(0, %r)\nimport run_game\n"
+              "p = run_game.spawn_spinner('burn', os.getpid())\nprint(p.pid, flush=True)\ntime.sleep(1.0)\n" % str(HERE))
+    out = subprocess.run([sys.executable, "-I", "-c", helper], capture_output=True, text=True, timeout=30,
+                         creationflags=_CREATE_NO_WINDOW)
+    try:
+        orphan = int(out.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        orphan = 0
+        check(False, "orphan test: the helper did not print a pid (%s)" % out.stderr.strip()[-200:])
+    if orphan:
+        t_end = time.monotonic() + 8.0
+        while _process_alive(orphan) and time.monotonic() < t_end:
+            time.sleep(0.1)
+        gone = not _process_alive(orphan)
+        if not gone:                                         # started here: clean it up
+            subprocess.run(["taskkill", "/PID", str(orphan), "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        check(gone, "an orphaned spinner (parent gone) ended by itself (pid %d)" % orphan)
+    print("spinner self-test: %s" % ("PASS" if ok else "FAIL"), flush=True)
+    return 0 if ok else EXIT_FAILED
 
 
 def write_png(path: Path, width: int, height: int, rgb: bytes) -> None:
@@ -908,6 +1312,29 @@ class RunOptions:
     activate: bool = False
     work: Optional[str] = None
     game: Optional[str] = None
+    schedule: List[str] = field(default_factory=list)   # --schedule specs: files or inline `;`-separated steps
+    window_pos: Optional[str] = None     # None = automatic (bottom-right unless topmost / activate); "" = SDK default
+    behind: Optional[bool] = None        # None = automatic (on unless topmost / activate)
+
+
+WINDOW_POS_NAMES = ("", "bottom-right", "bottom-left", "top-right", "top-left")
+_RE_WINDOW_XY = re.compile(r"-?[0-9]+,-?[0-9]+")
+
+
+def effective_window(opts: RunOptions) -> Tuple[str, bool]:
+    """(window_pos, behind) of a run: the explicit options, else the quiet defaults (bottom-right, behind the foreground
+    window) unless --topmost or --activate asks for a window that is meant to be seen."""
+    visible = opts.topmost or opts.activate
+    pos = opts.window_pos if opts.window_pos is not None else ("" if visible else "bottom-right")
+    behind = opts.behind if opts.behind is not None else not visible
+    return pos, behind
+
+
+def check_window_pos(pos: str) -> str:
+    pos = pos.strip()
+    if pos not in WINDOW_POS_NAMES and not _RE_WINDOW_XY.fullmatch(pos):
+        raise Fail("--window-pos '%s' is not one of %s or X,Y" % (pos, ", ".join(n or '""' for n in WINDOW_POS_NAMES)))
+    return pos
 
 
 def _work(opts: RunOptions) -> Path:
@@ -937,6 +1364,11 @@ def build_args(opts: RunOptions, game_root: Path, user_dir: Path, cache_dir: Pat
     }
     if not opts.audio:
         pairs["audio_mute"] = "true"  # the owner works on this machine while tests run
+    pos, behind = effective_window(opts)
+    if pos:
+        pairs["mcla_window_pos"] = check_window_pos(pos)    # "" = the SDK default (centred): no argument
+    if behind:
+        pairs["mcla_window_behind"] = "true"
     for spec in opts.cvars:
         key, eq, value = spec.partition("=")
         key = key.strip().lstrip("-")
@@ -1030,7 +1462,11 @@ def run(opts: RunOptions, on_start: Optional[Callable[[int, Path], None]] = None
     work, game = _work(opts), _game(opts)
     flow_file = resolve_flow(opts.flow)
     flow_text = flow_file.read_text(encoding="utf-8")
-    steps = parse_flow(flow_text)
+    steps, flow_sched = parse_script(flow_text)
+    extra_sched, sched_lines = load_schedule(opts.schedule)
+    sched = sorted(flow_sched + extra_sched, key=lambda st: st[0])
+    if opts.window_pos is not None:
+        check_window_pos(opts.window_pos)
     header = flow_header(flow_text)
     expected = opts.expect or header.get("expect", "none")
     seconds = float(opts.seconds if opts.seconds is not None else header.get("seconds", DEFAULT_SECONDS))
@@ -1055,6 +1491,10 @@ def run(opts: RunOptions, on_start: Optional[Callable[[int, Path], None]] = None
     if last_step > seconds:
         print("[run_game] note: the flow has steps until %.0f s, --seconds %.0f cuts it" % (last_step, seconds),
               file=sys.stderr, flush=True)
+    late = [st for st in sched if st[0] >= seconds]
+    if late:
+        print("[run_game] note: %d schedule step(s) at or after --seconds %.0f never run (first: '%s')"
+              % (len(late), seconds, late[0][4]), file=sys.stderr, flush=True)
 
     lease: contextlib.AbstractContextManager = contextlib.nullcontext()
     if opts.lock:
@@ -1063,13 +1503,14 @@ def run(opts: RunOptions, on_start: Optional[Callable[[int, Path], None]] = None
                                 cmd=cmd, wait_timeout=opts.lock_timeout, work=str(work))
     with lease:
         return _run_locked(opts, work, game_root, exe, flow_file, flow_text, flow_name, expected, seconds,
-                           fixture_dir, fixture_note, on_start)
+                           fixture_dir, fixture_note, on_start, sched, sched_lines)
 
 
 def _run_locked(opts: RunOptions, work: Path, game_root: Path, exe: Path, flow_file: Path, flow_text: str,
                 flow_name: str, expected: str, seconds: float, fixture_dir: Optional[Path],
                 fixture_note: Optional[Dict[str, int]],
-                on_start: Optional[Callable[[int, Path], None]]) -> Dict:
+                on_start: Optional[Callable[[int, Path], None]], sched: Sequence[SchedStep] = (),
+                sched_lines: Sequence[str] = ()) -> Dict:
     run_id = opts.run_id or "r%s-%s" % (datetime.datetime.now().strftime("%Y%m%d-%H%M%S"), flow_name)
     run_dir = work / "runs" / run_id
     if run_dir.exists():
@@ -1082,7 +1523,10 @@ def _run_locked(opts: RunOptions, work: Path, game_root: Path, exe: Path, flow_f
         user_dir.mkdir(parents=True)
         shots_dir.mkdir()
         cache_dir.mkdir(parents=True, exist_ok=True)
-        run_flow.write_bytes(flow_text.replace("\r\n", "\n").encode("utf-8"))
+        run_text = flow_text.replace("\r\n", "\n")
+        if sched_lines:                      # --schedule steps ride in the run's own copy of the flow (the host reads it)
+            run_text = run_text.rstrip("\n") + "\n\n" + "\n".join(sched_lines) + "\n"
+        run_flow.write_bytes(run_text.encode("utf-8"))
         if fixture_dir is not None:
             shutil.copytree(fixture_dir, user_dir, dirs_exist_ok=True)
         args = build_args(opts, game_root, user_dir, cache_dir, log_path, run_flow)
@@ -1096,11 +1540,16 @@ def _run_locked(opts: RunOptions, work: Path, game_root: Path, exe: Path, flow_f
             "run_id": run_id, "state": "running", "flow": flow_name, "flow_file": posix(flow_file),
             "fixture": opts.fixture, "fixture_copied": fixture_note, "api": opts.api, "config": opts.config,
             "exe": posix(exe), "args": args, "seconds": seconds, "expected": expected,
+            "window_pos": effective_window(opts)[0], "window_behind": effective_window(opts)[1],
+            "schedule": list(opts.schedule), "schedule_steps": [st[4] for st in sched],
         }
         write_json(run_dir / "summary.json", summary)
 
         job = Job()
         env = dict(os.environ)
+        if not opts.activate:
+            # SDL3 reads its hints from the environment: its own ShowWindow must not activate (focus-steal) the window.
+            env["SDL_WINDOW_ACTIVATE_WHEN_SHOWN"] = "0"
         started_wall = time.time()
         started = time.monotonic()
         try:
@@ -1136,6 +1585,11 @@ def _run_locked(opts: RunOptions, work: Path, game_root: Path, exe: Path, flow_f
     reached_at: Optional[float] = None
     next_shot = opts.screenshot_every or 0.0
     exit_code: Optional[int] = None
+    # Load spinners of the schedule's burn / burnmem steps (their time is the script's clock = this process start). None is
+    # started before the game runs; the finally below kills them on every way out (the job object is the second net).
+    spinners = Spinners(job, started)
+    burns = [st for st in sched if st[1] in ("burn", "burnmem")]
+    spinners_left = 0
 
     try:
         keep_awake(True)
@@ -1149,6 +1603,9 @@ def _run_locked(opts: RunOptions, work: Path, game_root: Path, exe: Path, flow_f
             if rc is not None:
                 ended_by, exit_code = "exited", rc
                 break
+            while burns and burns[0][0] <= elapsed:
+                _at, burn_kind, _name, burn_n, _text = burns.pop(0)
+                spinners.apply(burn_kind, int(burn_n), elapsed)
             if opts.stop_on_reach and expected != "none" and RANK[scanner.reached] >= RANK[expected]:
                 if reached_at is None:
                     reached_at = elapsed
@@ -1161,17 +1618,23 @@ def _run_locked(opts: RunOptions, work: Path, game_root: Path, exe: Path, flow_f
             if shooter is not None and elapsed >= next_shot:
                 shooter.shoot(shot_name(next_shot))
                 next_shot += opts.screenshot_every
-            time.sleep(0.25)
+            nap = 0.25
+            if burns:                                  # wake for the next burn step (a spinner step is on time to ~10 ms)
+                nap = max(0.005, min(nap, burns[0][0] - (time.monotonic() - started)))
+            time.sleep(nap)
     except KeyboardInterrupt:
         ended_by = "interrupted"
     finally:
         elapsed = time.monotonic() - started
-        if proc.poll() is None:
-            if shooter is not None and ended_by != "interrupted":
-                shooter.shoot("t%d_end.png" % int(round(elapsed)))
-            kill_tree(proc, job)
-        job.close()
-        keep_awake(False)
+        try:
+            if proc.poll() is None:
+                if shooter is not None and ended_by != "interrupted":
+                    shooter.shoot("t%d_end.png" % int(round(elapsed)))
+                kill_tree(proc, job)
+        finally:
+            spinners_left = spinners.kill_all()
+            job.close()
+            keep_awake(False)
 
     # One last read of what the kill left on disk, then the authoritative parse of the whole log.
     for kind, line in tail.pump():
@@ -1187,6 +1650,7 @@ def _run_locked(opts: RunOptions, work: Path, game_root: Path, exe: Path, flow_f
         "ended_by": ended_by, "exit_code": exit_code, "user_saves": user_saves(user_dir),
         "shots": shooter.taken if shooter else [], "shot_notes": shooter.final_notes() if shooter else [],
         "shot_methods": shooter.methods if shooter else {},
+        "burn_events": spinners.events,
     })
     if not log_path.is_file():
         summary["log_missing"] = True
@@ -1201,6 +1665,11 @@ def _run_locked(opts: RunOptions, work: Path, game_root: Path, exe: Path, flow_f
             print("\n".join("  stdout| " + l for l in tail_text.splitlines()[-15:]), flush=True)
     if not log_path.is_file():
         say("warning: no log was written at %s (the host died before logging?)" % posix(log_path))
+    if spinners.events or spinners.died_early:
+        say("burn: %d step(s) run, %d spinner(s) killed at the end%s%s" % (
+            len(spinners.events), spinners.killed_at_end,
+            (", %d died early" % spinners.died_early) if spinners.died_early else "",
+            "" if not spinners_left else "; %d STILL ALIVE (kill them by hand)" % spinners_left))
     if not summary["expect_met"]:
         say("expected '%s' but reached '%s'" % (expected, summary["reached"]))
     if shooter is not None:
@@ -1238,15 +1707,32 @@ def _summarize(arg: str, opts: RunOptions) -> int:
     return 0 if parsed["ok"] else EXIT_FAILED
 
 
-def _check_flow(name: str) -> int:
+def _sched_line(st: SchedStep, source: str) -> str:
+    at, kind, name, value, text = st
+    who = "run_game spinners + host log" if kind in ("burn", "burnmem") else ("host sets the cvar" if kind == "set" else "host marker")
+    return "  %7.1f s  %-34s [%s; %s]" % (at, text.split(":", 1)[1].strip(), who, source)
+
+
+def _check_flow(name: str, opts: RunOptions) -> int:
     path = resolve_flow(name)
     text = path.read_text(encoding="utf-8")
-    steps = parse_flow(text)
+    steps, flow_sched = parse_script(text)
+    extra, _ = load_schedule(opts.schedule)
+    check_window_pos(opts.window_pos or "")
     header = flow_header(text)
     end = max((at + hold / 1000.0 for at, hold, _ in steps), default=0.0)
     print("flow %s: %d steps, last ends at %.1f s; expect=%s seconds=%s fixture=%s"
           % (path.name, len(steps), end, header.get("expect", "none"), header.get("seconds", "-"),
              header.get("fixture", "-")))
+    both = [(st, "flow") for st in flow_sched] + [(st, "--schedule") for st in extra]
+    if both:
+        both.sort(key=lambda r: r[0][0])
+        print("schedule: %d step(s) (%d in the flow, %d from --schedule)" % (len(both), len(flow_sched), len(extra)))
+        for st, source in both:
+            print(_sched_line(st, source))
+    pos, behind = effective_window(opts)
+    print("window: pos=%s behind=%s (SDL activate-when-shown %s)"
+          % (pos or "SDK default", "yes" if behind else "no", "as inherited" if opts.activate else "off"))
     return 0
 
 
@@ -1285,9 +1771,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--audio", action="store_true", help="do not mute the game (default: --audio_mute=true)")
     ap.add_argument("--activate", action="store_true",
                     help="let the game window take the focus (default: shown without activation)")
+    ap.add_argument("--schedule", action="append", default=[], metavar="SPEC",
+                    help="a timed schedule (set / burn / burnmem / mark steps) added to the flow: a file, a name in "
+                         "tools/flows/schedules/, or inline `58:set k=v;70:burn 4`; repeatable")
+    ap.add_argument("--window-pos", metavar="POS",
+                    help="game window position, --mcla_window_pos=POS: bottom-right | bottom-left | top-right | top-left | X,Y | "
+                         "\"\" (SDK default, centred). Default bottom-right (\"\" with --topmost / --activate)")
+    ap.add_argument("--behind", dest="behind", action="store_true", default=None,
+                    help="place the window just behind the foreground window after it is shown, --mcla_window_behind=true "
+                         "(default on, off with --topmost / --activate)")
+    ap.add_argument("--no-behind", dest="behind", action="store_false", help="do not place the window behind the foreground one")
     ap.add_argument("--work", metavar="W", help="$WORK (default env MCLA_WORK, else %s)" % DEFAULT_WORK)
     ap.add_argument("--game", metavar="G", help="$GAME (default env MCLA_GAME, else %s)" % DEFAULT_GAME)
-    ap.add_argument("--check-flow", action="store_true", help="validate the flow file and stop")
+    ap.add_argument("--check-flow", action="store_true", help="validate the flow file (and --schedule) and stop")
+    ap.add_argument("--selftest-burn", action="store_true",
+                    help="no game: start 2 ALU + 1 memory spinner for 2 s, check them and that they are gone, and stop")
     ap.add_argument("--summarize", metavar="RUN", help="parse an existing run (id, run dir or log file) and stop")
     args = ap.parse_args(argv)
 
@@ -1295,14 +1793,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                       cvars=args.cvar, screenshot_every=args.screenshot_every, run_id=args.run_id,
                       config=args.config, exe=args.exe, lock=not args.no_lock, lock_timeout=args.lock_timeout,
                       stop_on_reach=args.stop_on_reach, expect=args.expect, topmost=args.topmost,
-                      audio=args.audio, activate=args.activate, work=args.work, game=args.game)
+                      audio=args.audio, activate=args.activate, work=args.work, game=args.game,
+                      schedule=args.schedule, window_pos=args.window_pos, behind=args.behind)
     try:
+        if args.selftest_burn:
+            return spinner_selftest()
         if args.summarize:
             return _summarize(args.summarize, opts)
         if not args.flow:
             ap.error("--flow is required")
         if args.check_flow:
-            return _check_flow(args.flow)
+            return _check_flow(args.flow, opts)
         _install_signals()
         summary = run(opts)
     except Fail as e:

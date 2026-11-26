@@ -1,0 +1,36 @@
+# A/B/A/B schedule FRAGMENT over the drive window of quick_drive (T+52..118 s): 4 CPU spinners (B) in 12 s slices against
+# none (A): A = 52..58, 70..82, 94..106 and B = 58..70, 82..94, 106..118. It is NOT a flow: it has no `# expect:`,
+# `# seconds:` or `# fixture:` header and no pad steps, so it is only for --schedule (it lives in tools/flows/schedules/ so
+# that run_game.py's flow list does not offer it as a flow).
+#
+#   python tools/run_game.py --flow quick_drive --fixture after_intro --config Release --schedule tools/flows/schedules/ab_example.txt
+#   python tools/run_game.py --flow quick_drive --check-flow --schedule ab_example        # validate + print, no run
+#   python tools/bench.py --flow quick_drive --no-warmup --schedule ab_example --variant base:
+#   python tools/segments.py <run id> --from-free-roam 16  # per segment, per label (pooled A, pooled B) and the A/B deltas
+#
+# Grammar (same as the flow's, `<seconds>:` counts from the process start; the host runs it, run_game.py runs the spinners):
+#   <s>:set <cvar>=<value>   a run-time cvar changes at that second (no spaces; the cvar must exist or the run fails at start)
+#   <s>:burn <n>             n CPU (ALU) spinner processes, 0..32; 0 stops them     (run_game.py starts / kills them)
+#   <s>:burnmem <n>          n memory-bandwidth spinner processes, 0..32           (run_game.py)
+#   <s>:mark <label>         a named boundary; the label becomes part of the segment label (use it to tell windows apart,
+#                            but note that segments with DIFFERENT labels are not pooled by segments.py)
+# The host's segment label is every key the schedule touches as sorted `key=value` (here `burn=0` / `burn=4`), so the three
+# A windows pool into `burn=0` and the three B windows into `burn=4`. segments.py drops the first 3 s of every segment
+# (--settle). Segment 0 (burn=0) is the state at the start: boot, free roam parked and the first 6 s of the drive; the drive
+# starts at T+52 = `-> free-roam` (~36.5 s) + ~16 s, so `--from-free-roam 16` keeps only the driving part of it.
+#
+# A = 0 spinners (initial state, segment 0), B = 4 spinners:
+58:burn 4
+70:burn 0
+82:burn 4
+94:burn 0
+106:burn 4
+#
+# The same shape with a cvar instead of load (a cvar that exists, e.g. the frame cap; uncomment, delete the burn lines above):
+#   58:set mcla_fps_cap=0
+#   70:set mcla_fps_cap=60
+#   82:set mcla_fps_cap=0
+#   94:set mcla_fps_cap=60
+#   106:set mcla_fps_cap=0
+# Both at once (the label then reads `burn=4 mcla_fps_cap=0` ...): put the steps of one change on the same second.
+# Memory-bandwidth load instead of ALU: replace `burn` by `burnmem`.
