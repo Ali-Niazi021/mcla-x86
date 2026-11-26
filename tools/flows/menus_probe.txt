@@ -1,0 +1,36 @@
+# MCLA menus probe (MENUS60 run 2): what the governor's level does on the title and in PAUSE, and the GPS map.
+# The menu MSAA fix is on (profile default). Title: closed loop (level 0, the governor holds outside driving) 30..40,
+# then pinned to level 4 (vrs 2 + the live gfx knobs) 40..50. PAUSE: closed loop 78..86 (the level the drive left), then
+# level 0 86..94. GPS map: Back held 1 s in roam, zoom, closed; a second Back later.
+# Use: python tools/bench.py --flow menus_probe --no-warmup --no-metrics --variant base: --cvar mcla_profile=1080p ...
+#
+# expect: free-roam
+# seconds: 128
+# fixture: after_intro
+0:mark boot
+30:mark title
+40:set mcla_gov_force_level=4
+50:set mcla_gov_force_level=-1
+50:mark title_start
+50:start/300
+52:start/300
+54:start/300
+62:b/300
+64:b/300
+66:mark drive
+66:rt=1/8000
+70:ls_right/500
+78:mark pause
+78:start/300
+86:set mcla_gov_force_level=0
+94:set mcla_gov_force_level=-1
+94:b/300
+98:mark map
+98:back/1000
+106:mark map_zoom
+106:rs_down/1500
+108:lt=1/1500
+112:b/300
+116:mark map2
+116:back/1000
+124:b/300

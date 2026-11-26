@@ -2,14 +2,14 @@
 # menu MSAA fix (mcla_menu_noaa) switched off and on inside the run, so each screen is an A/B of one process.
 # Timeline (fixture after_intro, 1080p profile): the title is up from ~30 s; Start is held back to 50 s so the title is
 # measured for 20 s (off 30..40, on 40..50); `front-end -> loading -> free-roam` follows (~58 s). A short drive is the
-# reference (1x single tile). Then PAUSE (off, then on), its tabs (RB), PAUSE closed, the GPS map (Back) on then off,
-# then the map's zoom (LT, right stick), closed with B.
+# reference (1x single tile). Then PAUSE (off, then on), its tabs (RB) and the SETTINGS > OPTIONS screen, PAUSE closed,
+# a second drive.
 # Use: python tools/bench.py --flow menus_tour --no-warmup --variant base: --cvar mcla_profile=1080p ...   (segments.py)
 #      python tools/run_game.py --flow menus_tour --config Release --screenshot-every 3   (pictures)
 # Format: <second>:<button>[+<button>...][/<hold ms>] and schedule steps (set / mark); '#' comments.
 #
 # expect: free-roam
-# seconds: 134
+# seconds: 132
 # fixture: after_intro
 0:set mcla_menu_noaa=false
 0:mark boot
@@ -31,21 +31,19 @@
 76:mark pause
 76:start/300
 84:set mcla_menu_noaa=true
-# the pause tabs, fix on
+# the pause tabs, fix on: RB -> MODES, RB -> SETTINGS, A = its first row (OPTIONS), B back, LB -> MODES
 92:mark pause_tabs
 92:rb/200
 96:rb/200
-100:rb/200
-104:lb/200
-106:lb/200
-108:lb/200
-# close PAUSE, then the GPS map (Back): on, then off, then its zoom
+100:mark pause_options
+100:a/200
+105:b/300
+107:lb/200
+# close PAUSE, drive again (the GPS map is not reachable with the after_intro fixture: Back does nothing in roam this
+# early in the story, runs mn1/mn2)
 110:b/300
 112:b/300
-114:mark map
-114:back/300
-121:set mcla_menu_noaa=false
-127:mark map_zoom
-127:lt=1/2000
-129:rs_down/1500
-131:b/300
+114:mark drive2
+116:rt=1/8000
+120:ls_left/500
+126:mark parked
