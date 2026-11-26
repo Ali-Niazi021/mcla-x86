@@ -497,6 +497,10 @@ void ScriptedInput::RunSchedule(double t) {
         sched_state_.SetBurnMem(s.n);
         REXLOG_INFO("[mcla-sched] t={:.3f} burnmem {}", t, s.n);
         break;
+      case SchedStep::kBurnGpu:
+        sched_state_.SetBurnGpu(s.n);
+        REXLOG_INFO("[mcla-sched] t={:.3f} burngpu {}", t, s.n);
+        break;
       case SchedStep::kMark:
         sched_state_.SetMark(s.name);
         REXLOG_INFO("[mcla-sched] t={:.3f} mark {}", t, s.name);

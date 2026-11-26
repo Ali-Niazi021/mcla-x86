@@ -22,7 +22,7 @@
 //
 // SCHEDULE STEPS. The same script (file and --input) can also carry a timed schedule, for A/B experiments inside one
 // run. A schedule step shares the <seconds>: prefix; the first word after the colon (case-insensitive) tells it from a
-// pad step (no button is called set, burn, burnmem or mark). No /hold and no '+' on these steps.
+// pad step (no button is called set, burn, burnmem, burngpu or mark). No /hold and no '+' on these steps.
 //
 //   <seconds>:set <cvar>=<value>   the host sets a run-time cvar at that time (rex::cvar::SetFlagByName). cvar is
 //                                  [A-Za-z0-9_]+; value is non-empty without whitespace, ';' or '#' and is passed on
@@ -31,15 +31,18 @@
 //   <seconds>:burn <n>             marker: tools/run_game.py starts/stops n CPU (ALU) spinner processes (0..32; 0 stops
 //                                  that kind). The host only logs it.
 //   <seconds>:burnmem <n>          marker: the same for n memory-bandwidth spinners.
+//   <seconds>:burngpu <pct>        marker: tools/run_game.py runs tools/telemetry/gpuload.exe, a foreign D3D11 compute load
+//                                  that keeps the GPU busy about pct % of the time (0..100; 0 stops it; at most one load,
+//                                  a new pct restarts it with the new duty). The host only logs it.
 //   <seconds>:mark <label>         marker: a named segment boundary; label is [A-Za-z0-9_.-]{1,40}.
 //
 // The host logs each one as `[mcla-sched] t=<s> set <name>=<value> ok now=<read back>` (or `FAILED (rejected)`),
-// `... burn <n>`, `... burnmem <n>`, `... mark <label>`, then ONE `[mcla-sched] t=<s> segment <k>: <label>` line for
+// `... burn <n>`, `... burnmem <n>`, `... burngpu <pct>`, `... mark <label>`, then ONE `[mcla-sched] t=<s> segment <k>: <label>` line for
 // all the steps that fell due in the same 10 ms tick. The label is the canonical state: every key the schedule touches,
 // sorted by name, as key=value joined by spaces (each set cvar with its current value, burn, burnmem and mark when the
 // schedule uses them), e.g. `segment 3: burn=4 mcla_gfx_preset=perf`; `segment 0` is the state at the start of the run.
 // Those lines are what tools/segments.py cuts its windows at; tools/run_game.py validates the same grammar and runs
-// the burn/burnmem spinners.
+// the burn/burnmem spinners and the burngpu load.
 //
 // The flags are read from the raw command line (a plain `--input-file X` with a space would become a positional
 // argument of the SDK's cvar parser, and an unknown `--x=y` is only stashed there, not usable as a cvar).
@@ -125,14 +128,14 @@ struct Step {
   std::string text;  // as written, for the log
 };
 
-// A schedule step (set / burn / burnmem / mark). Kept apart from the pad steps: StateAt and PressesBy never see these.
+// A schedule step (set / burn / burnmem / burngpu / mark). Kept apart from the pad steps: StateAt and PressesBy never see these.
 struct SchedStep {
-  enum Kind { kSet, kBurn, kBurnMem, kMark };
+  enum Kind { kSet, kBurn, kBurnMem, kBurnGpu, kMark };
   double at_s = 0;    // seconds since process start
   Kind kind = kSet;
   std::string name;   // kSet: the cvar; kMark: the label
   std::string value;  // kSet: the value, verbatim
-  int n = 0;          // kBurn / kBurnMem: how many spinners, 0..32
+  int n = 0;          // kBurn / kBurnMem: how many spinners, 0..32; kBurnGpu: the GPU duty in percent, 0..100
   std::string text;   // as written, for the log
 };
 
@@ -247,12 +250,12 @@ inline bool IsWord(const std::string& s, std::string_view extra) {
   return true;
 }
 
-// The cvars of a schedule are keys of the segment label next to these three, so a cvar may not share their names.
+// The cvars of a schedule are keys of the segment label next to these four, so a cvar may not share their names.
 inline bool IsReservedSchedKey(const std::string& name) {
-  return name == "burn" || name == "burnmem" || name == "mark";
+  return name == "burn" || name == "burnmem" || name == "burngpu" || name == "mark";
 }
 
-// What follows the keyword `kw` (lower case; "set", "burn", "burnmem" or "mark") of a schedule step, `rest` trimmed.
+// What follows the keyword `kw` (lower case; "set", "burn", "burnmem", "burngpu" or "mark") of a schedule step, `rest` trimmed.
 inline bool ParseSchedBody(const std::string& kw, const std::string& rest, SchedStep& step, std::string& err) {
   if (kw == "set") {
     step.kind = SchedStep::kSet;
@@ -298,6 +301,19 @@ inline bool ParseSchedBody(const std::string& kw, const std::string& rest, Sched
     }
     return true;
   }
+  if (kw == "burngpu") {
+    step.kind = SchedStep::kBurnGpu;
+    // Digits only (no sign, no space, no '%'), at most three: 0..100 below.
+    const bool digits =
+        !rest.empty() && rest.size() <= 3 &&
+        std::all_of(rest.begin(), rest.end(), [](unsigned char c) { return c >= '0' && c <= '9'; });
+    step.n = digits ? std::atoi(rest.c_str()) : -1;
+    if (step.n < 0 || step.n > 100) {
+      err = "burngpu needs a duty 0..100 (percent), got '" + rest + "'";
+      return false;
+    }
+    return true;
+  }
   // mark
   step.kind = SchedStep::kMark;
   if (rest.size() > 40 || !IsWord(rest, "_.-")) {
@@ -309,7 +325,7 @@ inline bool ParseSchedBody(const std::string& kw, const std::string& rest, Sched
 }
 
 // "20:start;24:a;30:rt=1/20000" -> steps (appended). False + err on a bad step.
-// Schedule steps ("10:set x=1", "20:burn 4", "30:burnmem 2", "40:mark foo") go to `sched` instead (appended, then the
+// Schedule steps ("10:set x=1", "20:burn 4", "30:burnmem 2", "35:burngpu 40", "40:mark foo") go to `sched` instead (appended, then the
 // whole vector is stable-sorted by time: file order stays for equal times); with `sched` null they are an error.
 inline bool ParseScript(const std::string& script, std::vector<Step>& out, std::string& err,
                         std::vector<SchedStep>* sched = nullptr) {
@@ -334,7 +350,7 @@ inline bool ParseScript(const std::string& script, std::vector<Step>& out, std::
     size_t word_end = 0;
     while (word_end < body.size() && !std::isspace(static_cast<unsigned char>(body[word_end]))) ++word_end;
     const std::string kw = ToLower(body.substr(0, word_end));
-    if (kw == "set" || kw == "burn" || kw == "burnmem" || kw == "mark") {
+    if (kw == "set" || kw == "burn" || kw == "burnmem" || kw == "burngpu" || kw == "mark") {
       if (!sched) {
         err = "schedule step '" + s + "' is not allowed here";
         return false;
@@ -437,8 +453,8 @@ inline long PressesBy(const Step& s, double t) {
 }
 
 // The state a schedule has reached, as the label of a segment: every key the schedule touches, sorted by name (plain
-// byte order), as key=value joined by single spaces. Keys: each cvar a set step names, `burn` and `burnmem` when the
-// schedule has such steps (the counts start at 0) and `mark` when it has mark steps (starts as "start"). The cvars'
+// byte order), as key=value joined by single spaces. Keys: each cvar a set step names, `burn`, `burnmem` and `burngpu`
+// when the schedule has such steps (the counts / duty start at 0) and `mark` when it has mark steps (starts as "start"). The cvars'
 // start values come from the cvar registry, which this header does not know: the caller fills them in with SetCvar().
 class SchedState {
  public:
@@ -451,6 +467,7 @@ class SchedState {
           break;
         case SchedStep::kBurn: kv_["burn"] = "0"; break;
         case SchedStep::kBurnMem: kv_["burnmem"] = "0"; break;
+        case SchedStep::kBurnGpu: kv_["burngpu"] = "0"; break;
         case SchedStep::kMark: kv_["mark"] = "start"; break;
       }
     }
@@ -462,6 +479,7 @@ class SchedState {
   void SetCvar(const std::string& name, const std::string& value) { kv_[name] = value; }
   void SetBurn(int n) { kv_["burn"] = std::to_string(n); }
   void SetBurnMem(int n) { kv_["burnmem"] = std::to_string(n); }
+  void SetBurnGpu(int pct) { kv_["burngpu"] = std::to_string(pct); }
   void SetMark(const std::string& label) { kv_["mark"] = label; }
 
   std::string Label() const {
