@@ -268,3 +268,25 @@ address = 0x822E5E90
 name = "mcla_hook_ws_tall_fov"
 registers = ["f2", "f30"]
 after_instruction = true
+
+# [menus] mcla_menu_msaa: sub_822E5ED8 (the scene pass), BEFORE `li r8,0` (loc_822E6008, the first instruction of the
+# arguments of `bl 0x8217A470`, BeginTiledRendering). r6 = the MSAA mode the pass hands to it (1 / 2 / 4): the
+# renderer's own mode (BE32[r31+384]; r3 on entry, `mr r31,r3`), raised to 4 when it is 3 or when one of the renderer
+# flags +393 / +373 / +433 (+432 gates which of the last two) is set: the front-end world and the pause-menu backdrop,
+# 7 tiles and 13056 EDRAM tiles at 1920x1080, out of reach of mcla_ws_single_tile. Void hook: with cvar mcla_menu_noaa
+# on it sets r6 to the renderer's own mode (a forced 4x only); it logs when the forced state changes. r31 = the
+# renderer. Build flag MCLA_HOOK_MENU_MSAA, cvar mcla_menu_noaa (default off). mcla/hooks/mcla_menu_msaa.cpp.
+# NEEDS A RE-CODEGEN (new entry).
+[[midasm_hook]]
+address = 0x822E6008
+name = "mcla_hook_menu_msaa_scene"
+registers = ["r6", "r31"]
+
+# [menus] mcla_menu_msaa: sub_822E5358 (the second scene pass), BEFORE `stb r31,164(r1)` (0x822E5428; the instruction
+# after `mr r6,r27` at 0x822E5424, `bl 0x8217A470` at 0x822E5438). r6 = r27 = BE32[r28+380], raised to 4 when it is 3
+# or when renderer flag +393 or +373 is set; r28 = the renderer (`mr r28,r3` on entry; r31 is a local zero here, NOT
+# the renderer). Same rule and cvar as the scene hook above. mcla/hooks/mcla_menu_msaa.cpp. NEEDS A RE-CODEGEN (new entry).
+[[midasm_hook]]
+address = 0x822E5428
+name = "mcla_hook_menu_msaa_pass2"
+registers = ["r6", "r28"]

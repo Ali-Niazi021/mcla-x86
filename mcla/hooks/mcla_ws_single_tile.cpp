@@ -36,7 +36,8 @@
 //   * a change of MSAA mode between two one-tile passes leaves the pass after it with the other mode's
 //     RB_SURFACE_INFO (Renan's finding, until the scene is drawn in tiles again): when this pass would merge right
 //     after a one-tile pass of another mode, the next kSettlePasses passes are drawn in the game's tiles first.
-// The 4x MSAA passes (pause menu, GPS map) never fit and keep the game's tiles.
+// The 4x MSAA passes (the pause backdrop, the moment of the title's Start) never fit and keep the game's tiles; with
+// mcla_menu_noaa (mcla_menu_msaa.cpp, on in the PC profile) they are drawn at the renderer's own 1x and merge here.
 //
 // Log, once per (size, MSAA, outcome): `[mcla-ws-single-tile] merged <W>x<H> <msaa>x into 1 tile (<n> EDRAM tiles of
 // <limit>)` (n = colour + depth, limit = the GPU's edram_tiles), a first `active:` line with the surface details, and

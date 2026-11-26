@@ -26,6 +26,8 @@
 #   widescreen WS_SCENE_SIZE, WS_RT_POOL, WS_RT_GUARD, WS_EDRAM, WS_EDRAM_LIMIT, WS_SINGLE_TILE (A/B, off), WS_PHYS_POOL,
 #             WS_TALL_FOV (Vert+ on a buffer taller than 16:9), WS_ASPECT, WS_CUTSCENE_FOV, WS_MAP_ASPECT, WS_UI (probes
 #             only), WS_TEXCLEAR; one master cvar, mcla_widescreen_width (0 = off = as shipped), plus mcla_scene_height
+#   menus     MENU_MSAA 0x822E6008 + 0x822E5428 (A/B, off): the scene passes the game forces to 4x MSAA (front-end world, pause-menu
+#             backdrop) are drawn in the renderer's own MSAA mode instead; cvar mcla_menu_noaa (default off, read on every pass)
 #   timing    SIM_FRAME_DELTA, SIM_STEP, SIM_CAMERA_POS, SIM_CAMERA_LOOKAT, SIM_CHASSIS, SIM_UI_ADVANCE,
 #             SIM_UI_COUNTDOWN, SIM_RACE_CLOCK, SIM_PRESENT_INTERVAL; one master cvar, mcla_sim60 (off = as shipped)
 #             SIM_PRESENT_IMMEDIATE 0x82419AC0 + census 0x82419920 (W4.5): the guest's present-immediate threshold
@@ -86,6 +88,8 @@ set(MCLA_HOOK_DEFINITIONS
     MCLA_HOOK_WS_MAP_ASPECT=1
     MCLA_HOOK_WS_UI=1
     MCLA_HOOK_WS_TEXCLEAR=1
+    # menus
+    MCLA_HOOK_MENU_MSAA=1
     # 60 fps timing
     MCLA_HOOK_SIM_FRAME_DELTA=1
     MCLA_HOOK_SIM_STEP=1

@@ -198,6 +198,17 @@ constexpr CvarDefault kLock60Defaults[] = {
     {"mcla_gov", "true"},
 };
 
+// ---- MENUS60 block (stream MENUS60: the screens that are not free-roam driving) ------------------------------------
+//
+// Applied after the LOCK60 block, for every preset (a preset or the command line still wins).
+constexpr CvarDefault kMenus60Defaults[] = {
+    // mcla_menu_msaa.cpp: the game forces 4x MSAA on the scene passes of the front-end world, the pause backdrop and the
+    // GPS map (renderer flags +373 / +393 / +433, sub_822E5ED8 / sub_822E5358): 7 tiles at 1920x1080 that the single-tile
+    // hook cannot merge. With this the passes keep the renderer's own mode (1x with mcla_noaa, the owner's anti-aliasing
+    // choice), so they are drawn like the driving scene: one 1x tile.
+    {"mcla_menu_noaa", "true"},
+};
+
 // ---- presets (W5.1) -------------------------------------------------------------------------------------------
 //
 // Why these cvars and not `resolution=WxH`: the SDK's `resolution` preset is only honoured while
@@ -867,6 +878,13 @@ void ApplyPcProfile() {
       continue;
     }
     Log({&entry, Apply(entry), std::string("LOCK60")}, &tally);
+  }
+  // MENUS60 block (kMenus60Defaults): the same rule.
+  for (const CvarDefault& entry : kMenus60Defaults) {
+    if (FindEntry(preset_entries, entry.name) != nullptr) {
+      continue;
+    }
+    Log({&entry, Apply(entry), std::string("MENUS60")}, &tally);
   }
   LogFpsTarget(&tally);
   CheckFsrMarkers();
