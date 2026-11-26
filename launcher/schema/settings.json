@@ -311,7 +311,7 @@
     {
       "id": "hdr",
       "label": "HDR output (experimental)",
-      "help": "HDR10 output: off, auto (when Windows has HDR switched on for the display) or on. Not validated in this port; leave off unless you want to try it.",
+      "help": "HDR10 (BT.2020 PQ). Auto: HDR when Windows HDR (Settings > Display > Use HDR) is on for the window's display. The game's look up to 60% of its white, real highlights above it up to the display's peak; HUD and menus at Windows' SDR content brightness. Measured cost: about 0.1-0.3 ms GPU per frame at 1080p on a Radeon 880M. Not yet judged by eye on an HDR screen.",
       "category": "display",
       "type": "enum",
       "cvar": "hdr",
@@ -319,7 +319,78 @@
       "options": [
         {"value": "off", "label": "Off", "help": "Standard dynamic range."},
         {"value": "auto", "label": "Auto", "help": "HDR when the display is in HDR mode."},
-        {"value": "on", "label": "On", "help": "Always output HDR10."}
+        {"value": "on", "label": "On", "help": "Always HDR10, even on an SDR desktop (Windows converts it back; use Auto)."}
+      ],
+      "advanced": true,
+      "emit": "nondefault"
+    },
+    {
+      "id": "hdr_peak_nits",
+      "label": "HDR peak brightness (nits)",
+      "help": "The brightest the highlights go. 0 = what Windows reports for the display (run the Windows HDR Calibration app for a measured value). Lower it if highlights clip.",
+      "category": "display",
+      "type": "float",
+      "cvar": "hdr_peak_nits",
+      "default": 0.0,
+      "min": 0.0,
+      "max": 4000.0,
+      "step": 50.0,
+      "advanced": true,
+      "emit": "nondefault"
+    },
+    {
+      "id": "hdr_paper_white_nits",
+      "label": "HDR paper white (nits)",
+      "help": "Where the game's white lands in HDR. 0 = Windows' SDR content brightness slider (the desktop's white).",
+      "category": "display",
+      "type": "float",
+      "cvar": "hdr_paper_white_nits",
+      "default": 0.0,
+      "min": 0.0,
+      "max": 480.0,
+      "step": 10.0,
+      "advanced": true,
+      "emit": "nondefault"
+    },
+    {
+      "id": "hdr_ui_nits",
+      "label": "HDR HUD and menu brightness (nits)",
+      "help": "Brightness of the HUD, menus and movies in HDR. 0 = paper white.",
+      "category": "display",
+      "type": "float",
+      "cvar": "hdr_ui_nits",
+      "default": 0.0,
+      "min": 0.0,
+      "max": 480.0,
+      "step": 10.0,
+      "advanced": true,
+      "emit": "nondefault"
+    },
+    {
+      "id": "mcla_hdr_highlights",
+      "label": "HDR highlights",
+      "help": "How far bright things go above the game's white: 1 normal, 1.5 bright, 2 brighter (default), 3 brightest.",
+      "category": "display",
+      "type": "float",
+      "cvar": "mcla_hdr_highlights",
+      "default": 2.0,
+      "min": 1.0,
+      "max": 4.0,
+      "step": 0.5,
+      "advanced": true,
+      "emit": "nondefault"
+    },
+    {
+      "id": "hdr_sdr_eotf",
+      "label": "HDR shadow curve",
+      "help": "How the game's colours are decoded in HDR. 2.2 gamma (default) keeps the deep blacks of the TVs the game was made for (right for OLED); sRGB matches how Windows shows SDR apps on an HDR desktop (lighter shadows).",
+      "category": "display",
+      "type": "enum",
+      "cvar": "hdr_sdr_eotf",
+      "default": "gamma22",
+      "options": [
+        {"value": "gamma22", "label": "2.2 gamma (deep blacks)"},
+        {"value": "srgb", "label": "sRGB (as the Windows desktop)"}
       ],
       "advanced": true,
       "emit": "nondefault"

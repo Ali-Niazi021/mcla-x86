@@ -1,0 +1,634 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Wed, 25 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0700: hdr_dump: write the presented back buffer (HDR10 or SDR) to a DDS + JSON sidecar at chosen seconds
+
+Source: Ours, written for this SDK (stream HDR). The SDK's presenter and its paint submission tracker are used as they are.
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: Verify HDR output with numbers instead of eyes on an HDR screen. Cvars (UI/Presenter): hdr_dump_dir (string, ""
+  = off), hdr_dump_at (comma list of seconds since process start), hdr_dump_every_s (0 = off). When a dump is due, the
+  D3D12 paint copies the back buffer (after the guest image and any UI overlay are drawn, before the PRESENT barrier) into
+  a readback buffer, waits for that paint submission (a one-frame stall, debug only), and writes
+  <dir>/hdr_<frame>_<t>s.dds (DX10 header, the swap chain's DXGI format: 24 R10G10B10A2 for HDR10, 87 B8G8R8A8 for SDR)
+  plus a .json with the levels the presenter used (paper white, peak, min, UI, roll-off start, SDR EOTF, the display's
+  DXGI levels). Off: one atomic load per paint. tools/hdr/hdr_analyze.py reads these files.
+Bucket: REDO
+
+Not covered: the frame generation paint (AMD's swap chain; logged and skipped). Run evidence: hdr2/hdr3 (14 dumps).
+---
+diff --git a/include/rex/ui/d3d12/d3d12_presenter.h b/include/rex/ui/d3d12/d3d12_presenter.h
+index ac37ce71..bf254b0b 100644
+--- a/include/rex/ui/d3d12/d3d12_presenter.h
++++ b/include/rex/ui/d3d12/d3d12_presenter.h
+@@ -556,6 +556,29 @@ class D3D12Presenter final : public Presenter {
+                              const GuestOutputPaintFlow& flow, uint64_t refresh_number);
+   void CompleteFusedGammaCheck();
+ 
++  // HDR debug dump (hdr_dump_dir, Presenter::ClaimHdrDump): the back buffer of a paint copied to a
++  // readback buffer by that paint's command list, written to files once the paint submission has
++  // completed (the paint thread waits for it). Lives in the paint that claimed the dump.
++  struct HdrDumpCapture {
++    HdrDumpRequest request;
++    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
++    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
++    UINT64 readback_size = 0;
++    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
++    uint32_t width = 0;
++    uint32_t height = 0;
++    bool hdr10 = false;
++    uint64_t frame = 0;
++  };
++  // Records the copy (back buffer RENDER_TARGET -> COPY_SOURCE, left in COPY_SOURCE: the caller's
++  // next barrier starts from there). False: nothing was recorded, the back buffer is still in
++  // RENDER_TARGET.
++  bool RecordHdrDump(ID3D12GraphicsCommandList* command_list, ID3D12Resource* back_buffer,
++                     uint64_t frame, HdrDumpCapture& capture);
++  // Waits for the paint submission, writes the files (unless the device was lost, when there is
++  // nothing to read), releases the readback buffer.
++  void CompleteHdrDump(HdrDumpCapture& capture, UINT64 paint_submission, bool device_lost);
++
+   // The first is the refresher submission tracker fence value at which the
+   // guest output texture was last refreshed, the second is the reference to the
+   // texture, which may be null. The indices are the mailbox indices.
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index a58b2f7f..5bd5bec8 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -22,6 +22,7 @@
+ #include <map>
+ #include <memory>
+ #include <mutex>
++#include <optional>
+ #include <string>
+ #include <thread>
+ #include <utility>
+@@ -797,6 +798,44 @@ class Presenter {
+   static HdrMetadataLevels GetHdrMetadataLevels();
+   static void SetHdrOutputActive(bool active);
+ 
++  // HDR debug dump of the presented frame, for checking the output numerically (cvars hdr_dump_dir,
++  // hdr_dump_at, hdr_dump_every_s; off while hdr_dump_dir is empty). A backend calls ClaimHdrDump in
++  // every paint that ends in a present, and when it returns a request, copies the back buffer as it
++  // is presented (before it goes to the present state) and, once that copy is on the CPU, gives it
++  // to WriteHdrDump. Times are seconds on the steady clock since the process started (this
++  // translation unit's static initialization, a few milliseconds in).
++  struct HdrDumpRequest {
++    std::string dir;
++    // Seconds since the process started, at the claim.
++    double time_s = 0.0;
++    // Counting from 1, the dumps claimed so far.
++    uint64_t sequence = 0;
++  };
++  struct HdrDumpImage {
++    uint32_t width = 0;
++    uint32_t height = 0;
++    // The back buffer's DXGI_FORMAT value, 4 bytes per pixel (24 R10G10B10A2_UNORM, 87
++    // B8G8R8A8_UNORM).
++    uint32_t dxgi_format = 0;
++    // The swap chain is HDR10 (else SDR).
++    bool hdr10 = false;
++    // The guest frame (refresh number) painted, 0 if none.
++    uint64_t frame = 0;
++    // The pixels as the GPU wrote them, row_pitch bytes between rows (the rows' padding is not
++    // written).
++    const uint8_t* pixels = nullptr;
++    size_t row_pitch = 0;
++  };
++  // Any thread, and cheap: while nothing is due this is one atomic load (and, with a dump
++  // scheduled, the clock). Returns a request when one is due now, which consumes it: the dump is
++  // then expected to be made (the times of hdr_dump_at that have passed make one dump, not several;
++  // those already past when the setting is read are due at once).
++  static std::optional<HdrDumpRequest> ClaimHdrDump();
++  // Writes <dir>/hdr_<frame>_<t>s.dds (DX10 header, the format as is) and the .json beside it (the
++  // levels in use, written last: its presence means the image is complete), logs it, and warns once
++  // if it can't write. Returns whether both were written.
++  static bool WriteHdrDump(const HdrDumpRequest& request, const HdrDumpImage& image);
++
+   // For capturing: guest output pixels (R10G10B10A2 words) to 8bpc ones as
+   // Packed10bpcRGBTo8bpcBytes does; HDR10 images are turned back into SDR, with
+   // SDR content coming back as it went in (to about one code) and light above
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 719c4eec..347af870 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -901,6 +901,13 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   if (frame_generation_) {
+     PaintResult frame_generation_result;
+     if (PaintWithFrameGeneration(execute_ui_drawers, frame_generation_result)) {
++      // hdr_dump_dir: that paint presents through AMD's swap chain, whose back buffers the present callback
++      // composes on its own queue; the dump isn't made there (the paint below, as without generation, is).
++      if (ClaimHdrDump()) {
++        REXLOG_WARN(
++            "Presenter: HDR dump skipped: frame generation's paint presents through AMD's swap chain "
++            "(turn frame_generation off to dump)");
++      }
+       return frame_generation_result;
+     }
+   }
+@@ -1649,13 +1656,29 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     ExecuteUIDrawersFromUIThread(ui_draw_context);
+   }
+ 
++  // hdr_dump_dir: if a dump is due, the finished back buffer (the guest output and the UI are all in it by
++  // now, whichever way they were drawn) is copied for reading back, before it goes to the present state.
++  // Every paint here ends in the one Present below; the one that doesn't is frame generation's
++  // (PaintWithFrameGeneration, above). With nothing scheduled this is a check of the schedule.
++  std::optional<HdrDumpCapture> hdr_dump;
++  if (std::optional<HdrDumpRequest> hdr_dump_request = ClaimHdrDump()) {
++    hdr_dump.emplace();
++    hdr_dump->request = std::move(*hdr_dump_request);
++    if (!RecordHdrDump(command_list, back_buffer, guest_output_properties.refresh_number,
++                       *hdr_dump)) {
++      hdr_dump.reset();
++    }
++  }
++
+   // End drawing to the back buffer.
+   D3D12_RESOURCE_BARRIER barrier_rtv_to_present;
+   barrier_rtv_to_present.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+   barrier_rtv_to_present.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+   barrier_rtv_to_present.Transition.pResource = back_buffer;
+   barrier_rtv_to_present.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+-  barrier_rtv_to_present.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++  // From COPY_SOURCE if the dump copied it.
++  barrier_rtv_to_present.Transition.StateBefore =
++      hdr_dump ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_RENDER_TARGET;
+   barrier_rtv_to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+   command_list->ResourceBarrier(1, &barrier_rtv_to_present);
+ 
+@@ -1694,6 +1717,13 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   if (fused_gamma_check_.recorded) {
+     CompleteFusedGammaCheck();
+   }
++  // hdr_dump_dir: the paint submission (signaled right after the paint's command list, before the present)
++  // has to be done to read what it copied. The one-frame stall of the paint thread is the price of a dump.
++  if (hdr_dump) {
++    CompleteHdrDump(*hdr_dump, current_paint_submission,
++                    present_result == DXGI_ERROR_DEVICE_REMOVED ||
++                        present_result == DXGI_ERROR_DEVICE_RESET);
++  }
+   switch (present_result) {
+     case DXGI_ERROR_DEVICE_REMOVED:
+       return PaintResult::kGpuLostExternally;
+@@ -2394,4 +2424,93 @@ void D3D12Presenter::CompleteFusedGammaCheck() {
+       differing_pixels ? fmt::format(", the first at {},{}", first_x, first_y) : std::string());
+ }
+ 
++bool D3D12Presenter::RecordHdrDump(ID3D12GraphicsCommandList* command_list,
++                                   ID3D12Resource* back_buffer, uint64_t frame,
++                                   HdrDumpCapture& capture) {
++  ID3D12Device* device = provider_.GetDevice();
++  const D3D12_RESOURCE_DESC back_buffer_desc = back_buffer->GetDesc();
++  // The dump writes 4 bytes per pixel (R10G10B10A2 in HDR10, B8G8R8A8 in SDR).
++  if (back_buffer_desc.Format != kSwapChainFormat &&
++      back_buffer_desc.Format != kSwapChainFormatHdr10) {
++    REXLOG_ERROR("D3D12Presenter: HDR dump: the back buffer's format ({}) isn't one it can write",
++                 uint32_t(back_buffer_desc.Format));
++    return false;
++  }
++  UINT64 readback_size = 0;
++  device->GetCopyableFootprints(&back_buffer_desc, 0, 1, 0, &capture.footprint, nullptr, nullptr,
++                                &readback_size);
++  D3D12_RESOURCE_DESC readback_desc;
++  util::FillBufferResourceDesc(readback_desc, readback_size, D3D12_RESOURCE_FLAG_NONE);
++  if (FAILED(device->CreateCommittedResource(&util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE,
++                                             &readback_desc, D3D12_RESOURCE_STATE_COPY_DEST,
++                                             nullptr, IID_PPV_ARGS(&capture.readback)))) {
++    REXLOG_ERROR("D3D12Presenter: HDR dump: failed to create the readback buffer ({} bytes)",
++                 readback_size);
++    return false;
++  }
++  capture.readback_size = readback_size;
++  capture.format = back_buffer_desc.Format;
++  capture.width = uint32_t(back_buffer_desc.Width);
++  capture.height = back_buffer_desc.Height;
++  capture.hdr10 = paint_context_.swap_chain_hdr;
++  capture.frame = frame;
++
++  // Nothing can fail from here on: the back buffer is left in COPY_SOURCE.
++  D3D12_RESOURCE_BARRIER barrier;
++  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++  barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
++  barrier.Transition.pResource = back_buffer;
++  barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++  command_list->ResourceBarrier(1, &barrier);
++  D3D12_TEXTURE_COPY_LOCATION copy_dest = {};
++  copy_dest.pResource = capture.readback.Get();
++  copy_dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++  copy_dest.PlacedFootprint = capture.footprint;
++  D3D12_TEXTURE_COPY_LOCATION copy_source = {};
++  copy_source.pResource = back_buffer;
++  copy_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++  copy_source.SubresourceIndex = 0;
++  command_list->CopyTextureRegion(&copy_dest, 0, 0, 0, &copy_source, nullptr);
++  return true;
++}
++
++void D3D12Presenter::CompleteHdrDump(HdrDumpCapture& capture, UINT64 paint_submission,
++                                     bool device_lost) {
++  // Always awaited, even with nothing to read: the readback buffer must not be released while the
++  // GPU may still be writing to it. This is the paint's own fence (signaled right after its command
++  // list), not the present's.
++  const bool completed =
++      paint_context_.paint_submission_tracker.AwaitSubmissionCompletion(paint_submission);
++  if (device_lost) {
++    capture.readback.Reset();
++    return;
++  }
++  if (!completed) {
++    REXLOG_ERROR("D3D12Presenter: HDR dump: the paint submission did not complete");
++    capture.readback.Reset();
++    return;
++  }
++  const D3D12_RANGE read_range = {0, SIZE_T(capture.readback_size)};
++  void* mapping = nullptr;
++  if (FAILED(capture.readback->Map(0, &read_range, &mapping)) || !mapping) {
++    REXLOG_ERROR("D3D12Presenter: HDR dump: failed to map the readback buffer");
++    capture.readback.Reset();
++    return;
++  }
++  HdrDumpImage image;
++  image.width = capture.width;
++  image.height = capture.height;
++  image.dxgi_format = uint32_t(capture.format);
++  image.hdr10 = capture.hdr10;
++  image.frame = capture.frame;
++  image.pixels = static_cast<const uint8_t*>(mapping) + capture.footprint.Offset;
++  image.row_pitch = capture.footprint.Footprint.RowPitch;
++  WriteHdrDump(capture.request, image);
++  const D3D12_RANGE written_range = {0, 0};
++  capture.readback->Unmap(0, &written_range);
++  capture.readback.Reset();
++}
++
+ }  // namespace rex::ui::d3d12
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 2cd2a8bc..ffe0dc1f 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -15,14 +15,23 @@
+ #include <chrono>
+ #include <cmath>
+ #include <condition_variable>
++#include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <limits>
+ #include <mutex>
++#include <optional>
+ #include <string>
++#include <string_view>
++#include <system_error>
+ #include <thread>
+ #include <utility>
++#include <vector>
+ 
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
++#include <rex/filesystem.h>
+ #include <rex/logging.h>
+ #include <rex/platform.h>
+ #include <rex/ui/presenter.h>
+@@ -270,6 +279,21 @@ REXCVAR_DEFINE_INT32(hdr_debug_ui, 0, "UI/Presenter",
+                      "the display table, 7 the HDR scene with the game's own curve, shown as the "
+                      "game shows it (SDR), 8 the output's HDR10 code values as grey levels")
+     .range(0, 8);
++// Debug dump of the presented frame (Presenter::ClaimHdrDump), for checking the HDR output
++// numerically where nobody can look at the screen.
++REXCVAR_DEFINE_STRING(hdr_dump_dir, "", "UI/Presenter",
++                      "HDR debugging: a folder to dump the presented frame (the back buffer, in the "
++                      "swap chain's format: R10G10B10A2 HDR10 codes or B8G8R8A8) to, as "
++                      "hdr_<guest frame>_<seconds>s.dds with a .json of the levels in use beside it, "
++                      "at the times of hdr_dump_at and every hdr_dump_every_s; empty = off");
++REXCVAR_DEFINE_STRING(hdr_dump_at, "", "UI/Presenter",
++                      "HDR debugging: when to dump, comma-separated seconds since the process "
++                      "started (steady clock), e.g. 60,75,90.5; a time that has already passed "
++                      "when this is read dumps at the next paint; needs hdr_dump_dir");
++REXCVAR_DEFINE_DOUBLE(hdr_dump_every_s, 0.0, "UI/Presenter",
++                      "HDR debugging: also dump every this many seconds (from the first paint, or "
++                      "from when this or hdr_dump_dir was set); 0 = off; needs hdr_dump_dir")
++    .range(0.0, 86400.0);
+ 
+ namespace {
+ using GuestOutputPaintConfig = rex::ui::Presenter::GuestOutputPaintConfig;
+@@ -500,6 +524,141 @@ void HdrSetMonitor(void* monitor, bool force_refresh) {
+     hdr_display_info_stale.store(true);
+   }
+ }
++
++// HDR debug dump (hdr_dump_dir, hdr_dump_at, hdr_dump_every_s; Presenter::ClaimHdrDump). The
++// settings are parsed when they change (a change callback), a paint only reads the earliest time
++// anything is due.
++//
++// Times are seconds on the steady clock since this translation unit's static initialization, which
++// is the start of the process to within some milliseconds.
++const std::chrono::steady_clock::time_point hdr_dump_epoch = std::chrono::steady_clock::now();
++constexpr double kHdrDumpNever = std::numeric_limits<double>::infinity();
++
++double HdrDumpNowSeconds() {
++  return std::chrono::duration<double>(std::chrono::steady_clock::now() - hdr_dump_epoch).count();
++}
++
++std::mutex hdr_dump_mutex;
++// Guarded by hdr_dump_mutex.
++std::string hdr_dump_dir;
++// Ascending, the times of hdr_dump_at not served yet.
++std::vector<double> hdr_dump_at;
++double hdr_dump_every_s = 0.0;
++// When the periodic dump is next due, kHdrDumpNever while it's off.
++double hdr_dump_every_next = kHdrDumpNever;
++uint64_t hdr_dump_sequence = 0;
++// What paints read: the earliest time anything is due, kHdrDumpNever for nothing (also while the
++// directory isn't set).
++std::atomic<double> hdr_dump_next_due{kHdrDumpNever};
++std::atomic<bool> hdr_dump_ready{false};
++std::once_flag hdr_dump_once;
++
++// With hdr_dump_mutex held.
++void HdrDumpUpdateNextDueLocked() {
++  double due = kHdrDumpNever;
++  if (!hdr_dump_dir.empty()) {
++    if (!hdr_dump_at.empty()) {
++      due = hdr_dump_at.front();
++    }
++    if (hdr_dump_every_s > 0.0) {
++      due = std::min(due, hdr_dump_every_next);
++    }
++  }
++  hdr_dump_next_due.store(due, std::memory_order_relaxed);
++}
++
++// With hdr_dump_mutex held: the periodic dump counts from now.
++void HdrDumpRestartEveryLocked() {
++  hdr_dump_every_next = (hdr_dump_every_s > 0.0 && !hdr_dump_dir.empty())
++                            ? HdrDumpNowSeconds() + hdr_dump_every_s
++                            : kHdrDumpNever;
++}
++
++void HdrDumpSetDir(std::string_view value) {
++  std::lock_guard<std::mutex> lock(hdr_dump_mutex);
++  hdr_dump_dir = std::string(value);
++  HdrDumpRestartEveryLocked();
++  HdrDumpUpdateNextDueLocked();
++}
++
++void HdrDumpSetAt(std::string_view value) {
++  std::vector<double> times;
++  size_t position = 0;
++  while (position <= value.size()) {
++    size_t comma = value.find(',', position);
++    if (comma == std::string_view::npos) {
++      comma = value.size();
++    }
++    std::string token(value.substr(position, comma - position));
++    position = comma + 1;
++    const size_t first = token.find_first_not_of(" \t");
++    if (first == std::string::npos) {
++      continue;
++    }
++    token = token.substr(first, token.find_last_not_of(" \t") - first + 1);
++    char* end = nullptr;
++    const double time = std::strtod(token.c_str(), &end);
++    if (end != token.c_str() + token.size() || !std::isfinite(time) || time < 0.0) {
++      REXLOG_WARN("Presenter: hdr_dump_at: '{}' is not a time in seconds, ignored", token);
++      continue;
++    }
++    times.push_back(time);
++  }
++  std::sort(times.begin(), times.end());
++  std::lock_guard<std::mutex> lock(hdr_dump_mutex);
++  hdr_dump_at = std::move(times);
++  HdrDumpUpdateNextDueLocked();
++}
++
++void HdrDumpSetEvery(double seconds) {
++  std::lock_guard<std::mutex> lock(hdr_dump_mutex);
++  hdr_dump_every_s = std::isfinite(seconds) && seconds > 0.0 ? seconds : 0.0;
++  HdrDumpRestartEveryLocked();
++  HdrDumpUpdateNextDueLocked();
++}
++
++void HdrDumpEnsureInitialized() {
++  if (hdr_dump_ready.load(std::memory_order_acquire)) {
++    return;
++  }
++  std::call_once(hdr_dump_once, [] {
++    // The callbacks first, so that a change between reading the values and registering is not lost.
++    rex::cvar::RegisterChangeCallback(
++        "hdr_dump_dir", [](std::string_view, std::string_view value) { HdrDumpSetDir(value); });
++    rex::cvar::RegisterChangeCallback(
++        "hdr_dump_at", [](std::string_view, std::string_view value) { HdrDumpSetAt(value); });
++    rex::cvar::RegisterChangeCallback(
++        "hdr_dump_every_s", [](std::string_view, std::string_view value) {
++          char* end = nullptr;
++          const std::string text(value);
++          const double seconds = std::strtod(text.c_str(), &end);
++          HdrDumpSetEvery(end == text.c_str() + text.size() ? seconds : 0.0);
++        });
++    HdrDumpSetDir(REXCVAR_GET(hdr_dump_dir));
++    HdrDumpSetAt(REXCVAR_GET(hdr_dump_at));
++    HdrDumpSetEvery(REXCVAR_GET(hdr_dump_every_s));
++    hdr_dump_ready.store(true, std::memory_order_release);
++  });
++}
++
++// DDS (DX10 header) writing helpers.
++void HdrDumpPutU32(uint8_t* destination, uint32_t value) {
++  destination[0] = uint8_t(value);
++  destination[1] = uint8_t(value >> 8);
++  destination[2] = uint8_t(value >> 16);
++  destination[3] = uint8_t(value >> 24);
++}
++
++const char* HdrDumpFormatName(uint32_t dxgi_format) {
++  switch (dxgi_format) {
++    case 24:
++      return "R10G10B10A2_UNORM";
++    case 87:
++      return "B8G8R8A8_UNORM";
++    default:
++      return "DXGI_FORMAT_UNKNOWN";
++  }
++}
+ }  // namespace
+ 
+ namespace rex {
+@@ -2564,6 +2723,175 @@ void Presenter::SetGuestOutputHdrAvailable(bool available) {
+   }
+ }
+ 
++std::optional<Presenter::HdrDumpRequest> Presenter::ClaimHdrDump() {
++  HdrDumpEnsureInitialized();
++  // Nothing scheduled (the usual case): this is all a paint does.
++  const double due = hdr_dump_next_due.load(std::memory_order_relaxed);
++  if (due == kHdrDumpNever || HdrDumpNowSeconds() < due) {
++    return std::nullopt;
++  }
++  std::lock_guard<std::mutex> lock(hdr_dump_mutex);
++  const double now = HdrDumpNowSeconds();
++  if (hdr_dump_dir.empty()) {
++    return std::nullopt;
++  }
++  bool dump_due = false;
++  // Everything of hdr_dump_at that has passed is one dump.
++  size_t passed = 0;
++  while (passed < hdr_dump_at.size() && hdr_dump_at[passed] <= now) {
++    ++passed;
++  }
++  if (passed) {
++    hdr_dump_at.erase(hdr_dump_at.begin(), hdr_dump_at.begin() + ptrdiff_t(passed));
++    dump_due = true;
++  }
++  if (hdr_dump_every_s > 0.0 && hdr_dump_every_next <= now) {
++    dump_due = true;
++    // The next time on the grid after now (the paints may not have come for a while).
++    hdr_dump_every_next +=
++        hdr_dump_every_s * (std::floor((now - hdr_dump_every_next) / hdr_dump_every_s) + 1.0);
++    if (hdr_dump_every_next <= now) {
++      hdr_dump_every_next = now + hdr_dump_every_s;
++    }
++  }
++  HdrDumpUpdateNextDueLocked();
++  if (!dump_due) {
++    return std::nullopt;
++  }
++  HdrDumpRequest request;
++  request.dir = hdr_dump_dir;
++  request.time_s = now;
++  request.sequence = ++hdr_dump_sequence;
++  return request;
++}
++
++bool Presenter::WriteHdrDump(const HdrDumpRequest& request, const HdrDumpImage& image) {
++  static std::atomic<bool> write_warned{false};
++  auto fail = [&](const std::string& what) {
++    if (!write_warned.exchange(true)) {
++      REXLOG_WARN("Presenter: HDR dump: {} (not logged again)", what);
++    }
++    return false;
++  };
++  const size_t row_bytes = size_t(image.width) * 4;
++  if (!image.pixels || !image.width || !image.height || image.row_pitch < row_bytes) {
++    return fail("no image to write");
++  }
++  const std::filesystem::path directory = rex::to_path(request.dir);
++  std::error_code error;
++  std::filesystem::create_directories(directory, error);
++  if (error) {
++    return fail(fmt::format("can't create the folder {}: {}", request.dir, error.message()));
++  }
++  const std::string stem = fmt::format("hdr_{}_{:.2f}s", image.frame, request.time_s);
++  const std::filesystem::path dds_path = directory / rex::to_path(stem + ".dds");
++  const std::filesystem::path json_path = directory / rex::to_path(stem + ".json");
++  const std::string dds_utf8 = rex::path_to_utf8(dds_path);
++
++  // The image: 'DDS ', DDS_HEADER (124 bytes), DDS_HEADER_DXT10 (20 bytes), then the rows.
++  {
++    // Written a byte at a time, so that it is little-endian whatever the host.
++    uint8_t header[4 + 124 + 20] = {};
++    const uint32_t values[] = {
++        0x20534444,                       // 'DDS '
++        124,                              // DDS_HEADER.dwSize
++        0x1 | 0x2 | 0x4 | 0x8 | 0x1000,   // CAPS | HEIGHT | WIDTH | PITCH | PIXELFORMAT
++        image.height,                     // dwHeight
++        image.width,                      // dwWidth
++        uint32_t(row_bytes),              // dwPitchOrLinearSize
++        0,                                // dwDepth
++        0,                                // dwMipMapCount
++        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // dwReserved1[11]
++        32,                               // ddspf.dwSize
++        0x4,                              // ddspf.dwFlags: FOURCC
++        0x30315844,                       // ddspf.dwFourCC: 'DX10'
++        0, 0, 0, 0, 0,                    // RGBBitCount, R/G/B/A masks
++        0x1000,                           // dwCaps: TEXTURE
++        0, 0, 0,                          // dwCaps2, dwCaps3, dwCaps4
++        0,                                // dwReserved2
++        image.dxgi_format,                // DDS_HEADER_DXT10.dxgiFormat
++        3,                                // resourceDimension: TEXTURE2D
++        0,                                // miscFlag
++        1,                                // arraySize
++        0,                                // miscFlags2
++    };
++    static_assert(sizeof(values) == sizeof(header), "The DDS header is 148 bytes");
++    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
++      HdrDumpPutU32(header + i * 4, values[i]);
++    }
++    FILE* file = rex::filesystem::OpenFile(dds_path, "wb");
++    if (!file) {
++      return fail(fmt::format("can't write {}", dds_utf8));
++    }
++    bool written = std::fwrite(header, 1, sizeof(header), file) == sizeof(header);
++    for (uint32_t y = 0; written && y < image.height; ++y) {
++      written = std::fwrite(image.pixels + size_t(y) * image.row_pitch, 1, row_bytes, file) ==
++                row_bytes;
++    }
++    written = std::fclose(file) == 0 && written;
++    if (!written) {
++      return fail(fmt::format("failed writing {}", dds_utf8));
++    }
++  }
++
++  // The levels the presenter used for this frame (HDR10 only: SDR output has none).
++  const HdrOutputState state = GetHdrOutputState();
++  const bool levels_in_use = image.hdr10 && state.active;
++  const HdrDisplayInfo display = GetLastHdrDisplayInfo();
++  auto finite = [](float value) { return std::isfinite(value) ? value : 0.0f; };
++  const float paper_white = levels_in_use ? finite(state.paper_white_nits) : 0.0f;
++  const float peak = levels_in_use ? finite(state.peak_nits) : 0.0f;
++  const float min_nits = levels_in_use ? finite(GetHdrMetadataLevels().min_nits) : 0.0f;
++  // HdrOutputState::sdr_white_nits is the level of SDR content (the UI, movies): hdr_ui_nits, or
++  // paper white if that is 0.
++  const float ui_nits = levels_in_use ? finite(state.sdr_white_nits) : 0.0f;
++  const float rolloff_start = levels_in_use ? finite(state.rolloff_start_nits) : 0.0f;
++  const std::string json = fmt::format(
++      "{{\n"
++      "  \"kind\": \"backbuffer\",\n"
++      "  \"colorspace\": \"{}\",\n"
++      "  \"width\": {},\n"
++      "  \"height\": {},\n"
++      "  \"frame\": {},\n"
++      "  \"t\": {:.3f},\n"
++      "  \"paper_white_nits\": {},\n"
++      "  \"peak_nits\": {},\n"
++      "  \"min_nits\": {},\n"
++      "  \"ui_nits\": {},\n"
++      "  \"rolloff_start_nits\": {},\n"
++      "  \"sdr_white_nits\": {},\n"
++      "  \"sdr_eotf\": \"{}\",\n"
++      "  \"display_hdr\": {},\n"
++      "  \"display_known\": {},\n"
++      "  \"display_max_nits\": {},\n"
++      "  \"display_full_frame_nits\": {},\n"
++      "  \"display_min_nits\": {},\n"
++      "  \"display_sdr_white_nits\": {},\n"
++      "  \"dxgi_format\": {},\n"
++      "  \"seq\": {},\n"
++      "  \"file\": \"{}.dds\"\n"
++      "}}\n",
++      image.hdr10 ? "hdr10" : "sdr", image.width, image.height, image.frame, request.time_s,
++      paper_white, peak, min_nits, ui_nits, rolloff_start, ui_nits,
++      hdr_sdr_pure_gamma_2_2.load(std::memory_order_relaxed) ? "gamma22" : "srgb",
++      display.known && display.hdr_enabled ? "true" : "false", display.known ? "true" : "false",
++      finite(display.peak_nits), finite(display.full_frame_nits), finite(display.min_nits),
++      finite(display.sdr_white_nits), image.dxgi_format, request.sequence, stem);
++  FILE* json_file = rex::filesystem::OpenFile(json_path, "wb");
++  if (!json_file) {
++    return fail(fmt::format("can't write {}", rex::path_to_utf8(json_path)));
++  }
++  bool json_written = std::fwrite(json.data(), 1, json.size(), json_file) == json.size();
++  json_written = std::fclose(json_file) == 0 && json_written;
++  if (!json_written) {
++    return fail(fmt::format("failed writing {}", rex::path_to_utf8(json_path)));
++  }
++
++  REXLOG_INFO("Presenter: HDR dump {} ({}x{}, {}, paper white {}, peak {})", dds_utf8, image.width,
++              image.height, HdrDumpFormatName(image.dxgi_format), paper_white, peak);
++  return true;
++}
++
+ Presenter::GuestOutputCaptureConverter::GuestOutputCaptureConverter(const GuestOutputHdr& hdr)
+     : is_pq_(hdr.is_pq) {
+   if (!is_pq_) {
