@@ -165,7 +165,8 @@ void McLaApp::OnPostInitLogging() {
     std::_Exit(2);
   }
   if (input_.active()) {
-    REXLOG_INFO("[mcla] scripted input: {} step(s), driven from the process clock", input_.step_count());
+    REXLOG_INFO("[mcla] scripted input: {} pad step(s), {} schedule step(s), driven from the process clock",
+                input_.step_count(), input_.sched_count());
   }
 }
 
