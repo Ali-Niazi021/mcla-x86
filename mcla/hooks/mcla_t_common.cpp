@@ -160,6 +160,7 @@ uint64_t g_drops = 0;
 // The governed rule (mcla_sim_pacer 2, LOCK60 A3): the pure judge of mcla_t_sim_math.h; counters under g_mutex.
 math::HoldJudge g_judge;
 int64_t g_defer_log_ns = 0;            // the last "hold deferred" line (at most one in 10 s)
+int64_t g_excuse_log_ns = 0;           // the last "window not judged: compile burst" line (at most one in 10 s)
 std::atomic<int> g_last_n{0};          // NextStep's answer of the previous frame, for the GPU frame governor
 std::atomic<uint64_t> g_substep_fail{0};
 // P1 begin: the 120 -> 60 tier (a cap above 60 only). g_mutex for the rest; the flag is read by EffectiveCap.
@@ -294,9 +295,10 @@ void Report(int64_t now_ns) {
   for (int k = 0; k < kSmoothKinds; ++k) {
     smooth_dt_total[k] = g_smooth_dt[k][0] + g_smooth_dt[k][1] + g_smooth_dt[k][2];
   }
-  // Pacer 2: the engine frames the hold rule did not look at in this window (a menu, the grace after one, a hold).
-  uint64_t not_judged_menu = 0, not_judged_grace = 0, not_judged_hold = 0;
-  g_judge.TakeSkipped(&not_judged_menu, &not_judged_grace, &not_judged_hold);
+  // Pacer 2: the engine frames the hold rule did not look at in this window (a menu, the grace after one, a hold, and the frames of
+  // the decision windows a shader-compile burst overlapped: those are the frames of a window that was high and not judged).
+  uint64_t not_judged_menu = 0, not_judged_grace = 0, not_judged_hold = 0, not_judged_compile = 0;
+  g_judge.TakeSkipped(&not_judged_menu, &not_judged_grace, &not_judged_hold, &not_judged_compile);
   REXLOG_INFO("[mcla-sim]   missed {} forced {} sleeps {} ({:.0f} ms) pace-resync {} substep-write-fail {}; "
               "smoothing calls (dt 1/30 : 1/60 : other, changed) cam-pos {}:{}:{} ({}) look-at {}:{}:{} ({}) "
               "chassis {}:{}:{} ({}); countdown {} (unknown ctx {}){}",
@@ -307,8 +309,8 @@ void Report(int64_t now_ns) {
               uint64_t(g_smooth_dt[2][1]), uint64_t(g_smooth_dt[2][2]), uint64_t(g_smooth_changed[2]),
               cd_calls, cd_unknown,
               REXCVAR_GET(mcla_sim_pacer) >= 2
-                  ? fmt::format("; not judged: menu {} grace {} hold {}", not_judged_menu, not_judged_grace,
-                                not_judged_hold)
+                  ? fmt::format("; not judged: menu {} grace {} hold {} compile {}", not_judged_menu, not_judged_grace,
+                                not_judged_hold, not_judged_compile)
                   : std::string());
   (void)smooth_dt_total;
   // P1: the stutter counters of the window (game-thread frame to frame; bench.py and read_device_log.py read it).
@@ -369,6 +371,10 @@ void StartHold30(int64_t now_ns, int hold_s, double pct, double window_s) {
 // The 120 -> 60 tier uses the same judge (menus, grace, windows in a row) but not the governor's gate: HoldAllowed is the
 // governor's word on the 60 -> 30 hold, and its budget is the 60 fps one. A tier start and a tier end open a grace like a
 // hold's end, so a drop from 120 to 60 is not followed by a 30 hold inside the settling time.
+// A high window that a shader-compile burst overlapped (mcla::gov::CompileBurstActive(), the governor's one source of the state, kept
+// with the governor off too) is not judged: run-time pipeline creation stalls the frames and no hold helps that. Bounded so that a real
+// overload still holds: at most mcla::gov::CompileExcuseS() / window seconds' worth of windows (2 of 2 s with the defaults) in a run of
+// high windows are excused, the next one is judged (HoldRule::compile_windows, HoldJudge).
 void DecideGoverned(int64_t now_ns, bool menu) {
   const bool fine = math::FineGrid(EffectiveCap());
   // mcla_sim_hold30_s = 0 (never hold), a forced step and a world held at 30 by its cap (no 60 step to judge) never hold.
@@ -381,13 +387,22 @@ void DecideGoverned(int64_t now_ns, bool menu) {
   rule.min_s = REXCVAR_GET(mcla_sim_hold30_min_s);
   rule.max_s = can_hold ? REXCVAR_GET(mcla_sim_hold30_s) : 0;
   rule.calm_s = REXCVAR_GET(mcla_sim_calm_s);
+  rule.compile_windows = int(std::floor(mcla::gov::CompileExcuseS() / double(std::max(1, rule.window_s)) + 1e-9));
   const int prev_hold_s = fine ? g_tier_prev_hold_s : g_prev_hold_s;
   const int64_t last_end_ns = fine ? g_tier_end_ns : g_last_hold_end_ns;
   const double since_end_s = last_end_ns ? double(now_ns - last_end_ns) / 1e9 : 1e9;
   const bool allowed = fine || mcla::gov::HoldAllowed();
-  const math::HoldVerdict v = g_judge.Tick(now_ns, menu, g_hold30.load(), allowed, prev_hold_s, since_end_s, rule);
+  const math::HoldVerdict v = g_judge.Tick(now_ns, menu, g_hold30.load(), allowed, prev_hold_s, since_end_s, rule, mcla::gov::CompileBurstActive());
   if (!v.window_ended) return;
   const double pct = v.frames ? 100.0 * double(v.missed) / double(v.frames) : 0.0;
+  if (v.excused) {
+    if (g_excuse_log_ns == 0 || now_ns - g_excuse_log_ns >= 10'000'000'000) {
+      g_excuse_log_ns = now_ns;
+      REXLOG_INFO("[mcla-sim] window not judged: shader-compile burst (missed {:.0f} % of {:.1f} s; window {} of at most {} excused in this run of high windows)",
+                  pct, v.window_s, v.excused_in_run, rule.compile_windows);
+    }
+    return;
+  }
   if (v.deferred) {
     if (g_defer_log_ns == 0 || now_ns - g_defer_log_ns >= 10'000'000'000) {
       g_defer_log_ns = now_ns;

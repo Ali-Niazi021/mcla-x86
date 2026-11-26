@@ -24,6 +24,20 @@
 //     c. at least 2 of the last 30 engine frames were missed (with or without a GPU signal)         ["missed frames"]
 //        Counted while driving, and from the frame after a step. A single missed frame sheds nothing: one 25 ms spike in a clean
 //        stream is the stream's, not the rung's.
+//   BELOW THE FLOOR (floor_shed_frames, 30; 0 = off: every shed is judged by a, b, c). A shed that goes to a tier under the floor tier F
+//     (F -> F-1, and further down to tier 1: the visible rungs, for the perf preset the anti-aliasing) needs SUSTAINED overload, not a
+//     snap. Field run lk-w3cold2 (a scene tour: the time of day / weather snaps every ~6 s, one 18-19 ms frame in a 10 ms stream): three
+//     snaps inside 0.5 s fired the tail rule and, VRS being at its maximum, took FXAA off, and it came back 4 s later, six times a
+//     minute. So for such a shed
+//        a. counts only when it HOLDS: the median of the last 4 samples was above shed_ms at a first check and is still above it at a
+//           check at least floor_shed_frames GPU frames later, with no check at or below the line in between (a sample whose median is
+//           at or below the line ends the run, and so does a screen change, a pause, a lost signal; a step does not: an overload that
+//           the rung just taken did not clear goes on down at the usual spacing),
+//        b. never counts (the tail rule alone does not take the ladder below the floor; it still sheds the enriched tiers and VRS),
+//        c. counts as it is: the player SEES two missed frames in 0.5 s.
+//     A restore from a rung below the floor back up is the normal restore; but a shed back to that rung within 30 s of it (kFloorBounceWindowNs:
+//     below the floor the probe-bounce window is 30 s, not 2 s) is a probe bounce too: the restore delay out of the rung doubles, so the
+//     visible rung cannot flap faster than that back-off.
 //   RESTORE (r - 1, r > 0; slow) when driving, and for the whole of the rung's restore delay (a) no frame was missed, (b) the player
 //     kept driving, (c) no change happened, and (d) with a GPU signal the p90 of the delay's samples is below restore_ms (and there
 //     are at least 10 samples a second of it); with no GPU signal (a/b/c alone) the quiet time is the whole condition. The delay is
@@ -40,7 +54,9 @@
 //     learned[k] (EMA 0.4, each sample clamped to 0..5 ms; only with at least learn_s x 30 samples on both sides; a pause or a change
 //     in between aborts it, except that a tier shed again before the window opened - one that costs far more than planned is over the
 //     shed line within a few frames - is measured by the median of the last 4 samples that made the shed (or the samples since the
-//     step, from 0.1 s after it, if there are at least 3)).
+//     step, from 0.1 s after it, if there are at least 3)). A measurement is DISCARDED (not folded; counted, LearnDiscarded) when any
+//     sample of its before or after window is above 1.5x that window's median: a scene snap or a hitch in the window would put its own
+//     size into the tier's cost (field: tier 2 drifted to +1.37 ms because the windows straddled scene snaps).
 //   BACK-OFF (per tier): a tier k that was entered by ENRICHMENT and is shed (back to k-1) within enrich_hold_s (30 s) of its entry
 //     doubles backoff[k] (30 s, cap 600 s: enrichment into k is not tried before it expires). The doubling decays one step (halves,
 //     below 30 s = gone) per backoff period spent without a new bounce, counted from the end of the wait it lengthened.
@@ -63,7 +79,24 @@
 //     0.5 s of a camera cut (the camera position jumped more than cut_m in one frame), or while the camera speed is above
 //     pop_speed_kmh. Enrichment and restore steps wait for one with no timeout. A SHED waits at most pop_wait_s (1.5 s) and goes
 //     at once on a missed frame. A step that is waiting when the player leaves the scene (driving -> not driving) goes at once.
+//   COMPILE BURST (compile_excuse_s, 4; 0 = off; Input::compile_burst, from CompileWatch below). Pipelines and shaders are created at run
+//     time (the SDK's pipeline cache / translator): a stretch of them stalls the command processor and the GPU samples and missed frames
+//     of it are the compiler's, not the picture's (field: a new street shed 0 -> 2 on a hitch no rung helps). While the flag is set,
+//     driving and outside a grace, such a frame is EXCUSED: its GPU sample and missed flag are not fed into the shed rules (median, tail,
+//     missed history), the restore / enrich windows, the learning; nothing is shed, restored or enriched on it; and it resets the quiet
+//     timer (a burst is not calm either, so the first restore / enrichment comes a full delay after it). What was recorded BEFORE the
+//     burst stays. Bounded, so a real overload still acts: the excused time is capped at compile_excuse_s within any 20 s (a sliding
+//     window, ExcuseBudget; a frame is charged its own length, and a not-driving frame or a frame in a grace is neither excused nor
+//     charged); a frame over the cap is judged like any other, and the budget refills as old charges age out of the 20 s.
 //   Pinning (Params::force_level >= 0) replaces the loop; a lowered cap, a changed floor / ceiling / VRS count moves the state at once.
+//
+// THE FLOOR ON AUTO (FloorForPreset / AutoFloor, the glue passes the cvars): the tier mcla_gfx_tier had before the governor first ran if it was
+// >= 1, else the tier of the preset mcla_gfx_preset: perf = 2 (perf + FXAA: the AA is part of normal play, so it is never the thing a
+// burst takes away: VRS absorbs it, the tier below the floor, tier 1 without FXAA, is only reached on the way to the 30 hold, and an
+// enrichment into tier 2 with its back-off, the field's flickering AA, does not exist), perf+ and lowest = 1, quality, default / none = 4,
+// ultra = 5. A player who pinned anti-aliasing (swap_post_effect set by hand) makes tiers 1 and 2 the same picture: the 2 -> 1 step then
+// buys nothing. It is harmless: the rung is the last one, so no further shed follows it, the learned cost of tier 2 comes out ~0 and the
+// enrichment's prediction takes the larger of that and the table's estimate, and a restore from it only costs its delay.
 //
 // Time is whatever steady clock the caller passes (nanoseconds); the samples carry no timestamps of their own, the call time stands
 // in for them (the SDK's value is 2-4 frames old by design, see rexgpu_gpu_frame_lag).
@@ -71,6 +104,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <deque>
@@ -223,6 +257,7 @@ constexpr int kMissedHistoryFrames = 30;               // the missed-frames rule
 constexpr int kMissedShedCount = 2;                    // ... and sheds at this many missed ones
 constexpr int64_t kSignalLiveNs = 1'000'000'000;       // no new sample for this long = no GPU signal
 constexpr int64_t kBounceWindowNs = 2'000'000'000;     // a shed back to the rung left by a restore within this = a bounce
+constexpr int64_t kFloorBounceWindowNs = 30'000'000'000;  // ... below the floor tier: within this (the visible rungs are held to a slower flap)
 constexpr int64_t kBounceDecayNs = 30'000'000'000;     // a doubling of the restore delay decays this long after the delay it lengthened
 constexpr double kMaxRestoreDelayS = 60.0;             // the cap of the doubled restore delay (never below restore_s itself)
 constexpr int kMaxBounceDoublings = 6;
@@ -235,8 +270,154 @@ constexpr int64_t kLearnSettleNs = 500'000'000;        // the first stretch afte
 constexpr int64_t kLearnLagNs = 100'000'000;           // the last stretch before a step is not measured (the export's lag)
 constexpr double kLearnMaxMs = 5.0;                    // one learned sample is clamped to 0 .. this
 constexpr double kLearnAlpha = 0.4;                    // the EMA weight of a new sample
+constexpr double kLearnSpikeRatio = 1.5;               // a learning window with a sample above this x its median is discarded (a snap / hitch)
 constexpr double kLearnMinSamplesPerS = 30.0;          // a learning window needs this many samples a second of its length
 constexpr int kQuickLearnSamples = 3;                  // a step shed again before its window opened is measured from this many samples
+constexpr int64_t kCompileExcuseWindowNs = 20'000'000'000;  // the excused time of compile bursts is capped within any stretch of this
+
+// ---- the floor on auto -----------------------------------------------------------------------------------------------------
+
+// The tier of the base rung for a preset (mcla_gfx_preset, case and surrounding blanks ignored): perf = 2 (perf + FXAA), perf+ / lowest = 1,
+// quality and as shipped ('', default, none, shipped) = 4, ultra = 5; an unknown name (mcla_gfx_tune applies nothing for it) = 1, as before.
+inline int FloorForPreset(const std::string& preset) {
+  size_t b = 0, e = preset.size();
+  while (b < e && std::isspace(static_cast<unsigned char>(preset[b]))) ++b;
+  while (e > b && std::isspace(static_cast<unsigned char>(preset[e - 1]))) --e;
+  std::string name = preset.substr(b, e - b);
+  for (char& c : name) c = char(std::tolower(static_cast<unsigned char>(c)));
+  if (name == "ultra") return 5;
+  if (name.empty() || name == "quality" || name == "default" || name == "none" || name == "shipped") return 4;
+  if (name == "perf") return 2;
+  return kMinTier;  // perf+ (perfplus, perf_plus, perf-plus), lowest, and what is not a preset
+}
+// The floor with mcla_gov_tier_floor = -1: the tier mcla_gfx_tier was set to before the governor first ran (>= 1), else the preset's.
+inline int AutoFloor(int configured_tier, const std::string& preset) {
+  return configured_tier >= kMinTier ? std::min(configured_tier, kMaxTier) : FloorForPreset(preset);
+}
+
+// ---- compile bursts ----------------------------------------------------------------------------------------------------------
+
+// The SDK's three words (rexgpu-xenos.dll, patch 0590): cumulative pipelines created, cumulative shaders translated at run time, and
+// asynchronous pipeline creations in flight. `valid` = the symbols exist (an older SDK has none: no compile signal, nothing is excused).
+struct CompileCounters {
+  bool valid = false;
+  uint32_t pipelines = 0;
+  uint32_t shaders = 0;
+  int32_t pending = 0;
+};
+
+// The compile-burst state: ACTIVE while a counter grew within the last `quiet` or a creation is in flight. A pure function of the
+// numbers handed in once per engine frame. The first call only takes the counters' values (what was compiled before the first look is
+// not a burst); the difference of a counter is taken modulo 2^32.
+class CompileWatch {
+ public:
+  struct Result {
+    bool active = false;
+    bool started = false;                 // a burst began on this call (pipelines / shaders: what it has seen so far)
+    bool ended = false;                   // a burst ended on this call: the fields describe the whole of it
+    uint32_t pipelines = 0, shaders = 0;  // created / translated during the burst
+    int64_t duration_ns = 0;              // from its start to the last call it was active (the quiet tail included)
+  };
+
+  Result Update(int64_t now_ns, const CompileCounters& c, int64_t quiet_ns) {
+    Result r;
+    if (!c.valid) {  // no signal: a burst that was running is over
+      have_ = false;
+      if (active_) r = Finish();
+      r.active = false;
+      return r;
+    }
+    uint32_t dp = 0, ds = 0;
+    if (have_) {
+      dp = c.pipelines - last_pipelines_;
+      ds = c.shaders - last_shaders_;
+    }
+    have_ = true;
+    last_pipelines_ = c.pipelines;
+    last_shaders_ = c.shaders;
+    if (dp != 0 || ds != 0) {
+      have_growth_ = true;
+      last_growth_ns_ = now_ns;
+    }
+    const bool recent = have_growth_ && now_ns - last_growth_ns_ <= std::max<int64_t>(0, quiet_ns);
+    if (recent || c.pending > 0) {
+      if (!active_) {
+        active_ = true;
+        start_ns_ = now_ns;
+        pipelines_ = shaders_ = 0;
+        r.started = true;
+      }
+      last_active_ns_ = now_ns;
+      pipelines_ += dp;
+      shaders_ += ds;
+      r.pipelines = pipelines_;
+      r.shaders = shaders_;
+      r.duration_ns = now_ns - start_ns_;
+    } else if (active_) {
+      r = Finish();
+    }
+    r.active = active_;
+    return r;
+  }
+  bool Active() const { return active_; }
+
+ private:
+  Result Finish() {
+    Result r;
+    r.ended = true;
+    r.pipelines = pipelines_;
+    r.shaders = shaders_;
+    r.duration_ns = std::max<int64_t>(0, last_active_ns_ - start_ns_);
+    active_ = false;
+    return r;
+  }
+  bool have_ = false, have_growth_ = false, active_ = false;
+  uint32_t last_pipelines_ = 0, last_shaders_ = 0;
+  uint32_t pipelines_ = 0, shaders_ = 0;  // of the burst in progress
+  int64_t last_growth_ns_ = 0, start_ns_ = 0, last_active_ns_ = 0;
+};
+
+// The excused time of compile bursts, capped within a sliding window: at most `cap` nanoseconds are charged in any `window` before now.
+class ExcuseBudget {
+ public:
+  // The frame that ended at `now_ns` and lasted `frame_ns`: excused if budget is left (the charge is its length, at most what is left,
+  // returned in *charged); false (nothing charged) when the window already holds `cap`.
+  bool Excuse(int64_t now_ns, int64_t frame_ns, int64_t cap_ns, int64_t window_ns, int64_t* charged = nullptr) {
+    Trim(now_ns, window_ns);
+    if (charged) *charged = 0;
+    const int64_t left = cap_ns - used_ns_;
+    if (left <= 0) return false;
+    const int64_t charge = std::clamp<int64_t>(frame_ns, 0, left);
+    if (charge > 0) {
+      charges_.push_back({now_ns, charge});
+      used_ns_ += charge;
+    }
+    if (charged) *charged = charge;
+    return true;
+  }
+  int64_t Used(int64_t now_ns, int64_t window_ns) {
+    Trim(now_ns, window_ns);
+    return used_ns_;
+  }
+  void Reset() {
+    charges_.clear();
+    used_ns_ = 0;
+  }
+
+ private:
+  struct Charge {
+    int64_t end_ns;
+    int64_t ns;
+  };
+  void Trim(int64_t now_ns, int64_t window_ns) {
+    while (!charges_.empty() && now_ns - charges_.front().end_ns > window_ns) {
+      used_ns_ -= charges_.front().ns;
+      charges_.pop_front();
+    }
+  }
+  std::deque<Charge> charges_;
+  int64_t used_ns_ = 0;
+};
 
 struct State {
   int tier = 1;
@@ -252,6 +433,7 @@ struct Params {
   double restore_ms = 12.8;
   int shed_frames = 6;        // GPU frames between two changes before a shed
   int shed_over_count = 3;    // the tail rule: this many of the last 30 GPU samples over shed_ms sheds (0 = off)
+  int floor_shed_frames = 30; // a shed below the floor tier: the median rule must hold this many GPU frames (see BELOW THE FLOOR); 0 = off
   double restore_s = 4.0;
   // the ladder
   int tier_floor = 1;         // F, 1..5: the configured tier (the base rung)
@@ -273,6 +455,8 @@ struct Params {
   // screen-change grace: engine frames after a change of the driving flag in which nothing is recorded and nothing is shed / restored /
   // enriched (0 = off: the previous screen's samples are not discarded either)
   int screen_grace_frames = 60;
+  // compile bursts: seconds of excused time per 20 s while Input::compile_burst is set (0 = off: a burst is judged like any other time)
+  double compile_excuse_s = 4.0;
 };
 
 // The shape of the ladder for one set of Params.
@@ -339,6 +523,7 @@ struct Input {
   int lag = 0;              // how many frames old the published value is (for the summary only)
   bool cut = false;         // the camera jumped more than cut_m this frame (a hiding moment)
   double speed_kmh = -1.0;  // the camera's speed, km/h; < 0 = unknown
+  bool compile_burst = false;  // pipelines / shaders are being compiled (CompileWatch::Active): see COMPILE BURST
 };
 
 enum class Reason { kNone, kGpuMedian, kGpuTail, kMissedFrames, kRestore, kEnrich, kForced, kCap, kRange };
@@ -388,6 +573,8 @@ struct Change {
   int stat_window = 0;         // ... out of this many (the tail window, the missed-frames window)
   int missed = 0;              // of the last 8 engine frames
   bool bounce = false;         // a shed that is the bounce of a restore probe
+  bool below_floor = false;    // a shed to a tier under the floor (judged by the median held floor_shed_frames, or the missed frames)
+  int sustained_frames = 0;    // ... the GPU frames the median had been over the line when it fired (the median rule)
   bool signal_gpu = false;
   double est_ms = -1.0;        // enrich: the table's estimate of the tier entered
   double learned_ms = -1.0;    // enrich: the learned cost of the tier entered (-1 = none yet)
@@ -400,6 +587,11 @@ struct Change {
   int learn_tier = 0;          // the tier whose cost over the one below was measured
   double learn_delta_ms = 0.0, learn_before_ms = 0.0, learn_after_ms = 0.0;  // the clamped sample and the two p50s
   int learn_n_before = 0, learn_n_after = 0;
+  // A tier step's measurement was thrown away: a sample above 1.5x the window's median (a scene snap, a hitch).
+  bool learn_discarded = false;
+  int learn_discard_tier = 0;
+  bool learn_discard_before = false;  // the window before the step (else the one after it)
+  double learn_discard_p50_ms = 0.0, learn_discard_max_ms = 0.0;
 };
 
 // One summary window (mcla_gov_log_s seconds).
@@ -412,6 +604,9 @@ struct Window {
   uint32_t missed = 0;               // engine frames missed
   uint32_t samples = 0;              // GPU samples
   uint32_t grace_frames = 0;         // engine frames spent in a screen-change grace
+  uint32_t compile_frames = 0;       // engine frames excused because of a compile burst
+  int64_t compile_excused_ns = 0;    // ... and the time charged for them
+  uint32_t compile_denied = 0;       // engine frames inside a compile burst that were judged anyway (the budget was spent)
   double p50_ms = -1.0, p95_ms = -1.0;
   int lag = 0;                       // the largest lag seen
   bool signal_gpu = false;           // at the end of the window
@@ -431,6 +626,12 @@ class Controller {
   bool Waiting() const { return plan_.active; }  // a step waits for a hiding moment
   bool InGrace() const { return in_grace_; }     // the last Step was inside a screen-change grace (nothing recorded, nothing decided)
   int GraceFramesLeft() const { return grace_left_; }  // frames of the grace still to come after the last Step
+  bool CompileExcused() const { return excused_; }         // the last Step excused its frame (a compile burst with budget left)
+  bool CompileDenied() const { return compile_denied_; }   // the last Step was inside a compile burst but judged anyway (the budget is spent)
+  // The excused time still charged within the last 20 s as of now_ns (the budget used).
+  int64_t CompileExcusedNs(int64_t now_ns) { return excuse_.Used(now_ns, kCompileExcuseWindowNs); }
+  // The excused time since the controller was made (monotonic): the difference of two readings is what a stretch of time was charged.
+  int64_t CompileExcusedTotalNs() const { return compile_excused_total_ns_; }
 
   // The 60 -> 30 hold may start: at the last rung (the cap, or tier 1 with VRS at its maximum) and still over budget (or, with no GPU
   // signal, at the last rung).
@@ -461,6 +662,10 @@ class Controller {
     return learned_n_[size_t(tier)] > 0 ? std::max(est, learned_ms_[size_t(tier)]) : est;
   }
   bool HasLearned(int tier) const { return tier >= 0 && tier < kTiers && learned_n_[size_t(tier)] > 0; }
+  // Measurements thrown away because of a spike in their window (since the controller was made).
+  int LearnDiscarded() const { return learn_discards_; }
+  // The GPU frames the median of the last 4 samples has been over the shed line without a break (0 = not over / not counting).
+  uint32_t OverloadFrames() const { return over_armed_ ? over_frames_ : 0u; }
   double LearnedMs(int tier) const { return HasLearned(tier) ? learned_ms_[size_t(tier)] : -1.0; }
   int LearnedCount(int tier) const { return tier >= 0 && tier < kTiers ? learned_n_[size_t(tier)] : 0; }
 
@@ -488,6 +693,7 @@ class Controller {
   Change Step(const Input& in, const Params& p) {
     const int64_t now = in.now_ns;
     const Ladder lad = Ladder::Of(p);
+    int64_t frame_ns = 0;  // the time since the previous call: what an excused frame is charged
     if (!started_) {
       started_ = true;
       win_start_ns_ = last_now_ns_ = quiet_start_ns_ = now;
@@ -495,7 +701,8 @@ class Controller {
       state_ = State{lad.floor, 0};
       win_.min_level = win_.max_level = lad.Rung(state_);
     } else {
-      win_.time_ns[Key(state_)] += std::max<int64_t>(0, now - last_now_ns_);
+      frame_ns = std::max<int64_t>(0, now - last_now_ns_);
+      win_.time_ns[Key(state_)] += frame_ns;
       last_now_ns_ = now;
     }
 
@@ -513,16 +720,37 @@ class Controller {
       ++win_.grace_frames;
     }
 
+    // A compile burst: while driving (outside a grace) and with budget left, this frame is EXCUSED (see COMPILE BURST).
+    excused_ = false;
+    compile_denied_ = false;
+    if (in.compile_burst && p.compile_excuse_s > 0.0 && in.driving && !in_grace_) {
+      int64_t charged = 0;
+      excused_ = excuse_.Excuse(now, frame_ns, int64_t(p.compile_excuse_s * 1e9), kCompileExcuseWindowNs, &charged);
+      compile_denied_ = !excused_;
+      if (excused_) {
+        ++win_.compile_frames;
+        win_.compile_excused_ns += charged;
+        compile_excused_total_ns_ += charged;
+      } else {
+        ++win_.compile_denied;
+      }
+    }
+
     // The engine frame: the missed history.
-    missed_history_ = in.driving && !in_grace_ ? ((missed_history_ << 1) | (in.missed ? 1u : 0u)) & kMissedMask : 0u;  // not driving, grace: nothing counts
+    if (!in.driving || in_grace_) {
+      missed_history_ = 0u;  // not driving, grace: nothing counts
+    } else if (!excused_) {
+      missed_history_ = ((missed_history_ << 1) | (in.missed ? 1u : 0u)) & kMissedMask;  // an excused frame is not recorded: the history stays as it was
+    }
     if (in.missed) ++win_.missed;
 
     // The GPU sample.
     const bool sample = in.new_sample && std::isfinite(in.gpu_ms) && in.gpu_ms > 0.0;
-    if (sample && !in_grace_) {
+    if (sample && !in_grace_ && !excused_) {
       recent_[size_t(recent_next_)] = in.gpu_ms;
       recent_next_ = (recent_next_ + 1) % kMedianSamples;
       recent_count_ = std::min(recent_count_ + 1, kMedianSamples);
+      TrackOverload(in, p);
     }
     if (sample) {
       last_sample_ms_ = in.gpu_ms;
@@ -533,11 +761,15 @@ class Controller {
     }
     win_.lag = std::max(win_.lag, in.lag);
     signal_live_ = have_sample_ && now - last_sample_ns_ <= kSignalLiveNs;
+    if (!signal_live_) {  // a median of samples that are no longer coming says nothing
+      over_armed_ = false;
+      over_frames_ = 0;
+    }
     // The spacing of changes counts GPU frames while the signal is live (the published count), engine frames without it.
     const uint32_t frames = signal_live_ ? (sample ? std::max<uint32_t>(1, in.seq_delta) : 0u) : 1u;
     frames_since_change_ = frames_since_change_ > UINT32_MAX - frames ? UINT32_MAX : frames_since_change_ + frames;
     // The tail: the samples taken while driving, once the step before them has shown (the export is 2-4 frames behind).
-    if (sample && in.driving && !in_grace_ && frames_since_change_ > uint32_t(kTailLagFrames)) {
+    if (sample && in.driving && !in_grace_ && !excused_ && frames_since_change_ > uint32_t(kTailLagFrames)) {
       tail_[size_t(tail_next_)] = in.gpu_ms;
       tail_next_ = (tail_next_ + 1) % kTailSamples;
       tail_count_ = std::min(tail_count_ + 1, kTailSamples);
@@ -556,11 +788,12 @@ class Controller {
       if (!in.driving && plan_.active && PlanValid(lad, p)) out = ApplyPlan(now, p, lad, Hide::kNotDriving);
       ResetQuiet(now);
     }
-    // The quiet timer: a frame that is not driving and a missed frame (outside a grace) start it over.
-    if (!in.driving || (in.missed && !in_grace_)) ResetQuiet(now);
+    // The quiet timer: a frame that is not driving, a missed frame (outside a grace) and an excused frame (a burst is not calm either)
+    // start it over.
+    if (!in.driving || (in.missed && !in_grace_) || excused_) ResetQuiet(now);
     const double delay_s = RestoreDelayS(state_, now, p);
-    const bool valid = sample && in.driving && !in.missed && !in_grace_;  // a sample the learning may use
-    if (sample && in.driving && !in_grace_) {
+    const bool valid = sample && in.driving && !in.missed && !in_grace_ && !excused_;  // a sample the learning may use
+    if (sample && in.driving && !in_grace_ && !excused_) {
       restore_win_.Add(now, in.gpu_ms);
       enrich_win_.Add(now, in.gpu_ms);
     }
@@ -583,6 +816,13 @@ class Controller {
     }
     level_ = lad.Rung(lad.Clamp(state_));
     out.signal_gpu = signal_live_;
+    if (learn.learn_discarded && !out.learn_discarded) {
+      out.learn_discarded = true;
+      out.learn_discard_tier = learn.learn_discard_tier;
+      out.learn_discard_before = learn.learn_discard_before;
+      out.learn_discard_p50_ms = learn.learn_discard_p50_ms;
+      out.learn_discard_max_ms = learn.learn_discard_max_ms;
+    }
     if (learn.learn_done) {
       out.learn_done = true;
       out.learn_tier = learn.learn_tier;
@@ -658,6 +898,8 @@ class Controller {
     recent_count_ = recent_next_ = 0;
     tail_count_ = tail_next_ = 0;
     missed_history_ = 0;
+    over_armed_ = false;
+    over_frames_ = 0;
     restore_win_.Reset();
     enrich_win_.Reset();
     learn_ring_.clear();
@@ -671,6 +913,26 @@ class Controller {
     std::sort(v.begin(), v.begin() + recent_count_);
     const int n = recent_count_;
     return (n % 2) ? v[size_t(n / 2)] : 0.5 * (v[size_t(n / 2 - 1)] + v[size_t(n / 2)]);
+  }
+  // The run of the median rule (BELOW THE FLOOR): called with every sample that entered the median ring. The run starts at the first
+  // sample whose median (of at least 3) is above the line, counts the GPU frames after it, and ends at the first one that is not.
+  void TrackOverload(const Input& in, const Params& p) {
+    if (!in.driving || recent_count_ < kMinMedianSamples || !(Median() > p.shed_ms)) {
+      over_armed_ = false;
+      over_frames_ = 0;
+      return;
+    }
+    if (!over_armed_) {
+      over_armed_ = true;
+      over_frames_ = 0;
+      return;
+    }
+    const uint32_t frames = std::max<uint32_t>(1, in.seq_delta);
+    over_frames_ = over_frames_ > UINT32_MAX - frames ? UINT32_MAX : over_frames_ + frames;
+  }
+  // The median rule holds for a shed below the floor: over the line for floor_shed_frames GPU frames (0 = the rule is off, so it always does).
+  bool OverloadHeld(const Params& p) const {
+    return p.floor_shed_frames <= 0 || (over_armed_ && over_frames_ >= uint32_t(p.floor_shed_frames));
   }
 
   // ---- hiding moments
@@ -715,9 +977,17 @@ class Controller {
         enriched_[size_t(to.tier)] = false;
       }
     }
-    // The probe bounce of a restore: a shed back to the state a restore left within 2 s.
+    // The probe bounce of a restore: a shed back to the state a restore left within 2 s (below the floor: within 30 s).
     if (kind == Kind::kShed) {
-      if (has_restore_ && restore_from_key_ == Key(to) && now - restore_ns_ <= kBounceWindowNs) {
+      bool bounce = has_restore_ && restore_from_key_ == Key(to) && now - restore_ns_ <= kBounceWindowNs;
+      if (to.tier < lad.floor) {  // a rung below the floor: a restore from it within 30 s, whatever came between, is a bounce too
+        const auto it = floor_restore_ns_.find(Key(to));
+        if (it != floor_restore_ns_.end()) {
+          bounce = bounce || now - it->second <= kFloorBounceWindowNs;
+          floor_restore_ns_.erase(it);
+        }
+      }
+      if (bounce) {
         const int doublings = std::min(Doublings(to, now) + 1, kMaxBounceDoublings);
         Bounce& b = bounce_[Key(to)];
         b.doublings = doublings;
@@ -730,8 +1000,10 @@ class Controller {
       has_restore_ = true;
       restore_from_key_ = Key(from);
       restore_ns_ = now;
+      if (from.tier < lad.floor) floor_restore_ns_[Key(from)] = now;
     } else {
       has_restore_ = false;
+      floor_restore_ns_.clear();
     }
     // A tier shed again before its measurement window opened (one that costs far more than planned is over the shed line within a few
     // frames): the median of the last 4 samples that made the shed is the measurement, or else the samples taken since the step, from
@@ -745,7 +1017,7 @@ class Controller {
     }
     // The cost of a tier step is measured (a step that is not a tier step, or one taken outside driving, is not).
     learn_.active = false;
-    if (to.tier != from.tier && driving_) StartLearn(from, to, now, p);
+    if (to.tier != from.tier && driving_) StartLearn(from, to, now, p, &c);
 
     state_ = to;
     frames_since_change_ = 0;
@@ -834,13 +1106,16 @@ class Controller {
     int n = 0;
     int window = 0;
   };
-  Trigger EvalShed(const Params& p) const {
+  // below_floor: the shed goes to a tier under the floor (BELOW THE FLOOR): the median rule must have held, the tail rule is not heard.
+  Trigger EvalShed(const Params& p, bool below_floor) const {
     Trigger t;
     if (signal_live_ && recent_count_ >= kMinMedianSamples) {
       const double median = Median();
-      if (median > p.shed_ms) return Trigger{true, Reason::kGpuMedian, "p50", median, recent_count_, recent_count_};
+      if (median > p.shed_ms && (!below_floor || OverloadHeld(p))) {
+        return Trigger{true, Reason::kGpuMedian, "p50", median, recent_count_, recent_count_};
+      }
     }
-    if (signal_live_ && p.shed_over_count > 0) {
+    if (!below_floor && signal_live_ && p.shed_over_count > 0) {
       int over = 0;
       double max_ms = 0.0;
       for (int i = 0; i < tail_count_; ++i) {
@@ -864,16 +1139,19 @@ class Controller {
       plan_ = Plan();
       return Change();
     }
-    // The first frames of a new screen (the grace): nothing was recorded for them, so nothing is decided. A step that already waits for
-    // a hiding moment is not touched here (it goes at the pause, or is judged again after the grace).
-    if (in_grace_) return Change();
+    // The first frames of a new screen (the grace) and the excused frames of a compile burst: nothing was recorded for them, so nothing is
+    // decided. A step that already waits for a hiding moment is not touched here (it goes at the pause, or is judged again after).
+    if (in_grace_ || excused_) return Change();
     const int r = lad.Rung(state_);
 
     // SHED
     if (r < lad.MaxRung(p) && frames_since_change_ >= uint32_t(std::max(1, p.shed_frames))) {
-      const Trigger t = EvalShed(p);
+      const bool below_floor = p.floor_shed_frames > 0 && r + 1 > lad.vrs;  // the next rung is a tier under the floor
+      const Trigger t = EvalShed(p, below_floor);
       if (t.fired) {
         Change info;
+        info.below_floor = below_floor;
+        info.sustained_frames = below_floor && t.reason == Reason::kGpuMedian ? int(over_frames_) : 0;
         info.reason = t.reason;
         info.stat_name = t.name;
         info.stat_ms = t.ms;
@@ -956,7 +1234,7 @@ class Controller {
 
   // ---- learning the cost of a tier
 
-  void StartLearn(State from, State to, int64_t now, const Params& p) {
+  void StartLearn(State from, State to, int64_t now, const Params& p, Change* c) {
     if (p.learn_s <= 0.0) return;
     // The p50 of the valid samples of the state left, from learn_s + the export's lag back to the lag.
     std::vector<int> before;
@@ -965,12 +1243,16 @@ class Controller {
       if (s.key == Key(from) && s.ns >= lo && s.ns <= hi) before.push_back(s.bucket);
     }
     if (int(before.size()) < LearnMinSamples(p)) return;
-    std::nth_element(before.begin(), before.begin() + before.size() / 2, before.end());
+    double p50 = 0.0, max_ms = 0.0;
+    if (Spiky(before, &p50, &max_ms)) {  // a snap or a hitch in the window before: the cost of the step is not measurable from it
+      NoteLearnDiscard(c, std::max(from.tier, to.tier), true, p50, max_ms);
+      return;
+    }
     learn_.active = true;
     learn_.from_tier = from.tier;
     learn_.to_tier = to.tier;
     learn_.change_ns = now;
-    learn_.before_ms = Histogram::BucketMs(before[before.size() / 2]);
+    learn_.before_ms = p50;
     learn_.before_n = int(before.size());
     learn_.after.clear();
     learn_.quick.clear();
@@ -999,8 +1281,28 @@ class Controller {
 
   // The measurement of the step in learn_ is `after` (bucket numbers; the median counts): the cost goes into the EMA of the tier.
   void FoldLearn(std::vector<int>& after, Change* out) {
-    std::nth_element(after.begin(), after.begin() + after.size() / 2, after.end());
-    FoldLearn(Histogram::BucketMs(after[after.size() / 2]), int(after.size()), out);
+    double p50 = 0.0, max_ms = 0.0;
+    if (Spiky(after, &p50, &max_ms)) {  // a snap or a hitch in the window after the step
+      NoteLearnDiscard(out, std::max(learn_.from_tier, learn_.to_tier), false, p50, max_ms);
+      return;
+    }
+    FoldLearn(p50, int(after.size()), out);
+  }
+  // The median (ms) and the largest sample (ms) of a window of bucket numbers; true when the largest is above kLearnSpikeRatio x the median.
+  static bool Spiky(std::vector<int>& buckets, double* p50_ms, double* max_ms) {
+    std::nth_element(buckets.begin(), buckets.begin() + buckets.size() / 2, buckets.end());
+    *p50_ms = Histogram::BucketMs(buckets[buckets.size() / 2]);
+    *max_ms = Histogram::BucketMs(*std::max_element(buckets.begin(), buckets.end()));
+    return *max_ms > kLearnSpikeRatio * *p50_ms;
+  }
+  void NoteLearnDiscard(Change* out, int tier, bool before, double p50_ms, double max_ms) {
+    ++learn_discards_;
+    if (out->learn_discarded) return;
+    out->learn_discarded = true;
+    out->learn_discard_tier = tier;
+    out->learn_discard_before = before;
+    out->learn_discard_p50_ms = p50_ms;
+    out->learn_discard_max_ms = max_ms;
   }
   void FoldLearn(double after_ms, int n_after, Change* out) {
     const bool up = learn_.to_tier > learn_.from_tier;
@@ -1032,6 +1334,10 @@ class Controller {
   uint32_t frames_since_change_ = UINT32_MAX;  // the first change is not held back
   int grace_left_ = 0;                         // frames of the screen-change grace still to come after the current one
   bool in_grace_ = false;                      // the current frame is inside it
+  bool excused_ = false;                       // the current frame is excused (a compile burst with budget left)
+  bool compile_denied_ = false;                // ... or was in a burst with the budget spent
+  ExcuseBudget excuse_;
+  int64_t compile_excused_total_ns_ = 0;
 
   static constexpr uint32_t kMissedMask = (1u << kMissedHistoryFrames) - 1u;
   uint32_t missed_history_ = 0;  // bit 0 = the latest engine frame; kMissedHistoryFrames bits; empty while not driving and after a step
@@ -1054,6 +1360,9 @@ class Controller {
   int restore_from_key_ = 0;
   int64_t restore_ns_ = 0;
   std::map<int, Bounce> bounce_;
+  std::map<int, int64_t> floor_restore_ns_;  // below the floor: the time of the last restore out of each rung (Key), for the 30 s bounce window
+  bool over_armed_ = false;                  // the median of the last 4 samples is over the line, and has been since over_frames_ GPU frames ago
+  uint32_t over_frames_ = 0;
 
   std::array<bool, kTiers> enriched_{};  // the tier was entered by enrichment ...
   std::array<int64_t, kTiers> enriched_at_ns_{};  // ... at this time
@@ -1062,6 +1371,7 @@ class Controller {
   std::array<int, kTiers> learned_n_{};
   std::deque<LearnSample> learn_ring_;  // valid samples of the last learn_s + 1 s with the state they were taken in
   Learn learn_;
+  int learn_discards_ = 0;
   Plan plan_;
 
   Window win_;

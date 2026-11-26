@@ -68,17 +68,24 @@ bool ImpostorsEnabled();
 // ---- the run-time detail tier (mcla_gfx_tier), for the frame-rate governor (LOCK60) --------------------------------------------
 //
 // The governor's contract:
-//   * It sets the tier with rex::cvar::SetFlagByName("mcla_gfx_tier", "N") (N = kTierMin..kTierMax; -1 = off) from any thread. OnFrame()
-//     applies it on the next engine frame: a tier writes the live knob cvars (mcla_gfx_env_interval, far_cascades_interval,
-//     shadow_dist, city_lod, traffic_lod, shadow_mode) and swap_post_effect, and logs one '[mcla-gfx] tier N: ...' line. CurrentTier()
-//     is the tier OnFrame has applied (-1 = off); read it back instead of assuming a SetFlagByName took effect.
+//   * It sets the tier with rex::cvar::SetFlagByName("mcla_gfx_tier", "N") (N = kTierMin..kTierMax; -1 = off) from any thread.
+//     mcla_gfx_tier is a transient cvar (never written to the config file, the command line still sets it). OnFrame() applies it on
+//     the next engine frame: a tier sets the DEFAULT (rex::cvar::SetDefaultValue) of the live knob cvars (mcla_gfx_env_interval,
+//     far_cascades_interval, shadow_dist, city_lod, traffic_lod, shadow_mode) and swap_post_effect, and logs one '[mcla-gfx] tier N:
+//     ...' line ('(yours)' after a knob the tier left alone, see below). CurrentTier() is the tier OnFrame has applied (-1 = off);
+//     read it back instead of assuming a SetFlagByName took effect.
 //   * Higher = more detail. The governor sheds by stepping DOWN and restores by stepping UP, ONE tier at a time, with hysteresis
 //     (est_gpu_ms_over_prev is the budget each step gives or takes). It never goes below tier 1 except in an emergency (tier 0 drops
 //     every sun shadow at once).
 //   * A tier does not touch mcla_gfx_shadow_res: that is read when the shadow map is created (a world load), so the shadow map size is
 //     whatever the preset or the knob gave at the load. mcla_gfx_dl_disable, impostors and the other knobs are not in the table either.
-//   * While the tier is on, the table overrides those knobs even when set by hand; at -1 each knob goes back to its default (a preset's
-//     app default included), or, when set by hand before the first tier, to that value.
+//   * The tier never makes a knob cvar 'runtime': a default set with SetDefaultValue keeps the cvar's source at kDefault, and a
+//     config save (rex::cvar::SaveConfig) writes only cvars whose source is kRuntime, so a tier can never end up in the saved config.
+//   * The player's own choice wins: a knob whose source is not kDefault (set on the command line, by the launcher, in the config file,
+//     in the settings overlay or the console) is never written by a tier; it keeps the player's value in every tier. A knob the player
+//     sets WHILE a tier is on is skipped from the next tier change on (the tier's default stays under it).
+//   * At -1 each knob's default goes back (SetDefaultValue again) to what it was before the tier first wrote it: the preset's app
+//     default (mcla_gfx_preset) or the compiled default. A knob the player has set since keeps the player's value; only its default moves.
 constexpr int kTierMin = 0, kTierMax = 5;
 
 struct TierInfo {

@@ -1,6 +1,7 @@
 // Unit test of the 60 fps timing arithmetic (mcla/hooks/mcla_t_sim_math.h): the n/60 quantiser
 // on top of mcla/hooks/frame_clock_policy.h, camera/chassis smoothing, the race clock carry, the Flash
-// movie 30 Hz stepper and the countdown accumulator. Standalone: no SDK, no game.
+// movie 30 Hz stepper and the countdown accumulator, the governed 60 -> 30 hold (menus, grace, windows in a row) and its excuse for
+// shader-compile bursts. Standalone: no SDK, no game.
 //
 // Built and run by CTest (mcla/tests/CMakeLists.txt, test mcla_sim_math_test). By hand:
 //   clang++ -std=c++23 -O1 -Wall -Wextra -I mcla/hooks \
@@ -396,9 +397,10 @@ struct JudgeSim {
   int64_t last_end_ns = 0;
   int prev_hold_s = 0;
   bool allowed = true;
+  bool compile = false;  // a shader-compile burst is active (mcla::gov::CompileBurstActive)
   std::vector<double> hold_start_s;  // seconds from the sim's start
   std::vector<int> hold_len_s;
-  int deferred = 0, windows_judged = 0, high_windows = 0;
+  int deferred = 0, windows_judged = 0, high_windows = 0, excused = 0;
   uint64_t frame_index = 0;
   // One frame.
   void Frame(bool menu, int miss_every) {
@@ -408,10 +410,11 @@ struct JudgeSim {
       judge.EndHold(now_ns, rule.grace_s);
     }
     const double since_end = last_end_ns ? double(now_ns - last_end_ns) / 1e9 : 1e9;
-    const m::HoldVerdict v = judge.Tick(now_ns, menu, hold_until_ns != 0, allowed, prev_hold_s, since_end, rule);
-    windows_judged += v.window_ended;
-    high_windows += v.high;
+    const m::HoldVerdict v = judge.Tick(now_ns, menu, hold_until_ns != 0, allowed, prev_hold_s, since_end, rule, compile);
+    windows_judged += v.window_ended && !v.excused;
+    high_windows += v.high && !v.excused;
     deferred += v.deferred;
+    excused += v.excused;
     if (v.start_hold) {
       prev_hold_s = v.hold_s;
       hold_until_ns = now_ns + int64_t(v.hold_s) * 1'000'000'000;
@@ -640,6 +643,173 @@ static void TestGovernedHold() {
               m::HoldRule{}.grace_s, m::HoldRule{}.windows);
 }
 
+// ---- shader-compile bursts (mcla_sim_pacer 2): a high window a burst overlapped is not judged, within a bound ----
+static void TestCompileHold() {
+  // A drive that misses every frame, with a compile burst the whole time: the first two high windows are excused, the third and
+  // fourth are judged: the hold comes at ~8 s instead of ~4 s, and the frames of the two excused windows are counted.
+  {
+    JudgeSim s;
+    s.compile = true;
+    s.Run(30, false, 1);
+    CHECK(!s.hold_start_s.empty(), "a real overload under a 30 s compile burst still holds");
+    if (!s.hold_start_s.empty()) {
+      CHECK(s.hold_start_s[0] > 7.9 && s.hold_start_s[0] < 8.3, "first hold at %.2f s (2 excused windows + 2 judged)", s.hold_start_s[0]);
+      CHECK(s.hold_len_s[0] == 6, "first hold 6 s (%d)", s.hold_len_s[0]);
+    }
+    CHECK(s.excused >= 2 && s.high_windows >= 2, "windows excused %d, judged high %d", s.excused, s.high_windows);
+    uint64_t menu = 0, grace = 0, hold = 0, compile = 0;
+    s.judge.TakeSkipped(&menu, &grace, &hold, &compile);
+    CHECK(compile >= 2 * 118 && compile <= 4 * 122 && menu == 0, "frames not judged: compile %llu menu %llu", (unsigned long long)compile, (unsigned long long)menu);
+    s.judge.TakeSkipped(&menu, &grace, &hold, &compile);
+    CHECK(compile == 0, "TakeSkipped clears the compile count too");
+    std::printf("compile hold: first hold %.2f s into a 30 s burst of real overload (4.0 s without the excuse)\n", s.hold_start_s.empty() ? -1.0 : s.hold_start_s[0]);
+  }
+  // The same overload with no burst: ~4 s, as before; with the excuse switched off (compile_windows 0) under a burst: also.
+  {
+    JudgeSim a;
+    a.Run(30, false, 1);
+    CHECK(!a.hold_start_s.empty() && a.hold_start_s[0] > 3.9 && a.hold_start_s[0] < 4.3 && a.excused == 0, "no burst: the hold at %.2f s", a.hold_start_s.empty() ? -1.0 : a.hold_start_s[0]);
+    JudgeSim b;
+    b.compile = true;
+    b.rule.compile_windows = 0;
+    b.Run(30, false, 1);
+    CHECK(!b.hold_start_s.empty() && b.hold_start_s[0] > 3.9 && b.hold_start_s[0] < 4.3 && b.excused == 0, "excuse off: the hold at %.2f s", b.hold_start_s.empty() ? -1.0 : b.hold_start_s[0]);
+  }
+  // A compile hitch in a clean drive: 3 s of misses with the burst on, then clean. The burst's windows are excused: no hold. The same
+  // misses with no burst flag make two high windows in a row and hold.
+  {
+    JudgeSim s;
+    s.Run(10, false, 0);
+    s.compile = true;
+    s.Run(3, false, 1);
+    s.compile = false;
+    s.Run(30, false, 0);
+    CHECK(s.hold_start_s.empty() && s.excused >= 1 && s.deferred == 0, "a 3 s compile hitch: no hold (%d windows excused)", s.excused);
+    JudgeSim c;
+    c.Run(10, false, 0);
+    c.Run(3, false, 1);
+    c.Run(30, false, 0);
+    CHECK(c.hold_start_s.size() == 1, "the control, same misses with no burst flag: %zu hold", c.hold_start_s.size());
+  }
+  // The windows, one by one (a driver that hands each window's frames in and the burst flag at a tick inside it).
+  {
+    m::HoldRule rule;  // windows 2, compile_windows 2
+    int64_t t = 1'000'000'000;
+    auto fresh = [&](m::HoldJudge& j) {
+      t = 1'000'000'000;
+      j.Tick(t, false, false, true, 0, 1e9, rule);  // starts the first window
+    };
+    // One window of 120 frames, `high` = 40 of them missed; the burst flag is seen at a tick 1 s into it (`burst`) or only on the very
+    // tick that ends it (`burst_at_end`).
+    auto window = [&](m::HoldJudge& j, bool high, bool burst, bool burst_at_end = false) {
+      for (int i = 0; i < 120; ++i) j.NoteStep(high && i < 40);
+      if (burst) j.Tick(t + 1'000'000'000, false, false, true, 0, 1e9, rule, true);
+      t += 2'000'000'000;
+      return j.Tick(t, false, false, true, 0, 1e9, rule, burst_at_end);
+    };
+    // E E J J: the run's first two high windows are excused, the streak starts at the third, the hold is at the fourth.
+    m::HoldJudge j;
+    fresh(j);
+    m::HoldVerdict v = window(j, true, true);
+    CHECK(v.window_ended && v.high && v.excused && v.streak == 0 && v.excused_in_run == 1 && !v.start_hold, "1st high window under a burst: excused (%d)", v.excused_in_run);
+    v = window(j, true, true);
+    CHECK(v.excused && v.excused_in_run == 2 && !v.start_hold, "2nd: excused");
+    v = window(j, true, true);
+    CHECK(!v.excused && v.high && v.streak == 1 && !v.start_hold, "3rd, burst still on: judged, streak 1 (the third high window is judged)");
+    v = window(j, true, true);
+    CHECK(!v.excused && v.streak == 2 && v.start_hold && v.hold_s == 6, "4th: judged, the hold");
+    CHECK(j.excused_in_run == 0 && j.streak == 0, "a hold starts the allowance over");
+    // H(judged, no burst) E H: the excused window is as if it had not happened: the streak is held, not advanced, not reset.
+    m::HoldJudge k;
+    fresh(k);
+    v = window(k, true, false);
+    CHECK(v.streak == 1 && !v.excused, "H: streak 1");
+    v = window(k, true, true);
+    CHECK(v.excused && v.streak == 1 && !v.start_hold, "E: streak stays 1");
+    v = window(k, true, false);
+    CHECK(!v.excused && v.streak == 2 && v.start_hold, "H: streak 2: hold");
+    // A window that is not high ends the run: the streak and the allowance start over.
+    m::HoldJudge n;
+    fresh(n);
+    window(n, true, true);
+    window(n, true, true);
+    v = window(n, false, true);  // calm, with a burst: judged, not high
+    CHECK(v.window_ended && !v.high && !v.excused && n.streak == 0 && n.excused_in_run == 0, "a calm window under a burst: judged, the allowance is back");
+    v = window(n, true, true);
+    CHECK(v.excused && v.excused_in_run == 1, "and the next high one is excused again");
+    // The burst flag counts when it is seen at the tick that ends the window (the burst began in the window's last frame).
+    m::HoldJudge e;
+    fresh(e);
+    v = window(e, true, false, /*burst_at_end=*/true);
+    CHECK(v.excused, "a burst active on the window's last frame overlaps it");
+    // It does not leak into the next window.
+    v = window(e, true, false);
+    CHECK(!v.excused && v.streak == 1, "the next window had no burst: judged");
+    // A menu starts the allowance over.
+    m::HoldJudge g;
+    fresh(g);
+    window(g, true, true);
+    window(g, true, true);
+    CHECK(g.excused_in_run == 2, "two excused");
+    g.Tick(t + 1'000'000'000, true, false, true, 0, 1e9, rule);  // a menu
+    CHECK(g.excused_in_run == 0 && g.streak == 0, "a menu: allowance and streak start over");
+    // compile_windows 0: the burst excuses nothing.
+    rule.compile_windows = 0;
+    m::HoldJudge z;
+    fresh(z);
+    v = window(z, true, true);
+    CHECK(!v.excused && v.streak == 1, "compile_windows 0: judged");
+    rule.compile_windows = 3;
+    m::HoldJudge y;
+    fresh(y);
+    window(y, true, true);
+    window(y, true, true);
+    v = window(y, true, true);
+    CHECK(v.excused && v.excused_in_run == 3, "compile_windows 3: three excused");
+    v = window(y, true, true);
+    CHECK(!v.excused && v.streak == 1, "the fourth is judged");
+    // Fewer than 30 frames: not high even under a burst (the existing rule), no excuse needed.
+    rule.compile_windows = 2;
+    m::HoldJudge x;
+    fresh(x);
+    for (int i = 0; i < 20; ++i) x.NoteStep(true);
+    x.Tick(t + 1'000'000'000, false, false, true, 0, 1e9, rule, true);
+    v = x.Tick(t + 2'000'000'000, false, false, true, 0, 1e9, rule, true);
+    CHECK(v.window_ended && !v.high && !v.excused, "a 20-frame window is not high, burst or not");
+    // The governor with room (allowed = false) defers a due hold as before; the excused windows come first.
+    m::HoldJudge d;
+    fresh(d);
+    window(d, true, true);
+    window(d, true, true);
+    window(d, true, false);  // judged, streak 1
+    for (int i = 0; i < 120; ++i) d.NoteStep(i < 40);
+    t += 2'000'000'000;
+    v = d.Tick(t, false, false, /*allowed=*/false, 0, 1e9, rule, false);
+    CHECK(v.deferred && !v.start_hold && v.streak == 2, "after the excused windows the usual deferral applies");
+  }
+  // The log counter is in frames: three excused windows of 120 frames.
+  {
+    m::HoldJudge j;
+    m::HoldRule rule;
+    rule.compile_windows = 3;
+    int64_t t = 1'000'000'000;
+    j.Tick(t, false, false, true, 0, 1e9, rule);
+    for (int w = 0; w < 3; ++w) {
+      for (int i = 0; i < 120; ++i) j.NoteStep(i < 40);
+      j.Tick(t + 1'000'000'000, false, false, true, 0, 1e9, rule, true);
+      t += 2'000'000'000;
+      j.Tick(t, false, false, true, 0, 1e9, rule, false);
+    }
+    uint64_t menu = 0, grace = 0, hold = 0, compile = 0;
+    j.TakeSkipped(&menu, &grace, &hold, &compile);
+    CHECK(compile == 360 && menu == 0 && grace == 0 && hold == 0, "skipped compile %llu", (unsigned long long)compile);
+    j.skipped_compile = 7;
+    j.TakeSkipped(&menu, &grace, &hold);  // the three-argument form still clears everything
+    CHECK(j.skipped_compile == 0, "the 3-argument TakeSkipped clears the compile count");
+  }
+  std::printf("compile hold test: a high window a burst overlapped is not judged, at most %d in a run; the next is judged\n", m::HoldRule{}.compile_windows);
+}
+
 // P1: the 120 fps grid (TIMING.md section 15). A cap above 60 quantises in 1/120 s; caps of 60 and below are
 // unchanged (the coarse functions are the same calls).
 static void Test120() {
@@ -746,6 +916,7 @@ int main() {
   TestUi();
   TestHold();
   TestGovernedHold();
+  TestCompileHold();
   std::printf("%d checks, %d failed\n", g_checks, g_failed);
   return g_failed ? 1 : 0;
 }

@@ -5,6 +5,12 @@
 // oscillation against a toy GPU), pop hiding (waits, hiding moments, the shed time-out, the missed-frame override), the camera
 // cut / speed tracker, HoldAllowed, the summary window, the screen-change grace (the previous screen's samples thrown away at a change of
 // the driving flag, 60 frames of nothing recorded or decided), and closed loops against a toy GPU (a DVFS-like slack response among them).
+// Also: the floor on auto (FloorForPreset / AutoFloor: perf = 2, perf+ / lowest = 1, quality / shipped = 4, ultra = 5) and the shed order from
+// floor 2 (VRS before tier 1, no AA flicker, a no-op 2 -> 1 step when AA is pinned), the compile-burst watch (CompileWatch), the excuse
+// budget (ExcuseBudget) and the compile excuse of the shed rules with its bounds (a 30 s burst of real overload still sheds).
+// And sustained overload below the floor (a scene tour of single 18-19 ms snaps never takes the tier under the floor 2, an 18 ms load
+// takes the whole ladder in about a second, 2 missed frames of 30 still shed there, the 30 s bounce window of a restore from a rung under the
+// floor) and the learning windows with a spike (discarded, the EMA only fed by clean ones).
 // Standalone: no SDK, no game, no clock.
 //
 // Built and run by CTest (mcla/tests/CMakeLists.txt, test mcla_gov_test). By hand:
@@ -12,6 +18,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -61,6 +68,7 @@ struct Rig {
   uint32_t seq_delta = 1;  // GPU frames published per sample
   bool cut = false;
   double speed = -1.0;
+  bool compile = false;  // a compile burst is on (Input::compile_burst)
   struct Event {
     int frame;
     int64_t ns;
@@ -69,6 +77,7 @@ struct Rig {
   std::vector<Event> events;  // steps
   std::vector<Event> waits;   // steps that started to wait for a hiding moment
   std::vector<Event> learns;  // finished measurements
+  std::vector<Event> discards;  // measurements thrown away (a spike in a window)
 
   Rig() {
     p.tier_floor = 1;
@@ -92,10 +101,12 @@ struct Rig {
     in.lag = lag;
     in.cut = cut;
     in.speed_kmh = speed;
+    in.compile_burst = compile;
     const m::Change ch = c.Step(in, p);
     if (ch.changed) events.push_back({frame, now, ch});
     if (ch.wait_started) waits.push_back({frame, now, ch});
     if (ch.learn_done) learns.push_back({frame, now, ch});
+    if (ch.learn_discarded) discards.push_back({frame, now, ch});
     ++frame;
     now += kFrameNs;
     return ch;
@@ -1282,9 +1293,11 @@ void TestPopShedWaits() {
             r.Last().frame - r.events[mid - 1].frame <= 7,
         "2 -> 1 goes at once");
   // A missed frame sends the waiting shed at once.
+  // (A shed across tier 3 from the floor 3 goes to a tier under the floor: the median must hold 30 GPU frames, so it starts waiting at
+  // about frame 33 and the missed frame comes at frame 60.)
   Rig m1 = ProdRig(3, 3, false);
   m1.Run(20, 20.0);
-  for (int i = 0; i < 20; ++i) m1.Frame(20.0);
+  for (int i = 0; i < 40; ++i) m1.Frame(20.0);
   CHECK(m1.c.Waiting() && m1.c.Tier() == 3, "waiting");
   const m::Change miss = m1.Frame(20.0, true);
   CHECK(miss.changed && miss.hide == m::Hide::kMissed && miss.to_tier == 2 && miss.waited_s > 0.3 && miss.waited_s < 1.0, "a missed frame sends it (waited %.2f s)", miss.waited_s);
@@ -1305,9 +1318,10 @@ void TestPopShedWaits() {
   for (int i = 0; i < 20; ++i) p3.Frame(20.0);
   CHECK(p3.c.Waiting(), "waiting");
   p3.Run(8, 9.0);
-  CHECK(p3.c.Waiting(), "the 20 ms samples are still in the tail window");
+  CHECK(!p3.c.Waiting() && p3.c.Tier() == 3,
+        "the load went: the plan is dropped at once (below the floor the tail window of the 20 ms samples does not hold it: only the held median counts), no shed");
   p3.Run(32, 9.0);
-  CHECK(!p3.c.Waiting() && p3.c.Tier() == 3, "the load went: the plan is dropped, no shed");
+  CHECK(!p3.c.Waiting() && p3.c.Tier() == 3, "and it stays dropped, no shed");
   // A shed in the first second after driving resumes (a load just ended) hides: no wait. (With a short grace: the shed waits for it, the
   // 3rd fresh sample after 10 frames of grace; the default 60 frames of grace use the second up, see below.)
   Rig q = ProdRig(3, 3, false);
@@ -1321,12 +1335,14 @@ void TestPopShedWaits() {
   q.driving = true;
   m::Change resume;
   int resume_frame = -1;
-  for (int i = 0; i < 40 && resume_frame < 0; ++i) {
+  for (int i = 0; i < 80 && resume_frame < 0; ++i) {
     resume = q.Frame(20.0);
     if (resume.changed) resume_frame = i;
   }
-  CHECK(resume_frame == 12 && resume.to_tier == 2 && resume.hide == m::Hide::kDrivingChange && resume.waited_s == 0.0,
-        "the first second after a pause: goes at once (frame %d, after the grace and 3 samples)", resume_frame);
+  // (3 -> 2 goes under the floor 3: the median is over the line from the 3rd fresh sample, frame 12, and must hold 30 GPU frames: frame 42,
+  // 0.7 s after the change of the flag, still inside its hiding second.)
+  CHECK(resume_frame == 42 && resume.to_tier == 2 && resume.hide == m::Hide::kDrivingChange && resume.waited_s == 0.0,
+        "the first second after a pause: goes at once (frame %d, after the grace, 3 samples and the 30 frames the median must hold)", resume_frame);
   // With the default 60 frames of grace the 1 s hiding moment after the change of the flag is over by the time a shed may go: it waits.
   Rig q2 = ProdRig(3, 3, false);
   q2.p.max_level = 2;
@@ -1335,7 +1351,7 @@ void TestPopShedWaits() {
   q2.Seconds(3.0, 20.0);
   q2.p.max_level = -1;
   q2.driving = true;
-  for (int i = 0; i < 70; ++i) q2.Frame(20.0);
+  for (int i = 0; i < 110; ++i) q2.Frame(20.0);  // the grace 60 + 3 samples + the 30 frames the median must hold (below the floor): ~frame 92
   CHECK(q2.c.Tier() == 3 && q2.c.Waiting() && q2.waits.size() == 1,
         "grace 60: the shed across tier 3 waits for a hiding moment (waits %zu)", q2.waits.size());
 }
@@ -1559,7 +1575,7 @@ void TestBackoff() {
   CHECK(t.c.Current() == (m::State{1, 2}), "(1, 2)");
   t.Seconds(4.2, 9.0);
   CHECK(t.c.Current() == (m::State{2, 2}) && t.Last().change.kind == m::Kind::kRestore, "restored to tier 2");
-  t.Run(30, 20.0);
+  t.Run(40, 20.0);  // 2 -> 1 is below the floor 2: the median must hold 30 GPU frames over the line
   CHECK(t.c.Tier() == 1 && t.Last().change.backoff_s == 0.0 && t.Last().change.bounce, "shed back: a probe bounce, no tier back-off");
 }
 
@@ -1675,6 +1691,794 @@ void TestNoOscillation() {
     }
     std::printf("varying scene: %d steps in 10 minutes, at most %d within 60 s\n", r.Changes(), worst);
     CHECK(worst <= 8 && r.Changes() <= 60, "the ladder does not thrash on a varying scene: %d steps, %d in the worst minute", r.Changes(), worst);
+  }
+}
+
+// ---- the floor on auto: the perf preset's floor is tier 2 -----------------------------------------------------------------
+
+void TestAutoFloor() {
+  // The preset names (mcla_gfx_preset): perf = tier 2 (perf + FXAA), perf+ and lowest = 1, quality and as shipped = 4, ultra = 5.
+  CHECK(m::FloorForPreset("perf") == 2, "perf: %d", m::FloorForPreset("perf"));
+  CHECK(m::FloorForPreset("Perf") == 2 && m::FloorForPreset("  PERF ") == 2, "case and blanks ignored");
+  CHECK(m::FloorForPreset("perf+") == 1 && m::FloorForPreset("perfplus") == 1 && m::FloorForPreset("perf_plus") == 1 && m::FloorForPreset("perf-plus") == 1,
+        "perf+ stays 1 (no far cascade, no impostors: a different picture, not perf)");
+  CHECK(m::FloorForPreset("lowest") == 1, "lowest stays 1");
+  CHECK(m::FloorForPreset("quality") == 4 && m::FloorForPreset("") == 4 && m::FloorForPreset("default") == 4 && m::FloorForPreset("none") == 4 &&
+            m::FloorForPreset("shipped") == 4,
+        "quality / as shipped: 4, unchanged");
+  CHECK(m::FloorForPreset("ultra") == 5 && m::FloorForPreset("ULTRA") == 5, "ultra: 5, unchanged");
+  CHECK(m::FloorForPreset("turbo") == 1, "an unknown name: 1, as before");
+  // The tier set before the governor first ran wins over the preset (and is clamped); 0 / -1 = not set.
+  CHECK(m::AutoFloor(3, "perf") == 3 && m::AutoFloor(1, "ultra") == 1 && m::AutoFloor(5, "") == 5 && m::AutoFloor(9, "perf") == 5, "a configured tier is the floor");
+  CHECK(m::AutoFloor(-1, "perf") == 2 && m::AutoFloor(0, "perf") == 2 && m::AutoFloor(-1, "perf+") == 1 && m::AutoFloor(-1, "quality") == 4, "else the preset's");
+}
+
+// Floor 2 (the perf preset), ceiling 2 so that nothing enriches: the base is (2, 0), then VRS 1 and 2, then tier 1, then the hold.
+void TestFloor2ShedOrder() {
+  for (const bool pop_free : {true, false}) {
+    Rig r = ProdRig(2, 2, pop_free);
+    r.Run(1, 9.0);
+    CHECK(r.c.Current() == (m::State{2, 0}) && r.c.Level() == 0 && m::Ladder::Of(r.p).shed == 3 && m::Ladder::Of(r.p).enrich == 0,
+          "the base rung is (2, 0), three shed rungs: (2, 1) (2, 2) (1, 2)");
+    CHECK(!r.c.HoldAllowed(r.p), "no hold at the base");
+    // A load nothing fixes: every rung in turn, none skipped, the hold allowed only at the last (tier 1, VRS at its maximum).
+    std::vector<bool> allowed_at;
+    size_t seen = 0;
+    for (int i = 0; i < 120; ++i) {
+      r.Frame(20.0);
+      if (r.events.size() != seen) {
+        seen = r.events.size();
+        allowed_at.push_back(r.c.HoldAllowed(r.p));
+      }
+    }
+    const std::vector<Step> down = StepsOf(r);
+    CHECK(down.size() == 3 && Is(down[0], 2, 1, m::Kind::kShed) && Is(down[1], 2, 2, m::Kind::kShed) && Is(down[2], 1, 2, m::Kind::kShed),
+          "shed order from floor 2: VRS 1, VRS 2, then tier 1 (%zu steps, pop_free %d)", down.size(), pop_free);
+    CHECK(r.c.Level() == 3 && r.c.Current() == (m::State{1, 2}) && allowed_at.size() == 3 && !allowed_at[0] && !allowed_at[1] && allowed_at[2],
+          "the hold becomes allowed only at tier 1");
+    CHECK(r.c.HoldAllowed(r.p) && r.Changes() == 3, "and nothing beyond it");
+    // Calm: the reverse, tier 1 -> 2 first, then the VRS levels, 4 s apart.
+    const size_t mid = r.events.size();
+    r.Seconds(20.0, 9.0);
+    const std::vector<Step> up = StepsOf(r, mid);
+    CHECK(up.size() == 3 && Is(up[0], 2, 2, m::Kind::kRestore) && Is(up[1], 2, 1, m::Kind::kRestore) && Is(up[2], 2, 0, m::Kind::kRestore),
+          "restore order: tier 2 back first, then VRS (%zu steps)", up.size());
+    CHECK(r.c.Current() == (m::State{2, 0}) && r.Changes() == 6, "back at the base, and it stays (no enrichment: ceiling 2)");
+    CHECK(r.Seconds(120.0, 9.0) < 0, "no step in two quiet minutes");
+  }
+  // With the default ceiling 4 the enriched tiers shed first: 4, 3, then VRS, then tier 1.
+  Rig e = ProdRig(2, 4);
+  e.Seconds(25.0, 9.0);
+  CHECK(e.c.Current() == (m::State{4, 0}) && e.c.Level() == -2, "enriched to (4, 0) from the floor 2");
+  CHECK(EntriesInto(e, 2) == 0, "tier 2 is never entered by enrichment: it is the base");
+  const size_t before = e.events.size();
+  e.Seconds(8.0, 20.0);
+  const std::vector<Step> shed = StepsOf(e, before);
+  CHECK(shed.size() == 5 && Is(shed[0], 3, 0, m::Kind::kShed) && Is(shed[1], 2, 0, m::Kind::kShed) && Is(shed[2], 2, 1, m::Kind::kShed) && Is(shed[3], 2, 2, m::Kind::kShed) &&
+            Is(shed[4], 1, 2, m::Kind::kShed),
+        "shed order from the enriched tiers: 4 -> 3 -> 2 (the base) -> VRS 1 -> VRS 2 -> tier 1 (%zu steps)", shed.size());
+  // Tier 2 -> 1 is the step that costs the table's estimate, and the step the learning measures when it happens (a plant that really
+  // takes 0.3 ms for it): the learned cost of tier 2 is then ~0.3, never negative, and the estimate stays the floor of the prediction.
+  {
+    Rig r = ProdRig(2, 2);
+    TierPlant plant;
+    plant.base = 16.5;  // over the line at (2, 0); VRS 2 takes 0.6; tier 1 takes 0.3 (tier 2's cost)
+    DriveSeconds(r, plant, 8.0);
+    CHECK(r.c.Current() == (m::State{1, 2}), "shed to tier 1");
+    plant.base = 9.0;  // calm: tier 1 is restored after the 4 s, and that step is measured
+    DriveSeconds(r, plant, 12.0);
+    CHECK(r.c.Tier() == 2 && r.c.HasLearned(2) && std::fabs(r.c.LearnedMs(2) - 0.3) < 0.15, "learned cost of tier 2 over 1: %.2f ms (the plant's: 0.3)", r.c.LearnedMs(2));
+    CHECK(r.c.PredictedCostMs(2, r.p) >= 0.3 - 1e-9, "the prediction never goes under the table's estimate");
+  }
+}
+
+// The field problem (gate run): from a floor of 1 the governor enriched to tier 2 (FXAA on), shed it on a burst, barred it for 30 s and
+// enriched again: the anti-aliasing flickered on and off. From floor 2 it is the base: a burst is absorbed by the enriched tiers and VRS.
+void TestFloor2NoAaFlicker() {
+  auto run = [](int floor, int* aa_flips, int* tier2_entries, int* backoffs, int* min_tier) {
+    Rig r = ProdRig(floor, 4);
+    TierPlant plant;
+    plant.base = 9.0;
+    plant.noise = 0.2;
+    for (int i = 0; i < 60 * 60 * 6; ++i) {  // six minutes; every 40 s, 3 s of a heavier scene (+6.5 ms)
+      const double t = double(i) / 60.0;
+      plant.base = 9.0 + (std::fmod(t, 40.0) >= 27.0 && std::fmod(t, 40.0) < 30.0 ? 6.5 : 0.0);
+      r.Frame(plant.Next(r.c.Current()));
+    }
+    *aa_flips = 0;
+    *tier2_entries = 0;
+    *backoffs = 0;
+    *min_tier = 9;
+    for (const auto& e : r.events) {
+      const bool from_aa = e.change.from_tier >= 2, to_aa = e.change.to_tier >= 2;
+      if (from_aa != to_aa) ++*aa_flips;
+      if (e.change.to_tier == 2 && e.change.from_tier == 1) ++*tier2_entries;
+      if (e.change.backoff_s > 0.0 && e.change.from_tier == 2) ++*backoffs;
+      *min_tier = std::min(*min_tier, e.change.to_tier);
+    }
+  };
+  int flips1 = 0, entries1 = 0, backoffs1 = 0, min1 = 0, flips2 = 0, entries2 = 0, backoffs2 = 0, min2 = 0;
+  run(1, &flips1, &entries1, &backoffs1, &min1);
+  run(2, &flips2, &entries2, &backoffs2, &min2);
+  std::printf("AA flicker over 6 min of 3 s bursts every 40 s: floor 1: %d flips, %d entries into tier 2, %d back-offs of tier 2; floor 2: %d flips, min tier %d\n", flips1,
+              entries1, backoffs1, flips2, min2);
+  CHECK(flips1 >= 6 && entries1 >= 3, "the old floor 1 flickers the AA: %d flips, %d entries into tier 2", flips1, entries1);
+  CHECK(flips2 == 0 && min2 >= 2 && entries2 == 0 && backoffs2 == 0, "floor 2: the AA never goes off in play (%d flips, lowest tier %d)", flips2, min2);
+}
+
+// The player pinned anti-aliasing (swap_post_effect by hand): tiers 1 and 2 are then the same picture and the 2 -> 1 step buys nothing.
+// It must be harmless: the rung is the last one (nothing is shed after it), the learned cost comes out ~0 and does not lower the
+// prediction under the table's estimate, the restore costs only its delay, and repeated loads never loop.
+void TestFloor2PinnedAa() {
+  Rig r = ProdRig(2, 2);
+  TierPlant plant;
+  plant.cost[2] = 0.0;  // tier 2 over tier 1 costs nothing
+  plant.base = 16.7;
+  DriveSeconds(r, plant, 30.0);
+  CHECK(r.c.Current() == (m::State{1, 2}) && r.Changes() == 3 && r.c.HoldAllowed(r.p), "overload: down to the last rung, and 30 s later nothing more (%d changes)", r.Changes());
+  plant.base = 9.0;
+  DriveSeconds(r, plant, 30.0);
+  CHECK(r.c.Current() == (m::State{2, 0}) && r.Changes() == 6, "calm: back to the base in 3 restores (%d changes)", r.Changes());
+  CHECK(r.c.HasLearned(2) && r.c.LearnedMs(2) < 0.05, "the no-op step measured ~0 (%.3f ms)", r.c.LearnedMs(2));
+  CHECK(std::fabs(r.c.PredictedCostMs(2, r.p) - r.p.tier_est_ms[2]) < 1e-9, "the prediction is still the table's estimate: %.2f ms", r.c.PredictedCostMs(2, r.p));
+  // Five cycles of 10 s of overload and 30 s of calm: each cycle takes 3 steps down and 3 up, no more.
+  Rig q = ProdRig(2, 2);
+  TierPlant plant2;
+  plant2.cost[2] = 0.0;
+  for (int cycle = 0; cycle < 5; ++cycle) {
+    plant2.base = 16.7;
+    DriveSeconds(q, plant2, 10.0);
+    plant2.base = 9.0;
+    DriveSeconds(q, plant2, 30.0);
+  }
+  int bounces = 0;
+  for (const auto& e : q.events) bounces += e.change.bounce ? 1 : 0;
+  // (The 40 s period puts every shed to tier 1 within 30 s of the previous cycle's restore from it: since the below-the-floor window of a
+  // probe bounce is 30 s, not 2 s, cycles 2..5 are bounces, the restore delay out of tier 1 doubles - and decays again 30 s after the
+  // delay it lengthened, so it does not grow, and every cycle still ends at the base.)
+  CHECK(q.Changes() == 30 && TierSteps(q) == 10 && bounces == 4 && q.c.Current() == (m::State{2, 0}),
+        "five load cycles: %d changes (%d of them tier steps), %d bounces (cycles 2..5): nothing loops", q.Changes(), TierSteps(q), bounces);
+  // And the same load with a floor of 1 and ceiling 4 (the plant's tier 2 free): the enrichment into tier 2 is tried once and stays.
+  Rig f = ProdRig(1, 2);
+  TierPlant plant3;
+  plant3.cost[2] = 0.0;
+  DriveSeconds(f, plant3, 120.0);
+  CHECK(f.c.Tier() == 2 && f.Changes() == 1, "a free tier 2 enriched into at floor 1 stays: %d changes", f.Changes());
+}
+
+// ---- sustained overload below the floor, and spiky learning windows ----------------------------------------------------------
+
+// The scene tour of the VISUALS runs (field run lk-w3cold2): the busy time is ~N(10, 0.6) ms and every ~6 s the time of day / weather snaps:
+// one 18-19 ms frame; every 3rd time three of them within 24 frames, every 6th time a storm of twelve three frames apart. The tail rule fires
+// on the clusters (and sheds VRS, which is invisible); the median of 4 never goes over the line. With the floor 2 (perf + FXAA) and VRS at
+// its maximum the old governor then took tier 2 -> 1 (FXAA off) and the restore brought it back 4 s later: six times a minute.
+struct TourResult {
+  int min_tier = 9, tier_sheds = 0, vrs_sheds = 0, tail_sheds = 0, tier_steps = 0, snaps = 0;
+  bool hold_ever = false;
+};
+TourResult RunSceneTour(int floor, int ceiling, int floor_shed_frames, double minutes) {
+  Rig r = ProdRig(floor, ceiling);
+  r.p.floor_shed_frames = floor_shed_frames;
+  Rng rng;
+  rng.s = 11;
+  TourResult out;
+  std::set<int> snap_at;
+  int next_event = 300, event = 0;
+  const int frames = int(minutes * 3600.0);
+  for (int i = 0; i < frames; ++i) {
+    if (i == next_event) {
+      ++event;
+      if (event % 6 == 0) {
+        for (int k = 0; k < 12; ++k) snap_at.insert(i + 3 * k);
+      } else if (event % 3 == 0) {
+        for (int k = 0; k < 3; ++k) snap_at.insert(i + 8 * k);
+      } else {
+        snap_at.insert(i);
+      }
+      next_event = i + 330 + int(rng.U() * 60.0);  // 5.5 .. 6.5 s
+    }
+    double v = std::max(5.0, 10.0 + 0.6 * rng.N());
+    if (snap_at.erase(i) > 0) {
+      v = 18.0 + rng.U();
+      ++out.snaps;
+    }
+    r.Frame(v);
+    if (r.c.HoldAllowed(r.p)) out.hold_ever = true;
+  }
+  for (const auto& e : r.events) {
+    const m::Change& c = e.change;
+    out.min_tier = std::min(out.min_tier, c.to_tier);
+    if (c.kind == m::Kind::kShed && c.to_tier < floor) ++out.tier_sheds;
+    if (c.kind == m::Kind::kShed && c.to_tier == c.from_tier && c.to_vrs > c.from_vrs) ++out.vrs_sheds;
+    if (c.kind == m::Kind::kShed && c.reason == m::Reason::kGpuTail) ++out.tail_sheds;
+    if (c.from_tier != c.to_tier) ++out.tier_steps;
+  }
+  return out;
+}
+
+// A governor at the last VRS rung of the floor 2 (the next shed is tier 2 -> 1, below the floor), calm.
+Rig AtVrsMaxFloor2() {
+  Rig r = ProdRig(2, 2);
+  r.p.force_level = 2;
+  r.Run(10, 10.0);
+  r.p.force_level = -1;
+  r.Run(10, 10.0);
+  return r;
+}
+
+void TestSceneTourBelowFloor() {
+  // (a) the tour: the tail rule sheds VRS (it may), the tier never goes below the floor in 10 minutes, so the hold is never allowed either.
+  for (const int ceiling : {2, 4}) {
+    const TourResult t = RunSceneTour(2, ceiling, 30, 10.0);
+    std::printf("scene tour, floor 2, ceiling %d, 10 min: %d snaps, %d VRS sheds (%d by the tail), %d tier sheds under the floor, lowest tier %d, %d tier steps\n", ceiling,
+                t.snaps, t.vrs_sheds, t.tail_sheds, t.tier_sheds, t.min_tier, t.tier_steps);
+    CHECK(t.snaps > 100, "the tour has its snaps (%d)", t.snaps);
+    CHECK(t.tail_sheds >= 3 && (ceiling > 2 || t.vrs_sheds >= 3), "the tail rule still sheds on the clusters (%d tail sheds, %d VRS sheds)", t.tail_sheds, t.vrs_sheds);
+    CHECK(t.tier_sheds == 0 && t.min_tier >= 2, "the tier never goes under the floor 2: %d sheds under it, lowest tier %d", t.tier_sheds, t.min_tier);
+    CHECK(!t.hold_ever, "so the 60 -> 30 hold is never allowed on it");
+  }
+  // The pattern is a real one: with the rule off (floor_shed_frames 0, the old governor) the same tour takes the tier below the floor.
+  const TourResult old = RunSceneTour(2, 2, 0, 10.0);
+  std::printf("scene tour with the below-the-floor rule off: %d tier sheds under the floor, lowest tier %d\n", old.tier_sheds, old.min_tier);
+  CHECK(old.tier_sheds >= 3 && old.min_tier == 1, "without the rule the storms switch FXAA off (%d sheds, lowest tier %d)", old.tier_sheds, old.min_tier);
+  // Floor 1 has no rung below it: nothing changes there.
+  const TourResult f1 = RunSceneTour(1, 1, 30, 5.0);
+  CHECK(f1.min_tier >= 1 && f1.vrs_sheds >= 1, "floor 1: VRS sheds as before (%d)", f1.vrs_sheds);
+}
+
+void TestSustainedOverloadBelowFloor() {
+  // (b) 18 ms for good: the whole ladder in about a second; the hold becomes allowed at the last rung only.
+  for (const bool noisy : {false, true}) {
+    for (const int floor : {2, 3, 4}) {
+      Rig r = ProdRig(floor, floor);
+      Rng rng;
+      r.Run(5, 10.0);
+      const int start = r.frame;
+      std::vector<bool> allowed_at;
+      size_t seen = 0;
+      for (int i = 0; i < 180; ++i) {
+        r.Frame(noisy ? std::max(16.5, 18.0 + 0.6 * rng.N()) : 18.0);
+        if (r.events.size() != seen) {
+          seen = r.events.size();
+          allowed_at.push_back(r.c.HoldAllowed(r.p));
+        }
+      }
+      const int rungs = 2 + floor - 1;
+      const int last_frame = r.events.empty() ? -1 : r.Last().frame - start;
+      CHECK(int(r.events.size()) == rungs && r.c.Current() == (m::State{1, 2}), "floor %d: %d sheds down to (1, 2) (%zu, now %d/%d)", floor, rungs, r.events.size(),
+            r.c.Tier(), r.c.Vrs());
+      CHECK(last_frame >= 30 && last_frame <= 60, "floor %d: tier 1 after %d frames (the median must hold 30 GPU frames first, then ~1 s at most)", floor, last_frame);
+      CHECK(!allowed_at.empty() && allowed_at.back() && std::count(allowed_at.begin(), allowed_at.end(), true) == 1, "the hold is allowed only at the last rung");
+      CHECK(r.c.HoldAllowed(r.p), "and stays allowed at 18 ms");
+      // The first shed under the floor says so: the median held for >= 30 GPU frames.
+      for (const auto& e : r.events) {
+        if (e.change.from_vrs == 2 && e.change.to_tier < floor && e.change.from_tier == floor) {
+          CHECK(e.change.below_floor && e.change.reason == m::Reason::kGpuMedian && e.change.sustained_frames >= 30 && e.change.sustained_frames < 45,
+                "floor %d: the first tier shed was judged as below the floor: sustained %d GPU frames", floor, e.change.sustained_frames);
+        }
+        if (e.change.from_vrs < 2 && e.change.kind == m::Kind::kShed && e.change.from_tier == floor && e.change.to_tier == floor) {
+          CHECK(!e.change.below_floor && e.change.sustained_frames == 0, "a VRS shed is not below the floor");
+        }
+      }
+    }
+  }
+  // The sustained-overload rule is the median's: 20 frames over the line (a long snap, a short hitch) shed nothing below the floor.
+  {
+    Rig r = AtVrsMaxFloor2();
+    const size_t before = r.events.size();
+    r.Run(20, 18.0);
+    CHECK(r.events.size() == before && r.c.Current() == (m::State{2, 2}) && r.c.OverloadFrames() > 10 && r.c.OverloadFrames() < 30, "20 frames over the line: no shed under the floor (%u frames held)",
+          r.c.OverloadFrames());
+    r.Run(60, 10.0);
+    CHECK(r.events.size() == before && r.c.OverloadFrames() == 0, "and the calm ends the run");
+  }
+  // A sample whose median is back under the line in between ends the run: the 30 frames count from the first check after it.
+  {
+    Rig r = AtVrsMaxFloor2();
+    const size_t before = r.events.size();
+    r.Run(20, 18.0);
+    r.Run(4, 10.0);
+    r.Run(20, 18.0);
+    CHECK(r.events.size() == before, "20 + break + 20 frames: not sustained (the break restarted the run)");
+    const int first = r.Run(20, 18.0);
+    CHECK(first >= 0 && r.c.Current() == (m::State{1, 2}) && r.Last().change.below_floor && r.Last().change.reason == m::Reason::kGpuMedian,
+          "the run goes on: the shed comes %d frames later", first);
+  }
+  // The same overload on the first rungs is the old fast shed (above the floor nothing changed): VRS in 3 samples.
+  {
+    Rig r = ProdRig(2, 2);
+    r.Run(5, 10.0);
+    const int first = r.Run(10, 18.0);
+    CHECK(first == 2 && !r.events.empty() && r.events[0].change.to_vrs == 1 && !r.events[0].change.below_floor, "VRS 1 after 3 samples (frame %d)", first);
+  }
+}
+
+void TestBelowFloorMissedAndTail() {
+  // (c) two missed frames in the last 30 still shed under the floor, with or without a GPU signal; one does not.
+  {
+    Rig r = AtVrsMaxFloor2();
+    const size_t before = r.events.size();
+    for (int i = 0; i < 60; ++i) r.Frame(10.0, i == 20);
+    CHECK(r.events.size() == before, "one missed frame: nothing");
+    m::Change c;
+    for (int i = 0; i < 12; ++i) {
+      const m::Change f = r.Frame(10.0, i == 0 || i == 10);
+      if (f.changed) c = f;
+    }
+    CHECK(c.changed && c.to_tier == 1 && c.to_vrs == 2 && c.reason == m::Reason::kMissedFrames && c.below_floor && c.stat_n == 2 && c.sustained_frames == 0,
+          "two missed frames in 30 (calm GPU): tier 2 -> 1 (reason %d, %d missed)", int(c.reason), c.stat_n);
+  }
+  {
+    Rig r = ProdRig(2, 2);
+    r.p.force_level = 2;
+    r.Run(10, 0.0);  // no GPU samples at all
+    r.p.force_level = -1;
+    r.Run(10, 0.0);
+    CHECK(r.c.Current() == (m::State{2, 2}) && !r.c.SignalLive(), "no GPU signal, at (2, 2)");
+    r.Frame(0.0, true);
+    r.Run(5, 0.0);
+    const m::Change c = r.Frame(0.0, true);
+    CHECK(c.changed && c.to_tier == 1 && c.reason == m::Reason::kMissedFrames && c.below_floor, "no GPU signal: two missed frames shed under the floor too");
+  }
+  // The tail rule alone never takes the ladder below the floor: 3, 5, 12 samples of 20 ms in 30 never shed tier 2 -> 1.
+  for (const int spikes : {3, 5, 15}) {
+    Rig r = AtVrsMaxFloor2();
+    const size_t before = r.events.size();
+    for (int i = 0; i < 120; ++i) r.Frame(i < 30 && i % (30 / spikes) == 0 ? 20.0 : 10.0);
+    CHECK(r.events.size() == before && r.waits.empty(), "%d spikes in 30 samples: the tail rule does not shed under the floor", spikes);
+  }
+  // ... but it sheds above the floor (VRS) as ever.
+  {
+    Rig r = ProdRig(2, 2);
+    r.Run(10, 10.0);
+    for (int i = 0; i < 30; ++i) r.Frame(i % 8 == 0 ? 20.0 : 10.0);
+    CHECK(r.Changes() == 1 && r.Last().change.reason == m::Reason::kGpuTail && r.Last().change.to_vrs == 1 && !r.Last().change.below_floor,
+          "the tail rule sheds VRS 1 (%d changes)", r.Changes());
+  }
+  // floor_shed_frames = 0: the old rules everywhere (the tail below the floor, the median at once).
+  {
+    Rig r = AtVrsMaxFloor2();
+    r.p.floor_shed_frames = 0;
+    for (int i = 0; i < 30; ++i) r.Frame(i % 8 == 0 ? 20.0 : 10.0);
+    CHECK(r.Last().change.reason == m::Reason::kGpuTail && r.c.Current() == (m::State{1, 2}) && !r.Last().change.below_floor, "off: the tail rule takes tier 1");
+    Rig q = AtVrsMaxFloor2();
+    q.p.floor_shed_frames = 0;
+    const int first = q.Run(10, 18.0);
+    CHECK(first == 2 && q.c.Current() == (m::State{1, 2}), "off: the median at once (frame %d)", first);
+  }
+  // The pin and the cap are not judged by any of it.
+  {
+    Rig r = AtVrsMaxFloor2();
+    r.p.force_level = 3;
+    r.Frame(10.0);
+    CHECK(r.c.Current() == (m::State{1, 2}), "a pin goes below the floor at once");
+    r.p.force_level = -1;
+    r.p.max_level = 2;
+    r.Frame(10.0);
+    CHECK(r.c.Current() == (m::State{2, 2}), "the cap takes it back");
+  }
+}
+
+void TestBelowFloorBounce() {
+  // (2) A restore from tier 1 back up to the floor is the normal one (4 s); a shed to tier 1 again within 30 s of it, whatever came in
+  // between (the VRS restores), is a bounce: the restore delay out of tier 1 doubles. A shed after 30 s is not.
+  auto overload = [](Rig& r) {
+    r.Run(5, 10.0);
+    r.Run(60, 18.0);
+  };
+  auto calm_until_tier = [](Rig& r, int tier, double max_s) {
+    const int64_t t0 = r.now;
+    while (r.c.Tier() != tier && double(r.now - t0) / kSec < max_s) r.Frame(10.0);
+  };
+  for (const double calm_s : {20.0, 40.0}) {
+    Rig r = ProdRig(2, 2);
+    overload(r);
+    CHECK(r.c.Current() == (m::State{1, 2}) && !r.Last().change.bounce && r.D(3) == 0, "the first shed to tier 1 is no bounce");
+    const size_t shed1 = r.events.size() - 1;
+    calm_until_tier(r, 2, 20.0);
+    CHECK(r.Last().change.kind == m::Kind::kRestore && r.Last().change.from_tier == 1 && r.Last().change.to_tier == 2, "restored to tier 2");
+    const double restore_gap = double(r.Last().ns - r.events[shed1].ns) / kSec;
+    CHECK(restore_gap >= 4.0 && restore_gap < 6.0, "the first restore is the normal one: %.1f s after the shed", restore_gap);
+    const int64_t restored_at = r.Last().ns;
+    r.Seconds(calm_s, 10.0);  // the VRS restores come in between
+    CHECK(r.c.Current() == (m::State{2, 0}), "back at the base");
+    overload(r);
+    const bool within = double(r.Last().ns - restored_at) / kSec <= 30.0;
+    CHECK(r.c.Current() == (m::State{1, 2}) && r.Last().change.to_tier == 1, "tier 1 again");
+    CHECK(within == (calm_s < 30.0), "the shed came %.1f s after the restore", double(r.Last().ns - restored_at) / kSec);
+    if (within) {
+      CHECK(r.Last().change.bounce && r.D(3) == 1 && std::fabs(r.Delay(3) - 8.0) < 1e-9, "within 30 s: a bounce, the delay out of tier 1 doubles (%d, %.1f s)", r.D(3), r.Delay(3));
+      const size_t shed2 = r.events.size() - 1;
+      // 6 s of calm are not enough now, the restore comes after the 8 s.
+      r.Seconds(6.0, 10.0);
+      CHECK(r.c.Tier() == 1, "no restore after 6 s");
+      calm_until_tier(r, 2, 10.0);
+      const double gap = double(r.Last().ns - r.events[shed2].ns) / kSec;
+      CHECK(r.c.Tier() == 2 && gap >= 8.0 && gap < 10.0, "restored %.1f s after the shed (8 s)", gap);
+    } else {
+      CHECK(!r.Last().change.bounce && r.D(3) == 0 && std::fabs(r.Delay(3) - 4.0) < 1e-9, "after 30 s: no bounce, the delay stays 4 s");
+    }
+  }
+  // The 2 s window above the floor is as it was: a VRS restore shed again after 10 s is no bounce.
+  {
+    Rig r = ProdRig(2, 2);
+    r.p.force_level = 1;
+    r.Run(5, 10.0);
+    r.p.force_level = -1;
+    r.Seconds(5.0, 10.0);
+    CHECK(r.c.Current() == (m::State{2, 0}), "VRS restored");
+    r.Seconds(10.0, 10.0);
+    r.Run(5, 18.0);
+    CHECK(r.c.Vrs() == 1 && !r.Last().change.bounce, "10 s later: no bounce above the floor");
+  }
+  // The restores of the rungs below a deeper floor are told apart: floor 3, (2, 2) and (1, 2) each have their own window.
+  {
+    Rig r = ProdRig(3, 3);
+    overload(r);
+    CHECK(r.c.Current() == (m::State{1, 2}), "floor 3, down to tier 1");
+    calm_until_tier(r, 2, 20.0);
+    calm_until_tier(r, 3, 20.0);
+    CHECK(r.c.Tier() == 3, "back at the floor tier");
+    r.Seconds(2.0, 10.0);
+    overload(r);  // sheds (3,1) (3,2), then (2,2) and (1,2)
+    int bounces = 0;
+    for (const auto& e : r.events) bounces += e.change.bounce && e.change.kind == m::Kind::kShed ? 1 : 0;
+    CHECK(r.c.Current() == (m::State{1, 2}) && bounces == 2, "both below-the-floor rungs bounced (%d)", bounces);
+  }
+}
+
+// ---- learning windows with a spike -----------------------------------------------------------------------------------------------
+
+struct LearnRun {
+  int step_frame = -1;
+  size_t learns = 0;
+  int discards = 0;
+  bool learned = false;
+  double learned_ms = -1.0;
+  bool discard_seen = false, discard_before = false;
+  double discard_p50 = 0.0, discard_max = 0.0;
+  int discard_tier = 0;
+  double after_pin_ms = -1.0;
+  int after_pin_n = 0;
+};
+// Floor 1, ceiling 2: the enrichment into tier 2 (a plant that really takes 0.7 ms for it) at ~10 s and its measurement; sample `spike_at`
+// (a frame index; -1 = none) is `spike_ms` instead. Then a pin steps tier 2 -> 1, a second, clean measurement.
+LearnRun RunLearn(int spike_at, double spike_ms) {
+  Rig r = ProdRig(1, 2);
+  TierPlant plant;
+  plant.cost[2] = 0.7;
+  plant.noise = 0.15;
+  LearnRun out;
+  for (int i = 0; i < 1500; ++i) {  // 25 s
+    double v = plant.Next(r.c.Current());
+    if (i == spike_at) v = spike_ms;
+    r.Frame(v);
+  }
+  out.step_frame = r.events.empty() ? -1 : r.events[0].frame;
+  out.learns = r.learns.size();
+  out.discards = r.c.LearnDiscarded();
+  out.learned = r.c.HasLearned(2);
+  out.learned_ms = r.c.LearnedMs(2);
+  for (const auto& e : r.discards) {
+    if (!out.discard_seen) {
+      out.discard_seen = true;
+      out.discard_before = e.change.learn_discard_before;
+      out.discard_p50 = e.change.learn_discard_p50_ms;
+      out.discard_max = e.change.learn_discard_max_ms;
+      out.discard_tier = e.change.learn_discard_tier;
+    }
+  }
+  r.p.force_level = 0;  // tier 2 -> 1 by a pin: a clean measurement, folded in
+  for (int i = 0; i < 480; ++i) r.Frame(plant.Next(r.c.Current()));
+  out.after_pin_n = r.c.LearnedCount(2);
+  out.after_pin_ms = r.c.LearnedMs(2);
+  return out;
+}
+
+void TestLearningIgnoresSpikes() {
+  // (d) a one-off spike (a scene snap, a hitch) in either window throws the measurement away; the EMA is only fed by clean ones.
+  const LearnRun base = RunLearn(-1, 0.0);
+  CHECK(base.step_frame > 0 && base.learns == 1 && base.discards == 0 && base.learned && std::fabs(base.learned_ms - 0.7) < 0.12,
+        "no spike: learned +%.2f ms (%zu measurements, %d discarded)", base.learned_ms, base.learns, base.discards);
+  CHECK(base.after_pin_n == 2 && std::fabs(base.after_pin_ms - 0.7) < 0.15, "and the pin's measurement folds in: %d samples, %.2f ms", base.after_pin_n, base.after_pin_ms);
+  const LearnRun after = RunLearn(base.step_frame + 90, 19.0);  // 1.5 s after the step: in the window of 0.5 .. 3.5 s
+  CHECK(after.step_frame == base.step_frame, "the spike does not move the step");
+  CHECK(after.learns == 0 && after.discards == 1 && !after.learned && after.discard_seen && !after.discard_before && after.discard_tier == 2 && after.discard_max > 18.5 &&
+            after.discard_p50 < 11.0,
+        "a spike after the step: nothing learned (%zu), %d discarded (the window after: %.1f ms vs p50 %.1f)", after.learns, after.discards, after.discard_max, after.discard_p50);
+  CHECK(after.after_pin_n == 1 && std::fabs(after.after_pin_ms - 0.7) < 0.15, "the next clean measurement is the first one folded: %d, %.2f ms", after.after_pin_n, after.after_pin_ms);
+  const LearnRun before = RunLearn(base.step_frame - 90, 19.0);  // 1.5 s before: in the window of 3.1 .. 0.1 s before
+  CHECK(before.step_frame == base.step_frame, "the spike does not move the step");
+  CHECK(before.learns == 0 && before.discards == 1 && !before.learned && before.discard_seen && before.discard_before && before.discard_max > 18.5,
+        "a spike before the step: nothing learned (%zu), %d discarded (the window before)", before.learns, before.discards);
+  CHECK(before.after_pin_n == 1 && std::fabs(before.after_pin_ms - 0.7) < 0.15, "and the next clean one folds: %d, %.2f ms", before.after_pin_n, before.after_pin_ms);
+  // A bump below 1.5x the median (13 ms on 9.7) is no spike: the measurement stands.
+  const LearnRun mild = RunLearn(base.step_frame + 90, 13.0);
+  CHECK(mild.learns == 1 && mild.discards == 0 && mild.learned && std::fabs(mild.learned_ms - 0.7) < 0.12, "a bump under 1.5x: measured (%zu, %d discarded, %.2f ms)", mild.learns,
+        mild.discards, mild.learned_ms);
+  // A spike outside both windows (the first 0.5 s after the step, which are skipped anyway, or later than 3.5 s) is nothing.
+  const LearnRun outside = RunLearn(base.step_frame + 240, 19.0);
+  CHECK(outside.learns == 1 && outside.discards == 0 && outside.learned, "a spike 4 s after the step: outside the windows (%zu, %d)", outside.learns, outside.discards);
+  // The spike does not inflate what a level change would: a pre-snap window at 9.7 ms and a post-snap one at 11.1 (scene +1.4 ms) with the
+  // snap's own spike in it: discarded, so the tier does not learn +1.4 ms for a change that was the scene's.
+  {
+    Rig r = ProdRig(1, 2);
+    TierPlant plant;
+    plant.cost[2] = 0.3;
+    plant.noise = 0.15;
+    for (int i = 0; i < 1500; ++i) {
+      if (!r.events.empty()) {  // the scene snaps 1.5 s after the step: +1.4 ms for good, and one 19 ms frame
+        const int since = i - r.events[0].frame;
+        plant.base = since >= 90 ? 10.4 : 9.0;
+      }
+      double v = plant.Next(r.c.Current());
+      if (!r.events.empty() && i == r.events[0].frame + 90) v = 19.0;
+      r.Frame(v);
+    }
+    CHECK(r.c.LearnDiscarded() == 1 && !r.c.HasLearned(2) && r.c.PredictedCostMs(2, r.p) == r.p.tier_est_ms[2],
+          "a snap in the after window: the tier does not learn the scene's +1.4 ms (discarded %d, learned %d)", r.c.LearnDiscarded(), int(r.c.HasLearned(2)));
+  }
+}
+
+// ---- compile bursts ------------------------------------------------------------------------------------------------------------
+
+constexpr int64_t kMs = 1'000'000;
+
+m::CompileCounters Counters(uint32_t pipelines, uint32_t shaders, int32_t pending = 0) {
+  m::CompileCounters c;
+  c.valid = true;
+  c.pipelines = pipelines;
+  c.shaders = shaders;
+  c.pending = pending;
+  return c;
+}
+
+void TestCompileWatch() {
+  const int64_t quiet = 500 * kMs;
+  // No symbols: never a burst.
+  {
+    m::CompileWatch w;
+    bool any = false;
+    for (int i = 0; i < 100; ++i) {
+      const auto r = w.Update(int64_t(i) * 16 * kMs, m::CompileCounters{}, quiet);
+      any = any || r.active || r.started || r.ended;
+    }
+    CHECK(!any && !w.Active(), "no symbols: no signal");
+  }
+  // The first look only takes the values; growth starts a burst; it ends `quiet` after the last growth.
+  {
+    m::CompileWatch w;
+    auto r = w.Update(0, Counters(120, 300), quiet);
+    CHECK(!r.active && !r.started, "the counters' first value is not a burst");
+    r = w.Update(100 * kMs, Counters(120, 300), quiet);
+    CHECK(!r.active, "still");
+    r = w.Update(1000 * kMs, Counters(123, 300), quiet);
+    CHECK(r.active && r.started && !r.ended && r.pipelines == 3 && r.shaders == 0, "3 pipelines: a burst starts (%u)", r.pipelines);
+    r = w.Update(1200 * kMs, Counters(124, 305), quiet);
+    CHECK(r.active && !r.started && r.pipelines == 4 && r.shaders == 5, "growth inside it adds up: %u pipelines %u shaders", r.pipelines, r.shaders);
+    r = w.Update(1600 * kMs, Counters(124, 305), quiet);
+    CHECK(r.active, "400 ms after the last growth: still active");
+    r = w.Update(1700 * kMs, Counters(124, 305), quiet);
+    CHECK(r.active && !r.ended, "exactly 500 ms: still active");
+    r = w.Update(1716 * kMs, Counters(124, 305), quiet);
+    CHECK(!r.active && r.ended && r.pipelines == 4 && r.shaders == 5 && r.duration_ns == 700 * kMs, "516 ms: over; %u pipelines %u shaders over %.0f ms", r.pipelines,
+          r.shaders, double(r.duration_ns) / 1e6);
+    r = w.Update(1732 * kMs, Counters(124, 305), quiet);
+    CHECK(!r.active && !r.ended && !w.Active(), "and it does not end twice");
+    // Shaders alone start one too.
+    r = w.Update(5000 * kMs, Counters(124, 306), quiet);
+    CHECK(r.active && r.started && r.pipelines == 0 && r.shaders == 1, "a shader translation alone");
+  }
+  // An asynchronous creation in flight keeps it active past the quiet time, whatever the counters do.
+  {
+    m::CompileWatch w;
+    w.Update(0, Counters(10, 10), quiet);
+    auto r = w.Update(1000 * kMs, Counters(10, 10, 2), quiet);
+    CHECK(r.active && r.started && r.pipelines == 0, "pending > 0 starts one with no growth");
+    r = w.Update(6000 * kMs, Counters(10, 10, 1), quiet);
+    CHECK(r.active && !r.ended, "5 s later, one still in flight");
+    r = w.Update(6016 * kMs, Counters(10, 10, 0), quiet);
+    CHECK(!r.active && r.ended && r.duration_ns == 5000 * kMs, "it ends at the first call with none in flight (%.0f ms)", double(r.duration_ns) / 1e6);
+    // growth at 10 s, one in flight until 11 s: the quiet time is over at 10.5 s, the pending keeps it
+    r = w.Update(10000 * kMs, Counters(11, 10, 1), quiet);
+    CHECK(r.active && r.started, "growth with one in flight");
+    r = w.Update(10900 * kMs, Counters(11, 10, 1), quiet);
+    CHECK(r.active && !r.ended, "past the quiet time with one in flight: active");
+    r = w.Update(11000 * kMs, Counters(11, 10, 0), quiet);
+    CHECK(!r.active && r.ended, "none in flight and the quiet time over: ended");
+  }
+  // quiet 0: only the call that sees the growth (and pending) counts. A wrapped counter is growth. A negative quiet reads as 0.
+  {
+    m::CompileWatch w;
+    w.Update(0, Counters(5, 5), 0);
+    auto r = w.Update(100 * kMs, Counters(6, 5), 0);
+    CHECK(r.active && r.started, "quiet 0: the call that sees the growth");
+    r = w.Update(116 * kMs, Counters(6, 5), -50 * kMs);
+    CHECK(!r.active && r.ended, "and not the next (a negative quiet is 0)");
+    m::CompileWatch x;
+    x.Update(0, Counters(0xFFFFFFFFu, 0), quiet);
+    r = x.Update(16 * kMs, Counters(1, 0), quiet);
+    CHECK(r.active && r.started && r.pipelines == 2, "a counter that wraps: growth of 2 (%u)", r.pipelines);
+  }
+  // The symbols vanish during a burst (the SDK was swapped): it ends.
+  {
+    m::CompileWatch w;
+    w.Update(0, Counters(1, 1), quiet);
+    w.Update(100 * kMs, Counters(2, 1), quiet);
+    const auto r = w.Update(200 * kMs, m::CompileCounters{}, quiet);
+    CHECK(!r.active && r.ended && !w.Active(), "no signal any more: over");
+  }
+}
+
+void TestExcuseBudget() {
+  const int64_t cap = 4'000 * kMs, window = 20'000 * kMs;
+  const int64_t t0 = 100'000 * kMs;
+  m::ExcuseBudget b;
+  int excused = 0;
+  int64_t charged = 0, total = 0;
+  for (int i = 1; i <= 100; ++i) {  // 100 ms frames for 10 s
+    if (b.Excuse(t0 + int64_t(i) * 100 * kMs, 100 * kMs, cap, window, &charged)) ++excused;
+    total += charged;
+  }
+  CHECK(excused == 40 && total == cap && b.Used(t0 + 10'000 * kMs, window) == cap, "4 s of 100 ms frames: %d excused, %.2f s charged", excused, double(total) / 1e9);
+  CHECK(!b.Excuse(t0 + 10'100 * kMs, 100 * kMs, cap, window, &charged) && charged == 0, "the next one is not");
+  // The window slides: at 20.2 s the first frame (it ended at 0.1 s) is out: 100 ms of budget, one frame.
+  CHECK(b.Used(t0 + 20'050 * kMs, window) == cap, "at 20.05 s the first charge (ended 0.1 s) is still inside");
+  CHECK(b.Used(t0 + 20'150 * kMs, window) == cap - 100 * kMs, "at 20.15 s it is out: %.1f s", double(b.Used(t0 + 20'150 * kMs, window)) / 1e9);
+  CHECK(b.Excuse(t0 + 20'150 * kMs, 100 * kMs, cap, window, &charged) && charged == 100 * kMs && !b.Excuse(t0 + 20'160 * kMs, 100 * kMs, cap, window), "one frame's worth is back");
+  // Well after the window all of it is back.
+  CHECK(b.Used(t0 + 60'000 * kMs, window) == 0 && b.Excuse(t0 + 60'000 * kMs, 100 * kMs, cap, window), "a minute later: empty");
+  // A frame that does not fit whole is charged what is left (the cap is exact); 0 cap never excuses; a zero-length frame is excused free.
+  m::ExcuseBudget c;
+  CHECK(c.Excuse(1000 * kMs, 100 * kMs, 250 * kMs, window, &charged) && charged == 100 * kMs, "1st");
+  CHECK(c.Excuse(1100 * kMs, 100 * kMs, 250 * kMs, window, &charged) && charged == 100 * kMs, "2nd");
+  CHECK(c.Excuse(1200 * kMs, 100 * kMs, 250 * kMs, window, &charged) && charged == 50 * kMs, "3rd: what is left");
+  CHECK(!c.Excuse(1300 * kMs, 100 * kMs, 250 * kMs, window, &charged) && charged == 0 && c.Used(1300 * kMs, window) == 250 * kMs, "then none: the cap is exact");
+  m::ExcuseBudget z;
+  CHECK(!z.Excuse(0, 100 * kMs, 0, window), "cap 0: never");
+  CHECK(z.Excuse(0, 0, cap, window, &charged) && charged == 0, "a zero-length frame is excused and charged nothing");
+  c.Reset();
+  CHECK(c.Used(1300 * kMs, window) == 0, "reset");
+}
+
+// The governor's own rules: an excused frame's sample and missed flag are not fed into the shed rules.
+void TestCompileExcuse() {
+  // (1) A burst of samples over the line is excused; the same without the flag (or with the excuse off) sheds at once.
+  {
+    Rig r;
+    r.Seconds(2.0, 10.0);
+    r.compile = true;
+    r.Seconds(2.0, 17.0);
+    CHECK(r.Changes() == 0 && r.c.CompileExcused(), "2 s of 17 ms inside a burst: no shed");
+    r.compile = false;
+    r.Seconds(3.0, 10.0);
+    CHECK(r.Changes() == 0 && r.c.Level() == 0 && !r.c.CompileExcused(), "and none after it");
+    Rig a;
+    a.Seconds(2.0, 10.0);
+    CHECK(a.Seconds(2.0, 17.0) == 2, "the control, no burst: the 3rd sample sheds");
+    Rig b;
+    b.p.compile_excuse_s = 0.0;
+    b.Seconds(2.0, 10.0);
+    b.compile = true;
+    CHECK(b.Seconds(2.0, 17.0) == 2 && !b.c.CompileExcused(), "excuse 0 (off): a burst is judged like any time");
+  }
+  // (2) Missed frames inside a burst: two of them do not shed (and the history does not fill up from them).
+  {
+    Rig r;
+    r.Seconds(1.0, 10.0);
+    r.compile = true;
+    r.Seconds(2.0, 10.0, /*missed=*/true);
+    CHECK(r.Changes() == 0, "every frame missed inside a burst: no shed");
+    r.compile = false;
+    r.Seconds(1.0, 10.0);
+    CHECK(r.Changes() == 0, "nor after it");
+    Rig a;
+    a.Seconds(1.0, 10.0);
+    CHECK(a.Seconds(2.0, 10.0, true) == 1 && a.Last().change.reason == m::Reason::kMissedFrames, "the control: the 2nd missed frame sheds");
+  }
+  // (3) What was recorded BEFORE the burst stays: two samples over the line, a burst of 17 ms (ignored), the third real one sheds.
+  {
+    Rig r;
+    r.Seconds(1.0, 10.0);
+    r.Run(2, 17.0);
+    r.compile = true;
+    r.Seconds(2.0, 17.0);
+    r.compile = false;
+    CHECK(r.Changes() == 0, "the burst's samples were not counted");
+    const m::Change ch = r.Frame(17.0);
+    CHECK(ch.changed && ch.reason == m::Reason::kGpuMedian && std::fabs(ch.stat_ms - 17.0) < 1e-9, "the third sample sheds, with the two from before the burst");
+  }
+  // (4) The bound: a 30 s burst of real overload still sheds, once the 4 s are used; the excused time never goes over 4 s in 20 s.
+  {
+    Rig r;
+    r.Seconds(1.0, 10.0);
+    r.compile = true;
+    const int64_t t0 = r.now;
+    int64_t worst = 0;
+    int excused_after_use = 0;
+    int first = -1;
+    for (int i = 0; i < 30 * 60; ++i) {
+      const m::Change ch = r.Frame(17.0);
+      worst = std::max(worst, r.c.CompileExcusedNs(r.now));
+      if (ch.changed && first < 0) first = i;
+      const double t = double(r.now - t0) / kSec;
+      if (t > 4.5 && t < 19.9 && r.c.CompileExcused()) ++excused_after_use;
+    }
+    const double first_s = double(first) * double(kFrameNs) / kSec;
+    CHECK(first >= 0 && first_s >= 4.0 && first_s <= 4.3, "the first shed comes after the 4 s of excuse and 3 samples: %.2f s into the burst", first_s);
+    CHECK(worst <= 4'000'000'000 && worst >= 3'900'000'000, "the excused time in any 20 s peaks at %.3f s (cap 4.0)", double(worst) / 1e9);
+    CHECK(excused_after_use == 0, "no frame is excused between 4.5 s and 19.9 s of a continuous burst (%d)", excused_after_use);
+    CHECK(r.c.Level() == 3 && r.c.HoldAllowed(r.p), "after 30 s of it the ladder is at its last rung and the hold is allowed");
+    std::printf("compile burst, 30 s of 17 ms: first shed at %.2f s, level %d, excused peak %.3f s\n", first_s, r.c.Level(), double(worst) / 1e9);
+  }
+  // (5) The budget is a sliding 20 s: a second burst 10 s after the first has nothing, one 25 s after it has its 4 s again.
+  for (const double gap : {5.0, 25.0}) {
+    Rig r;
+    r.Seconds(1.0, 10.0);
+    r.compile = true;
+    r.Seconds(6.0, 10.0);  // calm samples: the 4 s are used (up to ~4.0 s of the 6)
+    r.compile = false;
+    r.Seconds(gap, 10.0);
+    r.compile = true;
+    const int first = r.Seconds(8.0, 17.0);
+    if (gap < 10.0) {
+      CHECK(first >= 0 && first <= 3, "a burst 5 s after the first: no budget, the 3rd sample sheds (frame %d)", first);
+    } else {
+      const double s = double(first) * double(kFrameNs) / kSec;
+      CHECK(first >= 0 && s >= 3.9 && s <= 4.3, "a burst 25 s after: the budget is back: first shed %.2f s into it", s);
+    }
+  }
+  // (6) Only while driving, outside a grace: a burst during a pause or a load is neither excused nor charged.
+  {
+    Rig r;
+    r.Seconds(1.0, 10.0);
+    r.driving = false;
+    r.compile = true;
+    r.Seconds(10.0, 10.0);
+    CHECK(r.c.CompileExcusedTotalNs() == 0 && !r.c.CompileExcused(), "a 10 s burst while not driving: nothing excused, nothing charged");
+    r.driving = true;
+    const int first = r.Seconds(10.0, 17.0);  // the grace (60 frames), then 4 s of excuse, then 3 samples
+    CHECK(first >= 295 && first <= 310, "driving again: the grace, then the full 4 s of excuse, then the shed (frame %d)", first);
+    CHECK(r.c.CompileExcusedTotalNs() <= 4'000'000'000 && r.c.CompileExcusedTotalNs() >= 3'900'000'000, "charged %.3f s", double(r.c.CompileExcusedTotalNs()) / 1e9);
+  }
+  // (7) A burst is not calm: it starts the quiet timer over, so the restore comes a full delay after it, not after the shed.
+  {
+    Rig r;
+    r.SetAtLevel1();
+    r.Seconds(3.0, 9.0);  // 1 s from a restore
+    r.compile = true;
+    r.Seconds(0.5, 9.0);
+    r.compile = false;
+    const int64_t burst_end = r.now;
+    CHECK(r.Changes() == 1, "no restore inside the burst");
+    r.Seconds(8.0, 9.0);
+    CHECK(r.Changes() == 2 && r.Last().change.kind == m::Kind::kRestore, "restored");
+    const double after = double(r.Last().ns - burst_end) / kSec;
+    CHECK(after >= 3.9 && after <= 4.2, "the restore comes 4 s after the burst, not 1 s: %.2f s", after);
+    Rig e = ProdRig(1, 2);
+    e.Seconds(8.0, 9.0);
+    e.compile = true;
+    e.Seconds(0.5, 9.0);
+    e.compile = false;
+    CHECK(e.Seconds(9.8, 9.0) < 0 && e.Seconds(0.8, 9.0) >= 0 && e.c.Tier() == 2, "an enrichment waits its 10 s from the end of a burst too");
+  }
+  // (8) The grace is not charged, a pin and the cap are not held back, the summary counts it.
+  {
+    Rig r;
+    r.Run(10, 10.0);
+    r.c.TakeWindow(r.now);
+    r.compile = true;
+    r.Seconds(6.0, 10.0);
+    const m::Window w = r.c.TakeWindow(r.now);
+    CHECK(std::abs(int(w.compile_frames) - 240) <= 2 && std::fabs(double(w.compile_excused_ns) / 1e9 - 4.0) < 0.02 && std::abs(int(w.compile_denied) - 120) <= 2,
+          "the summary: %u frames excused (%.2f s), %u judged anyway", w.compile_frames, double(w.compile_excused_ns) / 1e9, w.compile_denied);
+    Rig f;
+    f.Run(10, 10.0);
+    f.compile = true;
+    f.Frame(10.0);
+    f.p.force_level = 2;
+    const m::Change pin = f.Frame(10.0);
+    CHECK(f.c.CompileExcused() && pin.changed && pin.reason == m::Reason::kForced && pin.to == 2, "a pin goes through a burst");
   }
 }
 
@@ -1800,6 +2604,18 @@ int main() {
   TestBackoff();
   TestBackoffDecay();
   TestNoOscillation();
+  TestAutoFloor();
+  TestFloor2ShedOrder();
+  TestFloor2NoAaFlicker();
+  TestFloor2PinnedAa();
+  TestSceneTourBelowFloor();
+  TestSustainedOverloadBelowFloor();
+  TestBelowFloorMissedAndTail();
+  TestBelowFloorBounce();
+  TestLearningIgnoresSpikes();
+  TestCompileWatch();
+  TestExcuseBudget();
+  TestCompileExcuse();
   TestClosedLoopConverges();
   TestClosedLoopDvfs();
   std::printf("%d checks, %d failed\n", g_checks, g_failed);

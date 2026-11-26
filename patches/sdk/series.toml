@@ -989,6 +989,15 @@ purpose = "ui_overlay_active_when_drawn: the UI overlay counts as shown only whi
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0590-pipeline-creation-export"
+source = "local"
+path = "patches/sdk/0590-pipeline-creation-export.patch"
+sha256 = "5695bc56ed1f421599e0e994d29929b63629459005fdcd1033911584a2f3601a"
+purpose = "Exports rexgpu_pipeline_creations / rexgpu_shader_translations / rexgpu_pipelines_pending (run-time pipeline creation and shader translation, async in flight) and a [pipelines] log line; the game excuses shader-compile bursts from its shed and hold rules. No behaviour change."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]

@@ -259,7 +259,12 @@ inline int HoldSeconds(int prev_hold_s, double since_end_s, int min_s, int max_s
 //     as driving, as before the screen was known;
 //   * grace_s seconds after a hold ends, and after a menu closes, nothing is judged (GPU clocks and queues settle);
 //   * a hold needs `windows` high windows IN A ROW (a window that is not high resets the count);
-//   * and only when the governor has nothing left to shed (`allowed`); otherwise the verdict is `deferred`.
+//   * and only when the governor has nothing left to shed (`allowed`); otherwise the verdict is `deferred`;
+//   * a high window that a SHADER-COMPILE BURST overlapped (`compile` of Tick, mcla::gov::CompileBurstActive) is not judged: a stretch
+//     of run-time pipeline creations stalls the frames for the compiler's sake, and no hold helps that. It neither advances nor
+//     resets the high-window count (it is as if the window had not happened), and it is counted as `not judged: compile`. Bounded, so
+//     a real overload still holds: within one run of consecutive high windows at most rule.compile_windows are excused (the third
+//     high window of the default two is judged); a window that is not high, a menu, a grace and a hold start the allowance over.
 // Pure: time comes in as a number, so the tests drive it with a made-up clock. The caller owns the cvars (HoldRule),
 // the hold in force and its length memory (prev_hold_s / since_end_s), the log lines and the rate limit of `deferred`.
 
@@ -271,6 +276,7 @@ struct HoldRule {
   int min_s = 6;      // mcla_sim_hold30_min_s: the first hold
   int max_s = 30;     // mcla_sim_hold30_s: the longest hold; 0 = never hold
   int calm_s = 30;    // mcla_sim_calm_s: seconds after a hold before the next one starts short again
+  int compile_windows = 2;  // mcla_compile_excuse_s / window_s (4.0 s / 2 s): high windows of a run a compile burst may excuse; 0 = none
 };
 
 struct HoldVerdict {
@@ -279,7 +285,9 @@ struct HoldVerdict {
   bool start_hold = false;    // start a hold of hold_s seconds now
   int hold_s = 0;
   bool deferred = false;      // a hold is due but the governor still has room: do not start
-  int streak = 0;             // consecutive high windows including this one
+  bool excused = false;       // a high window not judged: a compile burst overlapped it (high is still true, streak unchanged)
+  int excused_in_run = 0;     // high windows of the current run excused so far, this one included
+  int streak = 0;             // consecutive judged high windows including this one
   uint64_t frames = 0, missed = 0;  // the judged window
   double window_s = 0.0;
 };
@@ -292,8 +300,10 @@ struct HoldJudge {
   int streak = 0;
   int64_t grace_until_ns = 0;
   bool was_menu = false;
-  // Engine frames not judged (one count a Tick), for the 5 s log line (TakeSkipped).
-  uint64_t skipped_menu = 0, skipped_grace = 0, skipped_hold = 0;
+  bool window_compile = false;  // a compile burst was active during the window in progress
+  int excused_in_run = 0;       // high windows of the current run of them excused for a compile burst
+  // Engine frames not judged (one count a Tick; compile: the frames of the excused windows), for the 5 s log line (TakeSkipped).
+  uint64_t skipped_menu = 0, skipped_grace = 0, skipped_hold = 0, skipped_compile = 0;
 
   // One frame of the 60 step (the world step quantiser ran): `missed_step` = n >= 2 and not a resync.
   void NoteStep(bool missed_step) {
@@ -305,30 +315,39 @@ struct HoldJudge {
     started = true;
     window_start_ns = now_ns;
     frames = missed = 0;
+    window_compile = false;
   }
   // The hold in force ran out: grace_s seconds of nothing, then a fresh window.
   void EndHold(int64_t now_ns, int grace_s) {
     grace_until_ns = std::max(grace_until_ns, now_ns + int64_t(std::max(0, grace_s)) * 1'000'000'000);
     streak = 0;
+    excused_in_run = 0;
     Restart(now_ns);
   }
   // The skipped-frame counts since the last call (and clears them).
-  void TakeSkipped(uint64_t* menu, uint64_t* grace, uint64_t* hold) {
+  void TakeSkipped(uint64_t* menu, uint64_t* grace, uint64_t* hold, uint64_t* compile) {
     *menu = skipped_menu;
     *grace = skipped_grace;
     *hold = skipped_hold;
-    skipped_menu = skipped_grace = skipped_hold = 0;
+    *compile = skipped_compile;
+    skipped_menu = skipped_grace = skipped_hold = skipped_compile = 0;
+  }
+  void TakeSkipped(uint64_t* menu, uint64_t* grace, uint64_t* hold) {
+    uint64_t compile = 0;
+    TakeSkipped(menu, grace, hold, &compile);
   }
 
   // Once per engine frame, before that frame's step is noted. `menu` = ProfileMode() == 1; `hold_active` = a hold (30 or
   // the 120 -> 60 tier) is in force; `allowed` = mcla::gov::HoldAllowed(); `prev_hold_s` / `since_end_s` = the length of
-  // the previous hold and the seconds since it ended (1e9 = never), for HoldSeconds.
+  // the previous hold and the seconds since it ended (1e9 = never), for HoldSeconds; `compile` = a shader-compile burst is active now
+  // (mcla::gov::CompileBurstActive; false = no signal).
   HoldVerdict Tick(int64_t now_ns, bool menu, bool hold_active, bool allowed, int prev_hold_s, double since_end_s,
-                   const HoldRule& rule) {
+                   const HoldRule& rule, bool compile = false) {
     HoldVerdict v;
     if (hold_active) {  // it runs out normally; its frames are not judged
       ++skipped_hold;
       streak = 0;
+      excused_in_run = 0;
       was_menu = menu;
       Restart(now_ns);
       return v;
@@ -336,6 +355,7 @@ struct HoldJudge {
     if (menu) {  // a menu: never judged, and the window starts over when it closes
       ++skipped_menu;
       streak = 0;
+      excused_in_run = 0;
       was_menu = true;
       Restart(now_ns);
       return v;
@@ -347,6 +367,7 @@ struct HoldJudge {
     if (now_ns < grace_until_ns) {
       ++skipped_grace;
       streak = 0;
+      excused_in_run = 0;
       Restart(now_ns);
       return v;
     }
@@ -354,19 +375,32 @@ struct HoldJudge {
       Restart(now_ns);
       return v;
     }
+    if (compile) window_compile = true;
     const int64_t window_ns = int64_t(std::max(1, rule.window_s)) * 1'000'000'000;
     if (now_ns - window_start_ns < window_ns) return v;
     v.window_ended = true;
     v.frames = frames;
     v.missed = missed;
     v.window_s = double(now_ns - window_start_ns) / 1e9;
+    const bool compile_seen = window_compile;
     Restart(now_ns);
     // Fewer than 30 frames of the 60 step in a window decide nothing (and break a run of high windows).
     v.high = v.frames >= 30 && v.missed * 100 > v.frames * uint64_t(std::max(0, rule.miss_pct));
     if (!v.high) {
       streak = 0;
+      excused_in_run = 0;  // the run of high windows is over: the allowance starts again
       return v;
     }
+    // A compile burst overlapped it: not judged, within the allowance of the run (the streak stays as it was).
+    if (compile_seen && excused_in_run < std::max(0, rule.compile_windows)) {
+      ++excused_in_run;
+      skipped_compile += v.frames;
+      v.excused = true;
+      v.excused_in_run = excused_in_run;
+      v.streak = streak;
+      return v;
+    }
+    v.excused_in_run = excused_in_run;
     const int need = std::max(1, rule.windows);
     streak = std::min(streak + 1, need);
     v.streak = streak;
@@ -377,7 +411,7 @@ struct HoldJudge {
     }
     v.hold_s = HoldSeconds(prev_hold_s, since_end_s, rule.min_s, rule.max_s, rule.calm_s);
     v.start_hold = v.hold_s > 0;
-    if (v.start_hold) streak = 0;
+    if (v.start_hold) streak = excused_in_run = 0;
     return v;
   }
 };

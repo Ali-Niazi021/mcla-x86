@@ -43,8 +43,9 @@
 //                              the shipped detail plus FXAA, ultra = quality with 1.5x distances), applied once at first use
 //                              as app defaults; a knob set by hand wins (see ApplyPreset)
 //   mcla_gfx_tier             -1 = off (the knobs above rule); 0..5 = a run-time detail tier for the frame-rate governor: a row of
-//                              the table at ApplyTier overrides the live knobs and swap_post_effect, applied on the next engine
-//                              frame; back at -1 the knobs go back to what they were. Tiers() / CurrentTier() in mcla_gfx_tune.h
+//                              the table at ApplyTier sets the defaults (SetDefaultValue) of the live knobs and swap_post_effect,
+//                              applied on the next engine frame, never over a knob the player set, never saved to the config; back
+//                              at -1 the defaults go back to what they were. Tiers() / CurrentTier() in mcla_gfx_tune.h
 // mcla_gfx_dump logs words: 'SPEC/COUNT' joined by '+' (same SPEC), once per change of the string
 // (add '+0/0' to dump again); each line is the address, then 8 words as hex with the float reading.
 #include <algorithm>
@@ -175,13 +176,16 @@ REXCVAR_DEFINE_STRING(mcla_gfx_preset, "", "MCLA",
                       "Logs '[mcla-gfx] preset <name>: ...' once");
 REXCVAR_DEFINE_INT32(mcla_gfx_tier, -1, "MCLA",
                      "MCLA run-time detail tier, for the frame-rate governor: -1 = off (the mcla_gfx_* knob cvars rule). 0..5 = "
-                     "a row of the tier table (higher = more detail) overrides the live knobs mcla_gfx_env_interval, "
+                     "a row of the tier table (higher = more detail) sets the defaults of the live knobs mcla_gfx_env_interval, "
                      "far_cascades_interval, shadow_dist, city_lod, traffic_lod, shadow_mode and swap_post_effect (not "
                      "mcla_gfx_shadow_res, read at world load): 0 = emergency, no sun shadows; 1 = perf; 2 = perf + FXAA; "
                      "3 = shipped distances; 4 = shipped rates (the quality preset's live part); 5 = 1.5x distances (ultra's). "
-                     "Applied on the next engine frame; back at -1 the knobs go back to what they were. Logs "
-                     "'[mcla-gfx] tier N: ...' once per change. Live (mcla_gfx_tune.cpp, ApplyTier)")
-    .range(-1, 5);
+                     "A knob you set yourself (command line, launcher, config file, settings overlay) keeps your value in every "
+                     "tier. Applied on the next engine frame; back at -1 the knobs' defaults go back to what they were. Logs "
+                     "'[mcla-gfx] tier N: ...' once per change. Never saved to the config file (transient). Live (mcla_gfx_tune.cpp, "
+                     "ApplyTier)")
+    .range(-1, 5)
+    .transient();
 REXCVAR_DEFINE_STRING(mcla_gfx_dump, "none", "MCLA",
                       "MCLA debug: log guest words once per change of this string, 'ADDR/COUNT+...' "
                       "(ADDR as in mcla_gfx_poke). Live");
@@ -729,11 +733,14 @@ void ApplyPreset() {
 
 // ---- mcla_gfx_tier ------------------------------------------------------------------------------------------------
 //
-// A run-time detail tier for the frame-rate governor (LOCK60; the contract is in mcla_gfx_tune.h). Unlike a preset (app defaults,
-// applied once) a tier is written with SetFlagByName every time mcla_gfx_tier changes, over whatever the knobs hold, and taken
-// back when it goes to -1. The knobs are the ordinary cvars, so PublishPhaseIntervals, GatherKnobs and the hooks pick the change
-// up unchanged, in the same OnFrame (ApplyTier runs before the knobs are read). mcla_gfx_shadow_res is not in the table: it is
-// read when the shadow map is created (a world load). Higher = more detail; the governor sheds by stepping down.
+// A run-time detail tier for the frame-rate governor (LOCK60; the contract is in mcla_gfx_tune.h). Like a preset a tier is written
+// as the knobs' APP DEFAULTS (rex::cvar::SetDefaultValue), but every time mcla_gfx_tier changes, and it is taken back when it goes
+// to -1. That keeps each cvar's source at kDefault, so a config save never writes a tier, and it lets the player's own choice win:
+// a knob whose source is not kDefault (command line, launcher, config file, settings overlay, console) is skipped, whatever the
+// tier says ('(yours)' in the log line, as the preset's). The knobs are the ordinary cvars, so PublishPhaseIntervals, GatherKnobs and
+// the hooks pick the change up unchanged, in the same OnFrame (ApplyTier runs before the knobs are read). mcla_gfx_shadow_res is
+// not in the table: it is read when the shadow map is created (a world load). Higher = more detail; the governor sheds by stepping
+// down.
 // The columns are kTierCvars; the rows:
 //   0 emergency: no sun shadows (the game's own night path), perf's rates and distances, no AA
 //   1 perf (the live part of the perf preset), no AA
@@ -756,13 +763,14 @@ constexpr const char* kTierValues[kTierMax + 1][kTierKnobCount] = {
 };
 
 struct KnobBefore {
-  std::string value;
-  rex::cvar::Source source = rex::cvar::Source::kDefault;
+  bool captured = false;  // the tier has written this knob's default since the last tier -1
+  std::string value;      // the knob's default (and value, source being kDefault) as it stood just before that first write: the
+                          // preset's app default or the compiled one
 };
 
 int g_tier_last = -1;                // game thread only (OnFrame): the tier written last, -1 = off
 std::atomic<int> g_tier_applied{-1};  // the same, for CurrentTier() from any thread
-KnobBefore g_tier_before[kTierKnobCount];  // the knobs as they were when the tier first left -1
+KnobBefore g_tier_before[kTierKnobCount];  // per knob, game thread only
 
 // Game thread, from OnFrame, before the knobs are read into g_eff and the phase atomics.
 void ApplyTier() {
@@ -772,18 +780,27 @@ void ApplyTier() {
   }
   std::string line;
   if (tier >= 0) {
-    if (g_tier_last < 0) {
-      for (int i = 0; i < kTierKnobCount; ++i) {
-        g_tier_before[i].value = rex::cvar::GetFlagByName(kTierCvars[i]);
-        g_tier_before[i].source = rex::cvar::GetFlagSource(kTierCvars[i]);
-      }
-    }
     for (int i = 0; i < kTierKnobCount; ++i) {
-      const bool ok = rex::cvar::SetFlagByName(kTierCvars[i], kTierValues[tier][i]);
+      const char* cvar = kTierCvars[i];
       line += ' ';
-      line += ShortName(kTierCvars[i]);
+      line += ShortName(cvar);
       line += '=';
-      line += Pretty(rex::cvar::GetFlagByName(kTierCvars[i]));
+      // Set by the player (anything but the default source: command line, launcher, config file, settings overlay, console): the
+      // tier leaves it alone. Checked at every tier change, so a knob the player sets while a tier is on is skipped from then on.
+      if (rex::cvar::GetFlagSource(cvar) != rex::cvar::Source::kDefault) {
+        line += Pretty(rex::cvar::GetFlagByName(cvar));
+        line += "(yours)";
+        continue;
+      }
+      KnobBefore& before = g_tier_before[i];
+      if (!before.captured) {
+        // The first write since the tier was off: the source is kDefault, so the value is the knob's default (a preset's app
+        // default included). That is what tier -1 puts back.
+        before.value = rex::cvar::GetFlagByName(cvar);
+        before.captured = true;
+      }
+      const bool ok = rex::cvar::SetDefaultValue(cvar, kTierValues[tier][i]);
+      line += Pretty(rex::cvar::GetFlagByName(cvar));
       if (!ok) {
         line += "(REJECTED)";
       }
@@ -791,15 +808,16 @@ void ApplyTier() {
     REXLOG_INFO("[mcla-gfx] tier {}:{}", tier, line);
   } else {
     for (int i = 0; i < kTierKnobCount; ++i) {
-      // ResetToDefault goes back to the cvar's own default as SetDefaultValue left it (a preset's app default included, cvar.cpp),
-      // but also drops a value set by hand (command line, config): such a knob is written back as it was.
-      if (g_tier_before[i].source == rex::cvar::Source::kDefault) {
-        rex::cvar::ResetToDefault(kTierCvars[i]);
-      } else {
-        rex::cvar::SetFlagByName(kTierCvars[i], g_tier_before[i].value);
+      KnobBefore& before = g_tier_before[i];
+      if (!before.captured) {
+        continue;  // never written (the player's value all along)
       }
+      // SetDefaultValue on a cvar whose source is kDefault moves its value with the default; on one the player has set since it only
+      // moves the default, the player's value stays.
+      rex::cvar::SetDefaultValue(kTierCvars[i], before.value);
+      before.captured = false;
     }
-    REXLOG_INFO("[mcla-gfx] tier off: knobs back to their defaults");
+    REXLOG_INFO("[mcla-gfx] tier off: knob defaults back to what they were (a knob you set keeps your value)");
   }
   g_tier_last = tier;
   g_tier_applied.store(tier, std::memory_order_relaxed);

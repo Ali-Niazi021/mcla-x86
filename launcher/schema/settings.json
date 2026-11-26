@@ -491,20 +491,32 @@
       "emit": "nondefault"
     },
     {
+      "id": "aa_auto",
+      "label": "Anti-aliasing: automatic",
+      "help": "On (default): the launcher does not set it and the game decides. FXAA, a cheap edge smoother (about 0.3 ms GPU at 1080p), is on with the Quality and Ultra scene-detail presets and, while Adaptive detail is on, with Performance too; Adaptive detail drops it only as a late step if the GPU still cannot hold 60 fps. Without Adaptive detail, Performance has none. Off: you choose below.",
+      "category": "graphics",
+      "type": "bool",
+      "cvar": null,
+      "default": true,
+      "advanced": false,
+      "emit": "never"
+    },
+    {
       "id": "swap_post_effect",
-      "label": "Post-process anti-aliasing (FXAA)",
-      "help": "FXAA over the finished frame (HUD included), about 0.3 ms GPU at 1080p on a Radeon 880M. Smooths the stair-stepped edges the game has without MSAA. Changes while playing (no restart); also runs on the HDR image (not with frame generation).",
+      "label": "Anti-aliasing",
+      "help": "Your choice, passed to the game and kept: neither the scene-detail presets nor Adaptive detail change it. FXAA smooths the stair-stepped edges the game has without MSAA over the finished frame (HUD included), about 0.3 ms GPU at 1080p on a Radeon 880M. Changes while playing (no restart); also runs on the HDR image (not with frame generation).",
       "category": "graphics",
       "type": "enum",
       "cvar": "swap_post_effect",
-      "default": "none",
+      "default": "fxaa",
       "options": [
-        {"value": "none", "label": "Off", "help": "No post-process anti-aliasing."},
+        {"value": "none", "label": "Off", "help": "No post-process anti-aliasing, whatever the scene-detail preset and Adaptive detail would choose."},
         {"value": "fxaa", "label": "FXAA", "help": "Standard FXAA (recommended when there is GPU headroom)."},
         {"value": "fxaa_extreme", "label": "FXAA (extreme)", "help": "Stronger edge search; slightly softer picture, about the same cost."}
       ],
       "advanced": false,
-      "emit": "nondefault"
+      "requires": {"aa_auto": false},
+      "emit": "always"
     },
     {
       "id": "anisotropic_override",
@@ -577,7 +589,7 @@
     {
       "id": "mcla_gfx_tier",
       "label": "Detail tier (run-time)",
-      "help": "One switch for the live scene-detail knobs, used by the frame-rate governor; it overrides the knobs above while set. Changes while playing.",
+      "help": "One switch for the live scene-detail knobs, used by the frame-rate governor (while Adaptive detail is on it owns this: use the ceiling instead). It sets the knobs' defaults: a knob you set yourself keeps your value, and a tier is never saved to the game's config. Changes while playing.",
       "category": "graphics",
       "type": "enum",
       "cvar": "mcla_gfx_tier",
@@ -772,6 +784,35 @@
       "step": 5,
       "advanced": false,
       "requires": {"mcla_fps_target": 60},
+      "emit": "nondefault"
+    },
+    {
+      "id": "mcla_gov",
+      "label": "Adaptive detail",
+      "help": "Keeps 60 fps by itself. When the GPU runs short of time it first gives back any extra detail it had added, then lowers the shading rate where you cannot see it (variable-rate shading), and only last the visible detail below the scene-detail preset. When there is headroom it raises detail again, one step at a time, up to the ceiling below. Knobs you set yourself are left alone.",
+      "category": "performance",
+      "type": "bool",
+      "cvar": "mcla_gov",
+      "default": true,
+      "advanced": false,
+      "requires": {"mcla_fps_target": 60},
+      "emit": "always"
+    },
+    {
+      "id": "mcla_gov_tier_ceiling",
+      "label": "Adaptive detail ceiling",
+      "help": "The most detail Adaptive detail may add when the GPU has headroom. It never goes below the scene-detail preset, and a preset already at or above the ceiling gets no additions.",
+      "category": "performance",
+      "type": "enum",
+      "cvar": "mcla_gov_tier_ceiling",
+      "default": 4,
+      "options": [
+        {"value": 2, "label": "Performance", "help": "No detail added above the Performance look plus FXAA."},
+        {"value": 4, "label": "Shipped look (default)", "help": "Up to the game's own look: shipped shadow and detail distances, car reflections and far shadows every frame, plus FXAA."},
+        {"value": 5, "label": "Beyond console", "help": "Also the shadow, city and vehicle detail distances at 1.5x the console's: about 1 ms more GPU time while driving, farther objects and shadows appear at a switch."}
+      ],
+      "advanced": false,
+      "requires": {"mcla_gov": true},
       "emit": "nondefault"
     },
     {
