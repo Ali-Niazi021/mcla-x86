@@ -8,6 +8,8 @@
 //   rexgpu_gpu_frame_seq  bumped after each publish: a new value from a repeated one, and the count of frames
 //   rexgpu_gpu_frame_lag  how many frames old the published value is
 //   rexgpu_vrs_levels     how many variable-rate-shading levels above 0 exist (0 = none on this GPU / backend)
+//   rexgpu_pipeline_creations / rexgpu_shader_translations / rexgpu_pipelines_pending   (SDK patch 0590) cumulative pipelines created,
+//                         cumulative shaders translated at run time, asynchronous creations in flight: the COMPILE-BURST signal below
 // Outputs:
 //   rexgpu_vrs_level      WRITTEN here: -1 = not governed (the SDK's own cvar decides), 1..N coarser. -1 whenever the governor is off or
 //                         the ladder is at VRS 0, so a user's own VRS cvar keeps working at the base.
@@ -19,6 +21,18 @@
 //
 // Screen-change grace (mcla_gov_screen_grace_frames): after a change of the driving flag the math layer discards the previous screen's
 // samples and, for that many engine frames, records and decides nothing; this file only passes the cvar (and prints it in the summary).
+//
+// Below the floor (mcla_gov_floor_shed_frames): a shed to a tier under the floor tier (the perf preset's FXAA-less tier 1) needs the median
+// rule held over that many GPU frames or two missed frames; the tail rule alone never takes the ladder below the floor, and a shed back to
+// such a rung within 30 s of its restore doubles the restore delay out of it. The cost learning discards a measurement with a spike in its
+// window (a sample above 1.5x the window's median). This file only passes the cvar and logs it; the law is in mcla_gov_math.h.
+//
+// Compile bursts (mcla_compile_quiet_ms, mcla_compile_excuse_s): a stretch of run-time pipeline creations / shader translations stalls
+// the GPU and the frames are late for the compiler's sake, not the picture's. The burst state (a counter grew within the quiet time, or a
+// creation is in flight; mcla_gov_math.h CompileWatch) is kept here once per engine frame, EVEN WITH mcla_gov OFF, and read two ways: the
+// governor's own rules excuse the frames of a burst (bounded: mcla_compile_excuse_s per 20 s), and the 60 -> 30 judge of mcla_t_common.cpp
+// reads CompileBurstActive() / CompileExcuseS() (mcla_gov.h) and does not judge a decision window the burst overlapped (bounded: the
+// windows that add up to the same time, in a row). An SDK without the three symbols has no compile signal and behaves as before.
 //
 // While the governor is on, mcla_gfx_tier is its own: the tier table overrides the knob cvars (mcla_gfx_env_interval, ...), even ones set
 // by hand. To choose the tier range, set mcla_gov_tier_floor / mcla_gov_tier_ceiling (or mcla_gfx_tier BEFORE the governor first runs:
@@ -73,8 +87,16 @@ REXCVAR_DEFINE_DOUBLE(mcla_gov_shed_ms, 15.6, "MCLA",
 REXCVAR_DEFINE_INT32(mcla_gov_shed_over_count, 3, "MCLA",
                      "MCLA governor, the tail rule: shed one rung when at least this many of the last 30 GPU frame times (0.5 s) are above "
                      "mcla_gov_shed_ms, whatever their median. Under CPU or power contention the GPU frame is bimodal (p50 15.2 ms, "
-                     "one frame in ten at 25 ms) and the median never sheds. A lone spike in a clean stream is not enough. 0 = off. "
-                     "Live");
+                     "one frame in ten at 25 ms) and the median never sheds. A lone spike in a clean stream is not enough. It sheds "
+                     "enriched tiers and VRS, never a tier under the floor (mcla_gov_floor_shed_frames). 0 = off. Live");
+REXCVAR_DEFINE_INT32(mcla_gov_floor_shed_frames, 30, "MCLA",
+                     "MCLA governor, sustained overload below the floor: a shed to a tier UNDER the floor tier (the visible rungs; for the "
+                     "perf preset tier 1, FXAA off) needs the median of the last 4 GPU frame times over mcla_gov_shed_ms at a check and "
+                     "still over it at a check at least this many GPU frames later, with none at or below the line in between, or two "
+                     "of the last 30 engine frames missed. The tail rule alone never takes the ladder below the floor (field: scene "
+                     "snaps of 18-19 ms in a 10 ms stream switched FXAA off and on six times a minute). A restore back up is the normal "
+                     "one, but a shed back to that rung within 30 s of its restore doubles the restore delay out of it, like a probe "
+                     "bounce. 0 = off: the tail rule and the median shed below the floor as anywhere. Live");
 REXCVAR_DEFINE_DOUBLE(mcla_gov_restore_ms, 15.0, "MCLA",
                       "MCLA governor: a restore step (one rung back) is only considered while the GPU frame time stays below this, "
                       "in ms: its p90 over the whole of mcla_gov_restore_s. Also the line an enrichment must stay under (with the "
@@ -93,8 +115,10 @@ REXCVAR_DEFINE_INT32(mcla_gov_vrs_levels, 2, "MCLA",
                      "1 / 2); 0 = none. At most what the GPU / SDK has (rexgpu_vrs_levels). These are the first rungs below the base. Live");
 REXCVAR_DEFINE_INT32(mcla_gov_tier_floor, -1, "MCLA",
                      "MCLA governor: the floor F, the tier of the base rung (1 = perf ... 5). -1 = auto: the tier mcla_gfx_tier was set to "
-                     "(>= 1) before the governor first ran, else 1. The tiers below it (F-1 .. 1) are the last, visible rungs of the shed "
-                     "order. The governor starts here. Live");
+                     "(>= 1) before the governor first ran, else that of the preset mcla_gfx_preset: perf = 2 (perf + FXAA: normal play "
+                     "keeps the AA, VRS absorbs bursts, tier 1 is only reached on the way to the 30 hold), perf+ and lowest = 1, quality "
+                     "and as shipped = 4, ultra = 5. The tiers below it (F-1 .. 1) are the last, visible rungs of the shed order. The "
+                     "governor starts here. Live");
 REXCVAR_DEFINE_INT32(mcla_gov_tier_ceiling, 4, "MCLA",
                      "MCLA governor: the ceiling C, the richest tier enrichment may reach (1..5; 5 = 1.5x distances, 'ultra'). At or "
                      "below the floor = no enrichment (the picture never goes above the configured one). Live");
@@ -128,6 +152,19 @@ REXCVAR_DEFINE_INT32(mcla_gov_screen_grace_frames, 60, "MCLA",
                      "missed history, the restore / enrich windows, the cost learning), and for this many engine frames of the new screen "
                      "nothing is recorded and nothing is shed, restored or enriched: the samples of the previous screen and the hitchy "
                      "first frames of the new one are no judge of its load (field: entering driving shed 0 -> 4 in 0.3 s). 0 = off. Live");
+REXCVAR_DEFINE_INT32(mcla_compile_quiet_ms, 500, "MCLA",
+                     "MCLA compile bursts (SDK exports rexgpu_pipeline_creations / rexgpu_shader_translations / rexgpu_pipelines_pending): "
+                     "a burst is active while a pipeline was created or a shader translated within the last this many ms, or a creation "
+                     "is in flight. The GPU governor does not feed the frames of a burst into its shed rules and the 60 -> 30 judge does "
+                     "not judge a window that a burst overlapped, both bounded by mcla_compile_excuse_s. Without the SDK symbols nothing "
+                     "is a burst. Live")
+    .range(0, 60000);
+REXCVAR_DEFINE_DOUBLE(mcla_compile_excuse_s, 4.0, "MCLA",
+                      "MCLA compile bursts: the most time a burst may be excused, in seconds, so that a real overload still acts. The GPU "
+                      "governor excuses at most this much within any 20 s (beyond it the burst's frames are judged like any other); the "
+                      "60 -> 30 judge (mcla_sim_pacer 2) skips at most this many seconds of decision windows in a row (4.0 and 2 s "
+                      "windows: 2; the next high window is judged). 0 = bursts are not excused. Live")
+    .range(0.0, 20.0);
 REXCVAR_DEFINE_INT32(mcla_gov_max_level, -1, "MCLA",
                      "MCLA governor: the highest rung the closed loop may shed to (1.. = VRS rungs, then the tiers below the floor). -1 = "
                      "the whole ladder; 0 = never shed (the governor only enriches and logs). The 60 -> 30 hold is allowed once this rung "
@@ -159,6 +196,15 @@ struct Symbols {
   std::atomic<int32_t>* vrs_levels = nullptr;
   std::string module = "none";  // where the first one was found
   bool GpuTime() const { return gpu_us && seq; }
+};
+
+// The compile-burst words (SDK patch 0590). All three or none: with one missing there is no compile signal.
+struct CompileSymbols {
+  std::atomic<uint32_t>* pipelines = nullptr;  // rexgpu_pipeline_creations
+  std::atomic<uint32_t>* shaders = nullptr;    // rexgpu_shader_translations
+  std::atomic<int32_t>* pending = nullptr;     // rexgpu_pipelines_pending
+  std::string module = "none";
+  bool Found() const { return pipelines && shaders && pending; }
 };
 
 static_assert(std::atomic<uint32_t>::is_always_lock_free && std::atomic<int32_t>::is_always_lock_free,
@@ -193,12 +239,21 @@ Symbols Resolve() {
   return s;
 }
 
+CompileSymbols ResolveCompile() {
+  CompileSymbols s;
+  s.pipelines = static_cast<std::atomic<uint32_t>*>(FindSymbol("rexgpu_pipeline_creations", &s.module));
+  s.shaders = static_cast<std::atomic<uint32_t>*>(FindSymbol("rexgpu_shader_translations", &s.module));
+  s.pending = static_cast<std::atomic<int32_t>*>(FindSymbol("rexgpu_pipelines_pending", &s.module));
+  return s;
+}
+
 // ---- state shared with other threads (BeforeConfigSave, Shutdown, the accessors) --------------------------------------------
 
 std::atomic<int> g_level{0};
 std::atomic<int> g_tier{0};
 std::atomic<int> g_vrs{0};
 std::atomic<bool> g_hold_allowed{true};
+std::atomic<bool> g_compile_active{false};              // the compile-burst state as of the last OnFrame (the pacer reads it)
 std::atomic<std::atomic<int32_t>*> g_vrs_ptr{nullptr};  // rexgpu_vrs_level, once resolved
 std::atomic<std::int64_t> g_release_until_ns{0};        // BeforeConfigSave: the governor leaves mcla_gfx_tier alone until then
 std::atomic<bool> g_shutdown{false};
@@ -273,6 +328,18 @@ struct State {
   int32_t vrs_written = -1;
   int tier_state = kTierUnset;  // the tier written to the cvar, kTierReleased, or kTierUnset
   int floor_auto = 1;           // the floor with mcla_gov_tier_floor = -1
+  std::string floor_why;        // where floor_auto came from, for the start line
+  // The compile-burst signal: kept whether or not the governor is on.
+  bool compile_resolved = false;
+  CompileSymbols compile_sym;
+  math::CompileWatch compile_watch;
+  struct CompileLog {            // the burst lines: at most one every 5 s, the bursts in between are added up
+    std::int64_t last_ns = 0;
+    int bursts = 0;
+    uint32_t pipelines = 0, shaders = 0;
+    std::int64_t active_ns = 0, excused_ns = 0;
+    std::int64_t excused_total_at_start = 0;
+  } compile_log;
   int tier_mismatch_frames = 0;
   bool tier_mismatch_warned = false;
   std::int64_t external_warn_ns = 0;
@@ -348,12 +415,15 @@ void RestoreAll(State& s) {
 
 // ---- the parameters ------------------------------------------------------------------------------------------------------------
 
+double CompileExcuseSeconds() { return std::clamp(REXCVAR_GET(mcla_compile_excuse_s), 0.0, 20.0); }
+
 math::Params MakeParams(const State& s) {
   math::Params p;
   p.shed_ms = std::max(1.0, REXCVAR_GET(mcla_gov_shed_ms));
   p.restore_ms = std::max(0.1, REXCVAR_GET(mcla_gov_restore_ms));
   p.shed_frames = std::clamp<int32_t>(REXCVAR_GET(mcla_gov_shed_frames), 1, 600);
   p.shed_over_count = std::clamp<int32_t>(REXCVAR_GET(mcla_gov_shed_over_count), 0, math::kTailSamples);
+  p.floor_shed_frames = std::clamp<int32_t>(REXCVAR_GET(mcla_gov_floor_shed_frames), 0, 3600);
   p.restore_s = std::clamp(REXCVAR_GET(mcla_gov_restore_s), 0.1, 600.0);
   const int floor = REXCVAR_GET(mcla_gov_tier_floor);
   p.tier_floor = floor >= math::kMinTier ? std::min(floor, math::kMaxTier) : s.floor_auto;
@@ -369,6 +439,7 @@ math::Params MakeParams(const State& s) {
   p.pop_wait_s = std::max(0.0, REXCVAR_GET(mcla_gov_pop_wait_s));
   p.pop_speed_kmh = REXCVAR_GET(mcla_gov_pop_speed_kmh);
   p.screen_grace_frames = std::clamp<int32_t>(REXCVAR_GET(mcla_gov_screen_grace_frames), 0, 3600);
+  p.compile_excuse_s = CompileExcuseSeconds();
   p.tier_est_ms = s.tier_est;
   p.tier_pop_free = s.tier_pop_free;
   return p;
@@ -418,6 +489,12 @@ void LogChange(const State& s, const math::Change& ch, const math::Params& p, st
     }
   }
   detail += fmt::format(", missed {}", ch.missed);
+  if (ch.below_floor) {
+    detail += ch.sustained_frames > 0
+                  ? fmt::format(", below the floor: the median held over the line for {} GPU frames (needs {})", ch.sustained_frames, p.floor_shed_frames)
+                  : fmt::format(", below the floor: the missed frames (the tail and a short median do not shed there; the median needs {} GPU frames)",
+                                p.floor_shed_frames);
+  }
   if (ch.bounce) {
     detail += fmt::format(", bounce: a restore from tier {} vrs {} now waits {:.0f} s", ch.to_tier, ch.to_vrs,
                           s.ctrl.RestoreDelayS(math::State{ch.to_tier, ch.to_vrs}, now_ns, p));
@@ -450,6 +527,12 @@ void LogLearn(const State& s, const math::Change& ch, const math::Params& p) {
               LearnedText(s.ctrl, tier), p.tier_est_ms[size_t(tier)]);
 }
 
+void LogLearnDiscard(const math::Change& ch) {
+  REXLOG_INFO("[mcla-gov] learning of tier {} over tier {} discarded: a sample of the window {} the step was {:.2f} ms, above 1.5x the window's busy p50 {:.2f} ms (a snap or a hitch)",
+              ch.learn_discard_tier, ch.learn_discard_tier - 1, ch.learn_discard_before ? "before" : "after", ch.learn_discard_max_ms,
+              ch.learn_discard_p50_ms);
+}
+
 void LogLearned(const State& s, const math::Params& p, std::int64_t now_ns) {
   std::string out;
   for (int tier = math::kMinTier + 1; tier <= math::kMaxTier; ++tier) {
@@ -474,27 +557,97 @@ void LogWindow(const math::Window& w, const math::Controller& c) {
   }
   const std::string gpu = w.p50_ms >= 0.0 ? fmt::format("busy p50 {:.1f} p95 {:.1f} ms", w.p50_ms, w.p95_ms) : std::string("busy p50 - p95 - ms");
   REXLOG_INFO("[mcla-gov] {:.0f} s: tier {} vrs {} ({}), rung {}..{}, {} ({} samples, lag {}), sheds {} restores {} enriches {} bounces {} waits {}, "
-              "missed {}, signal {}, grace {} frames",
+              "missed {}, signal {}, grace {} frames{}",
               double(w.length_ns) / 1e9, c.Tier(), c.Vrs(), times, w.min_level, w.max_level, gpu, w.samples, w.lag, w.sheds, w.restores,
-              w.enriches, w.bounces, w.waits, w.missed, w.signal_gpu ? "gpu" : "missed-frames", w.grace_frames);
+              w.enriches, w.bounces, w.waits, w.missed, w.signal_gpu ? "gpu" : "missed-frames", w.grace_frames,
+              w.compile_frames > 0 || w.compile_denied > 0
+                  ? fmt::format(", compile burst: {} frames excused ({:.1f} s), {} judged anyway (budget spent)", w.compile_frames,
+                                double(w.compile_excused_ns) / 1e9, w.compile_denied)
+                  : std::string());
 }
 
 void LogStart(const State& s, const math::Params& p) {
   const math::Ladder lad = math::Ladder::Of(p);
-  REXLOG_INFO("[mcla-gov] on: shed above {:.1f} ms (median of 4; or {} of the last 30 samples; or 2 of the last 30 frames missed), restore below {:.1f} ms for {:.1f} s, {} GPU frames between sheds; ladder: floor tier {} ({}), "
+  REXLOG_INFO("[mcla-gov] on: shed above {:.1f} ms (median of 4; or {} of the last 30 samples; or 2 of the last 30 frames missed; a shed under the floor tier needs the median held over {} GPU frames or the 2 missed frames, never the tail), restore below {:.1f} ms for {:.1f} s, {} GPU frames between sheds; ladder: floor tier {} ({}), "
               "ceiling tier {} ({}), vrs levels {} (rexgpu_vrs_levels {}), rungs {}..{} (cap {}, pin {}); enrich over {:.1f} s with a {:.1f} ms "
               "margin, hold {:.0f} s, learn {:.1f} s; pop hiding: cut > {:.0f} m, speed > {:.0f} km/h, shed waits <= {:.1f} s, camera feed {}; screen grace {} frames; "
+              "compile bursts: excuse {:.1f} s per 20 s (quiet {} ms; rexgpu_pipeline_creations / rexgpu_shader_translations / rexgpu_pipelines_pending {}); "
               "symbols ({}): rexgpu_gpu_frame_us {}, rexgpu_gpu_frame_seq {}, rexgpu_gpu_frame_lag {}, rexgpu_vrs_level {}, rexgpu_vrs_levels {}{}",
-              p.shed_ms, p.shed_over_count, p.restore_ms, p.restore_s, p.shed_frames, lad.floor,
-              REXCVAR_GET(mcla_gov_tier_floor) >= math::kMinTier ? "mcla_gov_tier_floor" : s.floor_auto > 1 ? "auto: the configured mcla_gfx_tier" : "auto: perf",
+              p.shed_ms, p.shed_over_count, p.floor_shed_frames, p.restore_ms, p.restore_s, p.shed_frames, lad.floor,
+              REXCVAR_GET(mcla_gov_tier_floor) >= math::kMinTier ? std::string("mcla_gov_tier_floor") : s.floor_why,
               lad.ceiling, lad.enrich > 0 ? "enrichment on" : "no enrichment", lad.vrs,
               s.sym.vrs_levels ? s.sym.vrs_levels->load(std::memory_order_relaxed) : 0, -lad.enrich, lad.shed, p.max_level, p.force_level,
               p.enrich_s, p.enrich_margin_ms, p.enrich_hold_s, p.learn_s, REXCVAR_GET(mcla_gov_cut_m), p.pop_speed_kmh, p.pop_wait_s,
               g_cam_seq.load(std::memory_order_relaxed) != 0 ? "active" : "none yet (only the driving flag hides a pop)", p.screen_grace_frames,
+              p.compile_excuse_s, REXCVAR_GET(mcla_compile_quiet_ms),
+              s.compile_sym.Found() ? "found (" + s.compile_sym.module + ")" : std::string("MISSING: no compile signal, nothing is excused"),
               s.sym.module,
               s.sym.gpu_us ? "found" : "MISSING", s.sym.seq ? "found" : "MISSING", s.sym.lag ? "found" : "missing",
               s.sym.vrs_level ? "found" : "MISSING", s.sym.vrs_levels ? "found" : "MISSING",
               s.sym.GpuTime() ? "" : "; no GPU frame time: the missed-frames signal (last_n >= 2) drives the sheds and nothing enriches");
+}
+
+// ---- compile bursts ------------------------------------------------------------------------------------------------------------
+
+constexpr std::int64_t kCompileLogGapNs = 5'000'000'000;  // the burst lines: at most one every 5 s
+
+void FlushCompileLog(State& s, std::int64_t now_ns) {
+  State::CompileLog& l = s.compile_log;
+  if (l.bursts <= 0) return;
+  const bool gov = REXCVAR_GET(mcla_gov);
+  const std::string excused =
+      gov ? fmt::format("excused {:.1f} s of the shed rules (budget {:.1f} s per 20 s)", double(l.excused_ns) / 1e9, CompileExcuseSeconds())
+          : std::string("the governor is off: nothing excused there, the 60 -> 30 judge skips its windows");
+  if (l.bursts == 1) {
+    REXLOG_INFO("[mcla-gov] compile burst: {} pipelines, {} shaders over {:.1f} s; {}", l.pipelines, l.shaders, double(l.active_ns) / 1e9, excused);
+  } else {
+    REXLOG_INFO("[mcla-gov] compile bursts: {} since the last line, {} pipelines, {} shaders over {:.1f} s; {}", l.bursts, l.pipelines, l.shaders,
+                double(l.active_ns) / 1e9, excused);
+  }
+  l.bursts = 0;
+  l.pipelines = l.shaders = 0;
+  l.active_ns = l.excused_ns = 0;
+  l.last_ns = now_ns;
+}
+
+// Once per engine frame, whether or not the governor is on (the pacer's judge reads the state).
+void UpdateCompile(State& s, std::int64_t now_ns) {
+  if (!s.compile_resolved) {
+    s.compile_resolved = true;
+    s.compile_sym = ResolveCompile();
+    REXLOG_INFO("[mcla-gov] compile-burst signal: rexgpu_pipeline_creations {}, rexgpu_shader_translations {}, rexgpu_pipelines_pending {} ({}){}",
+                s.compile_sym.pipelines ? "found" : "MISSING", s.compile_sym.shaders ? "found" : "MISSING",
+                s.compile_sym.pending ? "found" : "MISSING", s.compile_sym.module,
+                s.compile_sym.Found() ? "" : "; no compile signal: bursts are not recognised (older SDK)");
+  }
+  math::CompileCounters c;
+  if (s.compile_sym.Found()) {
+    c.valid = true;
+    c.pipelines = s.compile_sym.pipelines->load(std::memory_order_relaxed);
+    c.shaders = s.compile_sym.shaders->load(std::memory_order_relaxed);
+    c.pending = s.compile_sym.pending->load(std::memory_order_relaxed);
+  }
+  const std::int64_t quiet_ns = std::int64_t(std::clamp<int32_t>(REXCVAR_GET(mcla_compile_quiet_ms), 0, 60000)) * 1'000'000;
+  const math::CompileWatch::Result r = s.compile_watch.Update(now_ns, c, quiet_ns);
+  g_compile_active.store(r.active, std::memory_order_relaxed);
+
+  State::CompileLog& l = s.compile_log;
+  if (r.started) {
+    l.excused_total_at_start = s.ctrl.CompileExcusedTotalNs();
+    if (now_ns - l.last_ns >= kCompileLogGapNs) {
+      l.last_ns = now_ns;
+      REXLOG_INFO("[mcla-gov] compile burst starts: {} pipelines, {} shaders, {} in flight; {}", r.pipelines, r.shaders,
+                  c.pending, REXCVAR_GET(mcla_gov) ? "the shed rules excuse its frames within the budget" : "the governor is off");
+    }
+  }
+  if (r.ended) {
+    ++l.bursts;
+    l.pipelines += r.pipelines;
+    l.shaders += r.shaders;
+    l.active_ns += r.duration_ns;
+    l.excused_ns += std::max<std::int64_t>(0, s.ctrl.CompileExcusedTotalNs() - l.excused_total_at_start);
+  }
+  if (l.bursts > 0 && !r.active && now_ns - l.last_ns >= kCompileLogGapNs) FlushCompileLog(s, now_ns);
 }
 
 // ---- on / off -------------------------------------------------------------------------------------------------------------------
@@ -523,19 +676,22 @@ void Activate(State& s) {
   }
   g_shutdown.store(false, std::memory_order_relaxed);
   TierCapture();
-  // The floor on auto: the tier the user configured before the governor first wrote the cvar (>= 1), else the tier of the
-  // configured preset (mcla_gfx_preset: perf / perf+ / lowest = 1, quality = 4, ultra = 5, none / default = 4: the shipped
-  // distances and every-frame env map and far cascade, which tier 4 is, plus FXAA), so the preset stays the floor of normal play.
+  // The floor on auto (math::AutoFloor): the tier the user configured before the governor first wrote the cvar (>= 1), else the tier
+  // of the configured preset (mcla_gfx_preset: perf = 2, perf + FXAA, so the AA is part of normal play and tier 1 only comes on the way
+  // to the 30 hold; perf+ / lowest = 1; quality / none / default = 4: the shipped distances and every-frame env map and far cascade
+  // plus FXAA; ultra = 5), so the preset stays the floor of normal play.
   {
-    std::lock_guard lock(g_tier_mutex);
-    if (g_tier_cvar.base_value >= math::kMinTier) {
-      s.floor_auto = std::min(g_tier_cvar.base_value, math::kMaxTier);
-    } else {
-      std::string preset = rex::cvar::GetFlagByName("mcla_gfx_preset");
-      for (char& c : preset) c = char(std::tolower(static_cast<unsigned char>(c)));
-      s.floor_auto = preset == "ultra" ? 5 : (preset == "quality" || preset.empty() || preset == "default" ||
-                                              preset == "none" || preset == "shipped") ? 4 : math::kMinTier;
+    int configured = -1;
+    {
+      std::lock_guard lock(g_tier_mutex);
+      configured = g_tier_cvar.base_value;
     }
+    const std::string preset = rex::cvar::GetFlagByName("mcla_gfx_preset");
+    s.floor_auto = math::AutoFloor(configured, preset);
+    s.floor_why = configured >= math::kMinTier
+                      ? fmt::format("auto: mcla_gfx_tier {} was set before the governor ran", configured)
+                      : fmt::format("auto: mcla_gfx_preset '{}'{}", preset.empty() ? std::string("as shipped") : preset,
+                                    s.floor_auto == 2 ? " = perf + FXAA, tier 1 only on the way to the 30 hold" : "");
   }
   s.ctrl = math::Controller();
   s.cam = math::CameraMotion();
@@ -567,6 +723,7 @@ void Deactivate(State& s) {
 void OnFrame(int64_t now_ns, int last_n, bool driving) {
   State& s = g;
   if (g_shutdown.load(std::memory_order_relaxed)) return;
+  UpdateCompile(s, now_ns);  // the burst state is the pacer's too: kept with mcla_gov off
   if (!REXCVAR_GET(mcla_gov)) {
     if (s.active) Deactivate(s);
     return;
@@ -607,11 +764,13 @@ void OnFrame(int64_t now_ns, int last_n, bool driving) {
     s.cam_speed = r.speed_kmh;
   }
   in.speed_kmh = now_ns - s.cam_last_ns <= 500'000'000 ? s.cam_speed : -1.0;  // a feed that stopped says nothing
+  in.compile_burst = s.compile_watch.Active();
 
   const math::Change change = s.ctrl.Step(in, p);
   if (change.changed) LogChange(s, change, p, now_ns);
   if (change.wait_started) LogWait(change, p);
   if (change.learn_done) LogLearn(s, change, p);
+  if (change.learn_discarded) LogLearnDiscard(change);
 
   WriteVrs(s, s.ctrl.Vrs());
   WriteTier(s, s.ctrl.Tier(), now_ns);
@@ -628,6 +787,10 @@ void OnFrame(int64_t now_ns, int last_n, bool driving) {
 }
 
 bool Enabled() { return REXCVAR_GET(mcla_gov); }
+
+bool CompileBurstActive() { return g_compile_active.load(std::memory_order_relaxed); }
+
+double CompileExcuseS() { return CompileExcuseSeconds(); }
 
 int Level() { return g_level.load(std::memory_order_relaxed); }
 int Tier() { return g_tier.load(std::memory_order_relaxed); }

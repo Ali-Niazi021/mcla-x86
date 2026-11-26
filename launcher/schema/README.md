@@ -6,8 +6,8 @@ command line. The format and the validator's rules are documented at the top of 
 
 Conventions used by this file:
 
-- A setting's `id` is the cvar it drives (`--<cvar>=<value>`). The only launcher-only setting is `close_on_launch`
-  (`cvar: null`, `emit: never`). The launcher hard-codes two ids: `close_on_launch`, and the setting whose cvar is
+- A setting's `id` is the cvar it drives (`--<cvar>=<value>`). The launcher-only settings (`cvar: null`, `emit: never`) are
+  `close_on_launch` and `aa_auto` (see Anti-aliasing below). The launcher hard-codes two ids: `close_on_launch`, and the setting whose cvar is
   `game_data_root` (a `path`, checked before Launch).
 - `default` is what the launcher starts with: the "Recommended (1080p)" preset (native 1080p, single tile, MSAA off, 60 fps profile, Performance scene detail). Where that differs from the
   cvar's own default (or from what `mcla/profile/pc_profile.cpp` applies), the setting uses `emit: always`, so the command
@@ -22,6 +22,14 @@ Conventions used by this file:
   Presets name `mcla_gfx_preset=default` for "as shipped" (an empty value would be an empty `--name=` argument). `720p-fsr1` is the shipped size plus `present_effect=fsr`.
 - `fullscreen_mode` and `temporal_aa_upscaler` come from SDK patches 0480 and 0470 (`patches/sdk`); both default to the
   patch's default and are only emitted when changed, so a build without those patches ignores them.
+- Anti-aliasing is Auto / Off / FXAA, made of two entries because a setting can only pass or skip the cvar by its value:
+  `aa_auto` (launcher-only, default on) leaves `swap_post_effect` off the command line, so the game decides (the Quality and
+  Ultra presets set FXAA as an app default, and the governor's tiers 2 to 5 do); with it off, `swap_post_effect` appears
+  (`emit: always`: Off = `none`, `fxaa`, `fxaa_extreme`). A value passed on the command line is the player's: the game's tiers
+  and presets (`SetDefaultValue`) never override it.
+- Adaptive detail (`mcla_gov`, `emit: always` because the code default is off and the profile switches it on) and its ceiling
+  (`mcla_gov_tier_ceiling`: 2 Performance, 4 Shipped look, 5 Beyond console; shown only with Adaptive detail on) sit in the
+  Performance category and need the 60 fps target.
 - Presets (`presets`) list every setting they own, so applying one is deterministic; a preset that no longer matches the
   current values shows as "Custom".
 

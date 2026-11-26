@@ -7,8 +7,8 @@
 //   * variable-rate shading (SDK patch 0500: rexgpu_vrs_level, 0 = full rate ... rexgpu_vrs_levels).
 //
 // The state is (tier t, vrs v). F = the floor (the configured tier: mcla_gov_tier_floor, or with -1 the tier mcla_gfx_tier had when the
-// governor first ran if that was >= 1, else 1 = perf), C = the ceiling (mcla_gov_tier_ceiling, default 4; C <= F = no enrichment).
-// It starts at (F, 0), the base.
+// governor first ran if that was >= 1, else that of the preset mcla_gfx_preset: perf = 2 (perf + FXAA), perf+ / lowest = 1, quality and
+// as shipped = 4, ultra = 5), C = the ceiling (mcla_gov_tier_ceiling, default 4; C <= F = no enrichment). It starts at (F, 0), the base.
 //
 //   SHED ORDER  (fast: the GPU busy time is over the line (median of the last 4 samples, or 3 of the last 30 over it: the tail rule),
 //      or 2 of the last 30 engine frames were missed):
@@ -22,6 +22,9 @@
 //      measuring earlier steps, when that is more) plus mcla_gov_enrich_margin_ms fits under mcla_gov_restore_ms. A tier that was
 //      entered by enrichment and is shed within mcla_gov_enrich_hold_s is barred for 30 s, doubling (cap 600 s) with every repeat and
 //      decaying while it stays quiet.
+//   COMPILE BURSTS (SDK patch 0590 exports): while pipelines / shaders are being created at run time the frames are late for the
+//      compiler's sake: the governor does not feed them into its shed rules and the 60 -> 30 judge does not judge the windows they
+//      are in, both bounded (mcla_compile_excuse_s) so that a real overload still acts. See CompileBurstActive() below.
 //   POP HIDING: a step across a tier that pops when switched (3 and 5) is only taken in a hiding moment: a pause, a load or a menu (the
 //      driving flag is false), the first second after one, a camera cut, or camera speed above mcla_gov_pop_speed_kmh. Enrich and
 //      restore wait for one without a limit; a shed waits at most mcla_gov_pop_wait_s and goes at once on a missed frame.
@@ -66,6 +69,21 @@ int Vrs();
 
 // The governor's master switch (cvar mcla_gov).
 bool Enabled();
+
+// ---- compile bursts ---------------------------------------------------------------------------------------------------
+//
+// ONE source of truth for the burst state: OnFrame computes it once per engine frame (math::CompileWatch over the SDK's
+// rexgpu_pipeline_creations / rexgpu_shader_translations / rexgpu_pipelines_pending, with mcla_compile_quiet_ms) EVEN WITH mcla_gov
+// OFF, and both consumers read it: the governor's own Step (Input::compile_burst: the bound is the sliding-window ExcuseBudget of
+// mcla_gov_math.h, mcla_compile_excuse_s per 20 s) and the 60 -> 30 judge of mcla_t_common.cpp (HoldJudge::Tick(..., compile): a decision
+// window a burst overlapped is not judged, at most CompileExcuseS() / window seconds' worth of windows in a row). The monotonic
+// total of what the governor excused is math::Controller::CompileExcusedTotalNs().
+//
+// True while a burst is active as of the last OnFrame. False with an SDK that lacks the symbols (no compile signal: nothing is excused).
+bool CompileBurstActive();
+// mcla_compile_excuse_s clamped to 0..20: how much time a burst may be excused, in seconds (0 = never). The judge derives its bound
+// from it (excuse / decision window = whole windows in a row).
+double CompileExcuseS();
 
 // ---- the camera feed (pop hiding by cut and speed) --------------------------------------------------------------------
 //

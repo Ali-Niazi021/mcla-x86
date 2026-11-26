@@ -136,8 +136,10 @@ int NextStep(int* substeps, int* quantum_hz = nullptr);
 // The 60 -> 30 rule is mcla_sim_pacer (0 shipped, 1 adaptive, 2 governed = the default, LOCK60 A3): pacer 2 judges
 // drives only (a menu, pause or load, mcla::gamestate::ProfileMode() == 1, resets the window), waits
 // mcla_sim_hold_grace_s after a hold or a menu, wants mcla_sim_hold_windows high windows in a row, and holds only when
-// mcla::gov::HoldAllowed() (the GPU frame governor is off or out of levels); the pure judge is
-// mcla::sim::math::HoldJudge (mcla_t_sim_math.h). Once per frame, at the end, outside the lock and before the pacer's
+// mcla::gov::HoldAllowed() (the GPU frame governor is off or out of levels); a high window that a shader-compile burst
+// overlapped (mcla::gov::CompileBurstActive()) is not judged, at most mcla::gov::CompileExcuseS() / window seconds' worth of
+// windows (2 by default) in a run of high windows, and is counted as `not judged: compile` in the `[mcla-sim]` line; the pure
+// judge is mcla::sim::math::HoldJudge (mcla_t_sim_math.h). Once per frame, at the end, outside the lock and before the pacer's
 // sleep, it also calls mcla::gov::OnFrame(now, last step n, driving) while mcla_sim60 is on.
 void OnFrameStart(int64_t now_ns);
 
