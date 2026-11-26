@@ -25,7 +25,8 @@ Owner: ORC. The plan is [PLAN.md](PLAN.md); this file tracks where execution sta
 ## Current phase
 
 **Wrapped up for now (2026-11-25).** Playable on the Radeon 880M laptop: 720p60 and 30 fps modes pass their gates;
-1080p holds 60.0 fps average with occasional dips (p99 20–22 ms vs the 20 ms bar). Launcher done. Resume from the
+1080p and 1920x1200 run at 60 fps most of the time, with a 6–18 s hold at 30 fps in the heaviest streets in about half
+of the 5-minute bench drives. Native 3200x2000 exists (`mcla_profile=2000p`, 23–26 fps). Launcher done. Resume from the
 task board's Todo list.
 
 ## Milestones
@@ -39,7 +40,7 @@ task board's Todo list.
 | M3 | Free-roam driving, 10 min soak | **pass** (b2.1): new profile → `cutscene -> free-roam` 136.9 s, save-backup lines ×2, drove 52 mph, pause open/close; fixture `after_intro`; 600 s soak `fatal=0` (run w2.1-m3c); parity with E2: cars coloured, no missing geometry/flashes. Owner check (radio balance) pending | 2026-11-24 |
 | M4 | Locked 30 fps at 720p | **pass** (V4m4, series 94): avg 30.00, p99 33.89 (≤35), max 39.2, world/real 1.000 | 2026-11-25 |
 | M5 | 60 fps at 720p | **pass** (V4m5): avg 60.00, p99 17.40, 0.00 % > 25 ms, max 26.7; GPU p50 10.6 ms | 2026-11-25 |
-| M6 | 60 fps at 1080p on the 880M | **near**: native 1080p single tile with the defaults + `mcla_gfx_preset=perf` (MyASUS Performance mode, ~45–50 W package): avg 59.95–60.00, 0.07–0.08 % > 25 ms, max 27.6–31.0, but p99 20.14 / 22.01 (bar 20) in two gates (V4m6, V4m6b). Upscaling loses here (FSR 3 49 fps, FSR 4 37 fps). 16:10 1280x800 ~57 fps (pre-optimization) | |
+| M6 | 60 fps at 1080p on the 880M | **near**: native 1080p single tile with the defaults + `mcla_gfx_preset=perf` (MyASUS Performance mode, ~45 W package, borderless fullscreen = Hardware: Independent Flip). Parked: 60.00 fps, p99 17.1–17.3 ms. Drive: bimodal. 3 runs clean (orc-ab-*: 59.97–60.00 fps, p99 17.3–17.7, ≤ 0.06 % > 25 ms); 4 runs with one 60 → 30 hold episode of 6 + 12 s (V5m6fs, V5m6u: 58.0 fps, 3.4–3.7 % > 25 ms; gate FAIL). 1920x1200 measures the same. The earlier V4m6 gates (p99 20–22, 0.07 % > 25 ms) ran with the flickering preset. Upscaling loses here (FSR 3 49 fps, FSR 4 37 fps) | |
 | Launcher | Settings UI + Launch | **done**: `mcla_launcher.exe` (schema-driven, presets, validation); end-to-end launch to the title (V4-launcher) | 2026-11-25 |
 
 ## Task board
@@ -50,12 +51,16 @@ task board's Todo list.
 
 ### Todo (next actions, in order)
 
-1. **M6 p99 tail** (20–22 ms vs 20): the misses come in bursts in heavy streets. Candidates: SDK 04e0 tone-map transfer
-   skip (fixed for the tone map's ALWAYS stencil after V4; needs a game run with `tonemap_transfer_skip=true,
-   tonemap_transfer_skip_poison=true`, expect `[tonemap-skip] N skipped, 0 kept`, ~0.55 ms); 04a0's fused gamma paint
-   (refused while a UI overlay is registered: `swap_direct_present: the gamma ramp is not applied …: a UI overlay is
-   shown`); R1-E texture fast path (needs a runtime count of signed/gamma fetches); R2 full-resource clears; the
-   `dxbc_ps_ieee_mul` white-frame question (V3). Owner check: M6 again with MyASUS Standard to split power-mode effects.
+1. **M6: the 60 → 30 hold decides it** (`mcla_t_common.cpp` `DecideHold`). In the bad runs a 2 s window with 18–55 %
+   missed frames (GPU 88–91 % busy at 2.7–2.9 GHz, no clock dip) starts a 6 s hold; 2 s after the hold ends the next
+   window reads 55–100 % missed and a 12 s hold follows (3 of 5 holds). Suspect: the GPU clock falls to ~2.1 GHz at 50 %
+   load during the hold and is not back when 60 resumes, so the first window after a hold should not be judged (a grace
+   window), or the return should be probed. Then re-gate; try `mcla_sim_hold30_s=0` as the A/B. Runs: `V5m6fs-m6fs`,
+   `V5m6u-m6`, `V5m6u-p1200`, `orc-fix-p1080` (holds), `orc-ab-*` (none). Note: `bench.py` gates run windowed
+   (`run_game.py` sets `fullscreen=false` = Composed: Flip on this desktop); add `--cvar fullscreen=true`.
+   Other GPU candidates as before: SDK 04e0 tone-map transfer skip (needs a game run with `tonemap_transfer_skip=true,
+   tonemap_transfer_skip_poison=true`, ~0.55 ms), 04a0's fused gamma paint (refused while a UI overlay is registered),
+   R1-E texture fast path, R2 full-resource clears, the `dxbc_ps_ieee_mul` white-frame question (V3).
 2. **60 fps gameplay fixes not yet done.** LARecomp-derived in Renan's port, so re-derive from the PPC:
    - **Warp hang:** override `sub_8221BE98`; it calls `sub_8221B790`/`sub_8221B8C8`. The warper state is at
      `*(0x8286D8D4)+0x51240`, with the state word at +288.
@@ -118,10 +123,17 @@ Reports in `$WORK/scratch/{S2,S3,S4,S5,R2,R3,R4,R5,R6}/REPORT.md`.
 - **8–13 ms of the GPU frame doesn't scale with the shader clock** (R6): bandwidth- or serialization-bound emulation work
   (resolves + texture reloads ~140 MB/frame, EDRAM transfers, swap path). Levers in flight: 0490 dual-write resolve
   (−0.8–1.1 ms est.), swap-direct-present (−0.2–0.35), quad lists without the GS, `clear_memory_page_state=false`.
-- **Game-side detail cuts barely move it** (`mcla_gfx_preset=perf` −0.3 ms, inside noise); `perf+` (impostors off) is
-  slower; `skip_overwritten_transfers=true` costs +6 ms (do not ship).
-- **Exclusive fullscreen stays "Composed: Flip"** with the SuperDisplay virtual second display attached; owner check:
-  detach DISPLAY2 for one run.
+- **The `perf` scene-detail preset** is: car reflections and shadow cascade 2 at half rate, shadow distance 0.6, LODs,
+  shadow map 512. The two half-rate knobs flickered until the phase's own object was skipped too (LEARNINGS,
+  Owner-report); they are worth ~5 points of GPU load at 1080p (81.5 → 76.5 % busy). Cascade 3 cannot be skipped (its
+  end call draws the player's car body path); `mcla_gfx_impostor_interval` holds nothing back. `perf+` (impostors off)
+  is slower; `skip_overwritten_transfers=true` costs +6 ms (do not ship).
+- **Flicker test:** `$WORK/scratch/ORC/burst.py` + `flicker_ab.py` (24 window captures in 1 s of the parked scene;
+  reference 0.2–0.4 % of pixels with a temporal std > 6). An empty `--mcla_gfx_preset=` swallows the next argument.
+- **Native 3200x2000:** `mcla_profile=2000p` = the 1600x1000 guest at `draw_resolution_scale` 2x2: correct picture,
+  23–26 fps, GPU 100 % busy; dual-write resolves and the direct present fall back at a scale above 1.
+- **Fullscreen is Hardware: Independent Flip** now that the SuperDisplay virtual display is detached; a window is
+  Composed: Flip (the desktop is 3200x2000).
 
 ## Decisions changed since PLAN
 

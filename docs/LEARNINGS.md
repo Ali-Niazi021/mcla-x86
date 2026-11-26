@@ -15,9 +15,16 @@ Owner: ORC (merges what tasks report). One entry per non-obvious finding, newest
 the 13 draw-list objects. The phase loop `sub_822E6408` still calls each phase's own object (`renderer[k]`, vtable +4 begin
 at `0x822E6800`, +8 end at `0x822E68E4`): it sets the target, clears it, draws nothing and resolves, so the env map / atlas
 quarter is overwritten with an empty target on every "skipped" frame (resolve log: env resolves in 726 of 731 frames).
-**Fix** Both knobs removed from `perf`; a still picture is not a flicker test. **Evidence** `$WORK/scratch/ORC/burst.py`
-(24 window captures in 1 s of the parked scene: 2.6 % of pixels with a temporal std > 6 with perf, 0.3 % without),
-`$WORK/runs/s7-env2-rlog`.
+**Fix** The `sub_822E6408` override zeroes `renderer[k]` of each skipped phase around the call (`mcla_fsr_markers.cpp`);
+cascade 3 is never skipped (zeroing its slot drops the "end of last cascade" call and the player's car body is not drawn).
+A still picture is not a flicker test. **Evidence** `$WORK/scratch/ORC/burst.py` (24 window captures in 1 s of the parked
+scene: 2.6 % of pixels with a temporal std > 6 before, 0.2 % after = the level without the preset), `$WORK/runs/s7-env2-rlog`.
+
+### Owner-report One late burst costs 18 s at 30 fps (the 60 → 30 hold)
+**Symptom** 1080p drive runs are bimodal: 0.06 % or 3.5 % of frames over 25 ms. **Cause** Not the GPU clock: one 2 s
+window with > 10 % missed frames starts a 6 s hold at 30 (`DecideHold`), and in 3 of 5 cases the first window after the
+hold reads 55–100 % missed, which starts a 12 s hold. **Fix** Open (PORT_STATE Todo 1). **Evidence** `[mcla-sim] cap 60 ->
+30` lines of `V5m6fs-m6fs`, `V5m6u-*`; none in `orc-ab-*`. Also: `bench.py` runs windowed unless `--cvar fullscreen=true`.
 
 ### Owner-request Native 3200x2000 = a 1600x1000 guest drawn at 2x2
 **Symptom** A 3200x2000 guest back buffer cannot exist (5,000 EDRAM tiles per surface, reach 2,048). **Fix** Profile

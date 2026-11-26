@@ -14,7 +14,7 @@
     {
       "id": "recommended",
       "label": "Recommended (1080p)",
-      "help": "True 1920x1080, single-tile scene, MSAA off, the 60 fps profile with late-frame release and the Performance scene-detail preset. 60.0 fps, 99th percentile 17.7 ms on a Radeon 880M in Performance mode (5 min drive); pick Balanced or Performance if your GPU is slower.",
+      "help": "True 1920x1080, single-tile scene, MSAA off, the 60 fps profile with late-frame release and the Performance scene-detail preset. On a Radeon 880M in Performance mode: 60 fps most of the time (parked scene 60.0 fps, 99th percentile 17.1 ms); in the heaviest streets the game may hold 30 fps for 6-18 s (see Max hold at 30 fps). Pick Balanced or Performance if your GPU is slower.",
       "set": {
         "mcla_profile": "1080p",
         "mcla_noaa": true,
@@ -34,7 +34,7 @@
     {
       "id": "panel_1200",
       "label": "16:10 panel 60 (1920x1200)",
-      "help": "A 1920x1200 (16:10) render at the 60 fps profile with the Performance scene-detail preset: fills a 16:10 panel with no black bars. Measured 60.0 fps, 99th percentile 17.3 ms on a Radeon 880M in Performance mode (5 min drive).",
+      "help": "A 1920x1200 (16:10) render at the 60 fps profile with the Performance scene-detail preset: fills a 16:10 panel with no black bars. On a Radeon 880M in Performance mode it behaves like 1080p: 60 fps most of the time (parked scene 60.0 fps, 99th percentile 17.2 ms), with a 6-18 s hold at 30 fps in the heaviest streets.",
       "set": {
         "mcla_profile": "1200p",
         "mcla_noaa": true,
@@ -190,8 +190,8 @@
         {"value": "900p16", "label": "1440x900 (16:10)", "help": "16:10 at 900 rows. Vert+ camera, HUD in a 16:9 band."},
         {"value": "900p", "label": "1600x900 (16:9)", "help": "A step below 1080p: a lighter load than 1920x1080, scaled to the screen by the presenter."},
         {"value": "1000p", "label": "1600x1000 (16:10)", "help": "16:10 at 1000 rows. Vert+ camera, HUD in a 16:9 band."},
-        {"value": "1080p", "label": "1920x1080 (16:9)", "help": "True 1920x1080 render, MSAA off. 60.0 fps, 99th percentile 17.7 ms on a Radeon 880M in Performance mode (5 min drive), with the Performance scene-detail preset."},
-        {"value": "1200p", "label": "1920x1200 (16:10)", "help": "16:10 at 1200 rows. Vert+ camera, HUD in a 16:9 band. Fills a 16:10 panel with no black bars; measured 60.0 fps, 99th percentile 17.3 ms on a Radeon 880M in Performance mode (5 min drive)."},
+        {"value": "1080p", "label": "1920x1080 (16:9)", "help": "True 1920x1080 render, MSAA off. On a Radeon 880M in Performance mode with the Performance scene-detail preset: 60 fps most of the time, with occasional holds at 30 fps in the heaviest streets."},
+        {"value": "1200p", "label": "1920x1200 (16:10)", "help": "16:10 at 1200 rows. Vert+ camera, HUD in a 16:9 band. Fills a 16:10 panel with no black bars; on a Radeon 880M it measured the same as 1920x1080 (60 fps most of the time, occasional holds at 30 fps)."},
         {"value": "2000p", "label": "3200x2000 (16:10, native laptop panel)", "help": "The game renders 1600x1000 and every render target is drawn at 2x2, so the picture is a true 3200x2000 (Vert+ camera, HUD in a 16:9 band); about 4x the GPU load of 1600x1000, measured 23-26 fps on a Radeon 880M (parked scene). Use Fullscreen mode \"Desktop size (borderless)\": with \"Switch the display to the game's mode\" the display would go to 1600x1000."}
       ],
       "advanced": false,
@@ -464,7 +464,7 @@
       "default": "perf",
       "options": [
         {"value": "default", "label": "Full (as shipped)", "help": "No change to the game's own detail levels."},
-        {"value": "perf", "label": "Performance", "help": "Shadow distance 0.6, vehicle LOD 0.7, city LOD 0.67, sun-shadow map 512: a near-identical picture at a lower cost."},
+        {"value": "perf", "label": "Performance", "help": "Car reflections and the second-farthest shadow cascade updated every 2nd frame (30 Hz, the console's own rate), shadow distance 0.6, vehicle LOD 0.7, city LOD 0.67, sun-shadow map 512: a near-identical picture, about 5 points less GPU load at 1080p on a Radeon 880M."},
         {"value": "perfplus", "label": "Performance+", "help": "Performance plus no far shadow cascade and no tree impostors."},
         {"value": "lowest", "label": "Lowest", "help": "Performance plus no sun shadows (the game's own night path): the largest saving, at the price of every sun shadow."}
       ],
@@ -547,7 +547,7 @@
     {
       "id": "mcla_gfx_env_interval",
       "label": "Car reflection update interval",
-      "help": "1 = the cars' paint and speedometer reflections are redrawn every frame (the default). 2 = they update at 30 Hz, the frames in between keep the last picture, for a little less GPU load (about 5 points of GPU load at 1080p together with the far-shadow knob). Not part of any preset.",
+      "help": "1 = the cars' paint and speedometer reflections are redrawn every frame (the default). 2 = they update at 30 Hz (what the Performance scene-detail preset uses), the frames in between keep the last picture, for a little less GPU load.",
       "category": "graphics",
       "type": "int",
       "cvar": "mcla_gfx_env_interval",

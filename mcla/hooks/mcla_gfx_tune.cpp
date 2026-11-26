@@ -162,10 +162,10 @@ REXCVAR_DEFINE_INT32(mcla_gfx_impostor_interval, 1, "MCLA",
     .range(0, 8);
 REXCVAR_DEFINE_STRING(mcla_gfx_preset, "", "MCLA",
                       "MCLA quality preset for a weak GPU, a bundle of the mcla_gfx_* knobs, applied once at first use as app "
-                      "defaults (a knob set by hand wins): '' = as shipped; perf = shadow_dist 0.6, "
-                      "traffic_lod 0.7, city_lod 0.67, shadow_res 512; perf+ (perfplus) = perf + dl_disable 256 (no far "
-                      "cascade) + impostors off; lowest = perf + shadow_mode 1 (no sun shadows). Logs '[mcla-gfx] preset "
-                      "<name>: ...' once");
+                      "defaults (a knob set by hand wins): '' = as shipped; perf = env_interval 2, far_cascades_interval 2, "
+                      "shadow_dist 0.6, traffic_lod 0.7, city_lod 0.67, shadow_res 512; perf+ (perfplus) = perf + "
+                      "dl_disable 256 (no far cascade) + impostors off; lowest = perf + shadow_mode 1 (no sun shadows). "
+                      "Logs '[mcla-gfx] preset <name>: ...' once");
 REXCVAR_DEFINE_STRING(mcla_gfx_dump, "none", "MCLA",
                       "MCLA debug: log guest words once per change of this string, 'ADDR/COUNT+...' "
                       "(ADDR as in mcla_gfx_poke). Live");
@@ -580,12 +580,18 @@ struct PresetKnob {
   const char* value;
 };
 
-// perf: near-identical picture: shorter shadow and LOD distances and a smaller shadow map. Nothing temporal:
-//   - mcla_gfx_env_interval=2 / mcla_gfx_far_cascades_interval=2 were here and flickered (owner report): the skipped phase
-//     still cleared and resolved its empty target. Fixed since (the phase's own object is taken out too, mcla_fsr_markers.cpp),
-//     but they come back only with a measured gain and a look at a moving picture.
-//   - mcla_gfx_impostor_interval=2 held nothing back (1800 requests per 300 frames, all let through): a no-op.
+// perf: near-identical picture: the car reflections and shadow cascade 2 at half rate, shorter shadow and LOD distances and
+// a smaller shadow map.
+//   - The two half-rate knobs flickered once (owner report: the skipped phase still cleared and resolved its empty target;
+//     fixed in mcla_fsr_markers.cpp, the phase's own object is taken out too). Checked since: parked, 24 captures in 1 s, 0.3 %
+//     of the pixels with a temporal std > 6 with and without them; driving, no frame-to-frame alternation of the car paint
+//     (scratch/ORC/flicker/drv, drv_t). They are worth about 5 points of GPU load at 1080p on the 880M (orc-ab-perf 81.5 %,
+//     orc-ab-perf_t 76.5 %), which is what keeps the heaviest streets at 60: without them one 40 s stretch of the bench drive
+//     alternated between 16.7 and 33 ms (V5m6fs: 3.6 % of the frames over 25 ms).
+//   - mcla_gfx_impostor_interval=2 held nothing back (1800 requests per 300 frames, all let through): a no-op, not here.
 constexpr PresetKnob kPresetPerf[] = {
+    {"mcla_gfx_env_interval", "2"},           // car paint / speedometer reflection at 30 Hz (the console's own rate)
+    {"mcla_gfx_far_cascades_interval", "2"},  // cascade 2 on alternate frames, matrices held; cascade 3 every frame
     {"mcla_gfx_shadow_dist", "0.6"},              // sections past 120 m cast no cascade shadows
     {"mcla_gfx_traffic_lod", "0.7"},
     {"mcla_gfx_city_lod", "0.67"},
