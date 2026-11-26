@@ -622,7 +622,9 @@ def cmd_rehash(args: argparse.Namespace) -> int:
             raise ToolError("patch file not found: %s" % p.path)
         if now == p.sha256:
             continue
-        pattern = re.compile(r'(\[\[patch\]\]\nname = "%s"\n(?:[^\n]*\n)*?sha256 = ")%s(")' % (re.escape(p.name), p.sha256))
+        # \r?\n: on a checkout with core.autocrlf the file has CRLF line ends.
+        pattern = re.compile(r'(\[\[patch\]\]\r?\nname = "%s"\r?\n(?:[^\n]*\n)*?sha256 = ")%s(")'
+                             % (re.escape(p.name), p.sha256))
         text, n = pattern.subn(lambda m: m.group(1) + now + m.group(2), text, count=1)
         if n != 1:
             raise ToolError("cannot find the sha256 line of %s in series.toml" % p.name)
