@@ -7,8 +7,9 @@
 // the game's own value when it goes back to its default. mcla_gfx_poke is the generic form (any
 // address) used to find them.
 //
-// mcla_gfx_preset (perf, perf+, lowest) is a bundle of these knobs, applied once, at first use, as app defaults
-// (rex::cvar::SetDefaultValue): a knob set by hand (command line, config, console) keeps its value. See
+// mcla_gfx_preset (perf, perf+, lowest, quality, ultra) is a bundle of these knobs, applied once, at first use, as app defaults
+// (rex::cvar::SetDefaultValue): a knob set by hand (command line, config, console) keeps its value. perf, perf+ and lowest are
+// for a weak GPU; quality (the shipped detail plus FXAA) and ultra (quality with 1.5x distances) are not built on perf. See
 // mcla_gfx_tune.cpp.
 #pragma once
 
@@ -63,5 +64,36 @@ uint32_t ShadowMapSize();
 // False when the tree-impostor system is switched off (mcla_gfx_impostors=false): the overrides of
 // mcla_gfx_impostors.cpp read it on every call.
 bool ImpostorsEnabled();
+
+// ---- the run-time detail tier (mcla_gfx_tier), for the frame-rate governor (LOCK60) --------------------------------------------
+//
+// The governor's contract:
+//   * It sets the tier with rex::cvar::SetFlagByName("mcla_gfx_tier", "N") (N = kTierMin..kTierMax; -1 = off) from any thread. OnFrame()
+//     applies it on the next engine frame: a tier writes the live knob cvars (mcla_gfx_env_interval, far_cascades_interval,
+//     shadow_dist, city_lod, traffic_lod, shadow_mode) and swap_post_effect, and logs one '[mcla-gfx] tier N: ...' line. CurrentTier()
+//     is the tier OnFrame has applied (-1 = off); read it back instead of assuming a SetFlagByName took effect.
+//   * Higher = more detail. The governor sheds by stepping DOWN and restores by stepping UP, ONE tier at a time, with hysteresis
+//     (est_gpu_ms_over_prev is the budget each step gives or takes). It never goes below tier 1 except in an emergency (tier 0 drops
+//     every sun shadow at once).
+//   * A tier does not touch mcla_gfx_shadow_res: that is read when the shadow map is created (a world load), so the shadow map size is
+//     whatever the preset or the knob gave at the load. mcla_gfx_dl_disable, impostors and the other knobs are not in the table either.
+//   * While the tier is on, the table overrides those knobs even when set by hand; at -1 each knob goes back to its default (a preset's
+//     app default included), or, when set by hand before the first tier, to that value.
+constexpr int kTierMin = 0, kTierMax = 5;
+
+struct TierInfo {
+  int tier;                      // kTierMin..kTierMax
+  const char* name;
+  float est_gpu_ms_over_prev;    // GPU ms per frame over the tier below (tier 1 = the baseline, 0; tier 0 is given against tier 1,
+                                 // so negative). Measured at 1080p on the Radeon 880M, parked scene, noise about +-0.3 ms, except tier 0
+  bool runtime_pop_free;         // false = the switch shows (a pop or a sudden change); switch such a tier at a camera cut or at speed
+  const char* note;
+};
+
+// The six rows, tier 0 first. `count` (may be null) gets 6. The array is static and lives for the process.
+const TierInfo* Tiers(int* count);
+
+// The tier OnFrame has applied: -1 = off (the knob cvars rule), else kTierMin..kTierMax. Any thread.
+int CurrentTier();
 
 }  // namespace mcla::gfxtune
