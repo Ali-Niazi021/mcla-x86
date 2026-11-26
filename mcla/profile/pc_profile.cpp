@@ -157,6 +157,20 @@ constexpr CvarDefault kProfileDefaults[] = {
     {"hid_mappings_file", ""},
 };
 
+// ---- LOCK60 block (stream LOCK60: GPU timing, the frame governor, load shedding) --------------------------------
+//
+// Applied after kProfileDefaults, for every preset (a preset or the command line still wins). Only levers proven exact or
+// clearly better in a game run are listed here; everything else of LOCK60 stays at its cvar default (= the old behaviour).
+constexpr CvarDefault kLock60Defaults[] = {
+    // SDK 04e0: skip the full-screen EDRAM ownership transfer that binding the tone map's 8888 target causes (it sits on the
+    // scene colour's tiles at 1080p single tile and the tone map rewrites every pixel). Exact: run lk-cm1 ran it with
+    // tonemap_transfer_skip_poison=true (the cut rectangle filled with magenta before the tone map): 0 magenta pixels in
+    // every screenshot except those of the experiment entries that removed the tone map's own draws (where the poison
+    // showed, 1.93 Mpx, proving the check is live); `[tonemap-skip] 668 transfers skipped, 0 kept` per 10 s. Defined in
+    // render_target/cache.cpp (false). It turns the render markers on by itself (mcla_render_markers -1 = auto).
+    {"tonemap_transfer_skip", "true"},
+};
+
 // ---- presets (W5.1) -------------------------------------------------------------------------------------------
 //
 // Why these cvars and not `resolution=WxH`: the SDK's `resolution` preset is only honoured while
@@ -819,6 +833,13 @@ void ApplyPcProfile() {
       }
     }
     Log({&entry, Apply(entry), origin}, &tally);
+  }
+  // LOCK60 block (kLock60Defaults): after the default profile and the preset, skipped where a preset sets the same cvar.
+  for (const CvarDefault& entry : kLock60Defaults) {
+    if (FindEntry(preset_entries, entry.name) != nullptr) {
+      continue;
+    }
+    Log({&entry, Apply(entry), std::string("LOCK60")}, &tally);
   }
   LogFpsTarget(&tally);
   CheckFsrMarkers();
