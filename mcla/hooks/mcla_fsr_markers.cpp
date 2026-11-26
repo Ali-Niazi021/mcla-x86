@@ -42,11 +42,14 @@
 // __imp__sub_822E55D0 and runs unchanged after the marker, so that site needs no sharing. The three originals' arguments
 // are kept: the override only reads r3 / r4, and the make-room path saves and restores the whole context.
 //
-// Gate. cvar mcla_render_markers (INT32, default -1 = auto): 1 on, 0 off, -1 on only while `temporal_aa` is `fsr` or the
+// Gate. cvar mcla_render_markers (INT32, default -1 = auto): 1 on, 0 off, -1 on only while `temporal_aa` is `fsr`, or the
 // SDK's `tonemap_transfer_skip` (patch 04e0: skips the full-screen ownership transfer the tone map's render target bind
-// causes, and needs kTonemapBegin to find the tone map) is on (read once at the start of each frame, so the game's own
-// setting of temporal_aa takes effect on the next frame). With the gate off every override is one relaxed load and the call
-// of the original. Log, once, at the first scene marker:
+// causes, and needs kTonemapBegin to find the tone map) is on, or the SDK's `hdr` (off / auto / on) is not `off` (the HDR
+// scene and UI-layer passes, patches hdr-scene-mcla and hdr-ui-layer, are driven by kTonemapBegin and kUIBegin: without the
+// markers the HDR output shows the whole frame as SDR content; `auto` counts as on even where the display is not in HDR
+// mode, the markers being NOPs that cost nothing and leave the picture unchanged). Read once at the start of each frame, so
+// the game's own setting of temporal_aa, or a change of `hdr` while running, takes effect on the next frame. With the gate
+// off every override is one relaxed load and the call of the original. Log, once, at the first scene marker:
 // `[mcla-fsr] render markers: scene begin/end at ...`.
 //
 // Build switch: MCLA_HOOK_FSR_MARKERS=0 compiles the overrides out (the generated weak functions run as shipped).
@@ -113,6 +116,21 @@ constexpr uint32_t kDeviceWriteLimit = 56;
 constexpr uint32_t kNopHeader = 0xC0021000;  // PM4 type 3, opcode NOP (0x10), 3 data words
 constexpr uint32_t kMagic = 0x5245584D;      // 'REXM'
 
+// True while the SDK's string cvar `hdr` (off / auto / on) is not `off`. GetFlagByName gives the stored value as it is
+// (`off`, no quotes; "" for a cvar this SDK build does not have, which counts as off), but the value is compared
+// without spaces or quotes and in lower case, so a differently written setting is read the same way.
+bool HdrWanted() {
+  const std::string value = rex::cvar::GetFlagByName("hdr");
+  std::string mode;
+  for (const char c : value) {
+    if (c == ' ' || c == '\t' || c == '"' || c == '\'') {
+      continue;
+    }
+    mode += (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c;
+  }
+  return !mode.empty() && mode != "off";
+}
+
 bool MarkersWanted() {
   const int32_t mode = REXCVAR_GET(mcla_render_markers);
   if (mode > 0) {
@@ -121,7 +139,7 @@ bool MarkersWanted() {
   if (mode == 0) {
     return false;
   }
-  return rex::cvar::GetFlagByName("temporal_aa") == "fsr" || rex::cvar::Query<bool>("tonemap_transfer_skip");
+  return rex::cvar::GetFlagByName("temporal_aa") == "fsr" || rex::cvar::Query<bool>("tonemap_transfer_skip") || HdrWanted();
 }
 
 mcla::hooks::Registration g_registration("fsr-markers", "mcla_render_markers", MCLA_HOOK_FSR_MARKERS != 0,
