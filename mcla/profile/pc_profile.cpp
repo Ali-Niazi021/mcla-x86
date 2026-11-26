@@ -155,6 +155,12 @@ constexpr CvarDefault kProfileDefaults[] = {
     // src/input/sdl/sdl_input_driver.cpp:23,98-113 (default "gamecontrollerdb.txt", empty skips the block);
     // W5.5 report section B.
     {"hid_mappings_file", ""},
+    // ---- HDR (stream HDR, SDK patches hdr-* and 07xx) ---- `hdr` itself stays at the SDK default (off; the launcher
+    // offers auto / on). Only how the game's SDR code values are decoded when HDR is on: the game targets a 2.2-gamma TV,
+    // and the SDK's default piecewise sRGB decode lifts its near-blacks 2-8x (code 2/255 at 304 nits paper white: sRGB
+    // 0.18 nits, 2.2 power 0.007 nits). Dumps of run hdr2 with srgb: black floor (p0.5) 0.14-0.20 nits on an OLED that
+    // shows 0.0057. Defined in src/ui/presenter.cpp (srgb).
+    {"hdr_sdr_eotf", "gamma22"},
 };
 
 // ---- presets (W5.1) -------------------------------------------------------------------------------------------
