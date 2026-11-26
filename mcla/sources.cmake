@@ -46,6 +46,9 @@
 #   input     INPUT_TITLE_LATCH 0x82615048 + 0x822C8B34, INPUT_MENU_REPEAT 0x822240C0 + 0x822241CC (W5.6): the 60 fps input
 #             fixes (a title Start press a polling script misses; one menu tap stepping twice); cvars
 #             mcla_input_title_latch / mcla_input_menu_repeat (-1 = auto: on while mcla_sim60 is on)
+#   vis       mcla_vis_ab.cpp (no flag, no codegen entry; the hooks/*.cpp glob below picks it up): the in-run A/B scheduler,
+#             cvar mcla_vis_ab = 'SEC:CVARNAME:VALUE+...' changes cvars at given seconds of one run; mcla::vis::OnFrame() is
+#             called from mcla::gfxtune::OnFrame
 set(MCLA_HOOK_DEFINITIONS
     # core
     MCLA_HOOK_HEARTBEAT=1

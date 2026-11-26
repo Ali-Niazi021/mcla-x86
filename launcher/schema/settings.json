@@ -422,15 +422,15 @@
     {
       "id": "swap_post_effect",
       "label": "Post-process anti-aliasing (FXAA)",
-      "help": "A cheap FXAA pass over the finished frame. Useful when MSAA is off and FSR is not used; not needed with FSR. Takes effect at start.",
+      "help": "FXAA over the finished frame (HUD included), about 0.3 ms GPU at 1080p on a Radeon 880M. Smooths the stair-stepped edges the game has without MSAA. Changes while playing (no restart); skipped while HDR output is active.",
       "category": "graphics",
       "type": "enum",
       "cvar": "swap_post_effect",
       "default": "none",
       "options": [
         {"value": "none", "label": "Off", "help": "No post-process anti-aliasing."},
-        {"value": "fxaa", "label": "FXAA", "help": "Standard FXAA."},
-        {"value": "fxaa_extreme", "label": "FXAA (extreme)", "help": "Stronger FXAA; softer picture."}
+        {"value": "fxaa", "label": "FXAA", "help": "Standard FXAA (recommended when there is GPU headroom)."},
+        {"value": "fxaa_extreme", "label": "FXAA (extreme)", "help": "Stronger edge search; slightly softer picture, about the same cost."}
       ],
       "advanced": false,
       "emit": "nondefault"
@@ -455,21 +455,57 @@
       "emit": "always"
     },
     {
+      "id": "texture_lod_bias",
+      "label": "Texture sharpness (mip bias)",
+      "help": "Shifts texture mip selection toward sharper levels: 0 = as the game asks; -0.5 = sharper distant textures. Without anti-aliasing a negative bias adds shimmer, so pair it with FXAA. Practically free on the GPU. Changes while playing.",
+      "category": "graphics",
+      "type": "float",
+      "cvar": "texture_lod_bias",
+      "default": 0.0,
+      "min": -1.0,
+      "max": 0.0,
+      "step": 0.25,
+      "advanced": true,
+      "emit": "nondefault"
+    },
+    {
       "id": "mcla_gfx_preset",
       "label": "Scene detail preset",
-      "help": "A bundle of the scene-detail knobs below for weak GPUs, applied at start. A knob you change below wins over the preset's value for it.",
+      "help": "A bundle of the scene-detail knobs below, applied at start: Performance for weak GPUs, Quality and Ultra for GPUs with headroom (they add FXAA). A knob you change below wins over the preset's value for it.",
       "category": "graphics",
       "type": "enum",
       "cvar": "mcla_gfx_preset",
       "default": "perf",
       "options": [
         {"value": "default", "label": "Full (as shipped)", "help": "No change to the game's own detail levels."},
+        {"value": "quality", "label": "Quality", "help": "The game's full detail (car reflections and all shadow cascades every frame, shipped shadow and detail distances, 640 shadow map) plus FXAA. About 1.5 ms more GPU time than Performance at 1080p on a Radeon 880M: only with headroom."},
+        {"value": "ultra", "label": "Ultra (beyond console)", "help": "Quality with the shadow, city and vehicle detail distances at 1.5x the console's: less pop-in in the distance, about 1 ms more GPU time while driving."},
         {"value": "perf", "label": "Performance", "help": "Car reflections and the second-farthest shadow cascade updated every 2nd frame (30 Hz, the console's own rate), shadow distance 0.6, vehicle LOD 0.7, city LOD 0.67, sun-shadow map 512: a near-identical picture, about 5 points less GPU load at 1080p on a Radeon 880M."},
         {"value": "perfplus", "label": "Performance+", "help": "Performance plus no far shadow cascade and no tree impostors."},
         {"value": "lowest", "label": "Lowest", "help": "Performance plus no sun shadows (the game's own night path): the largest saving, at the price of every sun shadow."}
       ],
       "advanced": false,
       "emit": "always"
+    },
+    {
+      "id": "mcla_gfx_tier",
+      "label": "Detail tier (run-time)",
+      "help": "One switch for the live scene-detail knobs, used by the frame-rate governor; it overrides the knobs above while set. Changes while playing.",
+      "category": "graphics",
+      "type": "enum",
+      "cvar": "mcla_gfx_tier",
+      "default": -1,
+      "options": [
+        {"value": -1, "label": "Off (use the knobs)", "help": "No tier: the knobs above decide."},
+        {"value": 0, "label": "0: emergency (no sun shadows)", "help": "Lowest tier: no sun shadows."},
+        {"value": 1, "label": "1: Performance", "help": "The Performance detail level."},
+        {"value": 2, "label": "2: Performance + FXAA", "help": "Performance plus FXAA."},
+        {"value": 3, "label": "3: shipped distances + FXAA", "help": "The game's shipped shadow and detail distances plus FXAA."},
+        {"value": 4, "label": "4: Quality (live part)", "help": "The live part of the Quality preset."},
+        {"value": 5, "label": "5: Ultra distances", "help": "Quality with the shadow, city and vehicle detail distances at 1.5x the console's."}
+      ],
+      "advanced": true,
+      "emit": "nondefault"
     },
     {
       "id": "mcla_gfx_shadow_res",
@@ -505,13 +541,13 @@
     {
       "id": "mcla_gfx_shadow_dist",
       "label": "Shadow distance",
-      "help": "Scale of the distance within which city sections draw shadows (the game's 200 m). Below 1 saves GPU and CPU. Changes at once.",
+      "help": "Scale of the distance within which city sections draw shadows (the game's 200 m). Below 1 saves GPU and CPU. Above 1 = farther than the console (more GPU). Changes at once.",
       "category": "graphics",
       "type": "float",
       "cvar": "mcla_gfx_shadow_dist",
       "default": 1.0,
       "min": 0.2,
-      "max": 1.0,
+      "max": 1.5,
       "step": 0.05,
       "advanced": true,
       "emit": "nondefault"
@@ -519,13 +555,13 @@
     {
       "id": "mcla_gfx_city_lod",
       "label": "City detail distance",
-      "help": "Scale of the city's high-detail draw distance (the game's 300 m). Below 1 draws fewer far objects. Changes at once.",
+      "help": "Scale of the city's high-detail draw distance (the game's 300 m). Below 1 draws fewer far objects. Above 1 = farther than the console (more GPU). Changes at once.",
       "category": "graphics",
       "type": "float",
       "cvar": "mcla_gfx_city_lod",
       "default": 1.0,
       "min": 0.3,
-      "max": 1.0,
+      "max": 1.5,
       "step": 0.05,
       "advanced": true,
       "emit": "nondefault"
@@ -533,13 +569,13 @@
     {
       "id": "mcla_gfx_traffic_lod",
       "label": "Vehicle detail distance",
-      "help": "Scale of the distances at which vehicles drop to lower LODs. Below 1 lowers them sooner. Changes at once.",
+      "help": "Scale of the distances at which vehicles drop to lower LODs. Below 1 lowers them sooner. Above 1 = farther than the console (more GPU). Changes at once.",
       "category": "graphics",
       "type": "float",
       "cvar": "mcla_gfx_traffic_lod",
       "default": 1.0,
       "min": 0.3,
-      "max": 1.0,
+      "max": 1.5,
       "step": 0.05,
       "advanced": true,
       "emit": "nondefault"

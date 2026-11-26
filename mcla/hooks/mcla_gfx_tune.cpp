@@ -39,8 +39,12 @@
 //                              constructor, mcla_gfx_shadow_res.cpp). Read when the shadow map is created: a world load
 //   mcla_gfx_impostors        false = no tree impostors (the game's own `noimpostors` switch, plus the guard of the refresh loop
 //                              the switch alone would hang in: mcla_gfx_impostors.cpp). Applies to impostors created after the change
-//   mcla_gfx_preset           "" = as shipped, perf, perf+, lowest: bundles of the knobs above and below, applied once at first use
+//   mcla_gfx_preset           "" = as shipped, perf, perf+, lowest, quality, ultra: bundles of the knobs above and below (quality =
+//                              the shipped detail plus FXAA, ultra = quality with 1.5x distances), applied once at first use
 //                              as app defaults; a knob set by hand wins (see ApplyPreset)
+//   mcla_gfx_tier             -1 = off (the knobs above rule); 0..5 = a run-time detail tier for the frame-rate governor: a row of
+//                              the table at ApplyTier overrides the live knobs and swap_post_effect, applied on the next engine
+//                              frame; back at -1 the knobs go back to what they were. Tiers() / CurrentTier() in mcla_gfx_tune.h
 // mcla_gfx_dump logs words: 'SPEC/COUNT' joined by '+' (same SPEC), once per change of the string
 // (add '+0/0' to dump again); each line is the address, then 8 words as hex with the float reading.
 #include <algorithm>
@@ -62,6 +66,7 @@
 #include <rex/logging.h>
 
 #include "mcla_gfx_tune.h"
+#include "mcla_vis.h"
 #include "mcla_guest.h"
 #include "mcla_hooks.h"
 
@@ -161,11 +166,22 @@ REXCVAR_DEFINE_INT32(mcla_gfx_impostor_interval, 1, "MCLA",
                      "mcla_gfx_impostors.cpp)")
     .range(0, 8);
 REXCVAR_DEFINE_STRING(mcla_gfx_preset, "", "MCLA",
-                      "MCLA quality preset for a weak GPU, a bundle of the mcla_gfx_* knobs, applied once at first use as app "
+                      "MCLA quality preset, a bundle of the mcla_gfx_* knobs, applied once at first use as app "
                       "defaults (a knob set by hand wins): '' = as shipped; perf = env_interval 2, far_cascades_interval 2, "
                       "shadow_dist 0.6, traffic_lod 0.7, city_lod 0.67, shadow_res 512; perf+ (perfplus) = perf + "
-                      "dl_disable 256 (no far cascade) + impostors off; lowest = perf + shadow_mode 1 (no sun shadows). "
+                      "dl_disable 256 (no far cascade) + impostors off; lowest = perf + shadow_mode 1 (no sun shadows); "
+                      "quality = the shipped scene detail (intervals 1, distances 1.0, shadow_res 640) plus swap_post_effect "
+                      "fxaa; ultra = quality + shadow_dist, city_lod and traffic_lod 1.5 (past the console's distances). "
                       "Logs '[mcla-gfx] preset <name>: ...' once");
+REXCVAR_DEFINE_INT32(mcla_gfx_tier, -1, "MCLA",
+                     "MCLA run-time detail tier, for the frame-rate governor: -1 = off (the mcla_gfx_* knob cvars rule). 0..5 = "
+                     "a row of the tier table (higher = more detail) overrides the live knobs mcla_gfx_env_interval, "
+                     "far_cascades_interval, shadow_dist, city_lod, traffic_lod, shadow_mode and swap_post_effect (not "
+                     "mcla_gfx_shadow_res, read at world load): 0 = emergency, no sun shadows; 1 = perf; 2 = perf + FXAA; "
+                     "3 = shipped distances; 4 = shipped rates (the quality preset's live part); 5 = 1.5x distances (ultra's). "
+                     "Applied on the next engine frame; back at -1 the knobs go back to what they were. Logs "
+                     "'[mcla-gfx] tier N: ...' once per change. Live (mcla_gfx_tune.cpp, ApplyTier)")
+    .range(-1, 5);
 REXCVAR_DEFINE_STRING(mcla_gfx_dump, "none", "MCLA",
                       "MCLA debug: log guest words once per change of this string, 'ADDR/COUNT+...' "
                       "(ADDR as in mcla_gfx_poke). Live");
@@ -606,6 +622,33 @@ constexpr PresetKnob kPresetPerfPlus[] = {
 constexpr PresetKnob kPresetLowest[] = {
     {"mcla_gfx_shadow_mode", "1"},
 };
+// quality: the scene detail as shipped plus FXAA. NOT built on perf: every knob perf touches is set explicitly (a perf default set
+// earlier in the same process is undone). swap_post_effect is an SDK cvar; since the SDK patch 0600 the command processor reads
+// it on every swap, so a default set here after graphics started still takes effect.
+// Measured with the in-run A/B (mcla_vis_ab; run vis3-parked-ab, 1080p, Radeon 880M, the parked scene, GPU busy at 60 fps, noise
+// about +-0.3 ms), GPU time per frame:
+//   - FXAA: about +0.3 ms (0.15 to 0.6).
+//   - the shipped car-reflection and far-cascade rates (env_interval 1, far_cascades_interval 1) over perf's 2 and 2: about +0.8 ms.
+//   - the shipped distances (shadow_dist, traffic_lod, city_lod 1.0) over perf's 0.6 / 0.7 / 0.67: about +0.3 to 0.6 ms.
+//   - ultra's 1.5x distances over the shipped ones: about +0.3 ms parked and about +1 ms while driving (vis4-drive-tiers, tier 5 against its
+//     neighbours), with no visible change at the parked spot; what they buy is
+//     objects and shadows appearing farther out while driving (pop-in), which is not measured.
+// The same steps, one at a time, are the run-time tiers 2 to 5 (mcla_gfx_tier, ApplyTier).
+constexpr PresetKnob kPresetQuality[] = {
+    {"mcla_gfx_env_interval", "1"},
+    {"mcla_gfx_far_cascades_interval", "1"},
+    {"mcla_gfx_shadow_dist", "1.0"},
+    {"mcla_gfx_traffic_lod", "1.0"},
+    {"mcla_gfx_city_lod", "1.0"},
+    {"mcla_gfx_shadow_res", "0"},  // 0 = as shipped, 640
+    {"swap_post_effect", "fxaa"},
+};
+// ultra: quality, with these three replacing quality's values (past the console's distances).
+constexpr PresetKnob kPresetUltra[] = {
+    {"mcla_gfx_shadow_dist", "1.5"},
+    {"mcla_gfx_city_lod", "1.5"},
+    {"mcla_gfx_traffic_lod", "1.5"},
+};
 
 std::string Lower(const std::string& text) {
   size_t b = 0, e = text.size();
@@ -625,6 +668,12 @@ std::string Pretty(std::string value) {
   return value;
 }
 
+// "mcla_gfx_city_lod" -> "city_lod"; a cvar without the prefix (swap_post_effect) as it is.
+const char* ShortName(const char* cvar) {
+  constexpr const char kPrefix[] = "mcla_gfx_";
+  return std::strncmp(cvar, kPrefix, sizeof(kPrefix) - 1) == 0 ? cvar + (sizeof(kPrefix) - 1) : cvar;
+}
+
 void ApplyPreset() {
   const std::string requested = REXCVAR_GET(mcla_gfx_preset);
   std::string name = Lower(requested);
@@ -634,23 +683,38 @@ void ApplyPreset() {
   if (name == "perfplus" || name == "perf_plus" || name == "perf-plus") {
     name = "perf+";  // '+' in a value is awkward in some shells and bench variants
   }
-  std::vector<PresetKnob> knobs(std::begin(kPresetPerf), std::end(kPresetPerf));
-  if (name == "perf+") {
-    knobs.insert(knobs.end(), std::begin(kPresetPerfPlus), std::end(kPresetPerfPlus));
-  } else if (name == "lowest") {
-    knobs.insert(knobs.end(), std::begin(kPresetLowest), std::end(kPresetLowest));
-  } else if (name != "perf") {
-    REXLOG_WARN("[mcla-gfx] preset '{}': unknown (perf, perf+, lowest, or empty for as shipped): nothing applied", requested);
+  std::vector<PresetKnob> knobs;
+  if (name == "quality" || name == "ultra") {
+    // Its own list, not perf's (see kPresetQuality); ultra = quality with the three distances replaced.
+    knobs.assign(std::begin(kPresetQuality), std::end(kPresetQuality));
+    if (name == "ultra") {
+      for (const PresetKnob& over : kPresetUltra) {
+        for (PresetKnob& knob : knobs) {
+          if (std::strcmp(knob.cvar, over.cvar) == 0) {
+            knob.value = over.value;
+          }
+        }
+      }
+    }
+  } else if (name == "perf" || name == "perf+" || name == "lowest") {
+    knobs.assign(std::begin(kPresetPerf), std::end(kPresetPerf));
+    if (name == "perf+") {
+      knobs.insert(knobs.end(), std::begin(kPresetPerfPlus), std::end(kPresetPerfPlus));
+    } else if (name == "lowest") {
+      knobs.insert(knobs.end(), std::begin(kPresetLowest), std::end(kPresetLowest));
+    }
+  } else {
+    REXLOG_WARN("[mcla-gfx] preset '{}': unknown (perf, perf+, lowest, quality, ultra, or empty for as shipped): nothing applied",
+                requested);
     return;
   }
-  const size_t prefix = std::strlen("mcla_gfx_");
   std::string line;
   for (const PresetKnob& knob : knobs) {
     // Set by hand (anything but the compiled-in default, an app default of the profile included) = the user's value stays.
     const bool by_hand = rex::cvar::GetFlagSource(knob.cvar) != rex::cvar::Source::kDefault;
     const bool ok = rex::cvar::SetDefaultValue(knob.cvar, knob.value);
     line += ' ';
-    line += knob.cvar + prefix;
+    line += ShortName(knob.cvar);
     line += '=';
     line += Pretty(rex::cvar::GetFlagByName(knob.cvar));
     if (by_hand) {
@@ -663,12 +727,113 @@ void ApplyPreset() {
   REXLOG_INFO("[mcla-gfx] preset {}:{}", name, line);
 }
 
+// ---- mcla_gfx_tier ------------------------------------------------------------------------------------------------
+//
+// A run-time detail tier for the frame-rate governor (LOCK60; the contract is in mcla_gfx_tune.h). Unlike a preset (app defaults,
+// applied once) a tier is written with SetFlagByName every time mcla_gfx_tier changes, over whatever the knobs hold, and taken
+// back when it goes to -1. The knobs are the ordinary cvars, so PublishPhaseIntervals, GatherKnobs and the hooks pick the change
+// up unchanged, in the same OnFrame (ApplyTier runs before the knobs are read). mcla_gfx_shadow_res is not in the table: it is
+// read when the shadow map is created (a world load). Higher = more detail; the governor sheds by stepping down.
+// The columns are kTierCvars; the rows:
+//   0 emergency: no sun shadows (the game's own night path), perf's rates and distances, no AA
+//   1 perf (the live part of the perf preset), no AA
+//   2 perf + FXAA
+//   3 shipped distances (shadow_dist, city_lod, traffic_lod 1.0), perf's rates, FXAA
+//   4 shipped rates (env_interval, far_cascades_interval 1) = the live part of the quality preset
+//   5 distances at 1.5x = the live part of the ultra preset
+constexpr int kTierKnobCount = 7;
+constexpr const char* kTierCvars[kTierKnobCount] = {
+    "mcla_gfx_env_interval", "mcla_gfx_far_cascades_interval", "mcla_gfx_shadow_dist", "mcla_gfx_city_lod",
+    "mcla_gfx_traffic_lod",  "mcla_gfx_shadow_mode",           "swap_post_effect",
+};
+constexpr const char* kTierValues[kTierMax + 1][kTierKnobCount] = {
+    {"2", "2", "0.6", "0.67", "0.7", "1", "none"},
+    {"2", "2", "0.6", "0.67", "0.7", "0", "none"},
+    {"2", "2", "0.6", "0.67", "0.7", "0", "fxaa"},
+    {"2", "2", "1.0", "1.0", "1.0", "0", "fxaa"},
+    {"1", "1", "1.0", "1.0", "1.0", "0", "fxaa"},
+    {"1", "1", "1.5", "1.5", "1.5", "0", "fxaa"},
+};
+
+struct KnobBefore {
+  std::string value;
+  rex::cvar::Source source = rex::cvar::Source::kDefault;
+};
+
+int g_tier_last = -1;                // game thread only (OnFrame): the tier written last, -1 = off
+std::atomic<int> g_tier_applied{-1};  // the same, for CurrentTier() from any thread
+KnobBefore g_tier_before[kTierKnobCount];  // the knobs as they were when the tier first left -1
+
+// Game thread, from OnFrame, before the knobs are read into g_eff and the phase atomics.
+void ApplyTier() {
+  const int tier = std::clamp<int>(REXCVAR_GET(mcla_gfx_tier), -1, kTierMax);
+  if (tier == g_tier_last) {
+    return;
+  }
+  std::string line;
+  if (tier >= 0) {
+    if (g_tier_last < 0) {
+      for (int i = 0; i < kTierKnobCount; ++i) {
+        g_tier_before[i].value = rex::cvar::GetFlagByName(kTierCvars[i]);
+        g_tier_before[i].source = rex::cvar::GetFlagSource(kTierCvars[i]);
+      }
+    }
+    for (int i = 0; i < kTierKnobCount; ++i) {
+      const bool ok = rex::cvar::SetFlagByName(kTierCvars[i], kTierValues[tier][i]);
+      line += ' ';
+      line += ShortName(kTierCvars[i]);
+      line += '=';
+      line += Pretty(rex::cvar::GetFlagByName(kTierCvars[i]));
+      if (!ok) {
+        line += "(REJECTED)";
+      }
+    }
+    REXLOG_INFO("[mcla-gfx] tier {}:{}", tier, line);
+  } else {
+    for (int i = 0; i < kTierKnobCount; ++i) {
+      // ResetToDefault goes back to the cvar's own default as SetDefaultValue left it (a preset's app default included, cvar.cpp),
+      // but also drops a value set by hand (command line, config): such a knob is written back as it was.
+      if (g_tier_before[i].source == rex::cvar::Source::kDefault) {
+        rex::cvar::ResetToDefault(kTierCvars[i]);
+      } else {
+        rex::cvar::SetFlagByName(kTierCvars[i], g_tier_before[i].value);
+      }
+    }
+    REXLOG_INFO("[mcla-gfx] tier off: knobs back to their defaults");
+  }
+  g_tier_last = tier;
+  g_tier_applied.store(tier, std::memory_order_relaxed);
+}
+
 }  // namespace
 
 void EnsurePreset() {
   static std::once_flag once;
   std::call_once(once, ApplyPreset);
 }
+
+const TierInfo* Tiers(int* count) {
+  static const TierInfo kTiers[] = {
+      {0, "emergency: no sun shadows", -3.0f, false,
+       "estimate (S3, vs tier 1), not measured on PC; every sun shadow vanishes at once"},
+      {1, "perf", 0.0f, true, "baseline: the live part of the perf preset, no AA"},
+      {2, "perf+fxaa", 0.3f, true, "FXAA on; the edges change subtly"},
+      {3, "shipped distances", 0.4f, false,
+       "objects and shadows at the LOD and shadow distance boundary appear at the switch: a small pop, best switched while moving "
+       "fast or behind a camera cut"},
+      {4, "shipped rates (quality)", 0.8f, true,
+       "car reflections and far shadow cascade at full rate; the phase skip forces a full draw on the first frame (LEARNINGS: no "
+       "flicker since the fix)"},
+      {5, "ultra distances", 1.0f, false,
+       "distances 1.5x: farther objects and shadows appear at the switch; +0.3 ms parked, about +1 ms while driving (vis4-drive-tiers)"},
+  };
+  if (count) {
+    *count = int(sizeof(kTiers) / sizeof(kTiers[0]));
+  }
+  return kTiers;
+}
+
+int CurrentTier() { return g_tier_applied.load(std::memory_order_relaxed); }
 
 uint32_t PhasesToSkip(uint32_t active_phases) {
   const uint32_t env = g_env_interval.load(std::memory_order_relaxed);
@@ -769,6 +934,8 @@ bool ImpostorsEnabled() {
 
 void OnFrame() {
   EnsurePreset();
+  mcla::vis::OnFrame();  // VISUALS: the mcla_vis_ab schedule (mcla_vis_ab.cpp), before the knobs are read
+  ApplyTier();           // mcla_gfx_tier: a tier writes the knob cvars, so it comes before they are read below
   std::lock_guard<std::mutex> lock(g_mutex);
   // The per-call hooks read these relaxed atomics, not the cvars.
   g_dl_clear.store(uint32_t(REXCVAR_GET(mcla_gfx_dl_clear)), std::memory_order_relaxed);

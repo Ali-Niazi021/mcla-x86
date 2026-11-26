@@ -872,6 +872,15 @@ purpose = "D3D12/Vulkan: cvar tonemap_transfer_skip (default false): skip the fu
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0600-vis-live-fxaa-lod-bias"
+source = "local"
+path = "patches/sdk/0600-vis-live-fxaa-lod-bias.patch"
+sha256 = "f4267b9816ece6f32d2f97b97f6afdb6c43b0bbf6aa82432df0781694db45510"
+purpose = "VISUALS (0600): swap_post_effect is read on every swap, so FXAA (none, fxaa, fxaa_extreme) switches while playing (D3D12 + Vulkan; still forced off while HDR10 output is active). New cvar texture_lod_bias (default 0 = as shipped, [-1.875, 0]): sampler mip bias for mipmapped textures, live through the sampler key's lod_bias field. Default = no change."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]
