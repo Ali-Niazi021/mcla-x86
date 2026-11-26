@@ -44,7 +44,8 @@
 //
 // Gate. cvar mcla_render_markers (INT32, default -1 = auto): 1 on, 0 off, -1 on only while `temporal_aa` is `fsr` or the
 // SDK's `tonemap_transfer_skip` (patch 04e0: skips the full-screen ownership transfer the tone map's render target bind
-// causes, and needs kTonemapBegin to find the tone map) is on (read once at the start of each frame, so the game's own
+// causes, and needs kTonemapBegin to find the tone map) or the SDK's per-phase GPU timing (`gpu_timing` >= 1, patch 04f0;
+// it also turns on a kPhase marker at the start of every phase) is on (read once at the start of each frame, so the game's own
 // setting of temporal_aa takes effect on the next frame). With the gate off every override is one relaxed load and the call
 // of the original. Log, once, at the first scene marker:
 // `[mcla-fsr] render markers: scene begin/end at ...`.
@@ -73,7 +74,7 @@ REXCVAR_DEFINE_INT32(mcla_render_markers, -1, "MCLA",
                      "MCLA: write the guest's render markers (no-op PM4 packets 'REXM' at the 3D scene's start, "
                      "its end and the tone map) into the GPU command stream, which the SDK's FSR 3.1 temporal AA / "
                      "upscaling and its tonemap_transfer_skip need to find the scene and the tone map. 1 = on, "
-                     "0 = off, -1 = auto: on only while temporal_aa is 'fsr' or tonemap_transfer_skip is on "
+                     "0 = off, -1 = auto: on only while temporal_aa is 'fsr', tonemap_transfer_skip is on or gpu_timing >= 1 "
                      "(default; inert otherwise). Draws nothing. Read once per frame");
 
 namespace {
@@ -89,6 +90,7 @@ enum MarkerKind : uint32_t {
   kSceneBegin = 7,
   kSceneTranslucent = 8,
   kSceneComposite = 9,
+  kPhase = 0x100,  // value = the renderer phase bit (LOCK60: written for every phase while the SDK's gpu_timing is on)
 };
 
 // The renderer's phase bits that mean something to the markers (frame-structure notes).
@@ -113,6 +115,10 @@ constexpr uint32_t kDeviceWriteLimit = 56;
 constexpr uint32_t kNopHeader = 0xC0021000;  // PM4 type 3, opcode NOP (0x10), 3 data words
 constexpr uint32_t kMagic = 0x5245584D;      // 'REXM'
 
+// LOCK60: the SDK's per-phase GPU timing (patch 04f0, cvar gpu_timing >= 1) cuts the GPU frame at the render markers, and
+// at a kPhase marker (value = the phase bit) written at the start of EVERY phase the loop runs. 0 on an SDK without the cvar.
+bool PhaseMarkersWanted() { return rex::cvar::Query<int32_t>("gpu_timing") > 0; }
+
 bool MarkersWanted() {
   const int32_t mode = REXCVAR_GET(mcla_render_markers);
   if (mode > 0) {
@@ -121,7 +127,8 @@ bool MarkersWanted() {
   if (mode == 0) {
     return false;
   }
-  return rex::cvar::GetFlagByName("temporal_aa") == "fsr" || rex::cvar::Query<bool>("tonemap_transfer_skip");
+  return rex::cvar::GetFlagByName("temporal_aa") == "fsr" || rex::cvar::Query<bool>("tonemap_transfer_skip") ||
+         PhaseMarkersWanted();
 }
 
 mcla::hooks::Registration g_registration("fsr-markers", "mcla_render_markers", MCLA_HOOK_FSR_MARKERS != 0,
@@ -141,6 +148,7 @@ REX_EXTERN(sub_82412710);
 namespace {
 
 std::atomic<bool> g_on{false};               // MarkersWanted() at the start of the current frame
+std::atomic<bool> g_phase_on{false};         // LOCK60: PhaseMarkersWanted() at the start of the current frame
 std::atomic<uintptr_t> g_render_thread{0};   // the thread that last ran the frame function
 std::atomic<uint32_t> g_frame{0};
 std::atomic<uint32_t> g_made_room{0};
@@ -206,6 +214,7 @@ void EmitMarker(PPCContext& ctx, uint8_t* base, uint32_t kind, uint32_t value) {
 extern "C" REX_FUNC(sub_822C0980) {
   MCLA_HOOK_ENTER();
   g_on.store(MarkersWanted(), std::memory_order_relaxed);
+  g_phase_on.store(PhaseMarkersWanted(), std::memory_order_relaxed);
   g_render_thread.store(ThisThread(), std::memory_order_relaxed);
   const uint32_t frame = g_frame.fetch_add(1, std::memory_order_relaxed) + 1;
   EmitMarker(ctx, base, kFrameBegin, frame);
@@ -292,6 +301,9 @@ extern "C" REX_FUNC(sub_822E6408) {
 extern "C" REX_FUNC(sub_822E55D0) {
   if (g_on.load(std::memory_order_relaxed)) {
     const uint32_t phase = ctx.r4.u32;
+    if (g_phase_on.load(std::memory_order_relaxed)) {
+      EmitMarker(ctx, base, kPhase, phase);  // LOCK60: before the named marker of the same phase (same cut point)
+    }
     switch (phase) {
       case kPhaseScene:
         EmitMarker(ctx, base, kSceneBegin, phase);
