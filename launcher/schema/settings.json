@@ -311,7 +311,7 @@
     {
       "id": "hdr",
       "label": "HDR output (experimental)",
-      "help": "HDR10 (BT.2020 PQ). Auto: HDR when Windows HDR (Settings > Display > Use HDR) is on for the window's display. The game's look up to 60% of its white, real highlights above it up to the display's peak; HUD and menus at Windows' SDR content brightness. About 0.5-1 ms GPU at 1080p.",
+      "help": "HDR10 (BT.2020 PQ). Auto: HDR when Windows HDR (Settings > Display > Use HDR) is on for the window's display. The game's look up to 60% of its white, real highlights above it up to the display's peak; HUD and menus at Windows' SDR content brightness. Measured cost: about 0.1-0.3 ms GPU per frame at 1080p on a Radeon 880M. Not yet judged by eye on an HDR screen.",
       "category": "display",
       "type": "enum",
       "cvar": "hdr",
