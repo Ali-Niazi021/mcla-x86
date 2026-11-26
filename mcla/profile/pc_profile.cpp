@@ -184,8 +184,9 @@ constexpr CvarDefault kLock60Defaults[] = {
     // render_target/cache.cpp (false). It turns the render markers on by itself (mcla_render_markers -1 = auto).
     {"tonemap_transfer_skip", "true"},
     // The GPU frame governor (mcla_gov.cpp; LOCK60 A5): a closed loop on the GPU's busy time per frame (SDK 04f0 export),
-    // shedding through variable rate shading (SDK 0500: post / composite / translucent / pre at 2x2, no visible change in run
-    // lk-vrs1) and then the live mcla_gfx knobs, restoring one level per 4 s of calm driving; holds its level outside driving.
+    // one two-way ladder: it sheds enriched detail tiers (mcla_gfx_tier) first, then variable rate shading (SDK 0500: post /
+    // composite / translucent / pre at 2x2, no visible change in run lk-vrs1), then tiers below the preset's, and enriches one
+    // tier at a time up to mcla_gov_tier_ceiling when the GPU has sustained headroom; holds its level outside driving.
     // Run lk-gov2: busy 11-12 ms at level 0 in normal 1080p driving, sheds within 0.1-0.3 s of a load rise, back at level 0
     // within ~16 s of calm. It only runs with mcla_sim60 (the 60 fps target); the 60 -> 30 hold (mcla_sim_pacer 2) waits for it.
     {"mcla_gov", "true"},

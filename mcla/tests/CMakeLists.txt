@@ -15,9 +15,10 @@
 #   mcla_swap_target_test      test_swap_target.cpp            hooks/mcla_t_swap_target.h (the guest swap callback's
 #                                                              target vblank, swap classes, timed-swap hand-off). New
 #                                                              in the TESTS slice too
-#   mcla_gov_test              test_gov.cpp                    hooks/mcla_gov_math.h (the GPU frame governor, LOCK60 A5:
-#                                                              level-table parser, shed / restore / probe-bounce control law,
-#                                                              pin and caps, HoldAllowed, closed loop against a toy GPU)
+#   mcla_gov_test              test_gov.cpp                    hooks/mcla_gov_math.h (the GPU frame governor, LOCK60 A5 / F1:
+#                                                              the tier / VRS ladder, shed rules (median, tail, missed frames),
+#                                                              restore, enrichment, learned costs, back-off, pop hiding, camera
+#                                                              cut / speed, pin and caps, HoldAllowed, closed loops against a toy GPU)
 #
 # `mcla_unit_tests` is the aggregate target (`cmake --build <dir> --target mcla_unit_tests`). The six executables
 # are also part of ALL, so a normal full build is followed by `ctest` (multi-config generators: `ctest -C <config>`).
