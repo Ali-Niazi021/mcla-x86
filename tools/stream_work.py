@@ -14,13 +14,17 @@ Creates <root>/mcla-x86-work-<name> (root default: the folder of the base work t
                                        --sdk shared: a junction to the base sdk (read-only: never build or reset it)
     build, runs, logs, scratch         empty; the stream's own
 
-Then use it with the environment variable MCLA_WORK=<that folder> (every tool and the CMake presets read it). The
-heavy lock stays machine-global (tools/heavy_lock.py lock_dir), so streams queue for the CPU and the GPU.
+Then use it with the environment variable MCLA_WORK=<that folder> (every Python tool reads it). The CMake presets do
+NOT: CMakePresets.json pins environment.MCLA_WORK to the main work tree, so a stream build needs a CMakeUserPresets.json
+(gitignored) next to it, written by this script when it is run from the stream's checkout: preset `stream-release`
+(configure and build) inherits win-amd64-release with this work tree. The heavy lock stays machine-global
+(tools/heavy_lock.py lock_dir), so streams queue for the CPU and the GPU.
 Safe to re-run: existing parts are left alone. Prints the folder as the last line.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -56,6 +60,23 @@ def copy_tree(src: Path, dst: Path, exclude_dirs: tuple = ()) -> None:
     print("  copy %s" % dst.name)
 
 
+def write_user_presets(work: Path) -> None:
+    """CMakeUserPresets.json in the current checkout (if it is one and has none): the build goes to this work tree."""
+    here = Path.cwd()
+    target = here / "CMakeUserPresets.json"
+    if not (here / "CMakePresets.json").is_file() or target.exists():
+        return
+    w = work.as_posix()
+    presets = {
+        "version": 6,
+        "configurePresets": [{"name": "stream-release", "inherits": "win-amd64-release", "binaryDir": w + "/build",
+                              "environment": {"MCLA_WORK": w}}],
+        "buildPresets": [{"name": "stream-release", "configurePreset": "stream-release", "configuration": "Release"}],
+    }
+    target.write_text(json.dumps(presets, indent=4) + "\n", encoding="utf-8")
+    print("  wrote %s (cmake --preset stream-release; cmake --build --preset stream-release)" % target.as_posix())
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Make a private $WORK for one work stream.")
     ap.add_argument("name")
@@ -80,6 +101,7 @@ def main() -> int:
         copy_tree(base / "sdk" / "install", work / "sdk" / "install")
     for name in ("build", "runs", "logs", "scratch"):
         (work / name).mkdir(exist_ok=True)
+    write_user_presets(work)
     print(work.as_posix())
     return 0
 
