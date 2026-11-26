@@ -953,6 +953,42 @@ purpose = "Fused HDR refresher: the HDR scene as a gain (HDR curve / game curve,
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0520-gpu-timing-ops"
+source = "local"
+path = "patches/sdk/0520-gpu-timing-ops.patch"
+sha256 = "8f79a65ffcedfbb0489600648b8a15aa7902343d74d2c87748520ec7206212d6"
+purpose = "gpu_timing_ops: GPU time per emulation operation class (resolve, dual-written resolve, texture load, EDRAM transfer, clear, upload, barrier) per render phase"
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0530-resolve-dual-write-msaa-defer-clears"
+source = "local"
+path = "patches/sdk/0530-resolve-dual-write-msaa-defer-clears.patch"
+sha256 = "918f6910b9cd04c5a5530376256e1af9a60b1cb6eda765bd000e4f3e954be7f1"
+purpose = "resolve_dual_write_msaa (MSAA and offset/partial destinations), resolve_defer_memory_write (deferred, materialised on demand), clear_full_resource, resolve_dual_write_nomem_dev"
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0540-overwrite-skip-with-tonemap"
+source = "local"
+path = "patches/sdk/0540-overwrite-skip-with-tonemap.patch"
+sha256 = "144dc564bd0571370e9e4cf81692e3fa867827f7122be80057b3f96e8636ea65"
+purpose = "skip_overwritten_transfers and tonemap_transfer_skip together: the tone map's draw takes 04e0's cut, every other rectangle draw 0450's"
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0580-ui-overlay-active-when-drawn"
+source = "local"
+path = "patches/sdk/0580-ui-overlay-active-when-drawn.patch"
+sha256 = "625396182afbe206b19753814ee837cba88702c0b7a0f99fcf444348a5f113b4"
+purpose = "ui_overlay_active_when_drawn: the UI overlay counts as shown only while something is drawn, so 04a0's fused gamma paint is made"
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]

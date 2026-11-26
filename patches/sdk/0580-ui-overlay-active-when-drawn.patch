@@ -1,0 +1,372 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Thu, 26 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0580: ui_overlay_active_when_drawn: the UI overlay counts as shown only while something is drawn, so 04a0's fused gamma paint is made
+
+Source: Ours (stream LOCK60 wave 2, F2f; finding by stream HDR). Validated in game: lk-fl4, lk-fl6, lk-val2
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: ReXApp always creates the AchievementToastDialog, so the ImGui drawer is registered all run and 04a0 refused the fused paint
+  ('a UI overlay is shown'). Cvar ui_overlay_active_when_drawn (false; PC profile true): UIDrawer::DrewSomething /
+  ImGuiDialog::HasVisibleContent (the toast: only while queued); conservative two-loop hysteresis and a wake counter for a dialog
+  or toast that appears; the empty overlay composite is skipped. Swap group -0.18 ms (lk-fl4/6).
+Bucket: REDO
+
+0580-ui-overlay-active-when-drawn.patch (mcla-x86 LOCK60 wave 2).
+
+---
+diff --git a/include/rex/ui/imgui_dialog.h b/include/rex/ui/imgui_dialog.h
+index 7be49e0b..93677b51 100644
+--- a/include/rex/ui/imgui_dialog.h
++++ b/include/rex/ui/imgui_dialog.h
+@@ -48,6 +48,12 @@ class ImGuiDialog {
+   // presents of its own.
+   virtual bool RepaintsContinuously() const { return true; }
+ 
++  // LOCAL PATCH - MCLA (0580): ui_overlay_active_when_drawn. Whether the dialog has something to show now or is about
++  // to (so the presenter can tell the drawer is registered with nothing on the screen). Called in the UI thread, after
++  // the dialog's Draw. A dialog that exists is shown, which is the default; one that stays registered while idle (the
++  // achievement toast, between toasts) says false while it is.
++  virtual bool HasVisibleContent() const { return true; }
++
+  protected:
+   ImGuiDialog(ImGuiDrawer* imgui_drawer);
+ 
+diff --git a/include/rex/ui/imgui_drawer.h b/include/rex/ui/imgui_drawer.h
+index a570fa00..698708b5 100644
+--- a/include/rex/ui/imgui_drawer.h
++++ b/include/rex/ui/imgui_drawer.h
+@@ -63,6 +63,10 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
+ 
+   void Draw(UIDrawContext& ui_draw_context) override;
+ 
++  // LOCAL PATCH - MCLA (0580): ui_overlay_active_when_drawn. Whether the last Draw produced draw data with any
++  // vertex, or a dialog still has (or is about to have) something to show. True until the first Draw has said.
++  bool DrewSomething() const override { return drew_something_; }
++
+  protected:
+   void OnKeyDown(KeyEvent& e) override;
+   void OnKeyUp(KeyEvent& e) override;
+@@ -135,6 +139,9 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
+ 
+   // Last value handed to the window, so detaching can clear it without a frame.
+   bool text_input_active_ = false;
++
++  // LOCAL PATCH - MCLA (0580): see DrewSomething. UI thread only.
++  bool drew_something_ = true;
+ };
+ 
+ }  // namespace ui
+diff --git a/include/rex/ui/overlay/achievement_toast.h b/include/rex/ui/overlay/achievement_toast.h
+index 76426017..d384eb65 100644
+--- a/include/rex/ui/overlay/achievement_toast.h
++++ b/include/rex/ui/overlay/achievement_toast.h
+@@ -35,6 +35,10 @@ class AchievementToastDialog : public AchievementNotificationDialog {
+   // Thread-safe: safe to call from any thread, including guest threads.
+   void Push(const rex::system::AchievementEvent& event) override;
+ 
++  // LOCAL PATCH - MCLA (0580): ui_overlay_active_when_drawn. Shown only while a toast is queued (the dialog stays
++  // registered with the presenter for the whole run, with nothing to draw between toasts). Thread-safe.
++  bool HasVisibleContent() const override;
++
+  protected:
+   void OnDraw(ImGuiIO& io) override;
+ 
+@@ -47,7 +51,8 @@ class AchievementToastDialog : public AchievementNotificationDialog {
+     std::optional<std::chrono::steady_clock::time_point> visible_since;
+   };
+ 
+-  std::mutex mutex_;
++  // LOCAL PATCH - MCLA (0580): mutable, for HasVisibleContent.
++  mutable std::mutex mutex_;
+   std::deque<PendingToast> queue_;
+   AchievementIconCache icon_cache_;
+ };
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index a58b2f7f..adb66803 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -456,6 +456,12 @@ class Presenter {
+   // Requests (re)painting with the UI if there's UI to draw.
+   void RequestUIPaintFromUIThread();
+ 
++  // LOCAL PATCH - MCLA (0580): ui_overlay_active_when_drawn. Any thread (a guest thread pushing a pop-up, a dialog
++  // being added): something may be about to appear in the UI overlay, which counts as shown (IsUIOverlayShown) from
++  // this call until the UI thread has drawn the drawers once afterwards and they said what they drew. Process-wide
++  // (there is one presenter), so it needs no pointer to a presenter that may be going away.
++  static void NoteUIOverlayMayShow();
++
+  protected:
+   enum class PaintResult {
+     kPresented,
+@@ -868,6 +874,14 @@ class Presenter {
+   // Whether the guest output thread's paint should put the overlay over the image
+   // (drawers are registered and an overlay has been rendered for them).
+   bool IsUIOverlayActive() const { return ui_overlay_active_.load(std::memory_order_acquire); }
++  // LOCAL PATCH - MCLA (0580): ui_overlay_active_when_drawn. Whether something is (or may be about to be) on the
++  // screen in the overlay, as opposed to drawers being registered that have nothing to draw (the achievement toast
++  // dialog stays registered for the whole run). With the cvar off it is IsUIOverlayActive(), as before. With it on:
++  // a NoteUIOverlayMayShow that no drawer loop has covered yet, or an active overlay whose drawers said they drew
++  // something in either of the last two loops (a frame after they stop is still counted). Any thread. For what has to
++  // be conservative about an overlay (the fused paint's refusal, 04a0) and for an overlay pass that would change
++  // nothing; not for the drawers' repaint requests, which want every registered drawer.
++  bool IsUIOverlayShown() const;
+   // The present log (cvar present_log): a present made by a pacer thread of the
+   // implementation's, for the image of the given refresh.
+   static void LogPresentFromPacer(uint64_t refresh_number, int result, uint64_t present_ns);
+@@ -1227,6 +1241,15 @@ class Presenter {
+   // overlay last published.
+   uint64_t ui_frames_drawn_ = 0;
+   std::atomic<uint64_t> ui_overlay_ui_frame_{0};
++  // LOCAL PATCH - MCLA (0580): ui_overlay_active_when_drawn (IsUIOverlayShown). Written by the UI thread at the end
++  // of each drawer loop (ExecuteUIDrawersFromUIThread): whether the drawers said they drew something in this loop
++  // or in the one before (true until two loops in a row have drawn nothing), the wake sequence number the loop
++  // started with, and the loops in a row that drew nothing (UI thread only). The wake sequence number is bumped by
++  // NoteUIOverlayMayShow from any thread.
++  std::atomic<bool> ui_overlay_drew_{true};
++  std::atomic<uint64_t> ui_overlay_wake_seen_{0};
++  uint32_t ui_overlay_empty_loops_ = 0;
++  static std::atomic<uint64_t> ui_overlay_wake_seq_;
+ 
+  protected:
+   // Set by the UI thread when it has drawn the overlay with drawers, cleared when
+diff --git a/include/rex/ui/ui_drawer.h b/include/rex/ui/ui_drawer.h
+index 4006af6a..19b7a582 100644
+--- a/include/rex/ui/ui_drawer.h
++++ b/include/rex/ui/ui_drawer.h
+@@ -30,6 +30,13 @@ class UIDrawer {
+   // quitting or resizing, if done in the UI, must be deferred via something
+   // like WindowedAppContext::CallInUIThreadDeferred.
+   virtual void Draw(UIDrawContext& context) = 0;
++
++  // LOCAL PATCH - MCLA (0580): ui_overlay_active_when_drawn. Whether the Draw that just returned put something on
++  // the screen (or whether what it has to show is about to be: a dialog that exists, a queued pop-up), so the
++  // presenter can tell an overlay that is shown from drawers that are registered with nothing to draw. Asked in the
++  // UI thread right after Draw, from the presenter's drawer loop. The default, true, is "always shown": the old
++  // behaviour for a drawer that doesn't say.
++  virtual bool DrewSomething() const { return true; }
+ };
+ 
+ }  // namespace ui
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 719c4eec..5f15e743 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -1632,8 +1632,12 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+       command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+       command_list->DrawInstanced(4, 1, 0, 0);
+     }
+-  } else if (!execute_ui_drawers && ui_overlay_paint_mode() && IsUIOverlayActive()) {
++  } else if (!execute_ui_drawers && ui_overlay_paint_mode() && IsUIOverlayActive() &&
++             IsUIOverlayShown()) {
+     // UI overlay painting: the UI thread's overlay over the image.
++    // LOCAL PATCH - MCLA (0580): ui_overlay_active_when_drawn: not while nothing is shown (IsUIOverlayShown is true
++    // with the cvar off): the layer is all zero then, which the premultiplied blend (ONE / INV_SRC_ALPHA) leaves
++    // exactly as it is, in SDR and HDR alike - a full-screen pass for nothing.
+     CompositeUIOverlay(command_list, back_buffer_rtv);
+     back_buffer_bound = true;
+   } else if (execute_ui_drawers) {
+diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
+index 94380930..6b6c6dc7 100644
+--- a/src/ui/imgui_drawer.cpp
++++ b/src/ui/imgui_drawer.cpp
+@@ -133,6 +133,9 @@ void ImGuiDrawer::AddDialog(ImGuiDialog* dialog) {
+     }
+   }
+   dialogs_.push_back(dialog);
++  // LOCAL PATCH - MCLA (0580): ui_overlay_active_when_drawn. A dialog is shown from here on, before the UI thread has
++  // drawn it once: the presenter counts the overlay as shown from now (see Presenter::NoteUIOverlayMayShow).
++  Presenter::NoteUIOverlayMayShow();
+ }
+ 
+ void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
+@@ -392,6 +395,8 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
+   SetupFontTexture();
+ 
+   if (dialogs_.empty()) {
++    // LOCAL PATCH - MCLA (0580): nothing drawn (and nothing registered to draw).
++    drew_something_ = false;
+     return;
+   }
+ 
+@@ -424,6 +429,9 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
+ 
+   ImGui::Render();
+   ImDrawData* draw_data = ImGui::GetDrawData();
++  // LOCAL PATCH - MCLA (0580): ui_overlay_active_when_drawn. Whether this frame put anything on the screen: draw data
++  // with a vertex (also what a dialog that closed itself in this frame drew last).
++  bool drew_something = draw_data && draw_data->TotalVtxCount > 0;
+   if (draw_data) {
+     RenderDrawLists(draw_data, ui_draw_context);
+   }
+@@ -437,6 +445,16 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
+   // it now if needed.
+   DetachIfLastDialogRemoved();
+ 
++  // LOCAL PATCH - MCLA (0580): ui_overlay_active_when_drawn. Or a dialog that is left says it has something to show
++  // (the default for a dialog: it is shown while it exists; the achievement toast says so only while it has a toast
++  // queued), such as one that draws nothing yet in its first frame (a fade-in at zero opacity).
++  if (!drew_something) {
++    drew_something = std::any_of(dialogs_.begin(), dialogs_.end(), [](const ImGuiDialog* dialog) {
++      return dialog->HasVisibleContent();
++    });
++  }
++  drew_something_ = drew_something;
++
+   if (!dialogs_.empty()) {
+     // Repaint (and handle input) continuously if still active. In detached mode
+     // there is no presenter; the app drives repaint via its own present loop.
+diff --git a/src/ui/overlay/achievement_toast.cpp b/src/ui/overlay/achievement_toast.cpp
+index 53b8c0b4..f7f63c57 100644
+--- a/src/ui/overlay/achievement_toast.cpp
++++ b/src/ui/overlay/achievement_toast.cpp
+@@ -25,8 +25,19 @@ AchievementToastDialog::AchievementToastDialog(ImGuiDrawer* drawer,
+ AchievementToastDialog::~AchievementToastDialog() {}
+ 
+ void AchievementToastDialog::Push(const rex::system::AchievementEvent& event) {
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    queue_.push_back({event, std::chrono::steady_clock::now()});
++  }
++  // LOCAL PATCH - MCLA (0580): ui_overlay_active_when_drawn. The overlay counts as shown from the moment a toast is
++  // pushed (this may be a guest thread), not from the UI thread's next draw of it.
++  Presenter::NoteUIOverlayMayShow();
++}
++
++// LOCAL PATCH - MCLA (0580): ui_overlay_active_when_drawn.
++bool AchievementToastDialog::HasVisibleContent() const {
+   std::lock_guard<std::mutex> lock(mutex_);
+-  queue_.push_back({event, std::chrono::steady_clock::now()});
++  return !queue_.empty();
+ }
+ 
+ void AchievementToastDialog::OnDraw(ImGuiIO& io) {
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 2cd2a8bc..748397d5 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -127,6 +127,19 @@ REXCVAR_DEFINE_BOOL(present_ui_overlay, true, "UI/Presenter",
+                     "sync (on Vulkan, with the IMMEDIATE or MAILBOX present mode)")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++// LOCAL PATCH - MCLA (0580): the overlay counts as shown (the fused gamma paint, 04a0, is refused; the overlay pass is
++// made) only while a drawer has something on the screen, instead of whenever drawers are registered.
++REXCVAR_DEFINE_BOOL(ui_overlay_active_when_drawn, false, "UI/Presenter",
++                    "With UI overlay painting (present_ui_overlay): count the UI overlay as shown only "
++                    "while one of the presenter's UI drawers has something on the screen (an overlay "
++                    "or a dialog is up, a pop-up such as an achievement toast is queued or fading, or "
++                    "has just stopped drawing) instead of for as long as drawers are registered (the "
++                    "achievement toast dialog is registered for the whole run, so the overlay was "
++                    "always counted). Where nothing is shown, the swap_direct_present fused gamma "
++                    "paint is allowed and the overlay pass over the picture, which would change "
++                    "nothing, is skipped. Off: the overlay is counted whenever drawers are registered")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_INT32(present_debug_stall_ms, 0, "UI/Presenter",
+                      "Development: when changed to a positive value, the guest output thread "
+                      "sleeps that long once at its next refresh (to test how UI overlay painting "
+@@ -896,6 +909,25 @@ bool Presenter::RenderUIOverlayForPaintsFromUIThread() {
+   return rendered;
+ }
+ 
++// LOCAL PATCH - MCLA (0580): ui_overlay_active_when_drawn.
++std::atomic<uint64_t> Presenter::ui_overlay_wake_seq_{0};
++
++void Presenter::NoteUIOverlayMayShow() {
++  ui_overlay_wake_seq_.fetch_add(1, std::memory_order_acq_rel);
++}
++
++bool Presenter::IsUIOverlayShown() const {
++  if (!REXCVAR_GET(ui_overlay_active_when_drawn)) {
++    return IsUIOverlayActive();
++  }
++  // Something may be about to appear that no drawer loop has looked at yet (a dialog added, a pop-up pushed).
++  if (ui_overlay_wake_seq_.load(std::memory_order_acquire) !=
++      ui_overlay_wake_seen_.load(std::memory_order_acquire)) {
++    return true;
++  }
++  return IsUIOverlayActive() && ui_overlay_drew_.load(std::memory_order_acquire);
++}
++
+ bool Presenter::IsUIOverlayPaintModeActive() const {
+   if (!ui_overlay_paint_mode_ || ui_overlay_paint_suspended_ || ui_overlay_render_failed_) {
+     return false;
+@@ -926,7 +958,20 @@ void Presenter::UpdateUIOverlayPaintSuspensionFromUIThread(bool draw_ui) {
+     // Before the first guest frame, silent since the presenter was set up.
+     const uint64_t since = last ? last : ui_overlay_paint_start_ns_;
+     const uint64_t silent_ns = ui_overlay_paint_forced_ ? kSilentForcedNs : kSilentNs;
+-    if (draw_ui && now > since + silent_ns) {
++    // LOCAL PATCH - MCLA (0580): ui_overlay_active_when_drawn. A silent guest takes the UI thread to repainting the
++    // last guest frame itself, which for a frame made as swap_direct_present's fused paint (a live render target,
++    // no finished image) shows an older one. With the cvar on the overlay isn't counted as shown just for having
++    // drawers registered, so fused frames are made while the toast dialog is idle; then a silent stretch must not
++    // take the UI thread over either (that frame is the one on the screen, and stays there) until something is shown:
++    // a dialog or a toast during a silent stretch still does, as it did, and its frames are the usual ones. Before the
++    // first guest frame (the UI thread paints the black the window shows meanwhile) and with frame generation (the
++    // pacer presents; never fused) it is as before.
++    bool suspension_wanted = draw_ui;
++    if (suspension_wanted && last && !ui_overlay_paint_forced_ &&
++        REXCVAR_GET(ui_overlay_active_when_drawn)) {
++      suspension_wanted = IsUIOverlayShown();
++    }
++    if (suspension_wanted && now > since + silent_ns) {
+       ui_overlay_paint_suspended_ = true;
+       ui_overlay_paint_suspended_ns_ = now;
+       ui_overlay_active_.store(false, std::memory_order_release);
+@@ -1419,7 +1464,8 @@ bool Presenter::LockForGuestOutputThreadPaintCheck(std::unique_lock<std::mutex>&
+     why_not = "the surface connection isn't paintable";
+   } else if (ui_overlay_paint_mode_ && !IsUIOverlayPaintModeActive()) {
+     why_not = "UI overlay painting is suspended or off";
+-  } else if (ui_overlay_paint_mode_ && IsUIOverlayActive()) {
++  } else if (ui_overlay_paint_mode_ && IsUIOverlayShown()) {
++    // LOCAL PATCH - MCLA (0580): ui_overlay_active_when_drawn: IsUIOverlayShown is IsUIOverlayActive with the cvar off.
+     why_not = "a UI overlay is shown (the UI thread can repaint the last guest frame while the guest is silent)";
+   }
+   if (why_not) {
+@@ -1855,6 +1901,9 @@ void Presenter::ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context) {
+   // Drawers can add or remove drawers (including themselves), need to ensure
+   // iterator validity in this case.
+   assert_false(is_executing_ui_drawers_);
++  // LOCAL PATCH - MCLA (0580): ui_overlay_active_when_drawn. A wake from now on is not covered by this loop.
++  const uint64_t wake_seq_at_start = ui_overlay_wake_seq_.load(std::memory_order_acquire);
++  bool drawers_drew_something = false;
+   ui_draw_next_iterator_ = ui_drawers_.begin();
+   is_executing_ui_drawers_ = true;
+   while (ui_draw_next_iterator_ != ui_drawers_.end()) {
+@@ -1870,11 +1919,36 @@ void Presenter::ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context) {
+     if (it_current->second.last_draw != ui_draw_current_) {
+       ui_draw_current_z_order_ = it_current->first;
+       it_current->second.last_draw = ui_draw_current_;
+-      it_current->second.drawer->Draw(ui_draw_context);
++      // LOCAL PATCH - MCLA (0580): the iterator may be invalid after Draw (a drawer may unregister itself), the
++      // drawer is not.
++      UIDrawer* const drawer = it_current->second.drawer;
++      drawer->Draw(ui_draw_context);
++      drawers_drew_something = drawers_drew_something || drawer->DrewSomething();
+     }
+   }
+   is_executing_ui_drawers_ = false;
+   ++ui_draw_current_;
++  // LOCAL PATCH - MCLA (0580): ui_overlay_active_when_drawn (IsUIOverlayShown). Counted as drawn until two loops in
++  // a row have drawn nothing: the first of them is the frame after the last drawn one, whose (empty) overlay layer
++  // gets published after it, so by the second the layer a paint would put over the image is an empty one. "Drew"
++  // is stored before the wake sequence number it covers, so a reader never sees both as nothing while something
++  // is shown.
++  if (drawers_drew_something) {
++    ui_overlay_empty_loops_ = 0;
++    if (!ui_overlay_drew_.exchange(true, std::memory_order_acq_rel) &&
++        REXCVAR_GET(ui_overlay_active_when_drawn)) {
++      REXLOG_INFO("Presenter: the UI drawers have something on the screen (ui_overlay_active_when_drawn)");
++    }
++  } else {
++    if (ui_overlay_empty_loops_ < 2) {
++      ++ui_overlay_empty_loops_;
++    }
++    if (ui_overlay_empty_loops_ >= 2 && ui_overlay_drew_.exchange(false, std::memory_order_acq_rel) &&
++        REXCVAR_GET(ui_overlay_active_when_drawn)) {
++      REXLOG_INFO("Presenter: the UI drawers have nothing on the screen (ui_overlay_active_when_drawn)");
++    }
++  }
++  ui_overlay_wake_seen_.store(wake_seq_at_start, std::memory_order_release);
+ }
+ 
+ void Presenter::SetPaintModeFromUIThread(PaintMode new_mode) {

@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Thu, 26 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0540: skip_overwritten_transfers and tonemap_transfer_skip together: the tone map's draw takes 04e0's cut, every other rectangle draw 0450's
+
+Source: Ours (stream LOCK60 wave 2, F2d). Validated in game: lk-fl1, lk-fl2 (poison), lk-fl3, lk-fl6
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: 0450 alone switched 04e0 off and did not cut the tone map (+0.4 ms there, lk-fl1). With both on: post-chain transfers
+  skipped (-0.25..-0.31 ms), tone map as 04e0. No change unless skip_overwritten_transfers is on (PC profile: on).
+Bucket: REDO
+
+0540-overwrite-skip-with-tonemap.patch (mcla-x86 LOCK60 wave 2).
+
+---
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index ebb1f370..d7429c03 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -828,7 +828,9 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+   const bool after_tonemap_marker = update_after_tonemap_marker_;
+   update_after_tonemap_marker_ = false;
+   const bool skip_overwritten_generic = REXCVAR_GET(skip_overwritten_transfers);
+-  const bool tonemap_skip_on = !skip_overwritten_generic && REXCVAR_GET(tonemap_transfer_skip);
++  // LOCAL PATCH - MCLA (0540): both can be on: the tone map's own draw takes 04e0's cut (colour only, whole screen), every
++  // other rectangle draw skip_overwritten_transfers' (0450 alone did not cut the tone map: +0.4 ms there, run lk-fl1).
++  const bool tonemap_skip_on = REXCVAR_GET(tonemap_transfer_skip);
+   if (tonemap_skip_on) {
+     g_tonemap_skip_stats.NoteDraw(after_tonemap_marker);
+   }
+@@ -1166,7 +1168,11 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+         color_transfers_needed |= !transfer_key.is_depth;
+       }
+     }
+-    if (transfers_needed && skip_overwritten_generic) {
++    // LOCAL PATCH - MCLA (0540): the tone map's draw first (04e0), the generic cut for the rest.
++    const bool tonemap_candidate = tonemap_skip_on && after_tonemap_marker && color_transfers_needed;
++    const bool tonemap_draw =
++        tonemap_candidate && pixel_shader->ucode_data_hash() == kTonemapPixelShaderHash;
++    if (transfers_needed && skip_overwritten_generic && !tonemap_draw) {
+       last_update_overwritten_rectangle_valid_ =
+           GetOverwrittenRectangle(vertex_shader, *pixel_shader, normalized_depth_control,
+                                   normalized_color_mask, last_update_overwritten_rectangle_);
+@@ -1177,7 +1183,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+                             last_update_overwritten_rectangle_.width_pixels,
+                             last_update_overwritten_rectangle_.height_pixels);
+       }
+-    } else if (!skip_overwritten_generic && color_transfers_needed) {
++    } else if (tonemap_candidate) {  // LOCAL PATCH - MCLA (0540): was !skip_overwritten_generic && color_transfers_needed
+       // LOCAL PATCH - MCLA (04e0): tonemap_transfer_skip. A draw after the tone map marker that needs a colour target's
+       // ownership changed: the tone map's own, or not.
+       const uint64_t pixel_shader_hash = pixel_shader->ucode_data_hash();

@@ -1,226 +1,88 @@
-// Midnight Club: Los Angeles: the pure logic of the GPU frame governor (LOCK60 A5, mcla_gov.cpp). No SDK, no guest memory, no
+// Midnight Club: Los Angeles: the pure logic of the GPU frame governor (LOCK60 A5 / F1, mcla_gov.cpp). No SDK, no guest memory, no
 // cvars, no clock: everything here is a function of numbers handed in (std only), so a unit test compiles it standalone
 // (mcla/tests/test_gov.cpp). The glue (symbols, cvars, the log lines) is mcla_gov.cpp.
 //
-// Two parts:
+// THE LADDER. The state is (tier t, VRS level v). t is the run-time detail tier of mcla_gfx_tune (1 = the perf preset ... 5 = 1.5x
+// distances), v the variable-rate-shading level (0 = full rate). Three numbers shape it: the floor F (the tier the picture is
+// configured at), the ceiling C (the richest tier the governor may enrich to; C < F = no enrichment) and V (VRS levels used).
+// The states form one line, the RUNG r (what Level() returns): r = 0 is the base (F, 0), r < 0 is enriched (F - r, 0), r > 0 is shed:
 //
-//   1. The level table (ParseLevelTable). `mcla_gov_levels` is a string: levels separated by ';', each level a comma-separated
-//      list of `name=value` actuator settings that HOLD at that level (absolute, not deltas; an actuator a level does not
-//      mention is at its base value). `vrs=K` is the variable-rate-shading level; any other name is a cvar. Level 0 is the
-//      configured picture and has no entry: the first entry of the string is level 1. A level whose effective settings equal
-//      the previous kept level's (VRS unsupported turns `vrs=1;vrs=2` into two copies of nothing; a level that repeats its
-//      predecessor) is skipped, so the level numbers are dense. The harness's command lines use `, ; =` themselves, so the
-//      parser also takes '|' for ';', '+' for ',' and ':' for '=' (no exponent notation in values then: "1e+3" would split).
+//      enriched tiers      (C,0) ... (F+1,0)      r = -(C-F) ... -1     richer than configured, only while there is headroom
+//      the base            (F,0)                  r = 0
+//      VRS                 (F,1) ... (F,V)        r = 1 ... V           invisible, ~0.4 / ~0.6 ms
+//      tiers below F       (F-1,V) ... (1,V)      r = V+1 ... V+F-1     visible; the last rung (1,V) is the last level: the
+//                                                                       60 -> 30 hold may start there (HoldAllowed)
 //
-//   2. The control law (Controller). One Step per engine frame, fed one GPU sample per new published frame, the missed-frame
-//      flag, the driving flag and the clock:
-//        SHED (level + 1) when at least shed_frames GPU frames passed since the last level change, the level is below the cap,
-//        and one of
-//          a. the median of the last 4 GPU samples (at least 3 of them) is above shed_ms        ["gpu median"]
-//          b. this engine frame was missed and the last GPU sample is above shed_ms - 1.0       ["missed frame at the budget"]
-//          c. there is NO GPU signal (no sample for 1 s) and 2 of the last 8 engine frames were missed
-//                                                                                              ["missed frames, no gpu signal"]
-//        RESTORE (level - 1) when driving, the level is above the floor, and for the whole of the level's restore delay (a)
-//        no frame was missed, (b) the player kept driving, (c) no level change happened, and (d) with a GPU signal the p90 of
-//        the delay's GPU samples is below restore_ms (and there are at least 10 samples a second of it); with no GPU signal
-//        (a/b/c alone) the quiet time is the whole condition. The delay is restore_s, doubled for every PROBE BOUNCE of that
-//        level that has not decayed yet (cap 60 s).
-//        A PROBE BOUNCE of level L = a restore from L followed within 2 s by a shed back to L. Each one doubles the delay of
-//        the next restore from L (restore_s x 2^k, cap 60 s); the doublings decay by one step per 30 s without a new bounce,
-//        counted from the end of the delay they lengthened (so a 32 s wait is not eaten by its own decay and the cap is
-//        reachable). This is the guard against DVFS: with slack the GPU clocks down and the frame time rises, so a plain
-//        threshold would restore, see the time rise, shed, and repeat.
-//        Not driving (a menu, a pause, a load): the level is held (no shed, no restore), and the restore timer is reset on
-//        every change of the driving flag and on every missed frame.
-//        Pinning (Params::force_level >= 0) replaces the loop; a lowered cap or a closed rich range moves the level at once.
-//   Levels below 0 (richer than the configured picture) are the same law mirrored: `Params::min_level` < 0 lets the restore
-//   step go on below 0; it is 0 in v1 unless mcla_gov_allow_rich is set (the table of those levels is mcla_gov_rich_levels).
+// SHED ORDER:   enriched tiers (C..F+1) -> VRS 1..V -> tiers F-1..1 -> hold.      RESTORE / ENRICH: the reverse, one rung at a time.
 //
-// Time is whatever steady clock the caller passes (nanoseconds); the samples carry no timestamps of their own, the call time
-// stands in for them (the SDK's value is 2-4 frames old by design, see rexgpu_gpu_frame_lag).
+//   SHED (r + 1; fast) when at least shed_frames GPU frames passed since the last change, r is below the cap, and one of
+//     a. the median of the last 4 GPU samples (at least 3 of them) is above shed_ms                  ["gpu median"]
+//     b. at least shed_over_count (3) of the last 30 GPU samples (0.5 s) are above shed_ms          ["gpu tail"]
+//        A tail rule, because under CPU / power contention the GPU frame is bimodal (field run int1-base: busy p50 15.1-15.3 ms, p95
+//        24-26 ms, 12-18 missed frames per 5 s, one frame in ~10 far longer) and the median alone never sheds. Samples count while
+//        driving and from the 5th published frame after a step (the export is 2-4 frames behind: the first ones are the old state).
+//     c. at least 2 of the last 30 engine frames were missed (with or without a GPU signal)         ["missed frames"]
+//        Counted while driving, and from the frame after a step. A single missed frame sheds nothing: one 25 ms spike in a clean
+//        stream is the stream's, not the rung's.
+//   RESTORE (r - 1, r > 0; slow) when driving, and for the whole of the rung's restore delay (a) no frame was missed, (b) the player
+//     kept driving, (c) no change happened, and (d) with a GPU signal the p90 of the delay's samples is below restore_ms (and there
+//     are at least 10 samples a second of it); with no GPU signal (a/b/c alone) the quiet time is the whole condition. The delay is
+//     restore_s, doubled for every PROBE BOUNCE of that rung that has not decayed yet (cap 60 s). A probe bounce = a restore from
+//     rung L followed within 2 s by a shed back to L; each doubles the next delay from L; the doublings decay one step per 30 s
+//     without a new bounce, counted from the end of the delay they lengthened. (The guard against DVFS: with slack the GPU clocks
+//     down and the frame time rises, so a plain threshold would restore, see the time rise, shed, and repeat.)
+//   ENRICH (r <= 0, t < C: (t,0) -> (t+1,0); slower still) when driving with a GPU signal, and for the whole of enrich_s (10 s)
+//     no frame was missed, the player kept driving, no change happened, and
+//         p90(busy over the window) + predicted_cost(t+1) + enrich_margin_ms <= restore_ms,
+//     and the back-off of tier t+1 has expired. predicted_cost(k) = max(the table's estimate of tier k over k-1, the cost LEARNED for
+//     k): after every tier step between k-1 and k (either way) the difference of the busy p50 over learn_s (3 s) before and after
+//     the step (the first 0.5 s after it skipped), over samples taken while driving and without a missed frame, is folded into
+//     learned[k] (EMA 0.4, each sample clamped to 0..5 ms; only with at least learn_s x 30 samples on both sides; a pause or a change
+//     in between aborts it, except that a tier shed again before the window opened - one that costs far more than planned is over the
+//     shed line within a few frames - is measured by the median of the last 4 samples that made the shed (or the samples since the
+//     step, from 0.1 s after it, if there are at least 3)).
+//   BACK-OFF (per tier): a tier k that was entered by ENRICHMENT and is shed (back to k-1) within enrich_hold_s (30 s) of its entry
+//     doubles backoff[k] (30 s, cap 600 s: enrichment into k is not tried before it expires). The doubling decays one step (halves,
+//     below 30 s = gone) per backoff period spent without a new bounce, counted from the end of the wait it lengthened.
+//   Not driving (a menu, a pause, a load): the rung is held (no shed, no restore, no enrich), and the quiet timer is reset on every
+//     change of the driving flag and on every missed frame.
+//   SCREEN-CHANGE GRACE (screen_grace_frames, 60; 0 = off). A change of the driving flag (either way) changes the scene: the GPU samples
+//     and missed frames taken on the previous screen (a 30 ms pause menu, a loading hitch) say nothing about the new one, and the first
+//     frames of the new one are hitchy too (field: entering driving from a load or the pause menu shed 0 -> 4 within 0.3-0.4 s on exactly
+//     those). So at the change (a) everything recorded so far is DISCARDED: the median ring, the tail window, the missed-frames history,
+//     the restore and enrich windows, the learning windows and their samples in progress; and (b) for the change frame and the next
+//     screen_grace_frames - 1 engine frames (the first screen_grace_frames frames of the new screen) no sample and no missed frame is
+//     recorded anywhere (nor resets the quiet timer), and nothing is shed, restored or enriched. After it the windows fill from empty:
+//     the first shed needs 3 fresh samples, the next ones their usual spacing. What is not gated: a pin, the cap, a range change, and a
+//     step that waits for a hiding moment, which still goes at the change of the flag to not driving (POP HIDING below; the
+//     1 s hiding moment after a change of the flag is unchanged, though with 60 frames of grace it is over about when the grace is).
+//     The summary window's own statistics (samples, p50 / p95, missed) and the signal liveness are not part of the decision and still
+//     take every sample.
+//   POP HIDING. A step between tiers k-1 and k whose tier k has pop_free = false (3 and 5) shows as a pop. Such a step (any kind) is
+//     taken only in a HIDING MOMENT: not driving (a pause, a load, a menu), within 1 s after a change of the driving flag, within
+//     0.5 s of a camera cut (the camera position jumped more than cut_m in one frame), or while the camera speed is above
+//     pop_speed_kmh. Enrichment and restore steps wait for one with no timeout. A SHED waits at most pop_wait_s (1.5 s) and goes
+//     at once on a missed frame. A step that is waiting when the player leaves the scene (driving -> not driving) goes at once.
+//   Pinning (Params::force_level >= 0) replaces the loop; a lowered cap, a changed floor / ceiling / VRS count moves the state at once.
+//
+// Time is whatever steady clock the caller passes (nanoseconds); the samples carry no timestamps of their own, the call time stands
+// in for them (the SDK's value is 2-4 frames old by design, see rexgpu_gpu_frame_lag).
 #pragma once
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <deque>
 #include <map>
 #include <string>
-#include <string_view>
 #include <vector>
 
 namespace mcla::gov::math {
 
-// ---- the level table -----------------------------------------------------------------------------------------------
-
-struct Setting {
-  std::string name;
-  std::string value;
-};
-
-// What holds at one level. `vrs`: -1 = not governed (the SDK's own cvar decides), 0 = full rate forced, K = level K.
-// `cvars`: one entry per cvar name, in the order the table wrote them.
-struct LevelSettings {
-  int vrs = -1;
-  std::vector<Setting> cvars;
-
-  const Setting* Find(std::string_view name) const {
-    for (const Setting& s : cvars) {
-      if (s.name == name) return &s;
-    }
-    return nullptr;
-  }
-  bool Empty() const { return vrs < 0 && cvars.empty(); }
-};
-
-namespace detail {
-
-inline std::string_view Trim(std::string_view t) {
-  while (!t.empty() && (t.front() == ' ' || t.front() == '\t' || t.front() == '\r' || t.front() == '\n')) t.remove_prefix(1);
-  while (!t.empty() && (t.back() == ' ' || t.back() == '\t' || t.back() == '\r' || t.back() == '\n')) t.remove_suffix(1);
-  return t;
-}
-
-inline bool ParseInt(std::string_view t, long& out) {
-  t = Trim(t);
-  if (t.empty()) return false;
-  const std::string text(t);
-  char* end = nullptr;
-  const long v = std::strtol(text.c_str(), &end, 10);
-  if (end != text.c_str() + text.size()) return false;
-  out = v;
-  return true;
-}
-
-inline bool ParseDouble(std::string_view t, double& out) {
-  t = Trim(t);
-  if (t.empty()) return false;
-  const std::string text(t);
-  char* end = nullptr;
-  const double v = std::strtod(text.c_str(), &end);
-  if (end != text.c_str() + text.size() || !std::isfinite(v)) return false;
-  out = v;
-  return true;
-}
-
-inline bool IsNameChar(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
-
-inline bool EqualNoCase(std::string_view a, std::string_view b) {
-  if (a.size() != b.size()) return false;
-  for (size_t i = 0; i < a.size(); ++i) {
-    const char x = (a[i] >= 'A' && a[i] <= 'Z') ? char(a[i] - 'A' + 'a') : a[i];
-    const char y = (b[i] >= 'A' && b[i] <= 'Z') ? char(b[i] - 'A' + 'a') : b[i];
-    if (x != y) return false;
-  }
-  return true;
-}
-
-}  // namespace detail
-
-// Two cvar values are the same setting: equal as numbers when both are numbers ("0.45" = "0.450000"), else equal text.
-inline bool ValuesEqual(const std::string& a, const std::string& b) {
-  double x = 0, y = 0;
-  if (detail::ParseDouble(a, x) && detail::ParseDouble(b, y)) {
-    return std::fabs(x - y) <= 1e-9 * std::max(1.0, std::max(std::fabs(x), std::fabs(y)));
-  }
-  return detail::EqualNoCase(detail::Trim(a), detail::Trim(b));
-}
-
-inline bool SameSettings(const LevelSettings& a, const LevelSettings& b) {
-  if (a.vrs != b.vrs || a.cvars.size() != b.cvars.size()) return false;
-  for (const Setting& s : a.cvars) {
-    const Setting* other = b.Find(s.name);
-    if (!other || !ValuesEqual(s.value, other->value)) return false;
-  }
-  return true;
-}
-
-// "vrs=2, mcla_gfx_env_interval=4" (what a log line shows for the level); "(base)" for a level that changes nothing.
-inline std::string Describe(const LevelSettings& level) {
-  std::string out;
-  if (level.vrs >= 0) out = "vrs=" + std::to_string(level.vrs);
-  for (const Setting& s : level.cvars) {
-    if (!out.empty()) out += ", ";
-    out += s.name + "=" + s.value;
-  }
-  return out.empty() ? std::string("(base)") : out;
-}
-
-struct ParsedTable {
-  std::vector<LevelSettings> levels;  // the kept levels; levels[0] is level 1 (rich table: levels[0] is level -1)
-  std::vector<int> skipped;           // 1-based positions in the string of the levels skipped as equal to the previous kept one
-  std::vector<std::string> warnings;  // entries that were not understood (they are ignored)
-  int source_levels = 0;              // levels the string had
-  int vrs_ignored = 0;                // `vrs=` entries dropped because the GPU has no VRS levels
-};
-
-// `vrs_levels` = rexgpu_vrs_levels (0 = no VRS on this GPU or SDK: `vrs=K` entries are dropped; K above it is clamped).
-inline ParsedTable ParseLevelTable(std::string_view text, int vrs_levels) {
-  ParsedTable out;
-  text = detail::Trim(text);
-  if (text.empty()) return out;
-  std::vector<std::string_view> pieces;
-  size_t begin = 0;
-  for (size_t i = 0; i <= text.size(); ++i) {
-    if (i == text.size() || text[i] == ';' || text[i] == '|') {
-      pieces.push_back(text.substr(begin, i - begin));
-      begin = i + 1;
-    }
-  }
-  if (!pieces.empty() && detail::Trim(pieces.back()).empty()) pieces.pop_back();  // a trailing ';'
-  LevelSettings previous;                                                        // level 0: nothing changed
-  int position = 0;
-  for (std::string_view piece : pieces) {
-    ++position;
-    ++out.source_levels;
-    LevelSettings level;
-    size_t item_begin = 0;
-    for (size_t i = 0; i <= piece.size(); ++i) {
-      if (i != piece.size() && piece[i] != ',' && piece[i] != '+') continue;
-      const std::string_view item = detail::Trim(piece.substr(item_begin, i - item_begin));
-      item_begin = i + 1;
-      if (item.empty()) continue;
-      const size_t eq = item.find_first_of("=:");
-      const std::string_view name = eq == std::string_view::npos ? std::string_view() : detail::Trim(item.substr(0, eq));
-      const std::string_view value = eq == std::string_view::npos ? std::string_view() : detail::Trim(item.substr(eq + 1));
-      bool name_ok = !name.empty();
-      for (char c : name) name_ok = name_ok && detail::IsNameChar(c);
-      if (!name_ok || value.empty()) {
-        out.warnings.push_back("level " + std::to_string(position) + ": '" + std::string(item) + "' is not name=value, ignored");
-        continue;
-      }
-      if (name == "vrs") {
-        long k = 0;
-        if (!detail::ParseInt(value, k)) {
-          out.warnings.push_back("level " + std::to_string(position) + ": '" + std::string(item) + "': vrs needs a whole number, ignored");
-        } else if (vrs_levels <= 0) {
-          ++out.vrs_ignored;
-        } else {
-          level.vrs = k < 0 ? -1 : int(std::min<long>(k, vrs_levels));
-        }
-        continue;
-      }
-      bool replaced = false;
-      for (Setting& s : level.cvars) {
-        if (s.name == name) {
-          s.value = std::string(value);
-          replaced = true;
-          out.warnings.push_back("level " + std::to_string(position) + ": '" + std::string(name) + "' set twice, the last value counts");
-        }
-      }
-      if (!replaced) level.cvars.push_back({std::string(name), std::string(value)});
-    }
-    if (SameSettings(level, previous)) {
-      out.skipped.push_back(position);
-      continue;
-    }
-    out.levels.push_back(level);
-    previous = out.levels.back();
-  }
-  return out;
-}
+constexpr int kTiers = 6;  // tiers 0..5 (the table of mcla_gfx_tune); the ladder uses 1..5
+constexpr int kMinTier = 1;
+constexpr int kMaxTier = 5;
 
 // ---- statistics ----------------------------------------------------------------------------------------------------
 
@@ -268,30 +130,204 @@ class Histogram {
   uint32_t total_ = 0;
 };
 
-// ---- the control law -----------------------------------------------------------------------------------------------
+// The samples of the last `keep` nanoseconds with a histogram over them.
+class TimedWindow {
+ public:
+  void Add(int64_t now, double ms) {
+    const int b = Histogram::BucketOf(ms);
+    ring_.push_back({now, b});
+    hist_.Add(b);
+  }
+  void Trim(int64_t now, int64_t keep_ns) {
+    while (!ring_.empty() && now - ring_.front().ns > keep_ns) {
+      hist_.Remove(ring_.front().bucket);
+      ring_.pop_front();
+    }
+  }
+  void Reset() {
+    ring_.clear();
+    hist_.Clear();
+  }
+  uint32_t Count() const { return hist_.Count(); }
+  double Percentile(double p) const { return hist_.Percentile(p); }
 
-constexpr int kMedianSamples = 4;              // the shed statistic: the median of the last 4 GPU samples
-constexpr int kMinMedianSamples = 3;           // ... and it needs at least 3 of them
-constexpr double kMissedShedMarginMs = 1.0;    // a missed frame sheds when the last sample is above shed_ms minus this
-constexpr int kMissedHistoryFrames = 8;        // the no-signal fallback looks at this many engine frames ...
-constexpr int kMissedFallbackCount = 2;        // ... and sheds at this many missed ones
+ private:
+  struct Item {
+    int64_t ns;
+    int bucket;
+  };
+  std::deque<Item> ring_;
+  Histogram hist_;
+};
+
+// ---- the camera: cuts and speed (the pop-hiding sources) ---------------------------------------------------------------
+
+// One call per engine frame with the camera's world position (metres). A jump of more than `cut_m` between two calls is a CUT (a
+// teleport, a replay camera change, a respawn); otherwise the speed is the distance over the real time between the calls, smoothed
+// (time constant 0.2 s), in km/h. -1 = unknown (the first call, or a gap of more than 0.5 s since the previous one).
+class CameraMotion {
+ public:
+  struct Result {
+    bool cut = false;
+    double speed_kmh = -1.0;
+  };
+
+  Result Update(int64_t now_ns, double x, double y, double z, double cut_m) {
+    Result r;
+    if (!have_) {
+      have_ = true;
+      Store(now_ns, x, y, z);
+      return r;
+    }
+    const double dist = std::sqrt((x - x_) * (x - x_) + (y - y_) * (y - y_) + (z - z_) * (z - z_));
+    const double dt = double(now_ns - ns_) / 1e9;
+    Store(now_ns, x, y, z);
+    if (cut_m > 0.0 && dist > cut_m) {
+      r.cut = true;
+      r.speed_kmh = speed_kmh_;  // the speed before the cut stays: a jump says nothing about it
+      return r;
+    }
+    if (!(dt > 0.0) || dt > kGapS) {
+      speed_kmh_ = -1.0;
+      return r;
+    }
+    const double inst = dist / dt * 3.6;
+    speed_kmh_ = speed_kmh_ < 0.0 ? inst : speed_kmh_ + (1.0 - std::exp(-dt / kTauS)) * (inst - speed_kmh_);
+    r.speed_kmh = speed_kmh_;
+    return r;
+  }
+  double SpeedKmh() const { return speed_kmh_; }
+
+ private:
+  static constexpr double kTauS = 0.2;
+  static constexpr double kGapS = 0.5;
+  void Store(int64_t ns, double x, double y, double z) {
+    ns_ = ns;
+    x_ = x;
+    y_ = y;
+    z_ = z;
+  }
+  bool have_ = false;
+  int64_t ns_ = 0;
+  double x_ = 0, y_ = 0, z_ = 0;
+  double speed_kmh_ = -1.0;
+};
+
+// ---- the ladder ----------------------------------------------------------------------------------------------------
+
+constexpr int kMedianSamples = 4;                      // the shed statistic: the median of the last 4 GPU samples
+constexpr int kMinMedianSamples = 3;                   // ... and it needs at least 3 of them
+constexpr int kTailSamples = 30;                       // the tail rule looks at the last 30 GPU samples (0.5 s at 60 fps) ...
+constexpr int kTailLagFrames = 4;                      // ... but not at the first 4 published frames after a step (they are the old state)
+constexpr int kMissedHistoryFrames = 30;               // the missed-frames rule looks at this many engine frames ...
+constexpr int kMissedShedCount = 2;                    // ... and sheds at this many missed ones
 constexpr int64_t kSignalLiveNs = 1'000'000'000;       // no new sample for this long = no GPU signal
-constexpr int64_t kBounceWindowNs = 2'000'000'000;     // a shed back to the level left by a restore within this = a bounce
+constexpr int64_t kBounceWindowNs = 2'000'000'000;     // a shed back to the rung left by a restore within this = a bounce
 constexpr int64_t kBounceDecayNs = 30'000'000'000;     // a doubling of the restore delay decays this long after the delay it lengthened
 constexpr double kMaxRestoreDelayS = 60.0;             // the cap of the doubled restore delay (never below restore_s itself)
 constexpr int kMaxBounceDoublings = 6;
-constexpr double kMinRestoreSamplesPerS = 10.0;        // a restore with a GPU signal needs this many samples a second of its delay
+constexpr double kMinRestoreSamplesPerS = 10.0;        // a restore / an enrichment with a GPU signal needs this many samples a second
+constexpr int64_t kDrivingResumeHideNs = 1'000'000'000;  // after a change of the driving flag this long is a hiding moment
+constexpr int64_t kCutHideNs = 500'000'000;            // after a camera cut this long is a hiding moment
+constexpr double kBackoffStartS = 30.0;                // the first back-off of a tier that bounced; below it nothing is left
+constexpr double kBackoffCapS = 600.0;
+constexpr int64_t kLearnSettleNs = 500'000'000;        // the first stretch after a step is not measured
+constexpr int64_t kLearnLagNs = 100'000'000;           // the last stretch before a step is not measured (the export's lag)
+constexpr double kLearnMaxMs = 5.0;                    // one learned sample is clamped to 0 .. this
+constexpr double kLearnAlpha = 0.4;                    // the EMA weight of a new sample
+constexpr double kLearnMinSamplesPerS = 30.0;          // a learning window needs this many samples a second of its length
+constexpr int kQuickLearnSamples = 3;                  // a step shed again before its window opened is measured from this many samples
+
+struct State {
+  int tier = 1;
+  int vrs = 0;
+};
+inline bool operator==(State a, State b) { return a.tier == b.tier && a.vrs == b.vrs; }
+inline bool operator!=(State a, State b) { return !(a == b); }
+inline int Key(State s) { return s.tier * 100 + s.vrs; }
 
 // The live settings (cvars), handed to every Step so a change takes effect on the next frame.
 struct Params {
   double shed_ms = 14.8;
   double restore_ms = 12.8;
-  int shed_frames = 6;        // GPU frames between two level changes before a shed
+  int shed_frames = 6;        // GPU frames between two changes before a shed
+  int shed_over_count = 3;    // the tail rule: this many of the last 30 GPU samples over shed_ms sheds (0 = off)
   double restore_s = 4.0;
-  int min_level = 0;          // the lowest level the loop may restore to (0, or minus the rich table's size)
-  int max_level = 0;          // the highest level the loop may shed to (the table's size, capped by mcla_gov_max_level)
-  int force_level = -1;       // >= 0 pins that level (already clamped to the table by the caller); < 0 = closed loop
+  // the ladder
+  int tier_floor = 1;         // F, 1..5: the configured tier (the base rung)
+  int tier_ceiling = 4;       // C, 1..5: the richest tier enrichment may reach (C <= F: none)
+  int vrs_levels = 2;         // V: VRS levels the ladder uses (0 = none)
+  int max_level = -1;         // the highest rung the loop may shed to; < 0 = the whole ladder; 0 = never shed
+  int force_level = -1;       // >= 0 pins that shed rung (clamped to the ladder; 0 = the base); < 0 = closed loop
+  // enrichment
+  double enrich_s = 10.0;
+  double enrich_margin_ms = 1.5;
+  double enrich_hold_s = 30.0;
+  double learn_s = 3.0;       // 0 = no learning
+  // the tier table (mcla_gfx_tune Tiers()): index = tier; the estimate is the ms over the tier below, pop_free = switching it does not show
+  std::array<double, kTiers> tier_est_ms{-3.0, 0.0, 0.3, 0.4, 0.8, 1.0};
+  std::array<bool, kTiers> tier_pop_free{false, true, true, false, true, false};
+  // pop hiding
+  double pop_wait_s = 1.5;
+  double pop_speed_kmh = 90.0;
+  // screen-change grace: engine frames after a change of the driving flag in which nothing is recorded and nothing is shed / restored /
+  // enriched (0 = off: the previous screen's samples are not discarded either)
+  int screen_grace_frames = 60;
 };
+
+// The shape of the ladder for one set of Params.
+struct Ladder {
+  int floor = 1, ceiling = 1, vrs = 0;
+  int enrich = 0;  // rungs above the base
+  int shed = 0;    // rungs below the base: V + F - 1 (the last one is the last level)
+
+  static Ladder Of(const Params& p) {
+    Ladder l;
+    l.floor = std::clamp(p.tier_floor, kMinTier, kMaxTier);
+    l.ceiling = std::clamp(p.tier_ceiling, kMinTier, kMaxTier);
+    l.vrs = std::max(0, p.vrs_levels);
+    l.enrich = std::max(0, l.ceiling - l.floor);
+    l.shed = l.vrs + (l.floor - 1);
+    return l;
+  }
+  int TopTier() const { return floor + enrich; }
+  // The rung of a state on the ladder (a state off it is read as its nearest rung).
+  int Rung(State s) const {
+    if (s.tier > floor) return -(s.tier - floor);
+    if (s.tier == floor) return std::clamp(s.vrs, 0, vrs);
+    return vrs + (floor - s.tier);
+  }
+  State At(int rung) const {
+    rung = std::clamp(rung, -enrich, shed);
+    if (rung <= 0) return State{floor - rung, 0};
+    if (rung <= vrs) return State{floor, rung};
+    return State{floor - (rung - vrs), vrs};
+  }
+  bool On(State s) const {
+    if (s.tier < kMinTier || s.tier > TopTier()) return false;
+    if (s.tier > floor) return s.vrs == 0;
+    if (s.tier == floor) return s.vrs >= 0 && s.vrs <= vrs;
+    return s.vrs == vrs;
+  }
+  // The nearest state on the ladder: the tier is kept when it can be (a tier below the floor with VRS short of its maximum
+  // gets the maximum: shedding more, never enriching, on a settings change).
+  State Clamp(State s) const {
+    s.tier = std::clamp(s.tier, kMinTier, TopTier());
+    s.vrs = std::clamp(s.vrs, 0, vrs);
+    if (s.tier > floor) s.vrs = 0;
+    if (s.tier < floor) s.vrs = vrs;
+    return s;
+  }
+  int MaxRung(const Params& p) const { return p.max_level >= 0 ? std::min(p.max_level, shed) : shed; }
+  // A step between these two states changes the tier across one with pop_free = false.
+  static bool Popping(State a, State b, const Params& p) {
+    if (a.tier == b.tier) return false;
+    const int hi = std::clamp(std::max(a.tier, b.tier), 0, kTiers - 1);
+    return !p.tier_pop_free[size_t(hi)];
+  }
+};
+
+// ---- the control law -----------------------------------------------------------------------------------------------
 
 struct Input {
   int64_t now_ns = 0;
@@ -301,101 +337,194 @@ struct Input {
   double gpu_ms = 0.0;      // the latest published GPU frame time (read when new_sample)
   uint32_t seq_delta = 0;   // frames published since the previous call (read when new_sample; >= 1)
   int lag = 0;              // how many frames old the published value is (for the summary only)
+  bool cut = false;         // the camera jumped more than cut_m this frame (a hiding moment)
+  double speed_kmh = -1.0;  // the camera's speed, km/h; < 0 = unknown
 };
 
-enum class Reason { kNone, kGpuMedian, kMissedAtBudget, kMissedFrames, kRestore, kForced, kCap, kRichOff };
+enum class Reason { kNone, kGpuMedian, kGpuTail, kMissedFrames, kRestore, kEnrich, kForced, kCap, kRange };
+enum class Kind { kNone, kShed, kRestore, kEnrich, kOther };
+// What let a step across a popping tier go.
+enum class Hide { kNone, kNotDriving, kDrivingChange, kCut, kSpeed, kMissed, kTimeout };
 
 inline const char* ReasonText(Reason r) {
   switch (r) {
     case Reason::kGpuMedian: return "gpu median over the shed line";
-    case Reason::kMissedAtBudget: return "missed frame at the budget";
-    case Reason::kMissedFrames: return "missed frames, no gpu signal";
+    case Reason::kGpuTail: return "gpu tail over the shed line";
+    case Reason::kMissedFrames: return "missed frames";
     case Reason::kRestore: return "restore";
+    case Reason::kEnrich: return "enrich";
     case Reason::kForced: return "forced";
     case Reason::kCap: return "level cap";
-    case Reason::kRichOff: return "rich levels off";
+    case Reason::kRange: return "floor / ceiling / vrs changed";
     case Reason::kNone: break;
   }
   return "";
 }
+inline const char* HideText(Hide h) {
+  switch (h) {
+    case Hide::kNotDriving: return "not driving";
+    case Hide::kDrivingChange: return "driving flag changed";
+    case Hide::kCut: return "camera cut";
+    case Hide::kSpeed: return "speed";
+    case Hide::kMissed: return "missed frame";
+    case Hide::kTimeout: return "wait over";
+    case Hide::kNone: break;
+  }
+  return "";
+}
 
-// What a Step did, for the log line: `[mcla-gov] level a -> b (<reason>: gpu <stat_name> x.x ms of the last n, missed m)`.
+// What a Step did, for the log line:
+//   `[mcla-gov] tier a -> b / vrs a -> b (<reason>: busy <stat_name> x.x ms of the last n, predicted +x.x ms, learned ..., missed m)`.
 struct Change {
-  bool changed = false;
-  int from = 0, to = 0;
+  bool changed = false;       // a step was taken (from_* / to_* are the step)
+  bool wait_started = false;  // a step now waits for a hiding moment (from_* / to_* are the planned step; changed is false)
+  int from = 0, to = 0;       // rungs
+  int from_tier = 0, to_tier = 0, from_vrs = 0, to_vrs = 0;
+  Kind kind = Kind::kNone;
   Reason reason = Reason::kNone;
-  const char* stat_name = "";  // "p50" (shed: the median of the last samples), "last" (a missed frame), "p90" (restore), "" = none
+  const char* stat_name = "";  // "p50" (the median of the last samples), "tail" (samples over the line; stat_ms = the largest), "missed", "p90" (restore, enrich), "" = none
   double stat_ms = -1.0;
-  int stat_n = 0;              // samples the statistic is over
+  int stat_n = 0;              // samples the statistic is over (tail: the number over the line, missed: the missed frames)
+  int stat_window = 0;         // ... out of this many (the tail window, the missed-frames window)
   int missed = 0;              // of the last 8 engine frames
-  bool bounce = false;         // a shed that is the bounce of a probe
+  bool bounce = false;         // a shed that is the bounce of a restore probe
   bool signal_gpu = false;
+  double est_ms = -1.0;        // enrich: the table's estimate of the tier entered
+  double learned_ms = -1.0;    // enrich: the learned cost of the tier entered (-1 = none yet)
+  double predicted_ms = -1.0;  // enrich: max of the two
+  double backoff_s = 0.0;      // a shed of an enriched tier that bounced: its new back-off
+  double waited_s = 0.0;       // a step that waited for a hiding moment: how long
+  Hide hide = Hide::kNone;     // what released a step across a popping tier
+  // A tier step's learning finished in this call (independent of `changed`).
+  bool learn_done = false;
+  int learn_tier = 0;          // the tier whose cost over the one below was measured
+  double learn_delta_ms = 0.0, learn_before_ms = 0.0, learn_after_ms = 0.0;  // the clamped sample and the two p50s
+  int learn_n_before = 0, learn_n_after = 0;
 };
 
 // One summary window (mcla_gov_log_s seconds).
 struct Window {
   int64_t start_ns = 0;
   int64_t length_ns = 0;
-  int min_level = 0, max_level = 0;
-  std::map<int, int64_t> time_ns;  // time at each level
-  int sheds = 0, restores = 0, bounces = 0;
-  uint32_t missed = 0;             // engine frames missed
-  uint32_t samples = 0;            // GPU samples
+  int min_level = 0, max_level = 0;  // rungs
+  std::map<int, int64_t> time_ns;    // time at each state (Key(State))
+  int sheds = 0, restores = 0, enriches = 0, bounces = 0, waits = 0;
+  uint32_t missed = 0;               // engine frames missed
+  uint32_t samples = 0;              // GPU samples
+  uint32_t grace_frames = 0;         // engine frames spent in a screen-change grace
   double p50_ms = -1.0, p95_ms = -1.0;
-  int lag = 0;                     // the largest lag seen
-  bool signal_gpu = false;         // at the end of the window
+  int lag = 0;                       // the largest lag seen
+  bool signal_gpu = false;           // at the end of the window
 };
 
 class Controller {
  public:
+  State Current() const { return state_; }
+  int Tier() const { return state_.tier; }
+  int Vrs() const { return state_.vrs; }
+  // The rung of the state as of the last Step (0 = the base, > 0 shed, < 0 enriched).
   int Level() const { return level_; }
   bool SignalLive() const { return signal_live_; }
   double LastSampleMs() const { return have_sample_ ? last_sample_ms_ : 0.0; }
   uint32_t FramesSinceChange() const { return frames_since_change_; }
   int64_t WindowStartNs() const { return win_start_ns_; }
+  bool Waiting() const { return plan_.active; }  // a step waits for a hiding moment
+  bool InGrace() const { return in_grace_; }     // the last Step was inside a screen-change grace (nothing recorded, nothing decided)
+  int GraceFramesLeft() const { return grace_left_; }  // frames of the grace still to come after the last Step
 
-  // The 60 -> 30 hold may start: at the last level and still over budget (or, with no GPU signal, at the last level).
+  // The 60 -> 30 hold may start: at the last rung (the cap, or tier 1 with VRS at its maximum) and still over budget (or, with no GPU
+  // signal, at the last rung).
   bool HoldAllowed(const Params& p) const {
-    if (level_ < p.max_level) return false;
+    const Ladder lad = Ladder::Of(p);
+    if (lad.Rung(lad.Clamp(state_)) < lad.MaxRung(p)) return false;
     return !signal_live_ || last_sample_ms_ > p.shed_ms;
   }
 
-  // The doublings of the restore delay of `level` still in force at `now_ns` (0 = none).
-  int Doublings(int level, int64_t now_ns) const {
-    const auto it = bounce_.find(level);
+  // The doublings of the restore delay out of `state` still in force at `now_ns` (0 = none).
+  int Doublings(State state, int64_t now_ns) const {
+    const auto it = bounce_.find(Key(state));
     if (it == bounce_.end()) return 0;
     const int64_t steps = std::max<int64_t>(0, now_ns - it->second.decay_from_ns) / kBounceDecayNs;
     return int(std::max<int64_t>(0, it->second.doublings - steps));
   }
-  // How long the quiet time before a restore from `level` is.
-  double RestoreDelayS(int level, int64_t now_ns, const Params& p) const {
+  // How long the quiet time before a restore out of `state` is.
+  double RestoreDelayS(State state, int64_t now_ns, const Params& p) const {
     const double base = std::max(0.1, p.restore_s);
     const double cap = std::max(kMaxRestoreDelayS, base);
-    return std::min(cap, base * double(1 << Doublings(level, now_ns)));
+    return std::min(cap, base * double(1 << Doublings(state, now_ns)));
+  }
+
+  // The cost of tier k over k-1 the enrichment rule plans with: the table's estimate, or what was learned when that is more.
+  double PredictedCostMs(int tier, const Params& p) const {
+    if (tier < 0 || tier >= kTiers) return 0.0;
+    const double est = p.tier_est_ms[size_t(tier)];
+    return learned_n_[size_t(tier)] > 0 ? std::max(est, learned_ms_[size_t(tier)]) : est;
+  }
+  bool HasLearned(int tier) const { return tier >= 0 && tier < kTiers && learned_n_[size_t(tier)] > 0; }
+  double LearnedMs(int tier) const { return HasLearned(tier) ? learned_ms_[size_t(tier)] : -1.0; }
+  int LearnedCount(int tier) const { return tier >= 0 && tier < kTiers ? learned_n_[size_t(tier)] : 0; }
+
+  // The back-off of `tier`: the period still in force (after its decay), 0 = none; and whether enrichment into it is barred now.
+  double BackoffPeriodS(int tier, int64_t now_ns) const {
+    if (tier < 0 || tier >= kTiers) return 0.0;
+    const Backoff& b = backoff_[size_t(tier)];
+    double period = b.period_s;
+    int64_t t = b.decay_from_ns;
+    while (period >= kBackoffStartS) {
+      const int64_t step = int64_t(period * 1e9);
+      if (now_ns - t < step) break;
+      t += step;
+      period *= 0.5;
+    }
+    return period >= kBackoffStartS ? period : 0.0;
+  }
+  bool BackedOff(int tier, int64_t now_ns) const {
+    return tier >= 0 && tier < kTiers && now_ns < backoff_[size_t(tier)].until_ns;
+  }
+  double BackoffLeftS(int tier, int64_t now_ns) const {
+    return BackedOff(tier, now_ns) ? double(backoff_[size_t(tier)].until_ns - now_ns) / 1e9 : 0.0;
   }
 
   Change Step(const Input& in, const Params& p) {
     const int64_t now = in.now_ns;
+    const Ladder lad = Ladder::Of(p);
     if (!started_) {
       started_ = true;
-      win_start_ns_ = last_now_ns_ = restore_start_ns_ = now;
+      win_start_ns_ = last_now_ns_ = quiet_start_ns_ = now;
       driving_ = in.driving;
-      win_.min_level = win_.max_level = level_;
+      state_ = State{lad.floor, 0};
+      win_.min_level = win_.max_level = lad.Rung(state_);
     } else {
-      win_.time_ns[level_] += std::max<int64_t>(0, now - last_now_ns_);
+      win_.time_ns[Key(state_)] += std::max<int64_t>(0, now - last_now_ns_);
       last_now_ns_ = now;
     }
 
+    // The screen-change grace: a change of the driving flag throws away what was recorded on the previous screen and opens a stretch of
+    // frames in which nothing is recorded (and nothing is decided, see ClosedLoop). The change frame is the first frame of the grace.
+    const int grace_len = std::max(0, p.screen_grace_frames);
+    if (in.driving != driving_ && grace_len > 0) {
+      DiscardRecords();
+      grace_left_ = grace_len;
+    }
+    grace_left_ = std::min(grace_left_, grace_len);  // switched off or shortened live
+    in_grace_ = grace_left_ > 0;
+    if (in_grace_) {
+      --grace_left_;
+      ++win_.grace_frames;
+    }
+
     // The engine frame: the missed history.
-    missed_history_ = uint8_t((missed_history_ << 1) | (in.missed ? 1u : 0u));
+    missed_history_ = in.driving && !in_grace_ ? ((missed_history_ << 1) | (in.missed ? 1u : 0u)) & kMissedMask : 0u;  // not driving, grace: nothing counts
     if (in.missed) ++win_.missed;
 
     // The GPU sample.
     const bool sample = in.new_sample && std::isfinite(in.gpu_ms) && in.gpu_ms > 0.0;
-    if (sample) {
+    if (sample && !in_grace_) {
       recent_[size_t(recent_next_)] = in.gpu_ms;
       recent_next_ = (recent_next_ + 1) % kMedianSamples;
       recent_count_ = std::min(recent_count_ + 1, kMedianSamples);
+    }
+    if (sample) {
       last_sample_ms_ = in.gpu_ms;
       last_sample_ns_ = now;
       have_sample_ = true;
@@ -404,32 +533,65 @@ class Controller {
     }
     win_.lag = std::max(win_.lag, in.lag);
     signal_live_ = have_sample_ && now - last_sample_ns_ <= kSignalLiveNs;
-    // The spacing of level changes counts GPU frames while the signal is live (the published count), engine frames without it.
+    // The spacing of changes counts GPU frames while the signal is live (the published count), engine frames without it.
     const uint32_t frames = signal_live_ ? (sample ? std::max<uint32_t>(1, in.seq_delta) : 0u) : 1u;
     frames_since_change_ = frames_since_change_ > UINT32_MAX - frames ? UINT32_MAX : frames_since_change_ + frames;
+    // The tail: the samples taken while driving, once the step before them has shown (the export is 2-4 frames behind).
+    if (sample && in.driving && !in_grace_ && frames_since_change_ > uint32_t(kTailLagFrames)) {
+      tail_[size_t(tail_next_)] = in.gpu_ms;
+      tail_next_ = (tail_next_ + 1) % kTailSamples;
+      tail_count_ = std::min(tail_count_ + 1, kTailSamples);
+    }
 
-    // The restore timer: a change of the driving flag, a frame that is not driving and a missed frame all start it over.
+    // The camera: a cut and the speed (the hiding moments).
+    if (in.cut) cut_until_ns_ = now + kCutHideNs;
+    speed_kmh_ = in.speed_kmh;
+
+    // The driving flag. A step that waits for a hiding moment goes when the player leaves the scene.
+    Change out;
     if (in.driving != driving_) {
       driving_ = in.driving;
-      ResetRestore(now);
+      driving_change_ns_ = now;
+      tail_count_ = tail_next_ = 0;  // the frames of a menu or a load are not the drive's
+      if (!in.driving && plan_.active && PlanValid(lad, p)) out = ApplyPlan(now, p, lad, Hide::kNotDriving);
+      ResetQuiet(now);
     }
-    if (!in.driving || in.missed) ResetRestore(now);
-    const double delay_s = RestoreDelayS(level_, now, p);
-    if (sample && in.driving) AddRestoreSample(now, in.gpu_ms);
-    TrimRestore(now, delay_s);
+    // The quiet timer: a frame that is not driving and a missed frame (outside a grace) start it over.
+    if (!in.driving || (in.missed && !in_grace_)) ResetQuiet(now);
+    const double delay_s = RestoreDelayS(state_, now, p);
+    const bool valid = sample && in.driving && !in.missed && !in_grace_;  // a sample the learning may use
+    if (sample && in.driving && !in_grace_) {
+      restore_win_.Add(now, in.gpu_ms);
+      enrich_win_.Add(now, in.gpu_ms);
+    }
+    restore_win_.Trim(now, int64_t(delay_s * 1e9));
+    enrich_win_.Trim(now, int64_t(std::max(0.1, p.enrich_s) * 1e9));
+    const Change learn = FeedLearn(now, in, valid, p);
 
-    // Pinned, capped, or the closed loop.
-    Change out;
-    if (p.force_level >= 0) {
-      if (level_ != p.force_level) out = ChangeTo(p.force_level, Reason::kForced, now);
-    } else if (level_ > p.max_level) {
-      out = ChangeTo(std::max(p.max_level, p.min_level), Reason::kCap, now);
-    } else if (level_ < p.min_level) {
-      out = ChangeTo(p.min_level, Reason::kRichOff, now);
-    } else {
-      out = ClosedLoop(in, p, now, delay_s);
+    if (!out.changed) {
+      if (!lad.On(state_)) {
+        out = Move(lad.Clamp(state_), Reason::kRange, p, lad, now);
+      } else if (p.force_level >= 0) {
+        const State target = lad.At(std::min(p.force_level, lad.shed));
+        plan_ = Plan();
+        if (state_ != target) out = Move(target, Reason::kForced, p, lad, now);
+      } else if (lad.Rung(state_) > lad.MaxRung(p)) {
+        out = Move(lad.At(lad.MaxRung(p)), Reason::kCap, p, lad, now);
+      } else {
+        out = ClosedLoop(in, p, lad, now, delay_s);
+      }
     }
+    level_ = lad.Rung(lad.Clamp(state_));
     out.signal_gpu = signal_live_;
+    if (learn.learn_done) {
+      out.learn_done = true;
+      out.learn_tier = learn.learn_tier;
+      out.learn_delta_ms = learn.learn_delta_ms;
+      out.learn_before_ms = learn.learn_before_ms;
+      out.learn_after_ms = learn.learn_after_ms;
+      out.learn_n_before = learn.learn_n_before;
+      out.learn_n_after = learn.learn_n_after;
+    }
     return out;
   }
 
@@ -453,33 +615,55 @@ class Controller {
     int doublings = 0;
     int64_t decay_from_ns = 0;  // the bounce's time plus the delay it set: the doublings decay from here, one per 30 s
   };
-  struct TimedBucket {
+  struct Backoff {
+    double period_s = 0.0;      // the wait the last bounce set (before its decay)
+    int64_t until_ns = 0;       // enrichment into the tier is barred until here
+    int64_t decay_from_ns = 0;  // the period halves one step per period from here (= until_ns)
+  };
+  struct Plan {  // a step that waits for a hiding moment
+    bool active = false;
+    Kind kind = Kind::kNone;
+    State to;
+    int64_t since_ns = 0;
+    Change info;  // reason, statistic, prediction of the step
+  };
+  struct LearnSample {
     int64_t ns;
     int bucket;
+    int key;
+  };
+  struct Learn {  // the measurement of one tier step in progress
+    bool active = false;
+    int from_tier = 0, to_tier = 0;
+    int64_t change_ns = 0;
+    double before_ms = 0.0;
+    int before_n = 0;
+    std::vector<int> after;  // the valid samples from 0.5 s to 3.5 s after the step
+    std::vector<int> quick;  // the valid samples from 0.1 s after the step on (for a step that is shed again before the window opens)
   };
 
-  static int PopCount(uint8_t v) {
+  static int PopCount(uint32_t v) {
     int n = 0;
-    for (; v; v = uint8_t(v & (v - 1))) ++n;
+    for (; v; v &= v - 1) ++n;
     return n;
   }
 
-  void ResetRestore(int64_t now) {
-    restore_start_ns_ = now;
-    restore_ring_.clear();
-    restore_hist_.Clear();
+  void ResetQuiet(int64_t now) {
+    quiet_start_ns_ = now;
+    restore_win_.Reset();
+    enrich_win_.Reset();
   }
-  void AddRestoreSample(int64_t now, double ms) {
-    const int b = Histogram::BucketOf(ms);
-    restore_ring_.push_back({now, b});
-    restore_hist_.Add(b);
-  }
-  void TrimRestore(int64_t now, double delay_s) {
-    const int64_t keep = int64_t(delay_s * 1e9);
-    while (!restore_ring_.empty() && now - restore_ring_.front().ns > keep) {
-      restore_hist_.Remove(restore_ring_.front().bucket);
-      restore_ring_.pop_front();
-    }
+  // The previous screen's records go (the screen-change grace): every window the shed / restore / enrich / learning rules read.
+  void DiscardRecords() {
+    recent_count_ = recent_next_ = 0;
+    tail_count_ = tail_next_ = 0;
+    missed_history_ = 0;
+    restore_win_.Reset();
+    enrich_win_.Reset();
+    learn_ring_.clear();
+    learn_.active = false;
+    learn_.after.clear();
+    learn_.quick.clear();
   }
   double Median() const {
     std::array<double, kMedianSamples> v{};
@@ -489,90 +673,371 @@ class Controller {
     return (n % 2) ? v[size_t(n / 2)] : 0.5 * (v[size_t(n / 2 - 1)] + v[size_t(n / 2)]);
   }
 
-  Change ChangeTo(int to, Reason reason, int64_t now) {
-    Change c;
-    c.changed = true;
-    c.from = level_;
-    c.to = to;
-    c.reason = reason;
+  // ---- hiding moments
+
+  Hide HidingNow(int64_t now, const Params& p) const {
+    if (!driving_) return Hide::kNotDriving;
+    if (now - driving_change_ns_ < kDrivingResumeHideNs) return Hide::kDrivingChange;
+    if (now < cut_until_ns_) return Hide::kCut;
+    if (speed_kmh_ >= 0.0 && speed_kmh_ > p.pop_speed_kmh) return Hide::kSpeed;
+    return Hide::kNone;
+  }
+
+  // ---- steps
+
+  Change Fill(Kind kind, State to, const Change& info, const Ladder& lad) const {
+    Change c = info;
+    c.kind = kind;
+    c.from_tier = state_.tier;
+    c.from_vrs = state_.vrs;
+    c.to_tier = to.tier;
+    c.to_vrs = to.vrs;
+    c.from = lad.Rung(state_);
+    c.to = lad.Rung(to);
     c.missed = PopCount(missed_history_);
-    level_ = to;
+    return c;
+  }
+
+  // Takes the step: the bookkeeping of enrichment, bounces and learning, then the state.
+  Change Apply(Kind kind, State to, const Change& info, const Params& p, const Ladder& lad, int64_t now) {
+    const State from = state_;
+    Change c = Fill(kind, to, info, lad);
+    c.changed = true;
+    c.wait_started = false;
+    // A tier step: the enrichment record of the tier left, the back-off of an enriched tier shed too soon.
+    if (to.tier != from.tier) {
+      if (kind == Kind::kShed && to.tier < from.tier) NoteEnrichedShed(from.tier, now, p, &c);
+      enriched_[size_t(from.tier)] = false;
+      if (kind == Kind::kEnrich && to.tier > from.tier) {
+        enriched_[size_t(to.tier)] = true;
+        enriched_at_ns_[size_t(to.tier)] = now;
+      } else {
+        enriched_[size_t(to.tier)] = false;
+      }
+    }
+    // The probe bounce of a restore: a shed back to the state a restore left within 2 s.
+    if (kind == Kind::kShed) {
+      if (has_restore_ && restore_from_key_ == Key(to) && now - restore_ns_ <= kBounceWindowNs) {
+        const int doublings = std::min(Doublings(to, now) + 1, kMaxBounceDoublings);
+        Bounce& b = bounce_[Key(to)];
+        b.doublings = doublings;
+        b.decay_from_ns = now + int64_t(RestoreDelayS(to, now, p) * 1e9);
+        ++win_.bounces;
+        c.bounce = true;
+      }
+      has_restore_ = false;
+    } else if (kind == Kind::kRestore) {
+      has_restore_ = true;
+      restore_from_key_ = Key(from);
+      restore_ns_ = now;
+    } else {
+      has_restore_ = false;
+    }
+    // A tier shed again before its measurement window opened (one that costs far more than planned is over the shed line within a few
+    // frames): the median of the last 4 samples that made the shed is the measurement, or else the samples taken since the step, from
+    // the 0.1 s the export lags, if there are at least 3.
+    if (learn_.active && kind == Kind::kShed && from.tier == learn_.to_tier && to.tier == learn_.from_tier) {
+      if (info.reason == Reason::kGpuMedian && info.stat_n >= kMinMedianSamples) {
+        FoldLearn(info.stat_ms, info.stat_n, &c);
+      } else if (int(learn_.quick.size()) >= kQuickLearnSamples) {
+        FoldLearn(learn_.quick, &c);
+      }
+    }
+    // The cost of a tier step is measured (a step that is not a tier step, or one taken outside driving, is not).
+    learn_.active = false;
+    if (to.tier != from.tier && driving_) StartLearn(from, to, now, p);
+
+    state_ = to;
     frames_since_change_ = 0;
-    ResetRestore(now);
-    win_.min_level = std::min(win_.min_level, to);
-    win_.max_level = std::max(win_.max_level, to);
-    return c;
-  }
-
-  Change Shed(Reason reason, const char* stat_name, double stat_ms, int stat_n, const Params& p, int64_t now) {
-    const int to = level_ + 1;
-    Change c = ChangeTo(to, reason, now);
-    c.stat_name = stat_name;
-    c.stat_ms = stat_ms;
-    c.stat_n = stat_n;
-    ++win_.sheds;
-    if (has_restore_ && restore_from_ == to && now - restore_ns_ <= kBounceWindowNs) {
-      const int doublings = std::min(Doublings(to, now) + 1, kMaxBounceDoublings);
-      Bounce& b = bounce_[to];
-      b.doublings = doublings;
-      b.decay_from_ns = now;
-      b.decay_from_ns = now + int64_t(RestoreDelayS(to, now, p) * 1e9);
-      ++win_.bounces;
-      c.bounce = true;
+    missed_history_ = 0;  // the frames before a step are the old state's: the shed rules start counting again
+    tail_count_ = tail_next_ = 0;
+    ResetQuiet(now);
+    plan_ = Plan();
+    win_.min_level = std::min(win_.min_level, c.to);
+    win_.max_level = std::max(win_.max_level, c.to);
+    switch (kind) {
+      case Kind::kShed: ++win_.sheds; break;
+      case Kind::kRestore: ++win_.restores; break;
+      case Kind::kEnrich: ++win_.enriches; break;
+      default: break;
     }
-    has_restore_ = false;
     return c;
   }
 
-  Change ClosedLoop(const Input& in, const Params& p, int64_t now, double delay_s) {
-    // Not driving (a menu, a pause, a load): the level is held. Loads hitch for reasons no level helps (streaming, pipeline
+  // A forced / capped / out-of-range move (no waiting, no statistics).
+  Change Move(State to, Reason reason, const Params& p, const Ladder& lad, int64_t now) {
+    Change info;
+    info.reason = reason;
+    return Apply(Kind::kOther, to, info, p, lad, now);
+  }
+
+  bool PlanValid(const Ladder& lad, const Params& p) const {
+    if (!lad.On(state_) || !lad.On(plan_.to)) return false;
+    const int a = lad.Rung(state_), b = lad.Rung(plan_.to);
+    if (std::abs(a - b) != 1) return false;
+    if (plan_.kind == Kind::kShed) return b <= lad.MaxRung(p) && p.force_level < 0;
+    return p.force_level < 0;
+  }
+
+  Change ApplyPlan(int64_t now, const Params& p, const Ladder& lad, Hide hide) {
+    const Plan plan = plan_;
+    Change c = Apply(plan.kind, plan.to, plan.info, p, lad, now);
+    c.waited_s = double(now - plan.since_ns) / 1e9;
+    c.hide = hide;
+    return c;
+  }
+
+  // The step `kind` to `to` is decided. Across a popping tier it waits for a hiding moment unless one is here.
+  Change TryStep(Kind kind, State to, const Change& info, const Input& in, const Params& p, const Ladder& lad, int64_t now) {
+    const bool waiting_same = plan_.active && plan_.kind == kind && plan_.to == to;
+    bool go = true;
+    Hide release = Hide::kNone;
+    if (Ladder::Popping(state_, to, p)) {
+      const Hide hide = HidingNow(now, p);
+      go = false;
+      if (hide != Hide::kNone) {
+        go = true;
+        release = hide;
+      } else if (kind == Kind::kShed && in.missed) {
+        go = true;
+        release = Hide::kMissed;
+      } else if (kind == Kind::kShed && waiting_same && double(now - plan_.since_ns) >= p.pop_wait_s * 1e9) {
+        go = true;
+        release = Hide::kTimeout;
+      }
+    }
+    if (go) {
+      const double waited = waiting_same ? double(now - plan_.since_ns) / 1e9 : 0.0;
+      Change c = Apply(kind, to, info, p, lad, now);
+      c.waited_s = waited;
+      c.hide = release;
+      return c;
+    }
+    if (waiting_same) {
+      plan_.info = info;  // fresh statistics, the same plan
+      return Change();
+    }
+    plan_ = Plan{true, kind, to, now, info};
+    ++win_.waits;
+    Change w = Fill(kind, to, info, lad);
+    w.wait_started = true;
+    return w;
+  }
+
+  // ---- the three kinds of step
+
+  struct Trigger {
+    bool fired = false;
+    Reason reason = Reason::kNone;
+    const char* name = "";
+    double ms = -1.0;
+    int n = 0;
+    int window = 0;
+  };
+  Trigger EvalShed(const Params& p) const {
+    Trigger t;
+    if (signal_live_ && recent_count_ >= kMinMedianSamples) {
+      const double median = Median();
+      if (median > p.shed_ms) return Trigger{true, Reason::kGpuMedian, "p50", median, recent_count_, recent_count_};
+    }
+    if (signal_live_ && p.shed_over_count > 0) {
+      int over = 0;
+      double max_ms = 0.0;
+      for (int i = 0; i < tail_count_; ++i) {
+        if (tail_[size_t(i)] > p.shed_ms) {
+          ++over;
+          max_ms = std::max(max_ms, tail_[size_t(i)]);
+        }
+      }
+      if (over >= p.shed_over_count) return Trigger{true, Reason::kGpuTail, "tail", max_ms, over, tail_count_};
+    }
+    if (PopCount(missed_history_) >= kMissedShedCount) {
+      return Trigger{true, Reason::kMissedFrames, "missed", -1.0, PopCount(missed_history_), kMissedHistoryFrames};
+    }
+    return t;
+  }
+
+  Change ClosedLoop(const Input& in, const Params& p, const Ladder& lad, int64_t now, double delay_s) {
+    // Not driving (a menu, a pause, a load): the rung is held. Loads hitch for reasons no step helps (streaming, pipeline
     // creation: run lk-gov2 shed 0 -> 4 on 25-35 ms loading frames), and the pause menu's cost is its UI.
-    if (!in.driving) return Change();
-    const int shed_frames = std::max(1, p.shed_frames);
-    if (level_ < p.max_level && frames_since_change_ >= uint32_t(shed_frames)) {
-      if (signal_live_ && recent_count_ >= kMinMedianSamples) {
-        const double median = Median();
-        if (median > p.shed_ms) return Shed(Reason::kGpuMedian, "p50", median, recent_count_, p, now);
-      }
-      if (signal_live_ && in.missed && last_sample_ms_ > p.shed_ms - kMissedShedMarginMs) {
-        return Shed(Reason::kMissedAtBudget, "last", last_sample_ms_, 1, p, now);
-      }
-      if (!signal_live_ && PopCount(missed_history_) >= kMissedFallbackCount) {
-        return Shed(Reason::kMissedFrames, "", -1.0, 0, p, now);
+    if (!in.driving) {
+      plan_ = Plan();
+      return Change();
+    }
+    // The first frames of a new screen (the grace): nothing was recorded for them, so nothing is decided. A step that already waits for
+    // a hiding moment is not touched here (it goes at the pause, or is judged again after the grace).
+    if (in_grace_) return Change();
+    const int r = lad.Rung(state_);
+
+    // SHED
+    if (r < lad.MaxRung(p) && frames_since_change_ >= uint32_t(std::max(1, p.shed_frames))) {
+      const Trigger t = EvalShed(p);
+      if (t.fired) {
+        Change info;
+        info.reason = t.reason;
+        info.stat_name = t.name;
+        info.stat_ms = t.ms;
+        info.stat_n = t.n;
+        info.stat_window = t.window;
+        return TryStep(Kind::kShed, lad.At(r + 1), info, in, p, lad, now);
       }
     }
-    if (in.driving && !in.missed && level_ > p.min_level && now - restore_start_ns_ >= int64_t(delay_s * 1e9)) {
-      if (!signal_live_) {
-        return Restore("", -1.0, 0, now);  // no GPU frame time to judge by: the quiet time with no missed frame is the condition
+    if (plan_.active && plan_.kind == Kind::kShed) plan_ = Plan();  // the trigger went away
+
+    // RESTORE (below the base) and ENRICH (at or above it)
+    bool want = false;
+    Kind kind = Kind::kNone;
+    State to = state_;
+    Change info;
+    if (!in.missed) {
+      if (r > 0) {
+        want = RestoreReady(in, p, now, delay_s, &info);
+        kind = Kind::kRestore;
+        to = lad.At(r - 1);
+      } else if (state_.tier < lad.TopTier() && state_.vrs == 0) {
+        to = State{state_.tier + 1, 0};
+        want = EnrichReady(p, now, to.tier, &info);
+        kind = Kind::kEnrich;
       }
-      const uint32_t count = restore_hist_.Count();
-      const uint32_t need = uint32_t(std::ceil(delay_s * kMinRestoreSamplesPerS));
-      const double p90 = restore_hist_.Percentile(0.90);
-      if (count >= need && p90 >= 0.0 && p90 < p.restore_ms) return Restore("p90", p90, int(count), now);
     }
-    return Change();
+    if (!want) {
+      if (plan_.active) plan_ = Plan();
+      return Change();
+    }
+    return TryStep(kind, to, info, in, p, lad, now);
   }
 
-  Change Restore(const char* stat_name, double stat_ms, int stat_n, int64_t now) {
-    Change c = ChangeTo(level_ - 1, Reason::kRestore, now);
-    c.stat_name = stat_name;
-    c.stat_ms = stat_ms;
-    c.stat_n = stat_n;
-    ++win_.restores;
-    has_restore_ = true;
-    restore_from_ = c.from;
-    restore_ns_ = now;
-    return c;
+  bool RestoreReady(const Input& in, const Params& p, int64_t now, double delay_s, Change* info) const {
+    if (!in.driving || in.missed || now - quiet_start_ns_ < int64_t(delay_s * 1e9)) return false;
+    info->reason = Reason::kRestore;
+    if (!signal_live_) return true;  // no GPU frame time to judge by: the quiet time with no missed frame is the condition
+    const uint32_t count = restore_win_.Count();
+    const uint32_t need = uint32_t(std::ceil(delay_s * kMinRestoreSamplesPerS));
+    const double p90 = restore_win_.Percentile(0.90);
+    if (count >= need && p90 >= 0.0 && p90 < p.restore_ms) {
+      info->stat_name = "p90";
+      info->stat_ms = p90;
+      info->stat_n = int(count);
+      return true;
+    }
+    return false;
   }
+
+  bool EnrichReady(const Params& p, int64_t now, int next_tier, Change* info) const {
+    const double window_s = std::max(0.1, p.enrich_s);
+    if (!signal_live_ || now - quiet_start_ns_ < int64_t(window_s * 1e9)) return false;
+    if (BackedOff(next_tier, now)) return false;
+    const uint32_t count = enrich_win_.Count();
+    if (count < uint32_t(std::ceil(window_s * kMinRestoreSamplesPerS))) return false;
+    const double p90 = enrich_win_.Percentile(0.90);
+    const double predicted = PredictedCostMs(next_tier, p);
+    if (!(p90 >= 0.0) || p90 + predicted + p.enrich_margin_ms > p.restore_ms) return false;
+    info->reason = Reason::kEnrich;
+    info->stat_name = "p90";
+    info->stat_ms = p90;
+    info->stat_n = int(count);
+    info->est_ms = p.tier_est_ms[size_t(next_tier)];
+    info->learned_ms = LearnedMs(next_tier);
+    info->predicted_ms = predicted;
+    return true;
+  }
+
+  // An enriched tier shed within enrich_hold_s of its entry: the back-off of that tier doubles.
+  void NoteEnrichedShed(int tier, int64_t now, const Params& p, Change* c) {
+    if (!enriched_[size_t(tier)] || double(now - enriched_at_ns_[size_t(tier)]) > p.enrich_hold_s * 1e9) return;
+    Backoff& b = backoff_[size_t(tier)];
+    const double current = BackoffPeriodS(tier, now);
+    const double next = current <= 0.0 ? kBackoffStartS : std::min(kBackoffCapS, current * 2.0);
+    b.period_s = next;
+    b.until_ns = now + int64_t(next * 1e9);
+    b.decay_from_ns = b.until_ns;
+    c->backoff_s = next;
+  }
+
+  // ---- learning the cost of a tier
+
+  void StartLearn(State from, State to, int64_t now, const Params& p) {
+    if (p.learn_s <= 0.0) return;
+    // The p50 of the valid samples of the state left, from learn_s + the export's lag back to the lag.
+    std::vector<int> before;
+    const int64_t hi = now - kLearnLagNs, lo = hi - int64_t(p.learn_s * 1e9);
+    for (const LearnSample& s : learn_ring_) {
+      if (s.key == Key(from) && s.ns >= lo && s.ns <= hi) before.push_back(s.bucket);
+    }
+    if (int(before.size()) < LearnMinSamples(p)) return;
+    std::nth_element(before.begin(), before.begin() + before.size() / 2, before.end());
+    learn_.active = true;
+    learn_.from_tier = from.tier;
+    learn_.to_tier = to.tier;
+    learn_.change_ns = now;
+    learn_.before_ms = Histogram::BucketMs(before[before.size() / 2]);
+    learn_.before_n = int(before.size());
+    learn_.after.clear();
+    learn_.quick.clear();
+  }
+  static int LearnMinSamples(const Params& p) { return std::max(10, int(p.learn_s * kLearnMinSamplesPerS)); }
+
+  Change FeedLearn(int64_t now, const Input& in, bool valid, const Params& p) {
+    Change out;
+    const int64_t keep = int64_t((std::max(0.0, p.learn_s) + 1.0) * 1e9);
+    if (valid && p.learn_s > 0.0) learn_ring_.push_back({now, Histogram::BucketOf(in.gpu_ms), Key(state_)});
+    while (!learn_ring_.empty() && now - learn_ring_.front().ns > keep) learn_ring_.pop_front();
+    if (!learn_.active) return out;
+    if (!in.driving || p.learn_s <= 0.0) {  // a pause changes the scene: the measurement is void
+      learn_.active = false;
+      return out;
+    }
+    const int64_t start = learn_.change_ns + kLearnSettleNs;
+    const int64_t end = start + int64_t(p.learn_s * 1e9);
+    if (valid && now >= learn_.change_ns + kLearnLagNs && now <= end) learn_.quick.push_back(Histogram::BucketOf(in.gpu_ms));
+    if (valid && now >= start && now <= end) learn_.after.push_back(Histogram::BucketOf(in.gpu_ms));
+    if (now <= end) return out;
+    learn_.active = false;
+    if (int(learn_.after.size()) >= LearnMinSamples(p)) FoldLearn(learn_.after, &out);
+    return out;
+  }
+
+  // The measurement of the step in learn_ is `after` (bucket numbers; the median counts): the cost goes into the EMA of the tier.
+  void FoldLearn(std::vector<int>& after, Change* out) {
+    std::nth_element(after.begin(), after.begin() + after.size() / 2, after.end());
+    FoldLearn(Histogram::BucketMs(after[after.size() / 2]), int(after.size()), out);
+  }
+  void FoldLearn(double after_ms, int n_after, Change* out) {
+    const bool up = learn_.to_tier > learn_.from_tier;
+    const int tier = std::max(learn_.from_tier, learn_.to_tier);
+    const double sample = std::clamp(up ? after_ms - learn_.before_ms : learn_.before_ms - after_ms, 0.0, kLearnMaxMs);
+    double& value = learned_ms_[size_t(tier)];
+    int& n = learned_n_[size_t(tier)];
+    value = n > 0 ? value + kLearnAlpha * (sample - value) : sample;
+    ++n;
+    out->learn_done = true;
+    out->learn_tier = tier;
+    out->learn_delta_ms = sample;
+    out->learn_before_ms = learn_.before_ms;
+    out->learn_after_ms = after_ms;
+    out->learn_n_before = learn_.before_n;
+    out->learn_n_after = n_after;
+  }
+
+  // ---- state
 
   bool started_ = false;
+  State state_;
   int level_ = 0;
   int64_t last_now_ns_ = 0;
   bool driving_ = true;
+  int64_t driving_change_ns_ = -(int64_t(1) << 60);  // no change seen yet
+  int64_t cut_until_ns_ = -(int64_t(1) << 60);
+  double speed_kmh_ = -1.0;
   uint32_t frames_since_change_ = UINT32_MAX;  // the first change is not held back
+  int grace_left_ = 0;                         // frames of the screen-change grace still to come after the current one
+  bool in_grace_ = false;                      // the current frame is inside it
 
-  uint8_t missed_history_ = 0;  // bit 0 = the latest engine frame; kMissedHistoryFrames bits
-  static_assert(kMissedHistoryFrames == 8, "missed_history_ is one byte");
+  static constexpr uint32_t kMissedMask = (1u << kMissedHistoryFrames) - 1u;
+  uint32_t missed_history_ = 0;  // bit 0 = the latest engine frame; kMissedHistoryFrames bits; empty while not driving and after a step
+  std::array<double, kTailSamples> tail_{};  // the last GPU samples taken while driving, since the last step (a ring: slots 0..count-1 until full)
+  int tail_next_ = 0;
+  int tail_count_ = 0;
 
   std::array<double, kMedianSamples> recent_{};
   int recent_next_ = 0;
@@ -582,13 +1047,22 @@ class Controller {
   bool have_sample_ = false;
   bool signal_live_ = false;
 
-  int64_t restore_start_ns_ = 0;
-  std::deque<TimedBucket> restore_ring_;
-  Histogram restore_hist_;
+  int64_t quiet_start_ns_ = 0;  // the last change, change of the driving flag, or missed frame
+  TimedWindow restore_win_;
+  TimedWindow enrich_win_;
   bool has_restore_ = false;
-  int restore_from_ = 0;
+  int restore_from_key_ = 0;
   int64_t restore_ns_ = 0;
   std::map<int, Bounce> bounce_;
+
+  std::array<bool, kTiers> enriched_{};  // the tier was entered by enrichment ...
+  std::array<int64_t, kTiers> enriched_at_ns_{};  // ... at this time
+  std::array<Backoff, kTiers> backoff_{};
+  std::array<double, kTiers> learned_ms_{};
+  std::array<int, kTiers> learned_n_{};
+  std::deque<LearnSample> learn_ring_;  // valid samples of the last learn_s + 1 s with the state they were taken in
+  Learn learn_;
+  Plan plan_;
 
   Window win_;
   Histogram win_hist_;
