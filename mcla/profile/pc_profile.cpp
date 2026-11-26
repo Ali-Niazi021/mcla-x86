@@ -155,6 +155,20 @@ constexpr CvarDefault kProfileDefaults[] = {
     // src/input/sdl/sdl_input_driver.cpp:23,98-113 (default "gamecontrollerdb.txt", empty skips the block);
     // W5.5 report section B.
     {"hid_mappings_file", ""},
+
+    // ---- HOST stream: thread policy under foreign CPU load (src/host/thread_policy.h) ---------------------------
+    // The frame-critical threads (GPU Commands, GPU Submission, Main XThread and the busy guest XThreads: the render
+    // thread among them) at THREAD_PRIORITY_HIGHEST, each on its own physical Zen 5 core (CPU sets of the highest
+    // efficiency class + ideal processor), the pipeline/shader compile, storage-writer and timer threads on the Zen 5c
+    // cores, and the process opted out of EcoQoS (a covered window is throttled otherwise). Measured within runs under
+    // 10-12 foreign spinner processes (h2run2, h2run3, hold off): 8 policy segments of 4-6 s, 0 % of frames over
+    // 25 ms in every one; policy off: 3 of 6 segments with p99 23-55 ms (pooled off p99 26-36 ms, 1.1-4.3 % over
+    // 25 ms). It cannot help when the GPU is the limit (foreign GPU or memory-bandwidth load). All live: 0/false
+    // restores the thread's own settings.
+    {"mcla_thread_hot_priority", "2"},
+    {"mcla_thread_hot_cpus", "2"},
+    {"mcla_thread_cold_cpus", "1"},
+    {"mcla_process_noecoqos", "true"},
 };
 
 // ---- presets (W5.1) -------------------------------------------------------------------------------------------

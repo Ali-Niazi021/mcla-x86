@@ -30,6 +30,9 @@
 
 #include "pc_profile.h"  // mcla/profile (GAME slice): mcla::ApplyPcProfileLogging(), mcla::ApplyPcProfile()
 #include "frame_cap.h"
+#include "gpu_priority.h"
+#include "power_boost.h"
+#include "system_status.h"
 #include "win32_time.h"
 #include "window_fit.h"
 
@@ -210,6 +213,13 @@ std::optional<rex::PathConfig> McLaApp::OnFinalizePaths(const rex::PathConfig& d
   // returns: the last moment to size the window before the first frame can be presented. Paths pass through unchanged.
   if (window()) {
     mcla_host::FitWindowToGuestPixels(*window());
+    // What the machine is doing (power source, Windows power mode, boost, display refresh): the first thing to know
+    // when a run is slow. Here because the HWND exists and the process is per-monitor DPI aware by now.
+    int32_t guest_width = 0;
+    int32_t guest_height = 0;
+    mcla_host::GuestVideoModeSize(guest_width, guest_height);
+    mcla_host::LogSystemStatus(mcla_host::QuerySystemStatus(window()->GetNativeWindowHandle()),
+                               rex::cvar::Query<int32_t>("mcla_fps_target"), guest_height);
   }
   return defaults;
 }
@@ -221,6 +231,12 @@ void McLaApp::OnPostSetup() {
     REXLOG_INFO("[mcla] hang watchdog off (--mcla_watchdog=false)");
   }
   input_.Start();
+  mcla_host::StartGpuPriority();
+  mcla_host::StartPowerBoost();  // also undoes a boost cap a crashed run left behind
+  thread_policy_.Start();
+  if (window()) {
+    mcla_host::LogFocusState(*window(), "post-setup");
+  }
 }
 
 void McLaApp::OnGuestThreadExit(rex::system::XThread* /*thread*/) {
@@ -231,6 +247,9 @@ void McLaApp::OnGuestThreadExit(rex::system::XThread* /*thread*/) {
 void McLaApp::OnShutdown() {
   watchdog_.Stop();
   input_.Stop();
+  thread_policy_.Stop();
+  mcla_host::StopGpuPriority();
+  mcla_host::StopPowerBoost();
   if (timer_resolution_active_) {
     mcla_host::EndTimerResolution(1);
     timer_resolution_active_ = false;

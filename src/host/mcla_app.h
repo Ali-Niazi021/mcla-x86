@@ -25,6 +25,7 @@
 #include <rex/rex_app.h>
 
 #include "input_script.h"
+#include "thread_policy.h"
 #include "watchdog.h"
 
 class McLaApp : public rex::ReXApp {
@@ -53,6 +54,7 @@ class McLaApp : public rex::ReXApp {
 
   mcla_host::ScriptedInput input_;
   mcla_host::Watchdog watchdog_;
+  mcla_host::ThreadPolicy thread_policy_;  // thread monitor + live thread/process policy (thread_policy.h)
 
   // Results of OnConfigurePaths, logged by OnPostInitLogging (the log does not exist yet when they are produced).
   std::string input_error_;

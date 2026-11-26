@@ -85,7 +85,11 @@ else()
       src/host/input_script.cpp
       src/host/win32_time.cpp
       src/host/win32_wait.cpp
-      src/host/window_fit.cpp)
+      src/host/window_fit.cpp
+      src/host/system_status.cpp
+      src/host/gpu_priority.cpp
+      src/host/thread_policy.cpp
+      src/host/power_boost.cpp)
 
   # The hook and profile sources are objects of the executable itself, not a library: a hook is a strong definition
   # that must replace the weak default inside the generated code, and an archive member nothing references is never
@@ -118,6 +122,14 @@ else()
   set_target_properties(mcla PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"   # Ninja Multi-Config appends /<Config>
       WIN32_EXECUTABLE ON)
+
+  # CPU boost cap restore helper (src/host/power_boost.h): waits for the game and puts a boost cap back if the game died
+  # without doing it. Built from the SDK-free half of power_boost.cpp; powrprof is loaded at run time.
+  add_executable(mcla_power_restore tools/power_restore/power_restore.cpp src/host/power_boost.cpp)
+  target_compile_definitions(mcla_power_restore PRIVATE MCLA_POWER_STANDALONE=1 NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_compile_features(mcla_power_restore PRIVATE cxx_std_20)
+  set_target_properties(mcla_power_restore PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_dependencies(mcla mcla_power_restore)
 endif()
 
 # --- Unit tests -------------------------------------------------------------------------------------------------------

@@ -668,6 +668,22 @@
       "emit": "nondefault"
     },
     {
+      "id": "mcla_cpu_boost_cap",
+      "label": "CPU boost while playing",
+      "help": "Changes the active Windows power plan's processor boost setting while the game runs and puts the old value back when the game exits (also after a crash: a small helper restores it, or the next start does). On this laptop the CPU and the GPU share one power budget, so less CPU boost can leave more watts for the GPU. It affects every program while the game runs.",
+      "category": "performance",
+      "type": "enum",
+      "cvar": "mcla_cpu_boost_cap",
+      "default": 0,
+      "options": [
+        {"value": 0, "label": "Leave (Windows decides)", "help": "The power plan is not touched."},
+        {"value": 1, "label": "Off while playing", "help": "Processor boost mode is set to Disabled in the active plan (plugged in and on battery) while the game runs."},
+        {"value": 2, "label": "Max 99 % while playing", "help": "Maximum processor state is set to 99 % in the active plan (plugged in and on battery) while the game runs; on most AMD systems this also turns boost off. A lower value already set is kept."}
+      ],
+      "advanced": true,
+      "emit": "nondefault"
+    },
+    {
       "id": "async_shader_compilation",
       "label": "Asynchronous shader compilation",
       "help": "Compiles shaders and pipelines in background threads: less stutter, but a draw may briefly be left out (a flash) while its pipeline is built. Off waits for each shader.",
@@ -675,6 +691,22 @@
       "type": "bool",
       "cvar": "async_shader_compilation",
       "default": true,
+      "advanced": true,
+      "emit": "nondefault"
+    },
+    {
+      "id": "mcla_thread_hot_priority",
+      "label": "Keep the game ahead of other programs",
+      "help": "Runs the game's frame-critical threads (GPU commands, render, main) at a higher priority on their own fast cores, and shader compiles on the efficient cores. Keeps frames on time while other programs use the CPU; it cannot help when another program uses the GPU.",
+      "category": "performance",
+      "type": "enum",
+      "cvar": "mcla_thread_hot_priority",
+      "default": 2,
+      "options": [
+        {"value": 2, "label": "On (highest)", "help": "Frame-critical threads at THREAD_PRIORITY_HIGHEST."},
+        {"value": 1, "label": "Mild (above normal)", "help": "Frame-critical threads one step above normal."},
+        {"value": 0, "label": "Off", "help": "Leave the priorities to Windows."}
+      ],
       "advanced": true,
       "emit": "nondefault"
     },
