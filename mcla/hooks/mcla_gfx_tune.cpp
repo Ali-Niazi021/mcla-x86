@@ -62,6 +62,7 @@
 #include <rex/logging.h>
 
 #include "mcla_gfx_tune.h"
+#include "mcla_vis.h"
 #include "mcla_guest.h"
 #include "mcla_hooks.h"
 
@@ -769,6 +770,7 @@ bool ImpostorsEnabled() {
 
 void OnFrame() {
   EnsurePreset();
+  mcla::vis::OnFrame();  // VISUALS: the mcla_vis_ab schedule (mcla_vis_ab.cpp), before the knobs are read
   std::lock_guard<std::mutex> lock(g_mutex);
   // The per-call hooks read these relaxed atomics, not the cvars.
   g_dl_clear.store(uint32_t(REXCVAR_GET(mcla_gfx_dl_clear)), std::memory_order_relaxed);
