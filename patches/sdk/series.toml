@@ -872,6 +872,33 @@ purpose = "D3D12/Vulkan: cvar tonemap_transfer_skip (default false): skip the fu
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "04f0-gpu-timing"
+source = "local"
+path = "patches/sdk/04f0-gpu-timing.patch"
+sha256 = "756b7126ce3634bd46f93582083a708b364edf165adfeb9920cdc5f7cec82e6d"
+purpose = "D3D12: cvar gpu_timing (0; 1 = timestamps at every guest render marker / phase cut, per-segment counters, '[gpu-timing]' log, per-frame CSV gpu_timing_csv) and gpu_timing_export (true: only the frame's start/end and list-boundary timestamps, one small resolve); data exports rexgpu_gpu_frame_us / _seq / _lag (the game's governor) and rexgpu_vrs_level / _levels (0500). Dev: gpu_draw_experiment (zero scissor / no draw / one primitive) with gpu_draw_experiment_phases, gpu_experiment_cycle (in-run cvar schedule, frame-exact). Off = no change but the export's timestamps."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0500-vrs"
+source = "local"
+path = "patches/sdk/0500-vrs.patch"
+sha256 = "184e8ac02552071fa9b128865bd29b4a875687640f3c7d40575abb222c9cdfaf"
+purpose = "D3D12: per-draw variable rate shading (RSSetShadingRate) chosen per render phase: cvars vrs_level (0 = off), vrs_levels (table), vrs_min_target_width (640); the title's governor sets the level through rexgpu_vrs_level. 1x1 forced for depth export, PS float24 conversion / sample rate, narrow targets, UI, internal draws; ROV path = off."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0510-gpu-timing-busy"
+source = "local"
+path = "patches/sdk/0510-gpu-timing-busy.patch"
+sha256 = "5bce59222f2e1468133a495d8e319839d7d6f5434d5c05a8edbaa6440b0a159d"
+purpose = "gpu_timing: the exported frame time (and CSV frame_us) is the GPU busy time, the idle gaps between a frame's lists removed (at a frame cap the span is about the frame period); CSV span_us; vrs_levels default = the two measured levels (no scene VRS: slower and blurred)."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]
