@@ -1,0 +1,23 @@
+# MCLA VISUALS-stream mid-asm hooks. Included from mcla_manifest.toml. FLAT schema, only [[midasm_hook]] entries. C++ side:
+# mcla/hooks/mcla_vis_motion_blur.cpp. Both are no-ops until mcla_vis_motion_blur leaves its default (1).
+
+# [V1] mcla_vis_motion_blur, the vehicle: sub_822E8448 (the motion blur's per-vehicle previous position), BEFORE `stfs f0,80(r1)`
+# at 0x822E85F8 (word 0xD0010050), after `lfs f0,-29232(r8)` at 0x822E85F4 (r8 = 0x82010000: the float 0x3E800000 = 0.25 at
+# 0x82008DD0): f0 = 0.25. The 0.25 is stored to the stack, splatted and multiplies velocity * dt (dt = the float [0x827D7508]):
+# previous position = current - velocity * dt * 0.25. This is the branch taken while the renderer byte [[0x8287E064]+374] is set (it
+# is, in normal play). f0 is not read again in the function. The hook scales f0 by the mcla_vis_motion_blur factor (1 = untouched).
+# NEEDS A RE-CODEGEN (new entry).
+[[midasm_hook]]
+address = 0x822E85F8
+name = "mcla_hook_vis_mblur_vehicle"
+registers = ["f0"]
+
+# [V2] mcla_vis_motion_blur, the camera: sub_822E8780 (the motion blur's camera previous position), BEFORE `stfs f0,80(r1)` at
+# 0x822E88E0 (word 0xD0010050), after `lfs f0,-29232(r7)` at 0x822E88DC (r7 = 0x82010000: the same 0.25 at 0x82008DD0): f0 = 0.25.
+# It multiplies the camera's displacement since the last frame (v58 = current - previous): previous position = current - 0.25 *
+# displacement, the same renderer byte +374 branch. f0 is written again (`lfs f0,3796(r9)` at 0x822E8A50) before any later read.
+# NEEDS A RE-CODEGEN (new entry).
+[[midasm_hook]]
+address = 0x822E88E0
+name = "mcla_hook_vis_mblur_camera"
+registers = ["f0"]
