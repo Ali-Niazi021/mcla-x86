@@ -24,4 +24,5 @@ rem sampler: ADLX (headers, ADLXHelper.cpp and WinAPIs.cpp are compiled in); ven
 "%CLANG%" %FLAGS% -Wno-everything -I"%ADLX%" "%HERE%sampler.cpp" "%ADLX%\SDK\ADLXHelper\Windows\Cpp\ADLXHelper.cpp" "%ADLX%\SDK\Platform\Windows\WinAPIs.cpp" -lwinmm -lpowrprof -lpdh -o "%OUT%\sampler.exe" || exit /b 1
 "%CLANG%" %FLAGS% "%HERE%threadtop.cpp" -o "%OUT%\threadtop.exe" || exit /b 1
 "%CLANG%" %FLAGS% "%HERE%burner.cpp" -ld3d11 -ld3dcompiler -o "%OUT%\burner.exe" || exit /b 1
+"%CLANG%" %FLAGS% "%HERE%gpuload.cpp" -ld3d11 -ld3dcompiler -ldxgi -o "%OUT%\gpuload.exe" || exit /b 1
 echo built sampler.exe threadtop.exe burner.exe in %OUT%

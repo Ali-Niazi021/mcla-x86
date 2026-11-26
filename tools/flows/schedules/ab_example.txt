@@ -12,6 +12,8 @@
 #   <s>:set <cvar>=<value>   a run-time cvar changes at that second (no spaces; the cvar must exist or the run fails at start)
 #   <s>:burn <n>             n CPU (ALU) spinner processes, 0..32; 0 stops them     (run_game.py starts / kills them)
 #   <s>:burnmem <n>          n memory-bandwidth spinner processes, 0..32           (run_game.py)
+#   <s>:burngpu <pct>        a foreign GPU load (tools/telemetry/gpuload.exe), busy ~pct % of the time, 0..100; 0 stops it;
+#                            one process at a time, a new pct restarts it           (run_game.py; needs gpuload.exe built)
 #   <s>:mark <label>         a named boundary; the label becomes part of the segment label (use it to tell windows apart,
 #                            but note that segments with DIFFERENT labels are not pooled by segments.py)
 # The host's segment label is every key the schedule touches as sorted `key=value` (here `burn=0` / `burn=4`), so the three
@@ -33,4 +35,5 @@
 #   94:set mcla_fps_cap=60
 #   106:set mcla_fps_cap=0
 # Both at once (the label then reads `burn=4 mcla_fps_cap=0` ...): put the steps of one change on the same second.
-# Memory-bandwidth load instead of ALU: replace `burn` by `burnmem`.
+# Memory-bandwidth load instead of ALU: replace `burn` by `burnmem`; GPU load instead: `burngpu 40` / `burngpu 0` (the label
+# key is then `burngpu=40` / `burngpu=0`).

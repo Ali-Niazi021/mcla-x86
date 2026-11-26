@@ -14,7 +14,8 @@
                    (<second>:<button>[+<button>...][/<hold ms>], '#' comments; seconds count from process start).
                    Header comments (`# expect: menu`, `# seconds: 180`, `# fixture: after_intro`) give the state the
                    flow must reach (none|title|menu|free-roam), the default --seconds and the fixture it is made for.
-  --fixture NAME   copy $WORK/fixtures/<NAME>/ into the fresh user dir before the start. The fixture is a copy of a
+  --fixture NAME   copy $WORK/fixtures/<NAME>/ into the fresh user dir before the start (default: the flow's
+                   `# fixture:` header; `--fixture none` = none). The fixture is a copy of a
                    run's user/ folder: <xuid>/545407F8/{00000001/mc4.sav/..., Headers/00000001/mc4.sav.header, ...}.
                    The fixture itself is never written; every run gets its own copy.
   --seconds N      wall-clock run time, counted from process start (the script's clock); then the process tree is
@@ -43,7 +44,7 @@
                    (SDL3 reads its hints from the environment; it keeps SDL's own ShowWindow from activating the window;
                    left alone with --activate), and the window is placed out of the way (bottom-right, behind).
   --schedule SPEC  a timed schedule added to the run (repeatable); SPEC is a file (a path, or a name in tools/flows/schedules/,
-                   e.g. `ab_example`; same grammar as a flow, '#' comments, only the four step kinds below) or an inline
+                   e.g. `ab_example`; same grammar as a flow, '#' comments, only the five step kinds below) or an inline
                    `;`-separated string (`58:set mcla_fps_cap=0;70:burn 4;80:burn 0`; a '#' starts a comment as in a file).
                    Validated like the flow, then appended to the run's flow.txt (the host reads that file), so any flow carries an
                    A/B schedule without a copy. Steps may also sit in the flow file itself.
@@ -57,13 +58,16 @@
                    (env MCLA_GAME, else C:/Users/Ali/Development/dumps/mcla-x360; the game files are in $GAME/game).
 
 Schedule steps (the host's SchedStep, src/host/input_script.h; tools/segments.py cuts a run at them)
-  <seconds>:set <cvar>=<value>   the host changes a run-time cvar then. cvar [A-Za-z0-9_]+ (not burn / burnmem / mark); value
+  <seconds>:set <cvar>=<value>   the host changes a run-time cvar then. cvar [A-Za-z0-9_]+ (not burn / burnmem / burngpu / mark); value
                                  non-empty without whitespace, ';' or '#', passed on verbatim; one pair per step.
   <seconds>:burn <n>             n CPU (ALU) spinner processes, 0..32 (0 = stop them). EXECUTED HERE; the host only logs it.
   <seconds>:burnmem <n>          n memory-bandwidth spinner processes, 0..32, executed here.
+  <seconds>:burngpu <pct>        a foreign GPU load (tools/telemetry/gpuload.exe: D3D11 compute on the default adapter, busy about
+                                 pct % of every 10 ms), pct 0..100, 0 = stop it. At most ONE gpuload process: a new pct restarts it
+                                 with the new duty. EXECUTED HERE; the host only logs it.
   <seconds>:mark <label>         a named marker, label [A-Za-z0-9_.-]{1,40}.
   The keyword is the first word after the colon (case-insensitive); no /hold and no '+' on these steps. The host logs
-  `[mcla-sched] t=<s> set <name>=<value> ok now=<value>` (or FAILED (rejected)), `... burn <n>` / `burnmem <n>` / `mark <label>` and
+  `[mcla-sched] t=<s> set <name>=<value> ok now=<value>` (or FAILED (rejected)), `... burn <n>` / `burnmem <n>` / `burngpu <pct>` / `mark <label>` and
   `segment <k>: <label>` (k from 0 = the initial state; label = every key the schedule touches as sorted key=value).
   Spinners (burn / burnmem): child processes `python -I -S -c <code> <run_game pid>`, CREATE_NO_WINDOW, no stdio, normal priority,
   in the game's job object (they die with the run however it ends) and killed explicitly on every way out of the run (timeout,
@@ -71,9 +75,17 @@ Schedule steps (the host's SchedStep, src/host/input_script.h; tools/segments.py
   into each other (memcpy bandwidth). A spinner exits by itself within ~0.1-1 s when its parent run_game process is gone. At a
   step's time (the script clock = process start; the loop wakes for it, plus the spawn time of its processes) the number of live
   spinners of that kind is set (more are started, extra ones killed); none exists before the game starts or after it ends. Printed when the counts change:
-  `[run_game] burn: t=<s> cpu=<n> mem=<n>`; summary.json burn_events [[t, kind, n]...] has every executed step.
+  `[run_game] burn: t=<s> cpu=<n> mem=<n> gpu=<pct>`; summary.json burn_events [[t, kind, n]...] has every executed step (kind burn |
+  burnmem | gpu; for gpu n is the duty in percent).
+  burngpu: `<gpuload.exe> <pct> <run_game pid>` found at $WORK/telemetry/gpuload.exe, else $WORK/toolchain/telemetry/gpuload.exe (build:
+  tools/telemetry/build.bat); a schedule with a burngpu step and no such exe is a setup error (exit 2, nothing runs; --check-flow only
+  warns). Same discipline as the spinners: CREATE_NO_WINDOW, normal priority, in the game's job object, killed on every way out, it
+  ends by itself when run_game is gone. Unlike tools/telemetry/burner.exe it does not stop when mcla.exe runs: it is meant to
+  compete with the game. It needs ~0.5 s to start (shader compile + calibration), so the load begins a little after the step's
+  time; its own output (start line, achieved busy % every 5 s) goes to <run dir>/gpuload.log.
   `--selftest-burn` runs the spinner logic without a game (2 ALU + 1 memory spinner for 2 s in a private job, then checks they are
-  gone, and that an orphaned spinner ends by itself).
+  gone, and that an orphaned spinner ends by itself); when gpuload.exe exists and mcla.exe is not running it also starts, restarts
+  and stops a gpuload (and checks an orphaned one ends by itself).
 
 What a run does
   1. Takes the heavy lock (tools/heavy_lock.py, FIFO; re-entrant under `heavy_lock.py -- python tools/run_game.py ...`).
@@ -120,7 +132,8 @@ Definitions (log lines; the file log pattern is `[Y-m-d H:M:S.mmm] [level] [cate
 
 summary.json keys: run_id, state (running|done), flow, flow_file, fixture, fixture_copied {files, bytes}, api, config,
   exe, args, window_pos, window_behind, schedule (the --schedule specs), schedule_steps (every schedule step of the run: the
-  flow's and --schedule's, as written, sorted by time), burn_events [[t, kind, n]...], seconds, started, ended, elapsed_s, ended_by (timeout|stop-on-reach|exited|interrupted), exit_code (only
+  flow's and --schedule's, as written, sorted by time), burn_events [[t, kind, n]...], gpuload (the exe, only when the schedule
+  has burngpu steps), seconds, started, ended, elapsed_s, ended_by (timeout|stop-on-reach|exited|interrupted), exit_code (only
   when the process exited by itself), exit_status, pid, expected, reached, expect_met, ok, fatal, fatal_log (events),
   fatal_lines, fatal_process, unregistered, hang_alarms, heartbeat_last, heartbeat_last_s, heartbeat_gap_s,
   heartbeat_lines, heartbeat_frames_last, t_title, t_menu, t_free_roam (seconds since process start), mode_changes
@@ -460,17 +473,20 @@ _RE_HEADER = re.compile(r"^\s*#\s*(expect|seconds|fixture)\s*:\s*(\S+)\s*$")
 
 
 # Schedule steps (the host's SchedStep, src/host/input_script.h): `<seconds>:set <cvar>=<value>`, `<seconds>:burn <n>`,
-# `<seconds>:burnmem <n>`, `<seconds>:mark <label>`. The first word after the colon (case-insensitive) tells them from a
-# pad step (no button is called set, burn, burnmem or mark).
-SCHED_KINDS = ("set", "burn", "burnmem", "mark")
+# `<seconds>:burnmem <n>`, `<seconds>:burngpu <pct>`, `<seconds>:mark <label>`. The first word after the colon
+# (case-insensitive) tells them from a pad step (no button is called set, burn, burnmem, burngpu or mark).
+SCHED_KINDS = ("set", "burn", "burnmem", "burngpu", "mark")
 BURN_MAX = 32
-_SCHED_RESERVED = ("burn", "burnmem", "mark")      # segment-label keys: not usable as a cvar name
+BURNGPU_MAX = 100
+_SCHED_RESERVED = ("burn", "burnmem", "burngpu", "mark")   # segment-label keys: not usable as a cvar name
 _RE_SCHED_NAME = re.compile(r"[A-Za-z0-9_]+")
 _RE_SCHED_COUNT = re.compile(r"[0-9]{1,2}")
+_RE_SCHED_PCT = re.compile(r"[0-9]{1,3}")
 _RE_SCHED_LABEL = re.compile(r"[A-Za-z0-9_.-]{1,40}")
 
 # A schedule step: (at_s, kind, name, value_or_n, text). set: name = cvar, value = the value (verbatim string);
-# burn / burnmem: name = "", value = n (int 0..32); mark: name = label, value = None. text = the step as written.
+# burn / burnmem: name = "", value = n (int 0..32); burngpu: name = "", value = pct (int 0..100); mark: name = label,
+# value = None. text = the step as written.
 SchedStep = Tuple[float, str, str, Union[str, int, None], str]
 
 
@@ -506,6 +522,11 @@ def _parse_sched_body(kw: str, rest: str, where: str) -> Tuple[str, Union[str, i
         if not 0 <= n <= BURN_MAX:
             raise Fail("%s: %s needs a count 0..%d, got '%s'" % (where, kw, BURN_MAX, rest))
         return "", n
+    if kw == "burngpu":
+        pct = int(rest) if _RE_SCHED_PCT.fullmatch(rest) else -1
+        if not 0 <= pct <= BURNGPU_MAX:
+            raise Fail("%s: burngpu needs a duty 0..%d (percent), got '%s'" % (where, BURNGPU_MAX, rest))
+        return "", pct
     if not _RE_SCHED_LABEL.fullmatch(rest):
         raise Fail("%s: bad mark label '%s' (1..40 of A-Z a-z 0-9 _ . -)" % (where, rest))
     return rest, None
@@ -556,7 +577,7 @@ def _parse_steps(text: str) -> Tuple[List[Tuple[float, int, str]], List[SchedSte
 
 def parse_flow(text: str) -> List[Tuple[float, int, str]]:
     """Validate a flow file like the host's parser does. Returns the PAD steps [(at_s, hold_ms, step text)]; raises Fail.
-    Schedule steps (set / burn / burnmem / mark) are validated too but not returned: see parse_schedule."""
+    Schedule steps (set / burn / burnmem / burngpu / mark) are validated too but not returned: see parse_schedule."""
     return _parse_steps(text)[0]
 
 
@@ -605,7 +626,7 @@ def load_schedule(specs: Sequence[str]) -> Tuple[List[SchedStep], List[str]]:
                            "schedules in %s: %s" % (spec, SCHEDULES_DIR.as_posix(), ", ".join(have) or "none"))
         pad, sched = _parse_steps(text)
         if pad:
-            raise Fail("--schedule '%s': pad step '%s' (a schedule takes only set / burn / burnmem / mark steps; "
+            raise Fail("--schedule '%s': pad step '%s' (a schedule takes only set / burn / burnmem / burngpu / mark steps; "
                        "pad steps belong in the flow)" % (label, pad[0][2]))
         if not sched:
             raise Fail("--schedule '%s' has no steps" % label)
@@ -762,7 +783,9 @@ class Job:
         if not job:
             return
         ext = w.JOB_EXTENDED()
-        ext.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        # KILL_ON_JOB_CLOSE | BREAKAWAY_OK: only a child that asks for it (CREATE_BREAKAWAY_FROM_JOB) leaves the job: the host's
+        # mcla_power_restore.exe helper, which must outlive a killed game to put a CPU boost cap back (power_boost.h).
+        ext.BasicLimitInformation.LimitFlags = 0x2000 | 0x800
         if not w.k32.SetInformationJobObject(job, 9, w.ctypes.byref(ext), w.ctypes.sizeof(ext)):  # 9 = extended limits
             w.k32.CloseHandle(job)
             return
@@ -822,7 +845,7 @@ def keep_awake(on: bool) -> None:
 
 
 # ================================================================================================================
-# Load spinners (`burn` / `burnmem` schedule steps): child processes that eat CPU or memory bandwidth during a run
+# Load spinners (`burn` / `burnmem` / `burngpu` schedule steps): child processes that eat CPU, memory bandwidth or GPU time
 # ================================================================================================================
 
 # The code of a spinner; argv[1] is the pid of the run_game process. The spinner exits by itself when that process is gone
@@ -872,6 +895,34 @@ _SPIN_LABEL = {"burn": "cpu", "burnmem": "mem"}
 _CREATE_NO_WINDOW = 0x08000000
 
 
+def find_gpuload(work: Path) -> Optional[Path]:
+    """tools/telemetry/gpuload.exe (build.bat): $WORK/telemetry/gpuload.exe, else $WORK/toolchain/telemetry/gpuload.exe."""
+    for cand in (work / "telemetry" / "gpuload.exe", work / "toolchain" / "telemetry" / "gpuload.exe"):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def spawn_gpuload(exe: Path, pct: int, parent_pid: int, log_path: Optional[Path] = None, note: str = "") -> "subprocess.Popen":
+    """`gpuload.exe <pct> <parent_pid>`: no window, no stdin, normal priority. Its output (the start line and the achieved
+    busy % every 5 s) is appended to log_path after a `# run_game: <note>` line, else dropped."""
+    log = None
+    if log_path is not None:
+        try:
+            log = open(log_path, "ab")
+            log.write(("# run_game: %s gpuload %d\n" % (note, pct)).encode("utf-8"))
+            log.flush()
+        except OSError:
+            log = None
+    try:
+        return subprocess.Popen([str(exe), str(pct), str(parent_pid)], stdin=subprocess.DEVNULL,
+                                stdout=log if log is not None else subprocess.DEVNULL, stderr=subprocess.STDOUT,
+                                creationflags=_CREATE_NO_WINDOW)
+    finally:
+        if log is not None:
+            log.close()
+
+
 def spawn_spinner(kind: str, parent_pid: int) -> "subprocess.Popen":
     """One spinner process (`python -I -S -c CODE <parent_pid>`): no window, no stdio, normal priority."""
     return subprocess.Popen([sys.executable, "-I", "-S", "-c", SPINNER_CODE[kind], str(parent_pid)],
@@ -880,20 +931,26 @@ def spawn_spinner(kind: str, parent_pid: int) -> "subprocess.Popen":
 
 
 class Spinners:
-    """The spinner processes of one run: `cpu` (kind `burn`) and `mem` (kind `burnmem`) counts, set by schedule steps.
+    """The load processes of one run: `cpu` (kind `burn`) and `mem` (kind `burnmem`) spinner counts and at most one gpuload
+    process (kind `burngpu`, duty in percent), set by schedule steps.
 
-    Every spinner is added to `job` (the game's job object: they die with the run whatever happens) and killed explicitly by
+    Every process is added to `job` (the game's job object: they die with the run whatever happens) and killed explicitly by
     kill_all(), which the run calls on every exit path. None exists before the game is started: the object is made empty and
-    only apply()/set() start processes. `started` (time.monotonic() at the game start) turns apply()'s time into seconds."""
+    only apply()/set()/set_gpu() start processes. `started` (time.monotonic() at the game start) turns apply()'s time into
+    seconds. `gpu_exe` is gpuload.exe (find_gpuload), `gpu_log` the file its output is appended to."""
 
     def __init__(self, job: Optional[Job] = None, started: Optional[float] = None, parent_pid: Optional[int] = None,
-                 quiet: bool = False) -> None:
+                 quiet: bool = False, gpu_exe: Optional[Path] = None, gpu_log: Optional[Path] = None) -> None:
         self.job = job
         self.started = time.monotonic() if started is None else started
         self.parent_pid = os.getpid() if parent_pid is None else parent_pid
         self.quiet = quiet
+        self.gpu_exe = gpu_exe
+        self.gpu_log = gpu_log
+        self.gpu: Optional["subprocess.Popen"] = None    # the one gpuload process, None when none runs
+        self.gpu_pct = 0                                 # its duty in percent (0 when none runs)
         self.procs: Dict[str, List["subprocess.Popen"]] = {"burn": [], "burnmem": []}
-        self.events: List[List] = []             # [[t, kind, n], ...] one per executed step
+        self.events: List[List] = []             # [[t, kind, n], ...] one per executed step (kind burn | burnmem | gpu)
         self.start_failures = 0
         self.died_early = 0
         self.killed_at_end = 0                   # spinners still running when kill_all() ended the run
@@ -906,13 +963,22 @@ class Spinners:
             alive = [p for p in lst if p.poll() is None]
             self.died_early += len(lst) - len(alive)
             self.procs[kind] = alive
+        if self.gpu is not None and self.gpu.poll() is not None:
+            self.died_early += 1
+            self.gpu, self.gpu_pct = None, 0
 
     def counts(self) -> Dict[str, int]:
+        """Live spinners per kind ({"burn": n, "burnmem": n}); the gpuload process is gpu_duty()."""
         self._reap()
         return {kind: len(lst) for kind, lst in self.procs.items()}
 
+    def gpu_duty(self) -> int:
+        """The duty (percent) of the live gpuload process, 0 when none runs."""
+        self._reap()
+        return self.gpu_pct
+
     def pids(self) -> List[int]:
-        return [p.pid for lst in self.procs.values() for p in lst]
+        return [p.pid for lst in self.procs.values() for p in lst] + ([self.gpu.pid] if self.gpu is not None else [])
 
     # ------------------------------------------------------------------ changes
     def set(self, kind: str, n: int) -> None:
@@ -935,21 +1001,52 @@ class Spinners:
         del lst[n:]
         _kill_procs(extra)
 
+    def set_gpu(self, pct: int, t: float = 0.0) -> None:
+        """Make the gpuload process run at this duty: none for 0, else exactly one; a different duty restarts it (the old one
+        is killed first), the same duty leaves it alone."""
+        self._reap()
+        if self.gpu is not None and (pct == 0 or pct != self.gpu_pct):
+            old, self.gpu, self.gpu_pct = self.gpu, None, 0
+            _kill_procs([old])
+        if pct == 0 or self.gpu is not None:
+            return
+        if self.gpu_exe is None:
+            self.start_failures += 1
+            say("warning: no gpuload.exe: burngpu %d not started" % pct)
+            return
+        try:
+            p = spawn_gpuload(self.gpu_exe, pct, self.parent_pid, self.gpu_log, "t=%.1f" % t)
+        except OSError as e:
+            self.start_failures += 1
+            say("warning: cannot start gpuload: %s" % e)
+            return
+        self.gpu, self.gpu_pct = p, pct
+        if self.job is not None and not self.job.add(p) and not self._warned_job:
+            self._warned_job = True
+            say("warning: gpuload could not be put in the job object (it still ends with this process and the run's kill)")
+
     def apply(self, kind: str, n: int, t: Optional[float] = None) -> None:
-        """Run one `burn` / `burnmem` step: set the count, record the event, print `burn: t=<s> cpu=<n> mem=<n>`."""
+        """Run one `burn` / `burnmem` / `burngpu` step: set the count (or the gpuload duty), record the event (kind `gpu` for
+        burngpu), print `burn: t=<s> cpu=<n> mem=<n> gpu=<pct>` when something changed."""
         if t is None:
             t = time.monotonic() - self.started
-        before = self.counts()
-        self.set(kind, n)
-        self.events.append([round(t, 2), kind, n])
-        after = self.counts()
+        before = (self.counts(), self.gpu_duty())
+        if kind == "burngpu":
+            self.set_gpu(n, t)
+        else:
+            self.set(kind, n)
+        self.events.append([round(t, 2), "gpu" if kind == "burngpu" else kind, n])
+        after = (self.counts(), self.gpu_duty())
         if after != before and not self.quiet:
-            say("burn: t=%.1f cpu=%d mem=%d" % (t, after["burn"], after["burnmem"]))
+            say("burn: t=%.1f cpu=%d mem=%d gpu=%d" % (t, after[0]["burn"], after[0]["burnmem"], after[1]))
 
     def kill_all(self) -> int:
         """Kill every spinner and wait for them; returns how many are still alive afterwards (0 in the normal case)."""
         self._reap()
         victims = [p for lst in self.procs.values() for p in lst]
+        if self.gpu is not None:
+            victims.append(self.gpu)
+            self.gpu, self.gpu_pct = None, 0
         self.killed_at_end += len(victims)
         for lst in self.procs.values():
             lst.clear()
@@ -1000,9 +1097,82 @@ def _process_cpu_s(pid: int) -> Optional[float]:
         w.k32.CloseHandle(h)
 
 
-def spinner_selftest(cpu: int = 2, mem: int = 1, seconds: float = 2.0) -> int:
+def _game_running() -> bool:
+    """True while an mcla.exe process exists (also when that cannot be told: then no GPU load is started)."""
+    try:
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq mcla.exe", "/NH"], capture_output=True, text=True,
+                             timeout=30, creationflags=_CREATE_NO_WINDOW).stdout
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return "mcla.exe" in out.lower()
+
+
+def _gpuload_selftest(exe: Path, check: Callable[[bool, str], None]) -> None:
+    """gpuload through Spinners.apply: one process in the job, same duty = no restart, new duty = restart (still one), 0 = gone,
+    its log has the start line, kill_all leaves none; then an orphaned gpuload (parent gone) ends by itself."""
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="gpuload_selftest_") as tmp:
+        log = Path(tmp) / "gpuload.log"
+        job = Job()
+        sp = Spinners(job, gpu_exe=exe, gpu_log=log, quiet=True)
+        p1 = p2 = p3 = 0
+        try:
+            sp.apply("burngpu", 30)
+            p1 = sp.gpu.pid if sp.gpu is not None else 0
+            check(p1 != 0 and sp.gpu_duty() == 30, "burngpu 30 started one gpuload (pid %d)" % p1)
+            time.sleep(2.5)
+            check(_process_alive(p1), "gpuload alive after 2.5 s")
+            check(p1 in set(job.pids()), "gpuload is in the job object")
+            sp.apply("burngpu", 30)
+            check(sp.gpu is not None and sp.gpu.pid == p1, "burngpu 30 again keeps the same process")
+            sp.apply("burngpu", 50)
+            p2 = sp.gpu.pid if sp.gpu is not None else 0
+            check(p2 not in (0, p1) and sp.gpu_duty() == 50 and not _process_alive(p1) and _process_alive(p2),
+                  "burngpu 50 restarted it (pid %d -> %d, the old one is gone)" % (p1, p2))
+            time.sleep(1.5)
+            check(_process_alive(p2), "the restarted gpuload is alive")
+            sp.apply("burngpu", 0)
+            time.sleep(0.2)
+            check(sp.gpu is None and sp.gpu_duty() == 0 and not _process_alive(p2), "burngpu 0 stopped it")
+            sp.apply("burngpu", 20)
+            p3 = sp.gpu.pid if sp.gpu is not None else 0
+            check(p3 != 0 and _process_alive(p3), "burngpu 20 started a new one (pid %d)" % p3)
+            check([e[1:] for e in sp.events] == [["gpu", 30], ["gpu", 30], ["gpu", 50], ["gpu", 0], ["gpu", 20]],
+                  "burn_events: %s" % [e[1:] for e in sp.events])
+        finally:
+            left = sp.kill_all()
+        time.sleep(0.3)
+        check(left == 0 and not _process_alive(p3), "kill_all left no gpuload")
+        job.terminate()
+        job.close()
+        text = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
+        check("gpuload duty=30%" in text and "gpuload duty=50%" in text,
+              "the log has the start lines of both: %s" % " | ".join(l for l in text.splitlines() if "duty=" in l and "t=" not in l))
+
+        helper = ("import os, sys, time\nsys.path.insert(0, %r)\nimport run_game\nfrom pathlib import Path\n"
+                  "p = run_game.spawn_gpuload(Path(%r), 20, os.getpid())\nprint(p.pid, flush=True)\ntime.sleep(2.5)\n"
+                  % (str(HERE), str(exe)))
+        out = subprocess.run([sys.executable, "-I", "-c", helper], capture_output=True, text=True, timeout=60,
+                             creationflags=_CREATE_NO_WINDOW)
+        try:
+            orphan = int(out.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            orphan = 0
+            check(False, "gpuload orphan test: the helper did not print a pid (%s)" % out.stderr.strip()[-200:])
+        if orphan:
+            t_end = time.monotonic() + 8.0
+            while _process_alive(orphan) and time.monotonic() < t_end:
+                time.sleep(0.1)
+            gone = not _process_alive(orphan)
+            if not gone:
+                subprocess.run(["taskkill", "/PID", str(orphan), "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            check(gone, "an orphaned gpuload (parent gone) ended by itself (pid %d)" % orphan)
+
+
+def spinner_selftest(cpu: int = 2, mem: int = 1, seconds: float = 2.0, gpu_exe: Optional[Path] = None) -> int:
     """No game: start `cpu` ALU + `mem` memory spinners in a private job object for `seconds` s, check they live, burn CPU and
     are in the job, kill them, check they are gone; then check that a spinner whose parent process dies ends by itself.
+    With `gpu_exe` (gpuload.exe) and no mcla.exe running, the same for a gpuload process (`burngpu`: start, restart, stop).
     Only processes started here are touched. Returns 0 when every check passes."""
     if os.name != "nt":
         print("spinner self-test: Windows only")
@@ -1063,6 +1233,14 @@ def spinner_selftest(cpu: int = 2, mem: int = 1, seconds: float = 2.0) -> int:
         if not gone:                                         # started here: clean it up
             subprocess.run(["taskkill", "/PID", str(orphan), "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         check(gone, "an orphaned spinner (parent gone) ended by itself (pid %d)" % orphan)
+
+    if gpu_exe is None:
+        print("  skip gpuload: no gpuload.exe in $WORK/telemetry or $WORK/toolchain/telemetry (tools/telemetry/build.bat)", flush=True)
+    elif _game_running():
+        print("  skip gpuload: mcla.exe is running (a GPU load would compete with the game)", flush=True)
+    else:
+        print("  gpuload: %s" % posix(gpu_exe), flush=True)
+        _gpuload_selftest(gpu_exe, check)
     print("spinner self-test: %s" % ("PASS" if ok else "FAIL"), flush=True)
     return 0 if ok else EXIT_FAILED
 
@@ -1465,6 +1643,12 @@ def run(opts: RunOptions, on_start: Optional[Callable[[int, Path], None]] = None
     steps, flow_sched = parse_script(flow_text)
     extra_sched, sched_lines = load_schedule(opts.schedule)
     sched = sorted(flow_sched + extra_sched, key=lambda st: st[0])
+    gpu_exe: Optional[Path] = None
+    if any(st[1] == "burngpu" for st in sched):
+        gpu_exe = find_gpuload(work)
+        if gpu_exe is None:
+            raise Fail("the schedule has a burngpu step but there is no gpuload.exe (looked in %s and %s); build it with "
+                       "tools\\telemetry\\build.bat" % (posix(work / "telemetry"), posix(work / "toolchain" / "telemetry")))
     if opts.window_pos is not None:
         check_window_pos(opts.window_pos)
     header = flow_header(flow_text)
@@ -1479,6 +1663,12 @@ def run(opts: RunOptions, on_start: Optional[Callable[[int, Path], None]] = None
     game_root = game / "game"
     if not (game_root / "default.xex").is_file():
         raise Fail("no default.xex in %s (python tools/xiso.py extract <iso> %s)" % (posix(game_root), posix(game_root)))
+    # No --fixture: the flow's `# fixture:` header (as bench.py does), so `--flow quick_drive` alone reaches free roam.
+    # `--fixture none` runs without one.
+    if opts.fixture is None and header.get("fixture"):
+        opts.fixture = header["fixture"]
+    elif opts.fixture in ("", "none"):
+        opts.fixture = None
     fixture_dir = work / "fixtures" / opts.fixture if opts.fixture else None
     fixture_note = check_fixture(fixture_dir) if fixture_dir is not None else None
     if opts.run_id is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", opts.run_id):
@@ -1503,14 +1693,14 @@ def run(opts: RunOptions, on_start: Optional[Callable[[int, Path], None]] = None
                                 cmd=cmd, wait_timeout=opts.lock_timeout, work=str(work))
     with lease:
         return _run_locked(opts, work, game_root, exe, flow_file, flow_text, flow_name, expected, seconds,
-                           fixture_dir, fixture_note, on_start, sched, sched_lines)
+                           fixture_dir, fixture_note, on_start, sched, sched_lines, gpu_exe)
 
 
 def _run_locked(opts: RunOptions, work: Path, game_root: Path, exe: Path, flow_file: Path, flow_text: str,
                 flow_name: str, expected: str, seconds: float, fixture_dir: Optional[Path],
                 fixture_note: Optional[Dict[str, int]],
                 on_start: Optional[Callable[[int, Path], None]], sched: Sequence[SchedStep] = (),
-                sched_lines: Sequence[str] = ()) -> Dict:
+                sched_lines: Sequence[str] = (), gpu_exe: Optional[Path] = None) -> Dict:
     run_id = opts.run_id or "r%s-%s" % (datetime.datetime.now().strftime("%Y%m%d-%H%M%S"), flow_name)
     run_dir = work / "runs" / run_id
     if run_dir.exists():
@@ -1543,6 +1733,8 @@ def _run_locked(opts: RunOptions, work: Path, game_root: Path, exe: Path, flow_f
             "window_pos": effective_window(opts)[0], "window_behind": effective_window(opts)[1],
             "schedule": list(opts.schedule), "schedule_steps": [st[4] for st in sched],
         }
+        if gpu_exe is not None:
+            summary["gpuload"] = posix(gpu_exe)
         write_json(run_dir / "summary.json", summary)
 
         job = Job()
@@ -1585,10 +1777,10 @@ def _run_locked(opts: RunOptions, work: Path, game_root: Path, exe: Path, flow_f
     reached_at: Optional[float] = None
     next_shot = opts.screenshot_every or 0.0
     exit_code: Optional[int] = None
-    # Load spinners of the schedule's burn / burnmem steps (their time is the script's clock = this process start). None is
-    # started before the game runs; the finally below kills them on every way out (the job object is the second net).
-    spinners = Spinners(job, started)
-    burns = [st for st in sched if st[1] in ("burn", "burnmem")]
+    # Load processes of the schedule's burn / burnmem / burngpu steps (their time is the script's clock = this process start).
+    # None is started before the game runs; the finally below kills them on every way out (the job object is the second net).
+    spinners = Spinners(job, started, gpu_exe=gpu_exe, gpu_log=run_dir / "gpuload.log")
+    burns = [st for st in sched if st[1] in ("burn", "burnmem", "burngpu")]
     spinners_left = 0
 
     try:
@@ -1709,7 +1901,9 @@ def _summarize(arg: str, opts: RunOptions) -> int:
 
 def _sched_line(st: SchedStep, source: str) -> str:
     at, kind, name, value, text = st
-    who = "run_game spinners + host log" if kind in ("burn", "burnmem") else ("host sets the cvar" if kind == "set" else "host marker")
+    who = ("run_game spinners + host log" if kind in ("burn", "burnmem") else
+           "run_game gpuload + host log" if kind == "burngpu" else
+           "host sets the cvar" if kind == "set" else "host marker")
     return "  %7.1f s  %-34s [%s; %s]" % (at, text.split(":", 1)[1].strip(), who, source)
 
 
@@ -1730,6 +1924,14 @@ def _check_flow(name: str, opts: RunOptions) -> int:
         print("schedule: %d step(s) (%d in the flow, %d from --schedule)" % (len(both), len(flow_sched), len(extra)))
         for st, source in both:
             print(_sched_line(st, source))
+        if any(st[1] == "burngpu" for st, _ in both):
+            work = _work(opts)
+            gpu = find_gpuload(work)
+            if gpu is not None:
+                print("gpuload: %s" % posix(gpu))
+            else:
+                print("WARNING gpuload: no gpuload.exe in %s or %s (build: tools/telemetry/build.bat); a run with this schedule "
+                      "would exit 2 before starting" % (posix(work / "telemetry"), posix(work / "toolchain" / "telemetry")))
     pos, behind = effective_window(opts)
     print("window: pos=%s behind=%s (SDL activate-when-shown %s)"
           % (pos or "SDK default", "yes" if behind else "no", "as inherited" if opts.activate else "off"))
@@ -1750,7 +1952,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                "1 run failed that test; 2 setup problem; 75 lock timeout; 130 interrupted. Details: the docstring "
                "at the top of this file.")
     ap.add_argument("--flow", metavar="NAME", help="pad script: tools/flows/<NAME>.txt or a file path")
-    ap.add_argument("--fixture", metavar="NAME", help="copy $WORK/fixtures/<NAME>/ into the fresh user dir")
+    ap.add_argument("--fixture", metavar="NAME", help="copy $WORK/fixtures/<NAME>/ into the fresh user dir "
+                    "(default: the flow's `# fixture:` header; `none` = no fixture)")
     ap.add_argument("--seconds", type=float, metavar="N",
                     help="run time in seconds from process start (default: the flow's `# seconds:` header, else %d)"
                          % DEFAULT_SECONDS)
@@ -1772,7 +1975,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--activate", action="store_true",
                     help="let the game window take the focus (default: shown without activation)")
     ap.add_argument("--schedule", action="append", default=[], metavar="SPEC",
-                    help="a timed schedule (set / burn / burnmem / mark steps) added to the flow: a file, a name in "
+                    help="a timed schedule (set / burn / burnmem / burngpu / mark steps) added to the flow: a file, a name in "
                          "tools/flows/schedules/, or inline `58:set k=v;70:burn 4`; repeatable")
     ap.add_argument("--window-pos", metavar="POS",
                     help="game window position, --mcla_window_pos=POS: bottom-right | bottom-left | top-right | top-left | X,Y | "
@@ -1785,7 +1988,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--game", metavar="G", help="$GAME (default env MCLA_GAME, else %s)" % DEFAULT_GAME)
     ap.add_argument("--check-flow", action="store_true", help="validate the flow file (and --schedule) and stop")
     ap.add_argument("--selftest-burn", action="store_true",
-                    help="no game: start 2 ALU + 1 memory spinner for 2 s, check them and that they are gone, and stop")
+                    help="no game: start 2 ALU + 1 memory spinner for 2 s, check them and that they are gone (and, when gpuload.exe "
+                         "exists and mcla.exe is not running, a gpuload start / restart / stop), and stop")
     ap.add_argument("--summarize", metavar="RUN", help="parse an existing run (id, run dir or log file) and stop")
     args = ap.parse_args(argv)
 
@@ -1797,7 +2001,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                       schedule=args.schedule, window_pos=args.window_pos, behind=args.behind)
     try:
         if args.selftest_burn:
-            return spinner_selftest()
+            return spinner_selftest(gpu_exe=find_gpuload(_work(opts)))
         if args.summarize:
             return _summarize(args.summarize, opts)
         if not args.flow:

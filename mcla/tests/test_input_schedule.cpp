@@ -1,5 +1,5 @@
 // Unit test of the schedule steps of the host's input script (src/host/input_script.h): `set <cvar>=<value>`,
-// `burn <n>`, `burnmem <n>` and `mark <label>`, parsed from the same script as the pad steps. Valid and invalid
+// `burn <n>`, `burnmem <n>`, `burngpu <pct>` and `mark <label>`, parsed from the same script as the pad steps. Valid and invalid
 // spellings, that the pad steps vector never sees a schedule step (StateAt / PressesBy), the stable time order, the
 // file-text comments, and the canonical-state label of a segment (SchedState). Standalone: header only, no SDK, no
 // game.
@@ -105,6 +105,7 @@ void TestSet() {
   Bad("5:set x.y=1");
   Bad("5:set burn=1");  // keys of the segment label
   Bad("5:set burnmem=1");
+  Bad("5:set burngpu=1");
   Bad("5:set mark=a");
   Bad("5:setx=1");  // not the keyword: a pad step with an unknown button
 }
@@ -134,6 +135,49 @@ void TestBurn() {
   Bad("1:burnmem 33");
   Bad("1:burnmem");
   Bad("1:burn4");
+}
+
+void TestBurnGpu() {
+  m::SchedStep s = One("30:burngpu 40");
+  CHECK(s.kind == m::SchedStep::kBurnGpu);
+  CHECK(s.n == 40);
+  CHECK(s.at_s == 30);
+  CHECK_STR(s.text, "30:burngpu 40");
+  CHECK(One("70:burngpu 0").n == 0);  // 0 stops the load
+  CHECK(One("1:burngpu 100").n == 100);
+  CHECK(One("1:burngpu 1").n == 1);
+  CHECK(One("1:BURNGPU 007").n == 7);
+  CHECK(One("1:BurnGpu 50").kind == m::SchedStep::kBurnGpu);
+  CHECK(One("1:burngpu\t25").n == 25);
+  CHECK(One("  2.5 :  burngpu   60  ").n == 60);
+
+  Bad("1:burngpu");
+  Bad("1:burngpu x");
+  Bad("1:burngpu -1");
+  Bad("1:burngpu +40");
+  Bad("1:burngpu 101");
+  Bad("1:burngpu 999");
+  Bad("1:burngpu 1000");
+  Bad("1:burngpu 0100");
+  Bad("1:burngpu 40%");
+  Bad("1:burngpu 40.5");
+  Bad("1:burngpu 40 50");
+  Bad("1:burngpu 40/200");
+  Bad("1:burngpu 40+1");
+  Bad("1:burngpu4");
+  Bad("1:burngpu=40");
+
+  // The new keyword leaves its neighbours alone: `burn 40` is still a spinner count (0..32), and a longer word is not a keyword.
+  CHECK(One("1:burn 32").kind == m::SchedStep::kBurn);
+  Bad("1:burn 40");
+  Bad("1:burng 40");
+  Bad("1:burngpus 40");
+
+  // With no schedule output it is an error, like the other schedule steps.
+  std::vector<m::Step> pad;
+  std::string err;
+  CHECK(!m::ParseScript("10:burngpu 40", pad, err));
+  CHECK(pad.empty());
 }
 
 void TestMark() {
@@ -198,11 +242,12 @@ void TestMixedAndOrder() {
   CHECK(m::PressesBy(p.pad[0], 5.0) == 1);
 
   // Time order, and file order for equal times (std::stable_sort).
-  const Parsed q = Parse("5:set a=1;3:mark m;5:set b=2;5:burn 1;1:burnmem 2;5:mark z;0:set c=3");
+  const Parsed q = Parse("5:set a=1;3:mark m;5:set b=2;5:burn 1;1:burnmem 2;5:burngpu 40;5:mark z;0:set c=3;2:burngpu 0");
   CHECK(q.ok);
-  const char* want[] = {"0:set c=3", "1:burnmem 2", "3:mark m", "5:set a=1", "5:set b=2", "5:burn 1", "5:mark z"};
-  CHECK(q.sched.size() == 7);
-  for (size_t i = 0; i < q.sched.size() && i < 7; ++i) CHECK_STR(q.sched[i].text, want[i]);
+  const char* want[] = {"0:set c=3", "1:burnmem 2", "2:burngpu 0",  "3:mark m",  "5:set a=1",
+                        "5:set b=2", "5:burn 1",    "5:burngpu 40", "5:mark z"};
+  CHECK(q.sched.size() == 9);
+  for (size_t i = 0; i < q.sched.size() && i < 9; ++i) CHECK_STR(q.sched[i].text, want[i]);
 
   // Several ParseScript calls on one vector (the order holds across them too).
   std::vector<m::Step> pad;
@@ -224,15 +269,17 @@ void TestFileText() {
       "10:set mcla_gfx_preset=perf   # switch to perf\n"
       "\n"
       "   20:burn 4 ; 30:mark go\r\n"
+      "35:burngpu 50   # foreign GPU load\n"
       "40:start\n";
   const Parsed p = Parse(m::ScriptFromFileText(text));
   CHECK(p.ok);
   CHECK(p.pad.size() == 1);
-  CHECK(p.sched.size() == 3);
-  if (p.sched.size() == 3) {
+  CHECK(p.sched.size() == 4);
+  if (p.sched.size() == 4) {
     CHECK_STR(p.sched[0].value, "perf");
     CHECK(p.sched[1].n == 4);
     CHECK_STR(p.sched[2].name, "go");
+    CHECK(p.sched[3].kind == m::SchedStep::kBurnGpu && p.sched[3].n == 50);
   }
 }
 
@@ -260,6 +307,23 @@ void TestSchedState() {
   s2.SetCvar("mcla_gfx_preset", "perf");
   CHECK_STR(s2.Label(), "burn=4 mcla_gfx_preset=perf");
 
+  // burngpu is its own key, sorted between burn and burnmem ('g' < 'm').
+  const Parsed g = Parse("1:burngpu 40;2:burn 4;3:burnmem 1;4:mark a;5:set mcla_x=1");
+  CHECK(g.ok);
+  m::SchedState s3(g.sched);
+  s3.SetCvar("mcla_x", "0");
+  CHECK_STR(s3.Label(), "burn=0 burngpu=0 burnmem=0 mark=start mcla_x=0");
+  s3.SetBurnGpu(40);
+  CHECK_STR(s3.Label(), "burn=0 burngpu=40 burnmem=0 mark=start mcla_x=0");
+  s3.SetBurnGpu(0);
+  s3.SetBurn(2);
+  CHECK_STR(s3.Label(), "burn=2 burngpu=0 burnmem=0 mark=start mcla_x=0");
+  const Parsed g2 = Parse("1:burngpu 25");
+  m::SchedState s4(g2.sched);
+  CHECK_STR(s4.Label(), "burngpu=0");
+  s4.SetBurnGpu(25);
+  CHECK_STR(s4.Label(), "burngpu=25");
+
   // No keys, no label.
   CHECK_STR(m::SchedState(std::vector<m::SchedStep>()).Label(), "");
 }
@@ -269,6 +333,7 @@ void TestSchedState() {
 int main() {
   TestSet();
   TestBurn();
+  TestBurnGpu();
   TestMark();
   TestBadTimeAndPadSteps();
   TestMixedAndOrder();
