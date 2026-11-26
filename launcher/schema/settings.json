@@ -469,6 +469,22 @@
       "emit": "nondefault"
     },
     {
+      "id": "mcla_vis_motion_blur",
+      "label": "Motion blur length",
+      "help": "The game blurs by how far things move in one frame, so at 60 fps its streaks are half as long as on the console (30 fps). No GPU cost either way. Changes while playing.",
+      "category": "graphics",
+      "type": "enum",
+      "cvar": "mcla_vis_motion_blur",
+      "default": 1,
+      "options": [
+        {"value": 1, "label": "60 fps natural (default)", "help": "As the game computes it at 60 fps: half the console's streak length, a crisper picture in motion."},
+        {"value": -1, "label": "Console look", "help": "Streaks as long as at 30 fps on the console, at any frame rate."},
+        {"value": 0, "label": "Off", "help": "No blur from camera or car movement."}
+      ],
+      "advanced": true,
+      "emit": "nondefault"
+    },
+    {
       "id": "mcla_gfx_preset",
       "label": "Scene detail preset",
       "help": "A bundle of the scene-detail knobs below, applied at start: Performance for weak GPUs, Quality and Ultra for GPUs with headroom (they add FXAA). A knob you change below wins over the preset's value for it.",

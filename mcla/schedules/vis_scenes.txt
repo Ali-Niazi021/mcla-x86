@@ -7,9 +7,10 @@
 #       --cvar mcla_present_immediate=-1 --cvar mcla_gfx_preset=perf
 #   python tools/segments.py <run> --from-free-roam 10 --settle 2
 #
-# Settle: the hour and the weather change on the next frame (mcla_dev_tod freezes the clock, so the weather blend snaps;
-# mcla_dev_weather_snap also writes the weights at once). Lights, shadows and exposure follow within ~1-2 s (eye
-# adaptation has a half-life); segments.py's --settle 2 drops that. Weather: 0 nice, 1 cloudy, 2 rain, 3 fog.
+# Settle (measured, run vis6-scene-tour, 1 s screenshots): the hour and the weather change on the next frame (mcla_dev_tod
+# freezes the clock, so the weather blend snaps; mcla_dev_weather_snap writes the weights at once); street lights, shadows
+# and the night path switch with it; eye adaptation leaves a small exposure drift for ~1 s and is flat by +2 s. So
+# segments.py --settle 2 drops the transition. First visit of a state in a fresh shader cache: expect compile hitches. Weather: 0 nice, 1 cloudy, 2 rain, 3 fog.
 # Parked (free roam .. 52 s): one look at each state, for pictures.
 38:set mcla_dev_tod=12
 38:set mcla_dev_weather=0
