@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Thu, 26 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0730: hdr=on stays SDR on a display that is not in HDR mode; the last known display state is kept
+
+Source: Ours, written for this SDK (stream HDR, mission 2), on Renan Queiroz's rexglue-hdr-output presenter code.
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: hdr=on made an HDR10 (PQ) swap chain even on an SDR desktop, which DWM converts back badly and which also blocked 04a0's
+  fused gamma paint. Presenter::IsHdrOutputWanted now returns SDR for `on` when the display state is known and not HDR (log once:
+  "Presenter: hdr=on, but the display is not in HDR mode (Windows HDR is off for it): SDR output"); `on` keeps HDR10 only where
+  the state has never been read (non-Windows, a failed first query). The last known display state is kept while a later query
+  comes back unknown (minimized window), for the wanted state, the auto levels and the HDR10 metadata, so neither on nor auto
+  flaps. On Windows `on` and `auto` now behave the same. hdr cvar help updated. Not run on an SDR desktop (code path only).
+Bucket: REDO
+---
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index 5bd5bec8..f2f4e354 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -778,8 +778,11 @@ class Presenter {
+   // HDR output, for the backends: whether the swap chain should be HDR10 now
+   // (the `hdr` setting, and the display's state, which a thread of its own
+   // refreshes about once a second while `hdr` isn't off), and publishing what
+-  // it is. 0: no; otherwise 1 (wanted, the display not in HDR mode) or 2 (in
+-  // HDR mode), so that a change of the display's state reconnects.
++  // it is. 0: no; otherwise 1 (`hdr=on` while the display's state was never
++  // read: no query on the platform, none succeeded yet) or 2 (the display is in
++  // HDR mode), so that a change of the display's state reconnects. The last
++  // state read stands in while a later read fails (a minimized window). `on` on
++  // a display known not to be in HDR mode is 0 (SDR), as `auto` is.
+   static uint32_t IsHdrOutputWanted();
+   class HdrDisplayWorker;
+   // For HDR10 metadata (BT.2020 primaries, D65): the peak (as content light
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index ffe0dc1f..54dedc25 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -252,7 +252,13 @@ REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
+ 
+ // HDR output (rexglue-hdr-output.patch).
+ REXCVAR_DEFINE_STRING(hdr, "off", "UI/Presenter",
+-                      "HDR output (HDR10): off, auto (when the display is in HDR mode) or on")
++                      "HDR output (HDR10): off; auto = HDR10 while the display the window is on is "
++                      "in HDR mode (Windows: Use HDR), SDR otherwise (the last state read is kept "
++                      "while a later read fails, e.g. a minimized window); on = the same, except "
++                      "where the display's HDR state has never been read (a platform without that "
++                      "query, or before the first successful read): there HDR10 regardless, where "
++                      "auto is SDR. On Windows with Windows HDR off for the display, on is SDR too "
++                      "(Windows would convert HDR10 back badly), logged")
+     .allowed({"off", "auto", "on"});
+ REXCVAR_DEFINE_DOUBLE(hdr_peak_nits, 0.0, "UI/Presenter",
+                       "HDR peak brightness in nits; 0 = what the display reports (1000 if it "
+@@ -490,9 +496,16 @@ namespace {
+ // Held only to copy hdr_display_info.
+ std::mutex hdr_display_mutex;
+ rex::ui::Presenter::HdrDisplayInfo hdr_display_info;  // hdr_display_mutex
++// The last display info that was known (known false until the first one), kept while later
++// queries come back unknown (the window isn't on a monitor while minimized, a failed query), so
++// that the swap chain doesn't switch back and forth with them. HdrGetEffectiveDisplayInfo.
++rex::ui::Presenter::HdrDisplayInfo hdr_last_known_display_info;  // hdr_display_mutex
+ std::atomic<bool> hdr_display_info_stale{true};
+ std::atomic<void*> hdr_monitor{nullptr};
+ std::atomic<bool> hdr_output_active{false};
++// `hdr` is `on`, and the display is known not to be in HDR mode: the output is SDR (as with
++// `auto`), logged once per change (IsHdrOutputWanted, from any thread).
++std::atomic<bool> hdr_on_display_sdr{false};
+ std::atomic<bool> hdr_guest_output_available{true};
+ // The string settings, parsed on change (the painting threads read these).
+ std::atomic<int> hdr_mode{0};  // 0 off, 1 auto, 2 on
+@@ -525,6 +538,30 @@ void HdrSetMonitor(void* monitor, bool force_refresh) {
+   }
+ }
+ 
++// What the display is taken to be for the choice of the output (and its levels): what it reports
++// now, else the last it reported (known is false only before the first reading, and on a platform
++// that doesn't report). The settings screens use the honest Presenter::GetLastHdrDisplayInfo.
++rex::ui::Presenter::HdrDisplayInfo HdrGetEffectiveDisplayInfo() {
++  std::lock_guard<std::mutex> lock(hdr_display_mutex);
++  return hdr_display_info.known || !hdr_last_known_display_info.known
++             ? hdr_display_info
++             : hdr_last_known_display_info;
++}
++
++// Notes whether `hdr=on` is falling back to SDR because the display isn't in HDR mode, logging a
++// change to it once (the exchange: it may be called from several threads at once). The way back
++// to HDR is logged by SetHdrOutputActive, and a way out by `hdr` changing needs no line.
++void HdrNoteOnDisplaySdr(bool on_display_sdr) {
++  if (hdr_on_display_sdr.load(std::memory_order_relaxed) == on_display_sdr) {
++    return;
++  }
++  if (hdr_on_display_sdr.exchange(on_display_sdr) != on_display_sdr && on_display_sdr) {
++    REXLOG_INFO(
++        "Presenter: hdr=on, but the display is not in HDR mode (Windows HDR is off for it): SDR "
++        "output");
++  }
++}
++
+ // HDR debug dump (hdr_dump_dir, hdr_dump_at, hdr_dump_every_s; Presenter::ClaimHdrDump). The
+ // settings are parsed when they change (a change callback), a paint only reads the earliest time
+ // anything is due.
+@@ -2475,7 +2512,7 @@ Presenter::HdrDisplayInfo Presenter::GetLastHdrDisplayInfo() {
+ }
+ 
+ Presenter::HdrAutoLevels Presenter::GetHdrAutoLevels() {
+-  HdrDisplayInfo info = GetLastHdrDisplayInfo();
++  HdrDisplayInfo info = HdrGetEffectiveDisplayInfo();
+   // Also not NaN (a comparison with NaN is false).
+   HdrAutoLevels levels;
+   levels.peak_nits = info.peak_nits >= 80.0f && info.peak_nits <= 10000.0f ? info.peak_nits
+@@ -2660,6 +2697,9 @@ void Presenter::HdrDisplayWorker::Query() {
+               info.sdr_white_nits != hdr_display_info.sdr_white_nits ||
+               info.refresh_hz != hdr_display_info.refresh_hz;
+     hdr_display_info = info;
++    if (info.known) {
++      hdr_last_known_display_info = info;
++    }
+   }
+   if (changed) {
+     if (info.known) {
+@@ -2686,6 +2726,7 @@ uint32_t Presenter::IsHdrOutputWanted() {
+   HdrRegisterSettingCallbacks();
+   int mode = hdr_mode.load(std::memory_order_relaxed);
+   if (!mode) {
++    HdrNoteOnDisplaySdr(false);
+     return 0;
+   }
+   HdrDisplayWorker& worker = HdrDisplayWorker::Get();
+@@ -2696,18 +2737,25 @@ uint32_t Presenter::IsHdrOutputWanted() {
+   if (!first_query_awaited.exchange(true, std::memory_order_relaxed)) {
+     worker.AwaitFirstQuery();
+   }
++  // The display's last known state while a later query comes back unknown (a minimized window, a
++  // failed query), so the swap chain doesn't switch with those.
++  HdrDisplayInfo info = HdrGetEffectiveDisplayInfo();
++  bool display_hdr = info.known && info.hdr_enabled;
++  // `on` on a display known not to be in HDR mode (Windows HDR off): SDR, like `auto` (DWM
++  // converts an HDR10 swap chain back to SDR badly there). Only while the display's state has
++  // never been known (no query on this platform, before the first successful read), `on` is HDR10.
++  bool display_sdr = info.known && !info.hdr_enabled;
++  HdrNoteOnDisplaySdr(mode == 2 && display_sdr);
+   if (!hdr_guest_output_available.load(std::memory_order_relaxed)) {
+     return 0;
+   }
+-  HdrDisplayInfo info = GetLastHdrDisplayInfo();
+-  bool display_hdr = info.known && info.hdr_enabled;
+-  return display_hdr ? 2 : (mode == 2 ? 1 : 0);
++  return display_hdr ? 2 : (mode == 2 && !display_sdr ? 1 : 0);
+ }
+ 
+ Presenter::HdrMetadataLevels Presenter::GetHdrMetadataLevels() {
+   auto valid = [](float nits) { return std::isfinite(nits) ? std::clamp(nits, 0.0f, 10000.0f) : 0.0f; };
+   HdrOutputState state = GetHdrOutputState();
+-  HdrDisplayInfo info = GetLastHdrDisplayInfo();
++  HdrDisplayInfo info = HdrGetEffectiveDisplayInfo();
+   HdrMetadataLevels levels;
+   levels.max_nits = valid(state.peak_nits);
+   levels.max_frame_average_nits =

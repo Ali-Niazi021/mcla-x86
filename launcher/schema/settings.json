@@ -319,7 +319,7 @@
       "options": [
         {"value": "off", "label": "Off", "help": "Standard dynamic range."},
         {"value": "auto", "label": "Auto", "help": "HDR when the display is in HDR mode."},
-        {"value": "on", "label": "On", "help": "Always HDR10, even on an SDR desktop (Windows converts it back; use Auto)."}
+        {"value": "on", "label": "On", "help": "HDR10 whenever the display is in HDR mode, as Auto; with Windows HDR off it stays SDR (logged)."}
       ],
       "advanced": true,
       "emit": "nondefault"
@@ -493,7 +493,7 @@
     {
       "id": "swap_post_effect",
       "label": "Post-process anti-aliasing (FXAA)",
-      "help": "FXAA over the finished frame (HUD included), about 0.3 ms GPU at 1080p on a Radeon 880M. Smooths the stair-stepped edges the game has without MSAA. Changes while playing (no restart); skipped while HDR output is active.",
+      "help": "FXAA over the finished frame (HUD included), about 0.3 ms GPU at 1080p on a Radeon 880M. Smooths the stair-stepped edges the game has without MSAA. Changes while playing (no restart); also runs on the HDR image (not with frame generation).",
       "category": "graphics",
       "type": "enum",
       "cvar": "swap_post_effect",
