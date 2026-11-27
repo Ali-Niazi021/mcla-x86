@@ -20,7 +20,10 @@
   Every poll also writes <state dir>/usage.json ({"five_hour_pct", "five_hour_resets_at", "seven_day_pct", ...,
   "checked_at"}) so anything else can read the last value without a request. State dir: $MCLA_WORK/usage, else
   mcla-x86-work/usage next to the repo.
-  Exit codes: 0 printed once; 10 threshold reached; 11 reset seen; 20 the usage could not be read 5 times in a row
+  The endpoint answers HTTP 429 to requests that come close together (two reads 28 s apart: the second was refused), so
+  ONE watcher polls, and a plain read prints the watcher's last value from usage.json when it is under 10 minutes old
+  (`--fresh` asks the endpoint anyway). A 429 is waited out (5 minutes) and is not a failure.
+  Exit codes: 0 printed once; 10 threshold reached; 11 reset seen; 20 the usage could not be read for 30 minutes
   (no login, no network, the endpoint changed): monitoring is then OFF and the lead must say so.
 """
 import argparse
@@ -113,21 +116,35 @@ def main() -> int:
     ap.add_argument("--until-reset", action="store_true")
     ap.add_argument("--resume-below", type=float, default=50.0)
     ap.add_argument("--interval", type=int, default=180)
+    ap.add_argument("--fresh", action="store_true")
     args = ap.parse_args()
 
-    failures = 0
+    watching = args.until is not None or args.until_reset
+    if not watching and not args.fresh:
+        try:
+            cached = json.loads((state_dir() / "usage.json").read_text(encoding="utf-8"))
+            age = (datetime.datetime.now(datetime.timezone.utc)
+                   - datetime.datetime.fromisoformat(cached["checked_at"])).total_seconds()
+            if age < 600:
+                print("%s (read %d s ago by the watcher)" % (describe(cached), age))
+                return 0
+        except (OSError, KeyError, ValueError):
+            pass
+
+    failing_since = None
     started_reset_at = None
     while True:
         try:
             status = read()
-            failures = 0
+            failing_since = None
         except (OSError, KeyError, ValueError, urllib.error.URLError) as error:
-            failures += 1
+            limited = isinstance(error, urllib.error.HTTPError) and error.code == 429
             reason = "HTTP %s" % error.code if isinstance(error, urllib.error.HTTPError) else type(error).__name__
-            if not (args.until is not None or args.until_reset) or failures >= 5:
+            failing_since = failing_since or time.time()
+            if not watching or time.time() - failing_since > 1800:
                 print("usage: could not be read (%s)" % reason, flush=True)
                 return 20
-            time.sleep(min(60, args.interval))
+            time.sleep(300 if limited else 60)
             continue
         five = status["five_hour_pct"]
         if args.until is None and not args.until_reset:
