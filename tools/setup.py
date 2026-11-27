@@ -13,10 +13,15 @@ Options
     --jobs N       cap the compiler jobs of the SDK build (default: by free memory)
     --force        run every step again, even the ones that look done
     --check        check the prerequisites, print what would be done, and stop
+    --no-nvidia    do not download NVIDIA Streamline (the game is built without DLSS)
 
 Steps (each one is skipped when its result is already there, so the command is safe to run again):
     1 tools     Git, CMake 3.25+, Python 3.11+, Visual Studio 2022 C++ tools, Windows SDK, Ninja
     2 compiler  download Clang/LLVM 20.1.8 (940 MB, SHA-256 checked) and unpack it to <work>/toolchain/llvm-20.1.8
+      nvidia    download NVIDIA Streamline 2.14.16 (276 MB, SHA-256 checked: DLSS Super Resolution, DLSS Frame Generation,
+                Reflex) and unpack its headers and x64 DLLs to <work>/toolchain/nvidia/streamline-2.14.16; the SDK build
+                is pointed at it and the DLLs end up next to mcla.exe. NVIDIA's files never enter the repo. --no-nvidia
+                skips it (no DLSS)
     3 game      check the .iso is the supported dump and extract the game files (6.1 GiB)
     4 sdk       fetch the ReXGlue SDK, apply the patch series, build and install it (tools/prepare_sdk.py)
     5 codegen   recompile default.xex to C++ (tools/codegen.py)
@@ -55,6 +60,16 @@ LLVM_FILE = "clang+llvm-%s-x86_64-pc-windows-msvc.tar.xz" % LLVM_VERSION
 LLVM_URL = "https://github.com/llvm/llvm-project/releases/download/llvmorg-%s/%s" % (LLVM_VERSION, LLVM_FILE)
 LLVM_SHA256 = "f229769f11d6a6edc8ada599c0cda964b7dee6ab1a08c6cf9dd7f513e85b107f"
 LLVM_BYTES = 939541912
+
+# NVIDIA Streamline (DLSS SR, DLSS-G, Reflex): the release zip from NVIDIA's GitHub, pinned. Only include/, bin/x64/ (the
+# production DLLs and development/) and the licence files are unpacked. Personal use: the development DLLs (unsigned,
+# NVIDIA's watermark) are the ones installed by default (REXGLUE_STREAMLINE_VARIANT, SDK patch 0770).
+STREAMLINE_VERSION = "2.14.16"
+STREAMLINE_FILE = "streamline-sdk-v%s.zip" % STREAMLINE_VERSION
+STREAMLINE_URL = "https://github.com/NVIDIA-RTX/Streamline/releases/download/v%s/%s" % (STREAMLINE_VERSION,
+                                                                                         STREAMLINE_FILE)
+STREAMLINE_SHA256 = "32041e51db0cab709a271b72a352281b690c2abbd669a827809401a5dd23956b"
+STREAMLINE_BYTES = 276016170
 PRESET = "local-release"
 PRESET_MARK = "mcla-x86/setup"
 FREE_GB_WANTED = 30
@@ -258,6 +273,48 @@ def ensure_compiler(work: Path, force: bool) -> None:
     say("  compiler ready (you can delete %s to save 940 MB)" % posix(archive))
 
 
+def ensure_streamline(work: Path, force: bool) -> None:
+    """NVIDIA Streamline into <work>/toolchain/nvidia/streamline-<version> (include/, bin/x64/, licences)."""
+    import zipfile
+    dest = work / "toolchain" / "nvidia" / ("streamline-%s" % STREAMLINE_VERSION)
+    if (dest / "include" / "sl.h").exists() and (dest / "bin" / "x64" / "sl.interposer.dll").exists() and not force:
+        say("  already there: %s" % posix(dest))
+        return
+    archive = work / "toolchain" / "nvidia" / "dl" / STREAMLINE_FILE
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    if not archive.exists() or archive.stat().st_size != STREAMLINE_BYTES:
+        say("  downloading %s (276 MB)" % STREAMLINE_URL)
+        download(STREAMLINE_URL, archive, STREAMLINE_BYTES)
+    say("  checking the SHA-256 of %s" % archive.name)
+    got = sha256_of(archive)
+    if got != STREAMLINE_SHA256:
+        archive.unlink()
+        raise Fail("the downloaded Streamline archive is damaged (SHA-256 %s, expected %s); it was deleted, run setup "
+                   "again" % (got, STREAMLINE_SHA256))
+    tmp = dest.with_name(dest.name + ".tmp")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir(parents=True)
+    keep = ("include/", "bin/x64/", "license.txt", "3rd-party-licenses.md")
+    with zipfile.ZipFile(archive) as z:
+        for member in z.infolist():
+            name = member.filename.replace("\\", "/")
+            parts = Path(name).parts
+            if member.is_dir() or not name.startswith(keep) or any(p in ("..", "") for p in parts):
+                continue
+            target = tmp.joinpath(*parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with z.open(member) as src, open(target, "wb") as out:
+                shutil.copyfileobj(src, out, 1 << 20)
+    if not (tmp / "include" / "sl.h").exists() or not (tmp / "bin" / "x64" / "development" / "sl.interposer.dll").exists():
+        raise Fail("the unpacked Streamline archive lacks include/sl.h or bin/x64/development/sl.interposer.dll (%s)"
+                   % posix(tmp))
+    if dest.exists():
+        shutil.rmtree(dest)
+    os.replace(tmp, dest)
+    say("  Streamline ready at %s (you can delete %s to save 276 MB)" % (posix(dest), posix(archive)))
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # 3 game
 # ---------------------------------------------------------------------------------------------------------------
@@ -393,6 +450,7 @@ def main() -> int:
     ap.add_argument("--jobs", type=int, help="cap the compiler jobs of the SDK build")
     ap.add_argument("--force", action="store_true", help="run every step again")
     ap.add_argument("--check", action="store_true", help="check the prerequisites, print the plan, and stop")
+    ap.add_argument("--no-nvidia", action="store_true", help="do not download NVIDIA Streamline (no DLSS)")
     args = ap.parse_args()
 
     work = Path(args.work or os.environ.get("MCLA_WORK") or (REPO.parent / "mcla-x86-work")).resolve()
@@ -411,10 +469,16 @@ def main() -> int:
             say("compiler     %s" % ("ready" if (work / "toolchain" / ("llvm-%s" % LLVM_VERSION) / "bin" / "clang++.exe").exists()
                                      else "will be downloaded (940 MB)"))
             say("game files   %s" % ("ready" if game_root_of(game) else "will be extracted from the .iso"))
+            say("nvidia       %s" % ("skipped (--no-nvidia): no DLSS" if args.no_nvidia else
+                                   ("ready" if (work / "toolchain" / "nvidia" / ("streamline-%s" % STREAMLINE_VERSION) / "include" / "sl.h").exists()
+                                    else "will be downloaded (276 MB, DLSS Super Resolution / Frame Generation / Reflex)")))
             say("check ok: run the same command without --check")
             return 0
         step(2, "compiler (Clang/LLVM %s)" % LLVM_VERSION)
         ensure_compiler(work, args.force)
+        if not args.no_nvidia:
+            say("  NVIDIA Streamline %s (DLSS, Reflex)" % STREAMLINE_VERSION)
+            ensure_streamline(work, args.force)
         step(3, "game files")
         game_root = ensure_game(iso, game, env, args.force)
         step(4, "ReXGlue SDK (fetch, patch, build)")

@@ -880,6 +880,11 @@ def plan_build(L: Layout, args: argparse.Namespace) -> BuildPlan:
     ffx_signed = L.work / "toolchain" / "ffx-signed"  # patch 0470's pinned signed FidelityFX DLLs, cached (58 MB)
     if ffx_signed.is_dir():
         configure.append("-DREXGLUE_FSR_SIGNED_DIR=" + ffx_signed.as_posix())
+    # NVIDIA Streamline (SDK patches 0770/0780: DLSS SR, DLSS-G, Reflex), fetched by tools/setup.py; its DLLs are installed
+    # next to the SDK's (development ones by default) and staged next to mcla.exe by mcla_stage_sdk_runtime.
+    streamline = L.work / "toolchain" / "nvidia" / "streamline-2.14.16"
+    if (streamline / "include" / "sl.h").is_file():
+        configure.append("-DREXGLUE_STREAMLINE_DIR=" + streamline.as_posix())
     configure += args.cmake_arg or []
     build = [cmake, "--build", str(bindir), "--config", args.config]
     if jobs:

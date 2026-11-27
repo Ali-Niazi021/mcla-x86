@@ -1070,6 +1070,33 @@ purpose = "D3D12 (hitch2): the host allocations of the first frames are kept in 
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0795-upload-pool-warm-up"
+source = "local"
+path = "patches/sdk/0795-upload-pool-warm-up.patch"
+sha256 = "2bfddebfbd2c6e2103a9f246bdcbf8a9ef9049d2a0918756dbce65a9af684aa9"
+purpose = "D3D12 (hitch3): the page counts of the upload buffer pools (shared memory, constants, transfer vertices, frame indices) are kept as kind 8 of 0790's key file (key = pool id << 24 | pages, the largest per pool wins) and the pages are made and touched at start by WarmUpHostAllocations (new GraphicsUploadBufferPool::PreallocatePages; cvars d3d12_warmup_pools default true, d3d12_warmup_pool_touch default 1 = a byte of each 4 KB, 2 = whole page, 0 = none), out of the 0794 budget but at most a quarter of it; the '[warm-up]' line ends with 'upload pool pages: N (M MiB, X ms, touch mode T): ...' and a page made while the game runs is logged ('Upload buffer pool ... page N made while the game runs: X us'). A reader of this build skips kinds 9-63 and keeps them; a 0790-0794 build cuts a file with kind 8 records at the first of them. Needs 0790-0794."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0770-dlss-super-resolution"
+source = "local"
+path = "patches/sdk/0770-dlss-super-resolution.patch"
+sha256 = "275b7a309da8e9ab4428d3689cb183cdb7dde8975b00241b77b0a87b92821048"
+purpose = "D3D12 (T9): NVIDIA DLSS Super Resolution through Streamline 2.14 (manual hooking) as temporal_aa_upscaler=dlss, in FSR's place with FSR's inputs (jittered squeezed scene, depth, the game's motion vectors); swap chains made through Streamline's proxy factory; cvars nvidia_streamline (auto|on|off), streamline_log, streamline_project_id, dlss_preset, dlss_debug; DLSS mode from temporal_aa_upscale; falls back to FSR when Streamline's DLLs, an RTX GPU or DLSS are missing. Built only with -DREXGLUE_STREAMLINE_DIR (tools/setup.py fetches NVIDIA's SDK into the work folder; nothing of NVIDIA's is in this tree). Needs 0750-0795."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0780-dlss-frame-generation-reflex"
+source = "local"
+path = "patches/sdk/0780-dlss-frame-generation-reflex.patch"
+sha256 = "6d9e752f8d63f6cb958dd644274ac7239cf84b307d650362baa6dfd24037b78c"
+purpose = "D3D12 (T9): NVIDIA DLSS Frame Generation (frame_generation=dlss; cvars dlssg_frames 1-5, dlssg_debug) through Streamline's proxy swap chain and, for the direct queue, its proxy device, with Reflex and PC latency markers through Streamline (the NVAPI Reflex cannot be used with DLSS-G); per guest frame the TAA pass's depth and vectors, the refresher's HUD-less image and the camera of that frame id are tagged before the Present; the UI layer separation is switched on for it; frame ids are the low-latency layer's (the engine frame heartbeat calls LowLatency::OnFrameStart: mcla_low_latency_frames). Shown 1:1 only (2000p on 3200x2000, 1080p on 1920x1080), SDR only (no HUD-less image in HDR), no UI alpha yet. RTX 40 gives 2x. On the RTX 4060 Laptop: 60 rendered frames shown as 118.7 a second with G-Sync. Needs 0770."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]

@@ -1289,7 +1289,7 @@ void Overlay::Row(const Item& it) {
       std::string custom;
       int current_index = -1;
       for (int i = 0; i < it.choice_count; ++i) {
-        if (current == it.choices[i].value) {
+        if (ChoiceIs(current, it.choices[i].value)) {
           preview = it.choices[i].label;
           current_index = i;
         }
@@ -1300,7 +1300,7 @@ void Overlay::Row(const Item& it) {
       }
       if (ImGui::BeginCombo("##v", preview)) {
         for (int i = 0; i < it.choice_count; ++i) {
-          const bool selected = current == it.choices[i].value;
+          const bool selected = ChoiceIs(current, it.choices[i].value);
           if (ImGui::Selectable(it.choices[i].label, selected)) {
             pad_log(it.choices[i].label, false);
             SetCvar(it.cvar, it.choices[i].value, !is_cheat);
@@ -1502,7 +1502,12 @@ void Overlay::DrawTabDisplay() {
   using namespace mcla_overlay::items;
   Section("Overlay", {&kFps, &kFpsCorner, &kFpsDetail, &kStats, &kScale, &kOpacity});
   Section("Picture", {&kFullscreen, &kAa, &kHdr, &kLodBias, &kAniso, &kTearing});
-  ImGui::TextColored(kDim, "The picture's size and the upscaler are chosen in the launcher (they need a restart).");
+  Section("Upscaling", {&kUpscale, &kUpscaler, &kUpscaleRatio, &kDlssPreset});
+  {
+    const std::string active = mcla_overlay::CvarString("temporal_aa_upscaler_active");
+    ImGui::TextColored(kDim, "now: %s", active.empty() || active == "none" ? "no upscaler running" : active.c_str());
+  }
+  ImGui::TextColored(kDim, "The picture's size is chosen in the launcher (it needs a restart).");
 }
 
 void Overlay::DrawTabGraphics() {

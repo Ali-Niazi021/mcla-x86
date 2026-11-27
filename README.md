@@ -53,6 +53,7 @@ have to watch it:
 |---|---|
 | 1 tools | Checks Git, CMake, Python, Visual Studio and the Windows SDK. If one is missing, it prints the command to install it. |
 | 2 compiler | Downloads Clang/LLVM 20.1.8 (940 MB, checksum verified) and unpacks it. No install, no admin rights. |
+| nvidia | Downloads NVIDIA Streamline 2.14.16 (276 MB, checksum verified: DLSS, Reflex) into the work folder and unpacks its headers and DLLs; the SDK build copies the DLLs next to the game. Nothing of NVIDIA's is stored in the repository. `--no-nvidia` skips it (no DLSS; the game builds and plays the same). |
 | 3 game | Checks that your `.iso` is the supported dump and extracts the game files (6.1 GB). |
 | 4 sdk | Downloads the ReXGlue SDK, applies the patches, builds it. This is the long step. |
 | 5 codegen | Translates the game's `default.xex` to C++ on your PC. |
@@ -101,10 +102,12 @@ Finished steps are skipped, so this is much faster than the first setup.
   The cheats (time of day, weather, traffic) are off at every start. The chord is a row of the Game tab (L3 + R3, Back +
   Start or LB + RB + Back) and the keys are rebound in the launcher; `--mcla_overlay=false` removes the whole thing,
   `--mcla_overlay_pad=false` leaves it to the keyboard and mouse.
-- **Presets:** Recommended 1080p, 16:10 panel (1920x1200), Balanced 900p, Performance 720p, native panel, and a
-  console-like 30 fps mode. If the game does not hold 60 fps, pick a lighter preset.
+- **Presets:** Recommended 1080p, 16:10 panel (1920x1200), Balanced 900p, Performance 720p, native panel (plain, with NVIDIA DLAA,
+  with DLSS Performance, or with Frame Generation on RTX cards), and a console-like 30 fps mode. If the game does not hold 60 fps, pick a lighter preset.
 - **Adaptive detail** (on by default): keeps 60 fps by lowering detail where it is least visible, and raises it again
   when the GPU has room.
+- **NVIDIA DLSS (RTX cards):** the launcher has presets **Native panel 3200x2000, NVIDIA DLAA** (anti-aliasing at the full size) and **NVIDIA DLSS Performance** (scene drawn at half size, model K), and a preset for **DLSS Frame Generation** (below); the mod menu's Display tab has an Upscaling section (the quality and the DLSS model change live, the upscaler and on / off at the next start). DLSS here is a picture-quality choice, not a speed-up: on an RTX 4060 Laptop it costs about 4-5 ms a frame at 3200x2000 (8.4 ms plain, 12.5-13.5 ms with DLSS; every mode holds 60 fps, none reaches a clean 120) and 20-26 W more GPU power at 60 fps. It needs an RTX GPU and NVIDIA's DLLs next to the game (the setup downloads them); without them, on another GPU, or with `--nvidia_streamline=off`, FSR runs and the log says so once. The DLLs are NVIDIA's development ones: they print a small NVIDIA notice at the bottom of the screen, which is for personal use only and must not be passed on.
+- **DLSS Frame Generation** (RTX 40 or newer, Windows' hardware-accelerated GPU scheduling on, G-Sync with **Allow tearing**): the preset **Native panel 3200x2000, 120 fps shown with NVIDIA DLSS Frame Generation** renders 60 frames a second and shows 118 (measured over a 6 minute drive); the game still simulates at 60, the HUD stays sharp, the frame between two rendered ones delays the real one a little (input latency was not measured). FXAA must be off (the preset does it). Only at the display's own size (3200x2000 on the laptop panel); not on the 1080p TV.
 - **Anti-aliasing:** automatic by default (FXAA).
 - **Vsync and tearing:** vsync is always on, and with tearing off each frame waits for the display's next refresh.
   Tearing is off by default, which is right for TVs and ordinary monitors. The launcher's **Allow tearing (G-Sync /

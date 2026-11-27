@@ -12,6 +12,79 @@
   ],
   "presets": [
     {
+      "id": "panel_2000_dlaa",
+      "label": "Native panel 3200x2000, NVIDIA DLAA (RTX, best picture)",
+      "help": "The 3200x2000 picture of the native-panel preset, anti-aliased by NVIDIA DLAA (DLSS at the native size: the transformer model, FXAA off, the HUD stays sharp). Needs an RTX GPU and NVIDIA's DLLs next to the game (the setup downloads them); without them FSR runs. Measured on an RTX 4060 Laptop (100 W), driving through traffic: the GPU needs 13.5 ms a frame against 8.4 ms for the plain 3200x2000 picture (about 5 ms for DLSS itself), so it holds 60 fps (GPU busy 14.8 ms, 60.00 fps, 1 % low 57.8) but not 120, at about 85 W of GPU power against 58 W. The upscaling modes (Quality, Balanced, Performance) cost the same here: DLSS does not make the game faster on this GPU, it makes the picture better.",
+      "set": {
+        "mcla_profile": "2000p",
+        "mcla_noaa": true,
+        "mcla_ws_single_tile": true,
+        "mcla_fps_target": 60,
+        "mcla_present_immediate": -1,
+        "mcla_gfx_preset": "perf",
+        "mcla_gfx_shadow_res": 320,
+        "present_effect": "bilinear",
+        "fullscreen_mode": "desktop",
+        "aa_auto": false,
+        "swap_post_effect": "none",
+        "temporal_aa": "fsr",
+        "temporal_aa_upscaler": "dlss",
+        "temporal_aa_upscale": 1.0,
+        "temporal_aa_sharpness": 0.3,
+        "fullscreen": true
+      }
+    },
+    {
+      "id": "panel_2000_dlss",
+      "label": "Native panel 3200x2000, NVIDIA DLSS Performance (RTX, cooler)",
+      "help": "The 3200x2000 picture with the 3D scene drawn at 1600x1000 and upscaled by NVIDIA DLSS Performance (model K), FXAA off. The HUD and the post-processing stay at 3200x2000. Needs an RTX GPU and NVIDIA's DLLs; otherwise FSR runs. Measured on an RTX 4060 Laptop: 12.4 ms of GPU time a frame (about 80 fps unlocked) against 13.5 ms for DLAA and 8.4 ms for the plain picture, at about 78 W of GPU power at 60 fps against 85 W for DLAA and 58 W plain. It is not faster than the plain 3200x2000 picture; it draws less than DLAA and is softer.",
+      "set": {
+        "mcla_profile": "2000p",
+        "mcla_noaa": true,
+        "mcla_ws_single_tile": true,
+        "mcla_fps_target": 60,
+        "mcla_present_immediate": -1,
+        "mcla_gfx_preset": "perf",
+        "mcla_gfx_shadow_res": 320,
+        "present_effect": "bilinear",
+        "fullscreen_mode": "desktop",
+        "aa_auto": false,
+        "swap_post_effect": "none",
+        "temporal_aa": "fsr",
+        "temporal_aa_upscaler": "dlss",
+        "temporal_aa_upscale": 2.0,
+        "dlss_preset": "k",
+        "temporal_aa_sharpness": 0.3,
+        "fullscreen": true
+      }
+    },
+    {
+      "id": "panel_2000_fg",
+      "label": "Native panel 3200x2000, 120 fps shown with NVIDIA DLSS Frame Generation (RTX 40 or newer, G-Sync)",
+      "help": "The native-panel 3200x2000 picture at the game's 60 fps, with NVIDIA DLSS Frame Generation putting a generated frame between every two rendered ones: 120 frames a second on the screen (measured 118.7 shown a second over a 6 minute drive, 1 % low 88 fps, no crash; G-Sync follows with Allow tearing on) for about 8 ms of GPU time a shown frame. The generated frame is made from the game's depth, motion vectors and the picture without the HUD, so the HUD stays sharp (checked on the generated frames alone). The game still runs its 60 fps simulation: handling feels like 60, the picture looks like 120; the frame generated in between delays the real one, so input latency is a little higher than plain 60 (not measured: PresentMon gave no input-to-photon figure for the plain game). Needs: an RTX 40 series or newer GPU, Windows' hardware-accelerated GPU scheduling, NVIDIA's DLLs next to the game (the setup downloads them), the 3200x2000 panel at its native size, and a G-Sync display with variable refresh on in the NVIDIA driver (on a panel without a 120 Hz mode the shown frames are even only with it). FXAA is off (frame generation needs it). Not for the 1080p TV: the setting is off there. Takes about 27 W more GPU power than the plain 60 fps picture (84 W against 57 W).",
+      "set": {
+        "mcla_profile": "2000p",
+        "mcla_noaa": true,
+        "mcla_ws_single_tile": true,
+        "mcla_fps_target": 60,
+        "mcla_present_immediate": -1,
+        "mcla_gfx_preset": "perf",
+        "mcla_gfx_shadow_res": 320,
+        "present_effect": "bilinear",
+        "fullscreen_mode": "desktop",
+        "aa_auto": false,
+        "swap_post_effect": "none",
+        "temporal_aa": "off",
+        "temporal_aa_upscaler": "fsr3",
+        "temporal_aa_upscale": 1.5,
+        "temporal_aa_sharpness": 0.3,
+        "frame_generation": "dlss",
+        "mcla_low_latency_frames": true,
+        "d3d12_allow_variable_refresh_rate_and_tearing": true,
+        "fullscreen": true
+      }
+    },
+    {
       "id": "recommended",
       "label": "Recommended (1080p)",
       "help": "True 1920x1080, single-tile scene, MSAA off, the 60 fps profile with late-frame release and the Performance scene-detail preset. On a Radeon 880M in Performance mode: 60 fps most of the time (parked scene 60.0 fps, 99th percentile 17.1 ms); in the heaviest streets the game may hold 30 fps for 6-18 s (see Max hold at 30 fps). Pick Balanced or Performance if your GPU is slower.",
@@ -468,7 +541,7 @@
     },
     {
       "id": "temporal_aa",
-      "label": "Upscaler (AMD FSR)",
+      "label": "Upscaler (FSR / DLSS)",
       "help": "AMD FSR temporal upscaling: the 3D scene is drawn smaller and upscaled to the output size, with temporal anti-aliasing. HUD and post-processing stay at full size. Needs: MSAA disabled, Single-tile scene on, Direct3D 12. On a Radeon 880M it measured slower than native 1080p (FSR 3: 49 fps, FSR 4: 37 fps against 60), so it only pays off where shading dominates.",
       "category": "graphics",
       "type": "enum",
@@ -476,7 +549,7 @@
       "default": "off",
       "options": [
         {"value": "off", "label": "Off (native resolution)", "help": "The scene is drawn at the output size, no temporal pass."},
-        {"value": "fsr", "label": "AMD FSR (temporal upscaler)", "help": "Draws the scene at output size divided by the quality ratio and upscales it with the FSR version chosen below."}
+        {"value": "fsr", "label": "Temporal upscaler (FSR or DLSS)", "help": "Draws the scene at output size divided by the quality ratio and upscales it with the upscaler chosen below (AMD FSR, or NVIDIA DLSS on an RTX GPU)."}
       ],
       "advanced": false,
       "requires": {"mcla_noaa": true, "mcla_ws_single_tile": true, "mcla_gpu_backend": "d3d12"},
@@ -484,8 +557,8 @@
     },
     {
       "id": "temporal_aa_upscaler",
-      "label": "FSR version",
-      "help": "Which FSR runs. FSR 4 (the machine-learning upscaler) needs AMD's signed runtime DLLs next to mcla.exe and a supported Radeon; without the DLLs the FSR 3.1 built into the game runs whatever this says.",
+      "label": "Upscaler",
+      "help": "Which upscaler runs. FSR 4 (the machine-learning upscaler) needs AMD's signed runtime DLLs next to mcla.exe and a supported Radeon; without the DLLs the FSR 3.1 built into the game runs. DLSS needs an NVIDIA RTX GPU and NVIDIA Streamline's DLLs next to mcla.exe (tools/setup.py fetches them); without them FSR runs.",
       "category": "graphics",
       "type": "enum",
       "cvar": "temporal_aa_upscaler",
@@ -493,7 +566,8 @@
       "options": [
         {"value": "fsr3", "label": "FSR 3.1", "help": "AMD FSR 3.1 (the temporal upscaler built into the game; FSR 3.1.6 with AMD's runtime). 49 fps measured on a Radeon 880M."},
         {"value": "fsr4", "label": "FSR 4 (ML)", "help": "AMD's machine-learning upscaler (experimental here; 37 fps measured on a Radeon 880M); the game falls back to FSR 3.1.6 where the GPU or the runtime does not offer it."},
-        {"value": "auto", "label": "Auto (FSR 4 if available, else FSR 3.1)", "help": "FSR 4.1 on RDNA 2 and newer and the Radeon 800M series when AMD's signed runtime is next to mcla.exe, else FSR 3.1."}
+        {"value": "auto", "label": "Auto (FSR 4 if available, else FSR 3.1)", "help": "FSR 4.1 on RDNA 2 and newer and the Radeon 800M series when AMD's signed runtime is next to mcla.exe, else FSR 3.1."},
+        {"value": "dlss", "label": "NVIDIA DLSS 4", "help": "NVIDIA DLSS Super Resolution (the transformer model) on an RTX GPU; the quality ratio below picks DLAA (1.0x), Quality, Balanced, Performance or Ultra Performance. Sharpness is not used. Takes effect at the next start."}
       ],
       "advanced": false,
       "requires": {"temporal_aa": "fsr"},
@@ -518,6 +592,52 @@
       "advanced": false,
       "requires": {"temporal_aa": "fsr"},
       "emit": "always"
+    },
+    {
+      "id": "frame_generation",
+      "label": "Frame generation",
+      "help": "NVIDIA DLSS Frame Generation: a generated frame between two rendered ones, 120 fps on the screen from the game's 60. Needs an RTX 40 or newer, hardware GPU scheduling, Streamline's DLLs, the picture shown 1:1 (3200x2000 panel, 1080p screen), 120 Hz+ or G-Sync, and Reflex frames on. Next start.",
+      "category": "graphics",
+      "type": "enum",
+      "cvar": "frame_generation",
+      "default": "off",
+      "options": [
+        {"value": "off", "label": "Off", "help": "Every frame on the screen is rendered by the game."},
+        {"value": "dlss", "label": "NVIDIA DLSS Frame Generation", "help": "Streamline presents a generated frame between the rendered ones; Reflex is turned on with it."}
+      ],
+      "advanced": false,
+      "requires": {"mcla_gpu_backend": "d3d12"},
+      "emit": "nondefault"
+    },
+    {
+      "id": "mcla_low_latency_frames",
+      "label": "Reflex frames",
+      "help": "Tells the GPU driver where each engine frame starts (NVIDIA Reflex's wait and markers). Needed by DLSS Frame Generation; with it on, Reflex also runs on NVIDIA GPUs without frame generation (low_latency auto).",
+      "category": "advanced",
+      "type": "bool",
+      "cvar": "mcla_low_latency_frames",
+      "default": false,
+      "advanced": true,
+      "emit": "nondefault"
+    },
+    {
+      "id": "dlss_preset",
+      "label": "DLSS model",
+      "help": "Which NVIDIA DLSS model runs. Automatic is K for DLAA, Quality and Balanced, M for Performance and L for Ultra Performance. J and K cost about the same here; M costs about 3 ms and L about 5 ms more a frame at 3200x2000 on an RTX 4060 Laptop. Changes while playing.",
+      "category": "graphics",
+      "type": "enum",
+      "cvar": "dlss_preset",
+      "default": "default",
+      "options": [
+        {"value": "default", "label": "Automatic", "help": "NVIDIA's choice for the mode."},
+        {"value": "j", "label": "J", "help": "A little cheaper, flickers a little more."},
+        {"value": "k", "label": "K", "help": "The usual model."},
+        {"value": "l", "label": "L", "help": "The sharpest and most expensive."},
+        {"value": "m", "label": "M", "help": "Between K and L."}
+      ],
+      "advanced": true,
+      "requires": {"temporal_aa_upscaler": "dlss"},
+      "emit": "nondefault"
     },
     {
       "id": "temporal_aa_sharpness",

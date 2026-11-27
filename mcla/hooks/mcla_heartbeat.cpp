@@ -41,6 +41,7 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/ui/low_latency.h>
 
 #include "game_profile.h"
 #include "mcla_gfx_tune.h"
@@ -51,6 +52,14 @@
 REXCVAR_DEFINE_BOOL(mcla_heartbeat, true, "MCLA",
                     "MCLA: count a frame at every engine-timer update for the hang watchdog and the "
                     "power probe (false: the watchdog sees only thread registers)");
+REXCVAR_DEFINE_BOOL(mcla_low_latency_frames, false, "MCLA",
+                    "MCLA: start the SDK's low-latency frame at every counted engine frame "
+                    "(rex::ui::LowLatency::OnFrameStart, after the 60 fps pacer's sleep and before the "
+                    "timer reads its clock): the driver's Reflex wait, the simulation-start and input "
+                    "markers, and the frame ids that DLSS Frame Generation (frame_generation=dlss) "
+                    "needs. Off by default: with it the NVIDIA Reflex sleep runs whenever "
+                    "low_latency is on (its default auto is on for Reflex). The DLSS-G profiles turn "
+                    "it on. Live");
 
 namespace {
 
@@ -105,8 +114,14 @@ void mcla_hook_heartbeat(PPCRegister& r3) {
   }
   // The game's own quality knobs (mcla_gfx_tune.cpp, NATIVE_RENDERER.md section 22): live writes.
   mcla::gfxtune::OnFrame();
-  // The 60 fps timing: pacer, substep reset, check line (mcla_t_common.cpp). Last: it may sleep.
+  // The 60 fps timing: pacer, substep reset, check line (mcla_t_common.cpp). It may sleep.
   mcla::sim::OnFrameStart(now);
+  // The SDK's low-latency frame (SDK patch low-latency; 0780 for DLSS-G): after the pacer, so the driver's wait (Reflex)
+  // comes on top of the even grid and the frame's simulation start and input sample are stamped when the engine really
+  // starts it (the timer reads its clock after this hook). One thread: only the counted frame gets here.
+  if (REXCVAR_GET(mcla_low_latency_frames)) {
+    rex::ui::LowLatency::OnFrameStart();
+  }
 }
 
 #else  // MCLA_HOOK_HEARTBEAT == 0: keeps hooks.toml linking, does nothing.

@@ -25,7 +25,9 @@
 //   Cheats and the run-time tier are never saved. Nothing is saved without the button.
 #pragma once
 
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <set>
 #include <string>
@@ -117,6 +119,32 @@ inline constexpr Choice kChoicesPadChord[] = {{"1", "Both stick clicks (L3 + R3)
                                               {"2", "Back + Start"},
                                               {"3", "LB + RB + Back"},
                                               {"0", "Nothing (the keyboard opens it)"}};
+// The upscaler (temporal_aa = fsr; SDK patch 0770 for DLSS).
+inline constexpr Choice kChoicesUpscale[] = {{"off", "Off (native resolution)"}, {"fsr", "On (upscaler below)"}};
+inline constexpr Choice kChoicesUpscaler[] = {{"auto", "Automatic (AMD FSR)"},
+                                              {"fsr3", "AMD FSR 3.1"},
+                                              {"fsr4", "AMD FSR 4 (Radeon)"},
+                                              {"dlss", "NVIDIA DLSS (RTX)"}};
+inline constexpr Choice kChoicesUpscaleRatio[] = {{"1", "Native size (DLSS: DLAA, anti-aliasing only)"},
+                                                  {"1.5", "Quality (1.5x)"},
+                                                  {"1.724", "Balanced (1.72x)"},
+                                                  {"2", "Performance (2x)"},
+                                                  {"3", "Ultra Performance (3x)"}};
+inline constexpr Choice kChoicesDlssPreset[] = {{"default", "Automatic (K, M for Performance, L for Ultra)"},
+                                                {"j", "J"},
+                                                {"k", "K"},
+                                                {"l", "L"},
+                                                {"m", "M"}};
+
+// A choice's value against the cvar's text: equal, or the same number ("1.500000" and "1.5").
+inline bool ChoiceIs(const std::string& current, const char* value) {
+  if (current == value) return true;
+  char* end_a = nullptr;
+  char* end_b = nullptr;
+  const double a = std::strtod(current.c_str(), &end_a);
+  const double b = std::strtod(value, &end_b);
+  return end_a != current.c_str() && *end_a == '\0' && end_b != value && *end_b == '\0' && std::abs(a - b) < 1e-6;
+}
 
 // The presets, as the launcher and mcla_gfx_preset name them.
 struct PresetOption {
@@ -177,6 +205,28 @@ inline constexpr Item kTearing{Kind::kToggle, "Allow tearing (G-Sync / FreeSync)
                                "Lets a variable-refresh display follow the game's frame rate. On a TV or an ordinary monitor it "
                                "tears: leave it off there. Read when the swap chain is made: takes effect at the next start.",
                                0, 0, "", nullptr, 0, kFlagRestart};
+
+// Display: the upscaler. Next start for the first two (the squeezed scene needs the single-tile scene and, for DLSS, NVIDIA's
+// runtime loaded at start); the quality and the DLSS model switch live.
+inline constexpr Item kUpscale{Kind::kChoice, "Upscaling", "temporal_aa",
+                               "Draws the 3D scene smaller and upscales it with temporal anti-aliasing (the HUD and the "
+                               "post-processing stay at full size). Needs the picture size chosen in the launcher or a profile "
+                               "with a single-tile scene (3200x2000 / 1080p profiles have it). Next start.",
+                               0, 0, "", kChoicesUpscale, CountOf(kChoicesUpscale), kFlagRestart};
+inline constexpr Item kUpscaler{Kind::kChoice, "Upscaler", "temporal_aa_upscaler",
+                                "NVIDIA DLSS needs an RTX card and NVIDIA's DLLs next to the game (the setup fetches them); "
+                                "without them the AMD FSR runs. DLSS costs about 5 ms a frame at 3200x2000 on an RTX 4060 laptop "
+                                "(a 3D scene drawn smaller does not pay it back): it is an anti-aliasing and picture quality "
+                                "choice, not a speed-up. Loaded at start: next start.",
+                                0, 0, "", kChoicesUpscaler, CountOf(kChoicesUpscaler), kFlagRestart};
+inline constexpr Item kUpscaleRatio{Kind::kChoice, "Upscaling quality", "temporal_aa_upscale",
+                                    "How much smaller the scene is drawn: the output size divided by this. With DLSS: native size "
+                                    "is DLAA, 1.5 Quality, 1.72 Balanced, 2 Performance, 3 Ultra Performance.",
+                                    0, 0, "", kChoicesUpscaleRatio, CountOf(kChoicesUpscaleRatio)};
+inline constexpr Item kDlssPreset{Kind::kChoice, "DLSS model", "dlss_preset",
+                                  "Which NVIDIA DLSS model runs. K is the usual one; J is a little cheaper and flickers a little "
+                                  "more; M and L cost more.",
+                                  0, 0, "", kChoicesDlssPreset, CountOf(kChoicesDlssPreset)};
 
 // Graphics.
 inline constexpr Item kGov{Kind::kToggle, "Adaptive detail", "mcla_gov",

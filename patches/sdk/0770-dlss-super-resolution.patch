@@ -1,0 +1,1540 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Fri, 27 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0770: NVIDIA DLSS Super Resolution through Streamline as temporal_aa_upscaler=dlss (Direct3D 12)
+
+Source: Ours, written for this SDK (DLSS study, $WORK/scratch/dlss/DESIGN.md). The calls are NVIDIA Streamline 2.14.16's
+  public API (sl.h, sl_dlss.h; "manual hooking" integration, ProgrammingGuide.md, ProgrammingGuideDLSS.md,
+  ProgrammingGuideManualHooking.md); no NVIDIA code is copied: the headers are included from the SDK folder that
+  REXGLUE_STREAMLINE_DIR names, outside this tree, and the DLLs are loaded at run time
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause). NVIDIA's
+  Streamline SDK and its DLLs are NVIDIA's (their licence.txt) and are never in the tree or the patch: mcla-x86's
+  tools/setup.py downloads them into the work folder and the install step copies the DLLs next to the executable
+Purpose: temporal_aa_upscaler=dlss runs NVIDIA DLSS Super Resolution (DLSS 4: the transformer models) in FSR's place for
+  temporal_aa=fsr on an RTX GPU, with exactly FSR's inputs: the jittered (Halton 2,3; 8 x ratio^2 phases), squeezed scene
+  of the motion blur draw (linear HDR before the tone map: colorBuffersHDR, auto exposure), the gathered render-size
+  colour and depth (R32, 1 near: depthInverted), the game's per-vehicle motion vectors (R16G16, previous minus current,
+  render pixels, unjittered: mvecScale 1/render size, cameraMotionIncluded), the camera cut as reset; output into the
+  same texture that is copied back into the scene. NVIDIA's guide asks more than FSR: the squeezed scene's mip bias is
+  one level sharper with dlss (log2(render/display) - 1, clamped at -1.875; DLAA takes texture_lod_bias -1) and the
+  jitter has at least 32 phases. temporal_aa_upscale picks the mode (1 DLAA, 1.5 Quality, 1.72
+  Balanced, 2 Performance, 3 Ultra Performance), dlss_preset the model (default|j|k|l|m), dlss_debug (bits: log, vector
+  sign, reset every frame, no matrices, alpha not upscaled). Found by running it: Streamline 2.14 refuses slSetTagForFrame
+  without PreferenceFlags::eUseFrameBasedResourceTagging (set); DLSS's alpha upscaling is on (the output's alpha is
+  otherwise left undefined, 0.03 ms); the picture matches native 2000p and FSR in colour and detail (the tint seen in some
+  runs is the game's own: the same two states appear without DLSS). Measured on an RTX 4060 Laptop at 3200x2000: DLSS costs
+  about 4-5 ms of GPU time in every mode (transformer model at the output size), so it is a quality choice (DLAA), not a
+  speed-up: native 2000p 8.4 ms, DLAA / Quality / Performance 12.5-13.5 ms, FSR 3.1 at 1.5x 11.4 ms. Streamline: cvars nvidia_streamline (auto|on|off: auto loads it when
+  temporal_aa_upscaler or frame_generation is dlss; never with frame_generation=fsr), streamline_log (0-2),
+  streamline_project_id. It is initialised in D3D12Provider::Initialize once the device exists (slInit with manual
+  hooking, slSetD3DDevice, slIsFeatureSupported per adapter LUID, NVIDIA GPUs only), and the swap chain is made through
+  its proxy factory (Streamline must see every Present). Log lines: `Streamline 2.14.16: active (manual hooking, ...);
+  DLSS Super Resolution available (DLSS 310.x.y)`, `Temporal AA: DLSS 310.x.y ready for 3200x2000 from 1600x1000
+  (Performance, 2.000x; Direct3D 12 through NVIDIA Streamline, preset default)`; temporal_aa_upscaler_active says the
+  same. Clean fallback: no DLLs, not NVIDIA, not supported, or a failed evaluation (the frame is left as it was, DLSS
+  given up for the session) -> FSR runs, logged once. The camera matrices DLSS wants (Streamline's clip space) are
+  computed in TaaCheckDraw from the motion blur draw's constants (TaaCamera grows; its z mapping of the previous frame
+  is unverified). cmake: cmake/rexglue_streamline.cmake, REXGLUE_STREAMLINE_DIR (empty: no DLSS, as before),
+  REXGLUE_STREAMLINE_VARIANT (development|production DLLs installed next to the SDK's). Needs 0750-0795.
+Bucket: REDO
+---
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -255,6 +255,9 @@ include(cmake/rexglue_fsr.cmake)
+ # AMD's signed FSR runtime (FSR 4.1) for the Direct3D 12 backend (optional)
+ include(cmake/rexglue_fsr_signed.cmake)
+ 
++# LOCAL PATCH - MCLA (0770): NVIDIA Streamline (DLSS) for the Direct3D 12 backend (optional, outside the tree)
++include(cmake/rexglue_streamline.cmake)
++
+ # Enable warnings after thirdparty
+ add_compile_options(
+     -Wall
+diff --git a/cmake/rexglue_streamline.cmake b/cmake/rexglue_streamline.cmake
+new file mode 100644
+--- /dev/null
++++ b/cmake/rexglue_streamline.cmake
+@@ -0,0 +1,56 @@
++# LOCAL PATCH - MCLA (0770): NVIDIA Streamline (DLSS Super Resolution; with 0780 DLSS Frame Generation and
++# Reflex) for the Direct3D 12 backend.
++#
++# Nothing of NVIDIA's is in this tree. REXGLUE_STREAMLINE_DIR names an unpacked Streamline SDK release
++# (github.com/NVIDIA-RTX/Streamline/releases, e.g. streamline-sdk-v2.14.16.zip: include/sl.h, bin/x64/...), which
++# mcla-x86's tools/setup.py downloads into its work folder and tools/prepare_sdk.py passes here. With it the GPU
++# plugin and the UI code are compiled against its headers (REX_HAS_STREAMLINE=1; everything is loaded at run time
++# from sl.interposer.dll, no import library is linked) and its DLLs are installed next to the SDK's own, from where
++# the game's build copies them next to its executable. Without it the SDK builds as before and DLSS reports
++# itself unavailable.
++#
++#   REXGLUE_STREAMLINE_DIR       the SDK folder (empty: no Streamline)
++#   REXGLUE_STREAMLINE_VARIANT   development (default: unsigned, NVIDIA's watermark, the plugins' hotkeys and
++#                                ImGui) or production (signed; DLSS-G hotkeys and on-screen text off)
++
++set(REXGLUE_STREAMLINE_DIR "" CACHE PATH
++    "NVIDIA Streamline SDK folder (an unpacked release with include/sl.h); empty: built without DLSS")
++set(REXGLUE_STREAMLINE_VARIANT "development" CACHE STRING
++    "Which Streamline DLLs are installed next to the SDK's: development or production")
++set_property(CACHE REXGLUE_STREAMLINE_VARIANT PROPERTY STRINGS development production)
++
++set(REXGLUE_HAS_STREAMLINE OFF)
++if(WIN32 AND REXGLUE_USE_D3D12 AND REXGLUE_STREAMLINE_DIR)
++  if(EXISTS "${REXGLUE_STREAMLINE_DIR}/include/sl.h")
++    set(REXGLUE_HAS_STREAMLINE ON)
++    set(REXGLUE_STREAMLINE_INCLUDE_DIR "${REXGLUE_STREAMLINE_DIR}/include")
++    if(REXGLUE_STREAMLINE_VARIANT STREQUAL "production")
++      set(_rexglue_sl_bin "${REXGLUE_STREAMLINE_DIR}/bin/x64")
++    else()
++      set(_rexglue_sl_bin "${REXGLUE_STREAMLINE_DIR}/bin/x64/development")
++    endif()
++    # The interposer, the plugins this SDK loads (sl.common is always loaded) and NVIDIA's models.
++    set(_rexglue_sl_dlls
++        sl.interposer.dll sl.common.dll sl.dlss.dll sl.dlss_g.dll sl.reflex.dll sl.pcl.dll
++        nvngx_dlss.dll nvngx_dlssg.dll)
++    if(NOT REXGLUE_STREAMLINE_VARIANT STREQUAL "production")
++      list(APPEND _rexglue_sl_dlls sl.imgui.dll)
++    endif()
++    set(_rexglue_sl_found 0)
++    foreach(_dll IN LISTS _rexglue_sl_dlls)
++      if(EXISTS "${_rexglue_sl_bin}/${_dll}")
++        install(FILES "${_rexglue_sl_bin}/${_dll}" DESTINATION "${CMAKE_INSTALL_BINDIR}")
++        math(EXPR _rexglue_sl_found "${_rexglue_sl_found} + 1")
++      else()
++        message(WARNING "Streamline: ${_rexglue_sl_bin}/${_dll} is missing; DLSS may not run")
++      endif()
++    endforeach()
++    message(STATUS "Streamline: headers from ${REXGLUE_STREAMLINE_INCLUDE_DIR}; ${_rexglue_sl_found} "
++                   "${REXGLUE_STREAMLINE_VARIANT} DLLs installed next to the SDK's")
++    unset(_rexglue_sl_bin)
++    unset(_rexglue_sl_dlls)
++    unset(_rexglue_sl_found)
++  else()
++    message(WARNING "Streamline: ${REXGLUE_STREAMLINE_DIR} has no include/sl.h; built without DLSS")
++  endif()
++endif()
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -502,6 +502,20 @@ class CommandProcessor {
+     float far_plane = 1000.0f;
+     float fov_vertical = 1.0f;
+     bool reset = false;  // a cut: the history is dropped
++    // LOCAL PATCH - MCLA (0770): what DLSS (NVIDIA Streamline's common constants) is given, from
++    // the same draw: 4x4 row-major, row vectors (v' = v M), no jitter, in Streamline's clip space
++    // (x, y as Direct3D's NDC, z the depth buffer's value: 1 near, 0 far). `matrices_valid` once
++    // a draw gave invertible matrices.
++    bool matrices_valid = false;
++    float view_to_clip[16] = {};
++    float clip_to_view[16] = {};
++    float clip_to_prev_clip[16] = {};
++    float prev_clip_to_clip[16] = {};
++    float position[3] = {};
++    float up[3] = {};
++    float right[3] = {};
++    float forward[3] = {};
++    float aspect_ratio = 1.0f;
+   };
+   TaaCamera taa_camera_;
+   // Fetch constants of the anti-aliasing draw: the scene (read and written),
+diff --git a/include/rex/ui/d3d12/d3d12_provider.h b/include/rex/ui/d3d12/d3d12_provider.h
+--- a/include/rex/ui/d3d12/d3d12_provider.h
++++ b/include/rex/ui/d3d12/d3d12_provider.h
+@@ -33,6 +33,12 @@ class D3D12Provider : public GraphicsProvider {
+   std::unique_ptr<ImmediateDrawer> CreateImmediateDrawer() override;
+ 
+   IDXGIFactory2* GetDXGIFactory() const { return dxgi_factory_; }
++  // LOCAL PATCH - MCLA (0770): the factory swap chains are made with: NVIDIA Streamline's proxy
++  // while Streamline is active (it must see every Present), else the native one.
++  IDXGIFactory2* GetSwapChainFactory() const {
++    return swap_chain_factory_ ? swap_chain_factory_ : dxgi_factory_;
++  }
++  bool SwapChainFactoryIsStreamline() const { return swap_chain_factory_ != nullptr; }
+   // nullptr if PIX not attached.
+   IDXGraphicsAnalysis* GetGraphicsAnalysis() const { return graphics_analysis_; }
+   ID3D12Device* GetDevice() const { return device_; }
+@@ -164,6 +170,8 @@ class D3D12Provider : public GraphicsProvider {
+   DxcCreateInstanceProc pfn_dxcompiler_dxc_create_instance_ = nullptr;
+ 
+   IDXGIFactory2* dxgi_factory_ = nullptr;
++  // LOCAL PATCH - MCLA (0770): Streamline's proxy of dxgi_factory_, or null.
++  IDXGIFactory2* swap_chain_factory_ = nullptr;
+   Microsoft::WRL::ComPtr<IDXGIAdapter3> dxgi_adapter3_;
+   std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> video_memory_ballast_;
+   ID3D12Device* device_ = nullptr;
+diff --git a/include/rex/ui/d3d12/d3d12_streamline.h b/include/rex/ui/d3d12/d3d12_streamline.h
+new file mode 100644
+--- /dev/null
++++ b/include/rex/ui/d3d12/d3d12_streamline.h
+@@ -0,0 +1,102 @@
++#pragma once
++/**
++ * LOCAL PATCH - MCLA (0770): NVIDIA Streamline on Direct3D 12, for DLSS Super Resolution (the
++ * temporal upscaler, src/graphics/d3d12/temporal_aa_dlss.cpp) and, with 0780, DLSS Frame
++ * Generation and Reflex.
++ *
++ * Streamline (NVIDIA's SDK, github.com/NVIDIA-RTX/Streamline) is loaded at run time: the
++ * interposer sl.interposer.dll and its plugins (sl.common, sl.dlss, ...) with NVIDIA's models
++ * (nvngx_dlss.dll, ...) next to the executable. None of them is part of this repository or of
++ * the SDK: tools/setup.py fetches the SDK into the work folder and the build copies the DLLs
++ * next to the executable. Without them, or on a GPU without DLSS, everything here reports
++ * "unavailable" and the callers keep their own paths (FSR, no frame generation).
++ *
++ * The integration is Streamline's "manual hooking" one (ProgrammingGuideManualHooking.md): the
++ * host keeps its native DXGI and Direct3D 12 interfaces and only the swap chain is made through
++ * Streamline's proxy factory (so Streamline sees every Present, which it needs every frame), and
++ * with frame generation the direct queue through its proxy device. The device is created before
++ * slInit, which manual hooking allows, so the adapter's vendor is known when deciding.
++ *
++ * Threads: Initialize / OnDeviceCreated / Shutdown on the thread that makes the provider;
++ * GetFrameToken from any thread (serialised here: slGetNewFrameToken is not thread safe); the
++ * function table from any thread once Initialize has returned.
++ */
++
++#include <cstdint>
++#include <string>
++
++struct ID3D12Device;
++struct IDXGIFactory2;
++
++#if defined(REX_HAS_STREAMLINE) && REX_HAS_STREAMLINE
++#include <sl.h>
++#include <sl_consts.h>
++#include <sl_dlss.h>
++#endif
++
++namespace rex::ui::d3d12::streamline {
++
++// Whether the cvars ask for Streamline in this session (nvidia_streamline, and a consumer:
++// temporal_aa_upscaler = dlss or frame_generation = dlss). Read once, in Initialize.
++bool Wanted();
++
++// D3D12Provider::Initialize, once the device exists and before the direct queue and any swap
++// chain are made: loads sl.interposer.dll from the executable's folder, slInit (manual
++// hooking), slSetD3DDevice, and asks which features the adapter supports. False (logged, with
++// the reason in UnavailableReason) when Streamline isn't wanted or can't run: the session goes on
++// without it.
++bool Initialize(ID3D12Device* native_device, const void* adapter_luid, uint32_t adapter_vendor_id);
++// ~D3D12Provider, before the device and the factory are released.
++void Shutdown();
++
++// Loaded and initialised for this session.
++bool IsActive();
++// The adapter has DLSS Super Resolution (the plugin loaded and works on the device).
++bool DlssSupported();
++// Why Streamline or DLSS isn't there (for the log and temporal_aa_upscaler_active).
++std::string UnavailableReason();
++
++// The factory the presenter makes its swap chain with: Streamline's proxy of `native` while
++// Streamline is active (an added reference, the caller releases it), else null.
++IDXGIFactory2* UpgradeFactory(IDXGIFactory2* native);
++
++#if defined(REX_HAS_STREAMLINE) && REX_HAS_STREAMLINE
++// Streamline's entry points, resolved from sl.interposer.dll, and the features' functions
++// (slGetFeatureFunction). Null where not loaded; a feature function is null where its feature
++// isn't supported.
++struct Api {
++  PFun_slInit* slInit = nullptr;
++  PFun_slShutdown* slShutdown = nullptr;
++  PFun_slIsFeatureSupported* slIsFeatureSupported = nullptr;
++  PFun_slIsFeatureLoaded* slIsFeatureLoaded = nullptr;
++  PFun_slSetFeatureLoaded* slSetFeatureLoaded = nullptr;
++  PFun_slEvaluateFeature* slEvaluateFeature = nullptr;
++  PFun_slAllocateResources* slAllocateResources = nullptr;
++  PFun_slFreeResources* slFreeResources = nullptr;
++  PFun_slSetTagForFrame* slSetTagForFrame = nullptr;
++  PFun_slGetFeatureRequirements* slGetFeatureRequirements = nullptr;
++  PFun_slGetFeatureVersion* slGetFeatureVersion = nullptr;
++  PFun_slUpgradeInterface* slUpgradeInterface = nullptr;
++  PFun_slSetConstants* slSetConstants = nullptr;
++  PFun_slGetNativeInterface* slGetNativeInterface = nullptr;
++  PFun_slGetFeatureFunction* slGetFeatureFunction = nullptr;
++  PFun_slGetNewFrameToken* slGetNewFrameToken = nullptr;
++  PFun_slSetD3DDevice* slSetD3DDevice = nullptr;
++  // DLSS Super Resolution (sl_dlss.h).
++  PFun_slDLSSGetOptimalSettings* slDLSSGetOptimalSettings = nullptr;
++  PFun_slDLSSGetState* slDLSSGetState = nullptr;
++  PFun_slDLSSSetOptions* slDLSSSetOptions = nullptr;
++};
++// The table while Streamline is active, else null.
++const Api* GetApi();
++
++// The frame token for a frame index (slGetNewFrameToken with the index given, under a lock).
++// Null if Streamline isn't active or the call failed. The token stays valid for the frame (it is
++// Streamline's), so it can be passed to the calls of the frame on any thread.
++sl::FrameToken* GetFrameToken(uint32_t frame_index);
++
++// "DLSS 310.4.0" for the plugin's NGX version, once known (else "DLSS").
++std::string DlssLabel();
++#endif
++
++}  // namespace rex::ui::d3d12::streamline
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -86,6 +86,7 @@ if(REXGLUE_USE_D3D12)
+         d3d12/resolve_defer.cpp  # LOCAL PATCH - MCLA (0560): resolve_defer_memory_write
+         d3d12/deferred_command_list.cpp
+         d3d12/temporal_aa.cpp
++        d3d12/temporal_aa_dlss.cpp  # LOCAL PATCH - MCLA (0770)
+         d3d12/frame_generation.cpp
+         d3d12/pipeline_cache.cpp
+     )
+@@ -162,6 +163,13 @@ if(REXGLUE_USE_VULKAN)
+     )
+ endif()
+ 
++# LOCAL PATCH - MCLA (0770): NVIDIA Streamline's headers for DLSS (cmake/rexglue_streamline.cmake); the same define
++# as rexui's, so the two agree on include/rex/ui/d3d12/d3d12_streamline.h.
++if(REXGLUE_HAS_STREAMLINE)
++    target_include_directories(rexgpu-xenos PRIVATE ${REXGLUE_STREAMLINE_INCLUDE_DIR})
++    target_compile_definitions(rexgpu-xenos PRIVATE REX_HAS_STREAMLINE=1)
++endif()
++
+ # FSR 3.1 temporal anti-aliasing: the ffx-api headers (MIT), and the runtime built
+ # by cmake/rexglue_fsr.cmake, loaded at run time (on the PS5, linked: REX_FSR_STATIC).
+ if(REXGLUE_ENABLE_FSR)
+diff --git a/src/graphics/d3d12/temporal_aa.cpp b/src/graphics/d3d12/temporal_aa.cpp
+--- a/src/graphics/d3d12/temporal_aa.cpp
++++ b/src/graphics/d3d12/temporal_aa.cpp
+@@ -20,6 +20,7 @@
+ #include <rex/ui/d3d12/d3d12_util.h>
+ 
+ #include "../temporal_aa_fsr.h"
++#include "temporal_aa_dlss.h"  // LOCAL PATCH - MCLA (0770)
+ 
+ #if defined(REX_HAS_FSR) && REX_HAS_FSR
+ #include <ffx_api/dx12/ffx_api_dx12.h>
+@@ -27,6 +28,8 @@
+ 
+ // Defined in ../temporal_aa.cpp.
+ REXCVAR_DECLARE(std::string, temporal_aa_upscaler);
++// LOCAL PATCH - MCLA (0770): defined in temporal_aa_dlss.cpp.
++REXCVAR_DECLARE(std::string, dlss_preset);
+ 
+ namespace rex::graphics::d3d12 {
+ 
+@@ -77,7 +80,13 @@ struct D3D12CommandProcessor::TaaFsr {
+   bool provider_published = false;
+ #endif
+   // FSR 4 (the machine-learning upscaler): it needs no reactive mask, so none is made.
++  // (Also set for DLSS.)
+   std::atomic<bool> ml{false};
++  // LOCAL PATCH - MCLA (0770): NVIDIA DLSS (temporal_aa_upscaler = dlss, temporal_aa_dlss.cpp)
++  // runs in FSR's place: no ffx context; the same textures. Its own frame count, for the frames
++  // without a low-latency id.
++  bool dlss = false;
++  uint32_t dlss_frames = 0;
+   // Set on the submission thread when FSR's dispatch failed.
+   std::atomic<bool> dispatch_failed{false};
+   // Released, destroyed once the submissions that may use them are done.
+@@ -185,6 +194,10 @@ ID3D12Resource* D3D12CommandProcessor::TaaFrameVectors() const {
+ 
+ bool D3D12CommandProcessor::TaaCheckAvailable() {
+ #if defined(REX_HAS_FSR) && REX_HAS_FSR
++  // LOCAL PATCH - MCLA (0770): DLSS, where it was asked for and can run, needs no FidelityFX DLL.
++  if (TaaDlssWanted() && TaaDlssAvailable(nullptr)) {
++    return true;
++  }
+   const std::filesystem::path folder = rex::filesystem::GetExecutableFolder();
+   // Loaded (and kept), not only looked for: a DLL whose imports fail (the Visual C++ runtime
+   // missing) is there and unusable.
+@@ -250,6 +263,7 @@ void D3D12CommandProcessor::TaaRelease() {
+   fsr.height = 0;
+   fsr.render_width = 0;
+   fsr.render_height = 0;
++  fsr.dlss = false;  // LOCAL PATCH - MCLA (0770)
+   fsr.dispatch_failed.store(false, std::memory_order_relaxed);
+ #if defined(REX_HAS_FSR) && REX_HAS_FSR
+   if (fsr.provider_published) {
+@@ -735,6 +749,20 @@ void D3D12CommandProcessor::TaaRun(const D3D12Shader& pixel_shader) {
+     taa_release_pending_ = true;
+     return;
+   }
++  // LOCAL PATCH - MCLA (0770): DLSS asked for or given up (temporal_aa_upscaler changed between
++  // dlss and an FSR): made again from the end of this frame. A DLSS that can't run counts as not
++  // asked for (FSR then runs, and stays).
++  if (state == TaaFsr::kReady && fsr.dlss != (TaaDlssWanted() && TaaDlssAvailable(nullptr))) {
++    taa_release_pending_ = true;
++    return;
++  }
++  if (fsr.dispatch_failed.load(std::memory_order_acquire) && fsr.dlss) {
++    // LOCAL PATCH - MCLA (0770): DLSS's evaluation failed: given up for the session, FSR from
++    // the end of this frame on.
++    TaaDlssGiveUp();
++    taa_release_pending_ = true;
++    return;
++  }
+   if (fsr.dispatch_failed.load(std::memory_order_acquire)) {
+     TaaSetUnavailable("its dispatch failed");
+     fsr.state.store(TaaFsr::kFailed, std::memory_order_release);
+@@ -773,12 +801,22 @@ void D3D12CommandProcessor::TaaRun(const D3D12Shader& pixel_shader) {
+     fsr.height = height;
+     fsr.render_width = render_width;
+     fsr.render_height = render_height;
+-    if (!fsr.runtime.Load("dx12", true)) {
++    // LOCAL PATCH - MCLA (0770): NVIDIA DLSS in FSR's place where it is asked for and can run.
++    std::string dlss_why;
++    const bool use_dlss = TaaDlssWanted() && TaaDlssAvailable(&dlss_why);
++    if (TaaDlssWanted() && !use_dlss) {
++      static std::atomic<bool> dlss_logged{false};
++      if (!dlss_logged.exchange(true)) {
++        REXGPU_WARN("Temporal AA: DLSS is unavailable ({}); FSR runs instead", dlss_why);
++      }
++    }
++    if (!use_dlss && !fsr.runtime.Load("dx12", true)) {
+       TaaSetUnavailable("neither amd_fidelityfx_loader_dx12.dll nor amd_fidelityfx_dx12.dll could be loaded");
+       fsr.state.store(TaaFsr::kFailed, std::memory_order_release);
+       return;
+     }
+-    if (!fsr.runtime.signed_loader() && REXCVAR_GET(temporal_aa_upscaler) != "auto") {
++    if (!use_dlss && !fsr.runtime.signed_loader() && REXCVAR_GET(temporal_aa_upscaler) != "auto" &&
++        REXCVAR_GET(temporal_aa_upscaler) != "dlss") {
+       REXGPU_WARN(
+           "Temporal AA: temporal_aa_upscaler={} needs AMD's signed FSR runtime (the loader and "
+           "the upscaler DLL next to the executable); the FSR 3.1.4 built with the SDK runs",
+@@ -842,6 +880,21 @@ void D3D12CommandProcessor::TaaRun(const D3D12Shader& pixel_shader) {
+     fsr.depth_in_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+     fsr.width = width;
+     fsr.height = height;
++    if (use_dlss) {
++      // LOCAL PATCH - MCLA (0770): DLSS's feature is made by Streamline at its first evaluation
++      // (the first frame, a one-off hitch of tens of milliseconds); nothing to wait for here.
++      fsr.dlss = true;
++      fsr.upscaler_want = REXCVAR_GET(temporal_aa_upscaler);
++      fsr.provider = TaaDlssLabel();
++      fsr.ml.store(true, std::memory_order_release);
++      const uint32_t mode = TaaDlssMode(width, render_width);
++      REXGPU_INFO("Temporal AA: {} ready for {}x{} from {}x{} ({}, {:.3f}x; Direct3D 12 through "
++                  "NVIDIA Streamline, preset {})",
++                  fsr.provider, width, height, render_width, render_height, TaaDlssModeName(mode),
++                  double(width) / double(render_width), REXCVAR_GET(dlss_preset));
++      fsr.state.store(TaaFsr::kReady, std::memory_order_release);
++      return;
++    }
+     fsr.state.store(TaaFsr::kCreating, std::memory_order_release);
+     uint32_t flags = kTaaFsrCreateFlags;
+     if (TaaDebug() == 1) {
+@@ -896,7 +949,8 @@ void D3D12CommandProcessor::TaaRun(const D3D12Shader& pixel_shader) {
+         }
+         REXGPU_INFO("Temporal AA: the FSR runtime offers {} (temporal_aa_upscaler={})",
+                     offered.empty() ? std::string("no upscaler") : offered, fsr.upscaler_want);
+-        if (fsr.upscaler_want != "auto") {
++        // (dlss here means DLSS could not run: FSR, as auto.)
++        if (fsr.upscaler_want != "auto" && fsr.upscaler_want != "dlss") {
+           pinned = FsrPickUpscalerVersion(versions, fsr.upscaler_want, nullptr);
+           if (!pinned && fsr.upscaler_want == "fsr4") {
+             REXGPU_WARN("Temporal AA: FSR 4 is not offered on this device; using FSR 3");
+@@ -1193,6 +1247,45 @@ void D3D12CommandProcessor::TaaRun(const D3D12Shader& pixel_shader) {
+ 
+   // FSR, recorded into the real command list where it falls (it restores the
+   // states it was given), then the output into the scene texture.
++  if (fsr.dlss) {
++    // LOCAL PATCH - MCLA (0770): DLSS, the same way (temporal_aa_dlss.cpp), with the same inputs.
++    const D3D12_RESOURCE_STATES read_state =
++        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++    TaaDlssDispatch dlss = {};
++    dlss.color = squeezed ? fsr.color_in.Get() : scene;
++    dlss.depth = squeezed ? fsr.depth_in.Get() : depth;
++    dlss.vectors = fsr.vectors.Get();
++    dlss.output = fsr.output.Get();
++    dlss.color_state = uint32_t(read_state);
++    dlss.depth_state = uint32_t(read_state);
++    dlss.vectors_state = uint32_t(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++    dlss.output_state = uint32_t(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++    dlss.render_width = render_width;
++    dlss.render_height = render_height;
++    dlss.width = width;
++    dlss.height = height;
++    dlss.frame_index = TaaDlssFrameIndex(fsr.dlss_frames);
++    TaaDlssFillSettings(dlss);
++    TaaFsrJitter(dlss.jitter);
++    dlss.near_plane = taa_camera_.near_plane;
++    dlss.far_plane = taa_camera_.far_plane;
++    dlss.fov_vertical = taa_camera_.fov_vertical;
++    dlss.aspect_ratio = taa_camera_.aspect_ratio;
++    dlss.reset = taa_camera_.reset;
++    dlss.matrices_valid = taa_camera_.matrices_valid;
++    std::memcpy(dlss.view_to_clip, taa_camera_.view_to_clip, sizeof(dlss.view_to_clip));
++    std::memcpy(dlss.clip_to_view, taa_camera_.clip_to_view, sizeof(dlss.clip_to_view));
++    std::memcpy(dlss.clip_to_prev_clip, taa_camera_.clip_to_prev_clip,
++                sizeof(dlss.clip_to_prev_clip));
++    std::memcpy(dlss.prev_clip_to_clip, taa_camera_.prev_clip_to_clip,
++                sizeof(dlss.prev_clip_to_clip));
++    std::memcpy(dlss.position, taa_camera_.position, sizeof(dlss.position));
++    std::memcpy(dlss.up, taa_camera_.up, sizeof(dlss.up));
++    std::memcpy(dlss.right, taa_camera_.right, sizeof(dlss.right));
++    std::memcpy(dlss.forward, taa_camera_.forward, sizeof(dlss.forward));
++    dlss.failed = &fsr.dispatch_failed;
++    deferred_command_list_.ExternalCallback(TaaDlssDispatchCallback, &dlss, sizeof(dlss));
++  } else {
+   TaaFsrDispatch dispatch = {};
+   dispatch.dispatch = fsr.runtime.dispatch;
+   dispatch.context = fsr.context;
+@@ -1229,6 +1322,7 @@ void D3D12CommandProcessor::TaaRun(const D3D12Shader& pixel_shader) {
+   desc.viewSpaceToMetersFactor = 1.0f;
+   desc.flags = TaaDebug() == 1 ? FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW : 0;
+   deferred_command_list_.ExternalCallback(TaaFsrDispatchCallback, &dispatch, sizeof(dispatch));
++  }  // LOCAL PATCH - MCLA (0770): FSR (not DLSS)
+   // FSR set its own descriptor heaps, root signature and pipeline.
+   if (bindless_resources_used_) {
+     deferred_command_list_.SetDescriptorHeaps(view_bindless_heap_, sampler_bindless_heap_current_);
+diff --git a/src/graphics/d3d12/temporal_aa_dlss.cpp b/src/graphics/d3d12/temporal_aa_dlss.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/graphics/d3d12/temporal_aa_dlss.cpp
+@@ -0,0 +1,331 @@
++/**
++ * LOCAL PATCH - MCLA (0770): NVIDIA DLSS Super Resolution through Streamline for temporal_aa.
++ * See temporal_aa_dlss.h.
++ */
++
++#include "temporal_aa_dlss.h"
++
++#include <atomic>
++#include <cmath>
++#include <cstring>
++#include <string>
++
++#include <rex/cvar.h>
++#include <rex/logging.h>
++#include <rex/ui/d3d12/d3d12_streamline.h>
++#include <rex/ui/low_latency.h>
++
++REXCVAR_DECLARE(std::string, temporal_aa_upscaler);
++
++REXCVAR_DEFINE_STRING(dlss_preset, "default", "GPU",
++                      "DLSS Super Resolution (temporal_aa_upscaler = dlss): the model\n"
++                      " default: NVIDIA's for the mode (DLSS 4: K for DLAA, Quality and Balanced, "
++                      "M for Performance, L for Ultra Performance)\n"
++                      " j, k: the transformer models J and K (K is the sharper and steadier)\n"
++                      " l: the Ultra Performance model\n"
++                      " m: the Performance model\n"
++                      "A change applies on the next frame")
++    .allowed({"default", "j", "k", "l", "m"})
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_UINT32(dlss_debug, 0, "GPU",
++                      "DLSS Super Resolution, development, bits: 1 logs every 300 frames what was "
++                      "evaluated (sizes, mode, preset, frame index, jitter, result); 2 the motion "
++                      "vectors given with the opposite sign (a picture that smears less in motion "
++                      "with it means the sign is wrong); 4 every frame a reset (no history: shows "
++                      "what the history does); 8 the camera matrices not given (only the vectors); 16 the alpha "
++                      "channel not upscaled (DLSS then leaves the output's alpha undefined)")
++    .range(0, 31)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++namespace rex::graphics::d3d12 {
++
++namespace ui_sl = rex::ui::d3d12::streamline;
++
++namespace {
++std::atomic<bool> g_dlss_given_up{false};
++}  // namespace
++
++bool TaaDlssWanted() { return REXCVAR_GET(temporal_aa_upscaler) == "dlss"; }
++
++void TaaDlssGiveUp() { g_dlss_given_up.store(true, std::memory_order_release); }
++
++bool TaaDlssAvailable(std::string* why_out) {
++  if (g_dlss_given_up.load(std::memory_order_acquire)) {
++    if (why_out) {
++      *why_out = "its evaluation failed earlier in this session";
++    }
++    return false;
++  }
++#if defined(REX_HAS_STREAMLINE) && REX_HAS_STREAMLINE
++  if (ui_sl::DlssSupported()) {
++    return true;
++  }
++  if (why_out) {
++    *why_out = ui_sl::IsActive() ? ui_sl::UnavailableReason()
++                                 : "Streamline isn't loaded: " + ui_sl::UnavailableReason();
++  }
++  return false;
++#else
++  if (why_out) {
++    *why_out = "this build has no Streamline";
++  }
++  return false;
++#endif
++}
++
++std::string TaaDlssLabel() {
++#if defined(REX_HAS_STREAMLINE) && REX_HAS_STREAMLINE
++  return ui_sl::DlssLabel();
++#else
++  return "DLSS";
++#endif
++}
++
++#if defined(REX_HAS_STREAMLINE) && REX_HAS_STREAMLINE
++
++uint32_t TaaDlssMode(uint32_t output_width, uint32_t render_width) {
++  if (!render_width || render_width >= output_width) {
++    return uint32_t(sl::DLSSMode::eDLAA);
++  }
++  // The mode whose ratio is nearest (Quality 1.5, Balanced 1.72, Performance 2, Ultra
++  // Performance 3); the render size itself is the squeeze's, which DLSS takes as it is (any size
++  // between the mode's minimum and the output works).
++  const double ratio = double(output_width) / double(render_width);
++  if (ratio < 1.61) {
++    return uint32_t(sl::DLSSMode::eMaxQuality);
++  }
++  if (ratio < 1.86) {
++    return uint32_t(sl::DLSSMode::eBalanced);
++  }
++  if (ratio < 2.45) {
++    return uint32_t(sl::DLSSMode::eMaxPerformance);
++  }
++  return uint32_t(sl::DLSSMode::eUltraPerformance);
++}
++
++const char* TaaDlssModeName(uint32_t mode) {
++  switch (sl::DLSSMode(mode)) {
++    case sl::DLSSMode::eDLAA:
++      return "DLAA";
++    case sl::DLSSMode::eMaxQuality:
++      return "Quality";
++    case sl::DLSSMode::eBalanced:
++      return "Balanced";
++    case sl::DLSSMode::eMaxPerformance:
++      return "Performance";
++    case sl::DLSSMode::eUltraPerformance:
++      return "Ultra Performance";
++    default:
++      return "?";
++  }
++}
++
++uint32_t TaaDlssFrameIndex(uint32_t& own_counter) {
++  const uint64_t id = rex::ui::LowLatency::GpuFrameId();
++  if (id) {
++    return uint32_t(id & 0x7FFFFFFFu);
++  }
++  own_counter = (own_counter + 1) & 0x7FFFFFFFu;
++  return 0x80000000u | own_counter;
++}
++
++void TaaDlssFillSettings(TaaDlssDispatch& dispatch) {
++  const std::string preset = REXCVAR_GET(dlss_preset);
++  sl::DLSSPreset value = sl::DLSSPreset::eDefault;
++  if (preset == "j") {
++    value = sl::DLSSPreset::ePresetJ;
++  } else if (preset == "k") {
++    value = sl::DLSSPreset::ePresetK;
++  } else if (preset == "l") {
++    value = sl::DLSSPreset::ePresetL;
++  } else if (preset == "m") {
++    value = sl::DLSSPreset::ePresetM;
++  }
++  dispatch.preset = uint32_t(value);
++  dispatch.mode = TaaDlssMode(dispatch.width, dispatch.render_width);
++  dispatch.debug = REXCVAR_GET(dlss_debug);
++}
++
++namespace {
++
++constexpr uint32_t kDlssViewport = 0;
++
++void SetMatrix(sl::float4x4& out, const float in[16]) {
++  for (uint32_t i = 0; i < 4; ++i) {
++    out.setRow(i, sl::float4(in[i * 4], in[i * 4 + 1], in[i * 4 + 2], in[i * 4 + 3]));
++  }
++}
++
++// The colour into the output (the frame as it was), as FSR's failed dispatch does.
++void CopyColorToOutput(ID3D12GraphicsCommandList* command_list, const TaaDlssDispatch& dispatch) {
++  D3D12_RESOURCE_BARRIER barriers[2] = {};
++  for (D3D12_RESOURCE_BARRIER& barrier : barriers) {
++    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++  }
++  barriers[0].Transition.pResource = dispatch.color;
++  barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATES(dispatch.color_state);
++  barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++  barriers[1].Transition.pResource = dispatch.output;
++  barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATES(dispatch.output_state);
++  barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
++  command_list->ResourceBarrier(2, barriers);
++  D3D12_TEXTURE_COPY_LOCATION dest = {dispatch.output, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
++  D3D12_TEXTURE_COPY_LOCATION source = {dispatch.color, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
++                                        {}};
++  dest.SubresourceIndex = 0;
++  source.SubresourceIndex = 0;
++  D3D12_BOX box = {0, 0, 0, dispatch.render_width, dispatch.render_height, 1};
++  command_list->CopyTextureRegion(&dest, 0, 0, 0, &source, &box);
++  for (D3D12_RESOURCE_BARRIER& barrier : barriers) {
++    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
++  }
++  command_list->ResourceBarrier(2, barriers);
++}
++
++}  // namespace
++
++void TaaDlssDispatchCallback(ID3D12GraphicsCommandList* command_list, const void* data) {
++  TaaDlssDispatch dispatch;
++  std::memcpy(&dispatch, data, sizeof(dispatch));
++  const ui_sl::Api* api = ui_sl::GetApi();
++  sl::FrameToken* token = api ? ui_sl::GetFrameToken(dispatch.frame_index) : nullptr;
++  sl::Result result = sl::Result::eErrorNotInitialized;
++  if (api && token && api->slDLSSSetOptions) {
++    const sl::ViewportHandle viewport(kDlssViewport);
++
++    // The options: the mode for the ratio, the output size, HDR colour, auto exposure.
++    sl::DLSSOptions options;
++    options.mode = sl::DLSSMode(dispatch.mode);
++    options.outputWidth = dispatch.width;
++    options.outputHeight = dispatch.height;
++    options.preExposure = 1.0f;
++    options.exposureScale = 1.0f;
++    options.colorBuffersHDR = sl::Boolean::eTrue;
++    options.useAutoExposure = sl::Boolean::eTrue;
++    // The output's alpha: the game's later passes read the scene's alpha, and without this DLSS leaves the output's alpha
++    // as it was made (undefined), which tinted some runs blue.
++    options.alphaUpscalingEnabled = (dispatch.debug & 16) ? sl::Boolean::eFalse : sl::Boolean::eTrue;
++    options.dlaaPreset = options.qualityPreset = options.balancedPreset =
++        options.performancePreset = options.ultraPerformancePreset =
++            options.ultraQualityPreset = sl::DLSSPreset(dispatch.preset);
++    result = api->slDLSSSetOptions(viewport, options);
++
++    // The common constants of the frame.
++    sl::Constants constants;
++    if (dispatch.matrices_valid && !(dispatch.debug & 8)) {
++      SetMatrix(constants.cameraViewToClip, dispatch.view_to_clip);
++      SetMatrix(constants.clipToCameraView, dispatch.clip_to_view);
++      SetMatrix(constants.clipToPrevClip, dispatch.clip_to_prev_clip);
++      SetMatrix(constants.prevClipToClip, dispatch.prev_clip_to_clip);
++      constants.cameraPos = sl::float3(dispatch.position[0], dispatch.position[1], dispatch.position[2]);
++      constants.cameraUp = sl::float3(dispatch.up[0], dispatch.up[1], dispatch.up[2]);
++      constants.cameraRight = sl::float3(dispatch.right[0], dispatch.right[1], dispatch.right[2]);
++      constants.cameraFwd = sl::float3(dispatch.forward[0], dispatch.forward[1], dispatch.forward[2]);
++    } else {
++      const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
++      SetMatrix(constants.cameraViewToClip, identity);
++      SetMatrix(constants.clipToCameraView, identity);
++      SetMatrix(constants.clipToPrevClip, identity);
++      SetMatrix(constants.prevClipToClip, identity);
++      constants.cameraPos = sl::float3(0.0f, 0.0f, 0.0f);
++      constants.cameraUp = sl::float3(0.0f, 1.0f, 0.0f);
++      constants.cameraRight = sl::float3(1.0f, 0.0f, 0.0f);
++      constants.cameraFwd = sl::float3(0.0f, 0.0f, 1.0f);
++    }
++    {
++      const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
++      SetMatrix(constants.clipToLensClip, identity);
++    }
++    constants.jitterOffset = sl::float2(dispatch.jitter[0], dispatch.jitter[1]);
++    // The vectors are in render pixels; Streamline wants them in [-1, 1] of the render size.
++    const float sign = (dispatch.debug & 2) ? -1.0f : 1.0f;
++    constants.mvecScale = sl::float2(sign / float(dispatch.render_width),
++                                     sign / float(dispatch.render_height));
++    constants.cameraPinholeOffset = sl::float2(0.0f, 0.0f);
++    constants.cameraNear = dispatch.near_plane;
++    constants.cameraFar = dispatch.far_plane;
++    constants.cameraFOV = dispatch.fov_vertical;
++    constants.cameraAspectRatio = dispatch.aspect_ratio;
++    constants.motionVectorsInvalidValue = 0.0f;
++    constants.depthInverted = sl::Boolean::eTrue;
++    constants.cameraMotionIncluded = sl::Boolean::eTrue;
++    constants.motionVectors3D = sl::Boolean::eFalse;
++    constants.reset = (dispatch.reset || (dispatch.debug & 4)) ? sl::Boolean::eTrue
++                                                                : sl::Boolean::eFalse;
++    constants.orthographicProjection = sl::Boolean::eFalse;
++    constants.motionVectorsDilated = sl::Boolean::eFalse;
++    constants.motionVectorsJittered = sl::Boolean::eFalse;
++    if (result == sl::Result::eOk) {
++      result = api->slSetConstants(constants, *token, viewport);
++    }
++
++    // The inputs at the render size (the top-left of nothing: the gathered textures are exactly
++    // that size, or, for DLAA, the scene's), the output at the output size. Their states are what
++    // they are in now; Streamline transitions and restores them.
++    sl::Resource color(sl::ResourceType::eTex2d, dispatch.color, nullptr, nullptr,
++                       dispatch.color_state);
++    sl::Resource depth(sl::ResourceType::eTex2d, dispatch.depth, nullptr, nullptr,
++                       dispatch.depth_state);
++    sl::Resource vectors(sl::ResourceType::eTex2d, dispatch.vectors, nullptr, nullptr,
++                         dispatch.vectors_state);
++    sl::Resource output(sl::ResourceType::eTex2d, dispatch.output, nullptr, nullptr,
++                        dispatch.output_state);
++    const sl::Extent render_extent = {0, 0, dispatch.render_width, dispatch.render_height};
++    const sl::Extent output_extent = {0, 0, dispatch.width, dispatch.height};
++    const sl::ResourceTag tags[] = {
++        sl::ResourceTag(&color, sl::kBufferTypeScalingInputColor,
++                        sl::ResourceLifecycle::eOnlyValidNow, &render_extent),
++        sl::ResourceTag(&output, sl::kBufferTypeScalingOutputColor,
++                        sl::ResourceLifecycle::eOnlyValidNow, &output_extent),
++        sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow,
++                        &render_extent),
++        sl::ResourceTag(&vectors, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow,
++                        &render_extent),
++    };
++    if (result == sl::Result::eOk) {
++      result = api->slSetTagForFrame(*token, viewport, tags, uint32_t(sizeof(tags) / sizeof(tags[0])),
++                                     command_list);
++    }
++    if (result == sl::Result::eOk) {
++      const sl::BaseStructure* inputs[] = {&viewport};
++      result = api->slEvaluateFeature(sl::kFeatureDLSS, *token, inputs, 1, command_list);
++    }
++  }
++  if ((dispatch.debug & 1) && (dispatch.frame_index % 300) == 0) {
++    REXGPU_INFO(
++        "DLSS: frame {:08X} {} preset {} {}x{} -> {}x{}, jitter {:.3f} {:.3f}, reset {}, "
++        "matrices {}, result {}",
++        dispatch.frame_index, TaaDlssModeName(dispatch.mode), dispatch.preset,
++        dispatch.render_width, dispatch.render_height, dispatch.width, dispatch.height,
++        dispatch.jitter[0], dispatch.jitter[1], dispatch.reset, dispatch.matrices_valid,
++        int(result));
++  }
++  if (result == sl::Result::eOk) {
++    return;
++  }
++  CopyColorToOutput(command_list, dispatch);
++  dispatch.failed->store(true, std::memory_order_release);
++  static std::atomic<bool> failure_logged{false};
++  if (!failure_logged.exchange(true)) {
++    REXGPU_ERROR("Temporal AA: DLSS's evaluation failed (Streamline result {}{}); giving DLSS up "
++                 "for FSR",
++                 int(result), token ? "" : ", no frame token");
++  }
++}
++
++#else  // !REX_HAS_STREAMLINE
++
++uint32_t TaaDlssMode(uint32_t, uint32_t) { return 0; }
++const char* TaaDlssModeName(uint32_t) { return "?"; }
++uint32_t TaaDlssFrameIndex(uint32_t& own_counter) { return ++own_counter; }
++void TaaDlssFillSettings(TaaDlssDispatch& dispatch) {
++  dispatch.mode = 0;
++  dispatch.preset = 0;
++  dispatch.debug = 0;
++}
++void TaaDlssDispatchCallback(ID3D12GraphicsCommandList*, const void*) {}
++
++#endif  // REX_HAS_STREAMLINE
++
++}  // namespace rex::graphics::d3d12
+diff --git a/src/graphics/d3d12/temporal_aa_dlss.h b/src/graphics/d3d12/temporal_aa_dlss.h
+new file mode 100644
+--- /dev/null
++++ b/src/graphics/d3d12/temporal_aa_dlss.h
+@@ -0,0 +1,98 @@
++#pragma once
++/**
++ * LOCAL PATCH - MCLA (0770): NVIDIA DLSS Super Resolution as the temporal upscaler of
++ * temporal_aa = fsr on Direct3D 12 (temporal_aa_upscaler = dlss), through NVIDIA Streamline
++ * (include/rex/ui/d3d12/d3d12_streamline.h).
++ *
++ * DLSS takes FSR's place and nothing else changes: the scene's draws are jittered and squeezed
++ * as for FSR (graphics/temporal_aa.cpp), the motion vectors, the gathered colour and depth are
++ * the same textures (d3d12/temporal_aa.cpp, TaaRun), DLSS runs where FSR would (the motion
++ * blur draw, before the tone map: linear HDR colour) and writes the same output, which is
++ * copied back into the scene texture. Recorded into the deferred command list as an external
++ * callback, like FSR's dispatch: Streamline is given the submission thread's command list.
++ *
++ * What DLSS is told:
++ *   colour       R16G16B16A16_FLOAT, linear HDR (before the tone map): colorBuffersHDR, auto
++ *                exposure (the game's eye adaptation is applied after, in the tone map)
++ *   depth        R32_FLOAT, 1 near, 0 far: depthInverted
++ *   vectors      R16G16_FLOAT, previous minus current, render pixels, without the jitter, the
++ *                game's per-vehicle reprojection: mvecScale 1/render size, cameraMotionIncluded,
++ *                not jittered, low resolution (render size) through the tags' extents
++ *   jitter       Halton(2, 3), 8 x ratio^2 phases (TaaEndFrame), render pixels, the value FSR is
++ *                given (TaaFsrJitter: temporal_aa_flip_jitter flips it for both)
++ *   matrices     TaaCamera (TaaCheckDraw), Streamline's clip space
++ *   reset        TaaCamera::reset (a camera cut)
++ */
++
++#include <atomic>
++#include <cstdint>
++#include <string>
++
++#include <d3d12.h>
++
++namespace rex::graphics::d3d12 {
++
++// temporal_aa_upscaler asks for DLSS.
++bool TaaDlssWanted();
++// Streamline is active and the adapter has DLSS Super Resolution; else false with the reason.
++bool TaaDlssAvailable(std::string* why_out);
++// After a failed evaluation: DLSS counts as unavailable for the rest of the session.
++void TaaDlssGiveUp();
++// "DLSS 310.4.0" (the model's NGX version) for temporal_aa_upscaler_active and the log.
++std::string TaaDlssLabel();
++// Streamline's DLSS mode (sl::DLSSMode) for an output width and the render width it is drawn at.
++uint32_t TaaDlssMode(uint32_t output_width, uint32_t render_width);
++// Its name for the log ("Quality").
++const char* TaaDlssModeName(uint32_t mode);
++
++// One evaluation, copied into the deferred command list (plain data).
++struct TaaDlssDispatch {
++  ID3D12Resource* color;    // render size
++  ID3D12Resource* depth;    // render size
++  ID3D12Resource* vectors;  // render size
++  ID3D12Resource* output;   // output size
++  uint32_t color_state;     // D3D12_RESOURCE_STATES each is in when the callback runs
++  uint32_t depth_state;
++  uint32_t vectors_state;
++  uint32_t output_state;
++  uint32_t render_width;
++  uint32_t render_height;
++  uint32_t width;
++  uint32_t height;
++  uint32_t frame_index;  // Streamline's frame (TaaDlssFrameIndex)
++  uint32_t mode;         // sl::DLSSMode
++  uint32_t preset;       // sl::DLSSPreset
++  uint32_t debug;        // dlss_debug
++  float jitter[2];
++  float near_plane;
++  float far_plane;
++  float fov_vertical;
++  float aspect_ratio;
++  bool reset;
++  bool matrices_valid;
++  float view_to_clip[16];
++  float clip_to_view[16];
++  float clip_to_prev_clip[16];
++  float prev_clip_to_clip[16];
++  float position[3];
++  float up[3];
++  float right[3];
++  float forward[3];
++  // Set on the submission thread when the evaluation failed (the caller gives DLSS up).
++  std::atomic<bool>* failed;
++};
++
++// The frame's index for Streamline, on the GPU command thread: the low-latency frame id (the swap
++// packet's ordinal, the one Reflex's markers and, with 0780, frame generation use) while markers
++// go out, else the upscaler's own count with the top bit set (never one of those ids).
++uint32_t TaaDlssFrameIndex(uint32_t& own_counter);
++
++// Reads the cvars into the fields that are not the frame's (mode, preset, debug).
++void TaaDlssFillSettings(TaaDlssDispatch& dispatch);
++
++// The deferred command list's external callback: tags, constants, options and the evaluation on
++// the command list it is replayed into. On a failure the colour is copied into the output (the
++// frame is left as it was) and *failed set.
++void TaaDlssDispatchCallback(ID3D12GraphicsCommandList* command_list, const void* data);
++
++}  // namespace rex::graphics::d3d12
+diff --git a/src/graphics/temporal_aa.cpp b/src/graphics/temporal_aa.cpp
+--- a/src/graphics/temporal_aa.cpp
++++ b/src/graphics/temporal_aa.cpp
+@@ -103,8 +103,9 @@ REXCVAR_DEFINE_STRING(temporal_aa_upscale_available, "unknown", "GPU",
+     .lifecycle(rex::cvar::Lifecycle::kHotReload)
+     .transient();
+ REXCVAR_DEFINE_STRING(temporal_aa_upscaler, "auto", "GPU",
+-                      "Which AMD FSR temporal_aa = fsr runs on Direct3D 12 "
+-                      "(0470-fsr4-signed-upscaler.patch), when AMD's signed runtime "
++                      "Which upscaler temporal_aa = fsr runs on Direct3D 12 "
++                      "(0470-fsr4-signed-upscaler.patch; dlss: LOCAL PATCH 0770). AMD FSR "
++                      "needs, for fsr4, AMD's signed runtime "
+                       "(amd_fidelityfx_loader_dx12.dll and amd_fidelityfx_upscaler_dx12.dll, "
+                       "FidelityFX SDK 2.4) is next to the executable:\n"
+                       " auto: the newest the device supports (FSR 4.1, the machine-learning "
+@@ -112,15 +113,24 @@ REXCVAR_DEFINE_STRING(temporal_aa_upscaler, "auto", "GPU",
+                       "elsewhere)\n"
+                       " fsr4: FSR 4 (FSR 3 if the device doesn't offer it)\n"
+                       " fsr3: FSR 3.1.6\n"
+-                      "Without the signed runtime the FSR 3.1.4 built with the SDK runs, whatever "
+-                      "this says. FSR 4 needs no reactive mask: temporal_aa_reactive is ignored "
+-                      "with it. A change is made on the next frame (the upscaler is made again).")
+-    .allowed({"auto", "fsr3", "fsr4"})
++                      " dlss: NVIDIA DLSS Super Resolution (DLSS 4 through NVIDIA Streamline: an "
++                      "RTX GPU and Streamline's DLLs next to the executable, see "
++                      "nvidia_streamline). The same jitter, motion vectors, depth and scene as "
++                      "FSR; the mode follows temporal_aa_upscale (1 DLAA, 1.5 Quality, 1.72 "
++                      "Balanced, 2 Performance, 3 Ultra Performance), dlss_preset picks the model, "
++                      "temporal_aa_sharpness is not used. Where DLSS can't run, FSR runs (logged "
++                      "once). Streamline is loaded at start only: dlss chosen in a session that "
++                      "started without it runs FSR until the next start\n"
++                      "Without the signed runtime the FSR 3.1.4 built with the SDK runs for auto, "
++                      "fsr3 and fsr4. FSR 4 and DLSS need no reactive mask: temporal_aa_reactive is "
++                      "ignored with them. A change is made on the next frame (the upscaler is made "
++                      "again).")
++    .allowed({"auto", "fsr3", "fsr4", "dlss"})
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_STRING(temporal_aa_upscaler_active, "none", "GPU",
+                       "FSR upscaling, set by the GPU plugin once the upscaler exists: the one "
+                       "that runs (FSR 4.1.2, FSR 3.1.6, FSR 3.1.4 (built) for the FSR built with "
+-                      "the SDK), or none")
++                      "the SDK; DLSS 310.x.y for NVIDIA's), or none")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload)
+     .transient();
+ 
+@@ -129,6 +139,11 @@ namespace rex::graphics {
+ namespace {
+ 
+ constexpr uint64_t kTaaMotionBlurPixelShader = 0xA6B9B6B0FA692C54;
++// LOCAL PATCH - MCLA (0770): temporal_aa_upscaler = dlss in the frame being built (TaaEndFrame):
++// NVIDIA's mip bias is one level sharper than FSR's, and its jitter wants at least 16 phases (32
++// preferred; DLSS Programming Guide 3.5 and 2.x). One command processor per process.
++std::atomic<bool> g_taa_dlss_frame{false};
++constexpr uint32_t kTaaDlssMinJitterPhases = 32;
+ // FSR's phase count at native resolution (8 x the scale squared; ffxFsr3GetJitterPhaseCount).
+ constexpr uint32_t kTaaJitterPhases = 8;
+ 
+@@ -394,6 +409,11 @@ uint32_t CommandProcessor::TaaLodBias() const {
+   // The pixels of the scene are (output / render) times as far apart, so textures are
+   // sampled at that many times the size: log2 of it, in eighths, a level sharper.
+   float bias = std::log2(float(taa_up_.out_width) / float(taa_up_.render_width)) * 8.0f;
++  // LOCAL PATCH - MCLA (0770): DLSS: log2(render / display) - 1, one level more (clamped at the
++  // sampler's 1.875). DLAA (not squeezed) gets no bias here: texture_lod_bias -1 does it.
++  if (g_taa_dlss_frame.load(std::memory_order_relaxed)) {
++    bias += 8.0f;
++  }
+   return uint32_t(std::clamp(bias + 0.5f, 0.0f, 15.0f));
+ }
+ 
+@@ -565,6 +585,52 @@ bool CommandProcessor::TaaCheckDraw() {
+       camera.far_plane = float(far_plane);
+       camera.fov_vertical = float(2.0 * std::atan(1.0 / std::abs(projection[1][1])));
+     }
++    // LOCAL PATCH - MCLA (0770): DLSS's (Streamline's) matrices, in its clip space. The game's
++    // clip z is 1 - depth (the vectors' shader, taa_motion_vectors_mcla.cs.xesl), Streamline's
++    // is the depth buffer's value: F swaps them (z' = w - z; F is its own inverse). The previous
++    // frame's matrix of the world (c69-c72, vehicle ID 0) ends in guest pixels (y down); P takes
++    // those back to clip space. UNVERIFIED: the game's third column is taken to be clip z (only
++    // the x and y rows are read by the vectors' shader); Streamline's ImGui (development DLLs)
++    // shows whether the camera motion it derives matches the vectors.
++    const Mat4 flip_z = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, -1, 0}, {0, 0, 1, 1}};
++    const Mat4 pixels_to_clip = {{2.0 / double(width), 0, 0, 0},
++                                 {0, -2.0 / double(height), 0, 0},
++                                 {0, 0, 1, 0},
++                                 {-1, 1, 0, 1}};
++    Mat4 previous0, view_to_clip, clip_to_view, step0, step1, step2, clip_to_prev, prev_to_clip;
++    for (uint32_t i = 0; i < 4; ++i) {
++      for (uint32_t j = 0; j < 4; ++j) {
++        previous0[i][j] = constant(69 + i, j);
++      }
++    }
++    TaaMul(projection, flip_z, view_to_clip);
++    TaaMul(flip_z, inverse_view_projection, step0);
++    TaaMul(step0, previous0, step1);
++    TaaMul(step1, pixels_to_clip, step2);
++    TaaMul(step2, flip_z, clip_to_prev);
++    camera.matrices_valid =
++        TaaInverse(view_to_clip, clip_to_view) && TaaInverse(clip_to_prev, prev_to_clip);
++    if (camera.matrices_valid) {
++      for (uint32_t i = 0; i < 4; ++i) {
++        for (uint32_t j = 0; j < 4; ++j) {
++          camera.view_to_clip[i * 4 + j] = float(view_to_clip[i][j]);
++          camera.clip_to_view[i * 4 + j] = float(clip_to_view[i][j]);
++          camera.clip_to_prev_clip[i * 4 + j] = float(clip_to_prev[i][j]);
++          camera.prev_clip_to_clip[i * 4 + j] = float(prev_to_clip[i][j]);
++        }
++      }
++      // c12-c15: the view's inverse, rows right, up, forward and position (c14 and c15 as the
++      // cut test below reads them; the handedness is UNVERIFIED).
++      for (uint32_t j = 0; j < 3; ++j) {
++        camera.right[j] = float(constant(12, j));
++        camera.up[j] = float(constant(13, j));
++        camera.forward[j] = float(constant(14, j));
++        camera.position[j] = float(constant(15, j));
++      }
++      camera.aspect_ratio = std::abs(projection[0][0]) > 1e-12
++                                ? float(std::abs(projection[1][1] / projection[0][0]))
++                                : 1.0f;
++    }
+   }
+   // A cut: the camera jumped, turned by more than 30 degrees, or zoomed by
+   // more than 5% (the replay cameras).
+@@ -689,6 +755,8 @@ void CommandProcessor::TaaEndFrame() {
+     // The size FSR is made for, with the ratio asked for now (TaaReady compares).
+     // Read once: the frame is squeezed and finished with this ratio even if the setting changes.
+     frame.up_ratio = REXCVAR_GET(temporal_aa_upscale);
++    // LOCAL PATCH - MCLA (0770): (whether DLSS runs is the backend's; the cvar is what is asked.)
++    g_taa_dlss_frame.store(REXCVAR_GET(temporal_aa_upscaler) == "dlss", std::memory_order_relaxed);
+     TaaUpscaleSizes(frame.mode == TaaMode::kFsr, frame.up_ratio);
+     frame.up_wanted = frame.mode == TaaMode::kFsr && !taa_up_.failed && frame.up_ratio > 1.0 &&
+                       TaaUpscaleSupported();
+@@ -720,6 +788,10 @@ void CommandProcessor::TaaEndFrame() {
+       float scale = taa_up_.render_width ? float(taa_up_.out_width) / float(taa_up_.render_width)
+                                          : 1.0f;
+       uint32_t phases = std::max(kTaaJitterPhases, uint32_t(std::ceil(8.0f * scale * scale)));
++      // LOCAL PATCH - MCLA (0770): DLSS: at least 32 phases (DLAA's 8 would be too few).
++      if (g_taa_dlss_frame.load(std::memory_order_relaxed)) {
++        phases = std::max(phases, kTaaDlssMinJitterPhases);
++      }
+       uint32_t phase = taa_jitter_index_++ % phases + 1;
+       frame.jitter[0] = TaaHalton(phase, 2) - 0.5f;
+       frame.jitter[1] = TaaHalton(phase, 3) - 0.5f;
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -63,6 +63,7 @@ if(REXGLUE_USE_D3D12)
+         d3d12/d3d12_presenter.cpp
+         d3d12/d3d12_presenter_frame_generation.cpp
+         d3d12/d3d12_provider.cpp
++        d3d12/d3d12_streamline.cpp  # LOCAL PATCH - MCLA (0770)
+         d3d12/d3d12_submission_tracker.cpp
+         d3d12/d3d12_upload_buffer_pool.cpp
+         d3d12/d3d12_util.cpp
+@@ -149,6 +150,13 @@ if(REXGLUE_ENABLE_FSR AND WIN32 AND REXGLUE_USE_D3D12)
+     target_compile_definitions(rexui PRIVATE REX_HAS_FRAME_GENERATION_DX12=1)
+ endif()
+ 
++# LOCAL PATCH - MCLA (0770): NVIDIA Streamline's headers (cmake/rexglue_streamline.cmake); its DLLs are loaded at
++# run time.
++if(REXGLUE_HAS_STREAMLINE)
++    target_include_directories(rexui PRIVATE ${REXGLUE_STREAMLINE_INCLUDE_DIR})
++    target_compile_definitions(rexui PRIVATE REX_HAS_STREAMLINE=1)
++endif()
++
+ # The Vulkan device checks FidelityFX's runtime before it offers frame generation
+ # (vulkan_device.cpp): on Windows its DLL, on Linux its shared object, on the PS5
+ # (REX_FSR_STATIC) that the title linked it.
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -911,7 +911,11 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+       // rate.
+       swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+     }
+-    IDXGIFactory2* dxgi_factory = provider_.GetDXGIFactory();
++    // LOCAL PATCH - MCLA (0770): Streamline's proxy factory while it is active (its proxy swap
++    // chain sees every Present); AMD's frame interpolation swap chain is never made then
++    // (streamline::Wanted keeps Streamline off with frame_generation = fsr).
++    IDXGIFactory2* dxgi_factory = provider_.GetSwapChainFactory();
++    const bool streamline_swap_chain = provider_.SwapChainFactoryIsStreamline();
+     ID3D12CommandQueue* direct_queue = provider_.GetDirectQueue();
+     Microsoft::WRL::ComPtr<IDXGISwapChain1> swap_chain_1;
+     switch (surface_type) {
+@@ -919,7 +923,8 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+       case Surface::kTypeIndex_Win32Hwnd: {
+         HWND surface_hwnd = static_cast<const Win32HwndSurface&>(new_surface).hwnd();
+         // Frame generation: AMD's frame interpolation swap chain, if wanted.
+-        if (!CreateFrameGenerationSwapChain(surface_hwnd, swap_chain_desc, swap_chain_1) &&
++        if ((streamline_swap_chain ||
++             !CreateFrameGenerationSwapChain(surface_hwnd, swap_chain_desc, swap_chain_1)) &&
+             FAILED(dxgi_factory->CreateSwapChainForHwnd(
+                 direct_queue, surface_hwnd, &swap_chain_desc, nullptr, nullptr, &swap_chain_1))) {
+           REXLOG_ERROR("D3D12Presenter: Failed to create a swap chain for the HWND");
+diff --git a/src/ui/d3d12/d3d12_provider.cpp b/src/ui/d3d12/d3d12_provider.cpp
+--- a/src/ui/d3d12/d3d12_provider.cpp
++++ b/src/ui/d3d12/d3d12_provider.cpp
+@@ -17,6 +17,7 @@
+ #include <rex/ui/d3d12/d3d12_immediate_drawer.h>
+ #include <rex/ui/d3d12/d3d12_presenter.h>
+ #include <rex/ui/d3d12/d3d12_provider.h>
++#include <rex/ui/d3d12/d3d12_streamline.h>  // LOCAL PATCH - MCLA (0770)
+ 
+ #include <malloc.h>
+ 
+@@ -126,6 +127,12 @@ bool D3D12Provider::AllocateVideoMemoryBallast(uint64_t bytes) {
+ }
+ 
+ D3D12Provider::~D3D12Provider() {
++  // LOCAL PATCH - MCLA (0770): Streamline goes before the device and the factory (its guide).
++  if (swap_chain_factory_ != nullptr) {
++    swap_chain_factory_->Release();
++    swap_chain_factory_ = nullptr;
++  }
++  streamline::Shutdown();
+   video_memory_ballast_.clear();
+   dxgi_adapter3_.Reset();
+   if (graphics_analysis_ != nullptr) {
+@@ -419,6 +426,11 @@ bool D3D12Provider::Initialize() {
+     d3d12_info_queue->Release();
+   }
+ 
++  // LOCAL PATCH - MCLA (0770): NVIDIA Streamline (DLSS), once the device exists and before the
++  // direct queue and any swap chain (manual hooking: the device may come first). Logs what it
++  // finds; without it the session goes on as before.
++  streamline::Initialize(device, &adapter_desc.AdapterLuid, adapter_desc.VendorId);
++
+   // Create the command queue for graphics.
+   D3D12_COMMAND_QUEUE_DESC queue_desc;
+   queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+@@ -461,6 +473,8 @@ bool D3D12Provider::Initialize() {
+   dxgi_factory_ = dxgi_factory;
+   device_ = device;
+   direct_queue_ = direct_queue;
++  // LOCAL PATCH - MCLA (0770): swap chains through Streamline's proxy factory while it is active.
++  swap_chain_factory_ = streamline::UpgradeFactory(dxgi_factory);
+ 
+   // Get descriptor sizes for each type.
+   for (uint32_t i = 0; i < D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES; ++i) {
+diff --git a/src/ui/d3d12/d3d12_streamline.cpp b/src/ui/d3d12/d3d12_streamline.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/ui/d3d12/d3d12_streamline.cpp
+@@ -0,0 +1,378 @@
++/**
++ * LOCAL PATCH - MCLA (0770): NVIDIA Streamline on Direct3D 12. See
++ * include/rex/ui/d3d12/d3d12_streamline.h.
++ */
++
++#include <rex/ui/d3d12/d3d12_streamline.h>
++
++#include <atomic>
++#include <filesystem>
++#include <mutex>
++#include <string>
++#include <system_error>
++
++#include <rex/cvar.h>
++#include <rex/filesystem.h>
++#include <rex/logging.h>
++#include <rex/platform.h>
++
++#include <windows.h>
++#include <dxgi1_4.h>
++#include <d3d12.h>
++
++REXCVAR_DEFINE_STRING(nvidia_streamline, "auto", "GPU",
++                      "NVIDIA Streamline (DLSS Super Resolution, and with frame_generation = dlss "
++                      "DLSS Frame Generation and Reflex; LOCAL PATCH 0770): loaded at start from "
++                      "sl.interposer.dll and its plugins next to the executable (tools/setup.py "
++                      "fetches them), on an NVIDIA GPU only.\n"
++                      " auto: when temporal_aa_upscaler = dlss or frame_generation = dlss (the "
++                      "default)\n"
++                      " on: whenever the DLLs and an NVIDIA GPU are there (the swap chain is then "
++                      "always Streamline's)\n"
++                      " off: never (FSR and AMD frame generation as before)\n"
++                      "Not with frame_generation = fsr (AMD's swap chain): Streamline then stays "
++                      "off and temporal_aa_upscaler = dlss runs FSR. A change takes effect at the "
++                      "next start")
++    .allowed({"auto", "on", "off"})
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_INT32(streamline_log, 0, "GPU",
++                     "NVIDIA Streamline's messages: 0 its warnings and errors in this log (the "
++                     "default); 1 also its information messages; 2 also its own verbose log "
++                     "files (sl.log and the plugins', in the executable's folder) and its console "
++                     "window")
++    .range(0, 2)
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_STRING(streamline_project_id, "5c0f3a6e-2b7d-4e91-a8c4-0d3f6b1e9a27", "GPU",
++                      "NVIDIA Streamline: the project id given to slInit (a GUID; any value works "
++                      "with the development DLLs, which also show NVIDIA's watermark)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
++namespace rex::ui::d3d12::streamline {
++
++namespace {
++
++constexpr uint32_t kVendorNvidia = 0x10DE;
++
++struct State {
++  HMODULE module = nullptr;
++  bool active = false;
++  bool dlss = false;
++  std::string why = "NOT LOADED";
++  std::string dlss_label = "DLSS";
++#if defined(REX_HAS_STREAMLINE) && REX_HAS_STREAMLINE
++  Api api;
++#endif
++  std::mutex token_mutex;
++};
++State g_state;
++
++#if defined(REX_HAS_STREAMLINE) && REX_HAS_STREAMLINE
++
++std::string ResultText(sl::Result result) {
++  switch (result) {
++    case sl::Result::eOk:
++      return "ok";
++    case sl::Result::eErrorIO:
++      return "I/O error";
++    case sl::Result::eErrorDriverOutOfDate:
++      return "the driver is too old";
++    case sl::Result::eErrorOSOutOfDate:
++      return "Windows is too old";
++    case sl::Result::eErrorOSDisabledHWS:
++      return "hardware-accelerated GPU scheduling is off";
++    case sl::Result::eErrorNoSupportedAdapterFound:
++      return "no supported adapter (not an RTX GPU, or the wrong one)";
++    case sl::Result::eErrorAdapterNotSupported:
++      return "the adapter isn't supported";
++    case sl::Result::eErrorFeatureMissing:
++      return "the feature's plugin is missing";
++    case sl::Result::eErrorFeatureNotSupported:
++      return "the feature isn't supported here";
++    case sl::Result::eErrorFeatureFailedToLoad:
++      return "the feature's plugin failed to load";
++    default:
++      return "Streamline result " + std::to_string(int(result));
++  }
++}
++
++// Streamline's messages into the log (they end with a line feed). Any thread.
++void LogMessage(sl::LogType type, const char* message) {
++  std::string text = message ? message : "";
++  while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
++    text.pop_back();
++  }
++  switch (type) {
++    case sl::LogType::eError:
++      REXLOG_ERROR("Streamline: {}", text);
++      break;
++    case sl::LogType::eWarn:
++      REXLOG_WARN("Streamline: {}", text);
++      break;
++    default:
++      if (REXCVAR_GET(streamline_log) >= 1) {
++        REXLOG_INFO("Streamline: {}", text);
++      }
++      break;
++  }
++}
++
++template <typename T>
++bool Resolve(HMODULE module, const char* name, T*& out) {
++  out = reinterpret_cast<T*>(GetProcAddress(module, name));
++  return out != nullptr;
++}
++
++template <typename T>
++void ResolveFeature(sl::Feature feature, const char* name, T*& out) {
++  void* function = nullptr;
++  out = nullptr;
++  if (g_state.api.slGetFeatureFunction &&
++      g_state.api.slGetFeatureFunction(feature, name, function) == sl::Result::eOk) {
++    out = reinterpret_cast<T*>(function);
++  }
++}
++
++void Unload(const char* why) {
++  g_state.active = false;
++  g_state.dlss = false;
++  g_state.why = why;
++  g_state.api = Api();
++  if (g_state.module) {
++    FreeLibrary(g_state.module);
++    g_state.module = nullptr;
++  }
++}
++
++#endif  // REX_HAS_STREAMLINE
++
++}  // namespace
++
++bool Wanted() {
++  const std::string mode = REXCVAR_GET(nvidia_streamline);
++  if (mode == "off") {
++    return false;
++  }
++  // AMD's frame generation makes the swap chain through its own proxy: never both.
++  if (rex::cvar::GetFlagByName("frame_generation") == "fsr") {
++    return false;
++  }
++  if (mode == "on") {
++    return true;
++  }
++  return rex::cvar::GetFlagByName("temporal_aa_upscaler") == "dlss" ||
++         rex::cvar::GetFlagByName("frame_generation") == "dlss";
++}
++
++bool Initialize(ID3D12Device* native_device, const void* adapter_luid, uint32_t adapter_vendor_id) {
++#if defined(REX_HAS_STREAMLINE) && REX_HAS_STREAMLINE
++  if (g_state.active) {
++    return true;
++  }
++  if (!Wanted()) {
++    g_state.why = rex::cvar::GetFlagByName("frame_generation") == "fsr"
++                      ? "AMD FRAME GENERATION IN USE"
++                      : "NOT ASKED FOR";
++    if (REXCVAR_GET(nvidia_streamline) != "off" &&
++        rex::cvar::GetFlagByName("temporal_aa_upscaler") == "dlss") {
++      REXLOG_WARN("Streamline: not loaded with frame_generation = fsr (AMD's swap chain); "
++                  "temporal_aa_upscaler = dlss runs FSR");
++    }
++    return false;
++  }
++  if (adapter_vendor_id != kVendorNvidia) {
++    g_state.why = "NOT AN NVIDIA GPU";
++    REXLOG_INFO("Streamline: not loaded, the GPU isn't NVIDIA's (vendor 0x{:04X}); DLSS is "
++                "unavailable",
++                adapter_vendor_id);
++    return false;
++  }
++  const std::filesystem::path folder = rex::filesystem::GetExecutableFolder();
++  const std::filesystem::path interposer = folder / "sl.interposer.dll";
++  std::error_code exists_error;
++  if (!std::filesystem::exists(interposer, exists_error)) {
++    g_state.why = "SL.INTERPOSER.DLL MISSING";
++    REXLOG_WARN("Streamline: sl.interposer.dll isn't next to the executable (tools/setup.py "
++                "fetches NVIDIA's Streamline SDK and the build copies its DLLs); DLSS is "
++                "unavailable");
++    return false;
++  }
++  // The development DLLs are not signed; the production ones are, and the interposer checks the
++  // plugins' signatures itself. (No WinVerifyTrust here: personal-use build, owner's decision.)
++  g_state.module = LoadLibraryExW(interposer.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
++  if (!g_state.module) {
++    REXLOG_ERROR("Streamline: sl.interposer.dll doesn't load (error {}); DLSS is unavailable",
++                 GetLastError());
++    Unload("SL.INTERPOSER.DLL DOESN'T LOAD");
++    return false;
++  }
++  Api& api = g_state.api;
++  bool resolved = Resolve(g_state.module, "slInit", api.slInit) &&
++                  Resolve(g_state.module, "slShutdown", api.slShutdown) &&
++                  Resolve(g_state.module, "slIsFeatureSupported", api.slIsFeatureSupported) &&
++                  Resolve(g_state.module, "slIsFeatureLoaded", api.slIsFeatureLoaded) &&
++                  Resolve(g_state.module, "slSetFeatureLoaded", api.slSetFeatureLoaded) &&
++                  Resolve(g_state.module, "slEvaluateFeature", api.slEvaluateFeature) &&
++                  Resolve(g_state.module, "slAllocateResources", api.slAllocateResources) &&
++                  Resolve(g_state.module, "slFreeResources", api.slFreeResources) &&
++                  Resolve(g_state.module, "slSetTagForFrame", api.slSetTagForFrame) &&
++                  Resolve(g_state.module, "slGetFeatureRequirements",
++                          api.slGetFeatureRequirements) &&
++                  Resolve(g_state.module, "slGetFeatureVersion", api.slGetFeatureVersion) &&
++                  Resolve(g_state.module, "slUpgradeInterface", api.slUpgradeInterface) &&
++                  Resolve(g_state.module, "slSetConstants", api.slSetConstants) &&
++                  Resolve(g_state.module, "slGetNativeInterface", api.slGetNativeInterface) &&
++                  Resolve(g_state.module, "slGetFeatureFunction", api.slGetFeatureFunction) &&
++                  Resolve(g_state.module, "slGetNewFrameToken", api.slGetNewFrameToken) &&
++                  Resolve(g_state.module, "slSetD3DDevice", api.slSetD3DDevice);
++  if (!resolved) {
++    REXLOG_ERROR("Streamline: sl.interposer.dll lacks Streamline's entry points; DLSS is "
++                 "unavailable");
++    Unload("SL.INTERPOSER.DLL IS NOT STREAMLINE");
++    return false;
++  }
++
++  const int32_t log = REXCVAR_GET(streamline_log);
++  const std::wstring plugin_folder = folder.wstring();
++  const wchar_t* plugin_paths[] = {plugin_folder.c_str()};
++  const std::string project_id = REXCVAR_GET(streamline_project_id);
++  // The features this patch uses (0780 adds frame generation, Reflex and PC latency).
++  const sl::Feature features[] = {sl::kFeatureDLSS};
++  sl::Preferences preferences;
++  preferences.showConsole = log >= 2;
++  preferences.logLevel = log >= 2 ? sl::LogLevel::eVerbose : sl::LogLevel::eDefault;
++  preferences.pathsToPlugins = plugin_paths;
++  preferences.numPathsToPlugins = 1;
++  preferences.pathToLogsAndData = log >= 2 ? plugin_folder.c_str() : nullptr;
++  preferences.logMessageCallback = &LogMessage;
++  // Manual hooking (the host keeps its native interfaces); no over-the-air updates, so what runs
++  // is exactly the DLLs next to the executable.
++  // Frame based resource tagging (slSetTagForFrame, which a FrameToken names: 2.14 refuses it without the flag).
++  preferences.flags = sl::PreferenceFlags::eDisableCLStateTracking |
++                      sl::PreferenceFlags::eUseManualHooking |
++                      sl::PreferenceFlags::eUseFrameBasedResourceTagging;
++  preferences.featuresToLoad = features;
++  preferences.numFeaturesToLoad = uint32_t(sizeof(features) / sizeof(features[0]));
++  preferences.applicationId = 0;
++  preferences.engine = sl::EngineType::eCustom;
++  preferences.engineVersion = "ReXGlue";
++  preferences.projectId = project_id.c_str();
++  preferences.renderAPI = sl::RenderAPI::eD3D12;
++  sl::Result result = api.slInit(preferences, sl::kSDKVersion);
++  if (result != sl::Result::eOk) {
++    REXLOG_ERROR("Streamline: slInit failed ({}); DLSS is unavailable", ResultText(result));
++    Unload("SLINIT FAILED");
++    return false;
++  }
++  result = api.slSetD3DDevice(native_device);
++  if (result != sl::Result::eOk) {
++    REXLOG_ERROR("Streamline: slSetD3DDevice failed ({}); DLSS is unavailable", ResultText(result));
++    api.slShutdown();
++    Unload("SLSETD3DDEVICE FAILED");
++    return false;
++  }
++  g_state.active = true;
++  g_state.why.clear();
++
++  sl::AdapterInfo adapter;
++  adapter.deviceLUID = reinterpret_cast<uint8_t*>(const_cast<void*>(adapter_luid));
++  adapter.deviceLUIDSizeInBytes = uint32_t(sizeof(LUID));
++  result = api.slIsFeatureSupported(sl::kFeatureDLSS, adapter);
++  g_state.dlss = result == sl::Result::eOk;
++  if (g_state.dlss) {
++    ResolveFeature(sl::kFeatureDLSS, "slDLSSGetOptimalSettings", api.slDLSSGetOptimalSettings);
++    ResolveFeature(sl::kFeatureDLSS, "slDLSSGetState", api.slDLSSGetState);
++    ResolveFeature(sl::kFeatureDLSS, "slDLSSSetOptions", api.slDLSSSetOptions);
++    if (!api.slDLSSGetOptimalSettings || !api.slDLSSSetOptions) {
++      g_state.dlss = false;
++      g_state.why = "DLSS FUNCTIONS MISSING";
++    }
++    sl::FeatureVersion version;
++    if (api.slGetFeatureVersion(sl::kFeatureDLSS, version) == sl::Result::eOk &&
++        version.versionNGX) {
++      g_state.dlss_label = "DLSS " + version.versionNGX.toStr();
++    }
++  } else {
++    g_state.why = "DLSS: " + ResultText(result);
++  }
++  REXLOG_INFO("Streamline {}.{}.{}: active (manual hooking, {} DLLs); DLSS Super Resolution {}",
++              SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH,
++              log >= 2 ? "development log" : "quiet",
++              g_state.dlss ? "available (" + g_state.dlss_label + ")"
++                           : "unavailable (" + ResultText(result) + ")");
++  return true;
++#else
++  (void)native_device;
++  (void)adapter_luid;
++  (void)adapter_vendor_id;
++  g_state.why = "NOT BUILT WITH STREAMLINE";
++  if (Wanted()) {
++    REXLOG_WARN("Streamline: this build has no Streamline (the SDK was configured without "
++                "REXGLUE_STREAMLINE_DIR); DLSS is unavailable");
++  }
++  return false;
++#endif
++}
++
++void Shutdown() {
++#if defined(REX_HAS_STREAMLINE) && REX_HAS_STREAMLINE
++  if (g_state.active && g_state.api.slShutdown) {
++    const sl::Result result = g_state.api.slShutdown();
++    if (result != sl::Result::eOk) {
++      REXLOG_WARN("Streamline: slShutdown failed ({})", ResultText(result));
++    }
++  }
++  Unload("SHUT DOWN");
++#endif
++}
++
++bool IsActive() { return g_state.active; }
++
++bool DlssSupported() { return g_state.active && g_state.dlss; }
++
++std::string UnavailableReason() { return g_state.why; }
++
++IDXGIFactory2* UpgradeFactory(IDXGIFactory2* native) {
++#if defined(REX_HAS_STREAMLINE) && REX_HAS_STREAMLINE
++  if (!g_state.active || !native) {
++    return nullptr;
++  }
++  // slUpgradeInterface replaces the pointer with the proxy, which keeps the reference it was given.
++  native->AddRef();
++  void* factory = native;
++  const sl::Result result = g_state.api.slUpgradeInterface(&factory);
++  if (result != sl::Result::eOk || factory == native) {
++    REXLOG_ERROR("Streamline: the DXGI factory couldn't be upgraded ({}); swap chains are made "
++                 "without Streamline, which then can't run",
++                 ResultText(result));
++    native->Release();
++    return nullptr;
++  }
++  REXLOG_INFO("Streamline: swap chains are made through its proxy factory");
++  return static_cast<IDXGIFactory2*>(factory);
++#else
++  (void)native;
++  return nullptr;
++#endif
++}
++
++#if defined(REX_HAS_STREAMLINE) && REX_HAS_STREAMLINE
++
++const Api* GetApi() { return g_state.active ? &g_state.api : nullptr; }
++
++sl::FrameToken* GetFrameToken(uint32_t frame_index) {
++  if (!g_state.active) {
++    return nullptr;
++  }
++  std::lock_guard<std::mutex> lock(g_state.token_mutex);
++  sl::FrameToken* token = nullptr;
++  if (g_state.api.slGetNewFrameToken(token, &frame_index) != sl::Result::eOk) {
++    return nullptr;
++  }
++  return token;
++}
++
++std::string DlssLabel() { return g_state.dlss_label; }
++
++#endif  // REX_HAS_STREAMLINE
++
++}  // namespace rex::ui::d3d12::streamline

@@ -47,6 +47,11 @@ REXCVAR_DEFINE_STRING(mcla_profile, "", "MCLA",
                       "1280x800 upscaled by FSR (1.5x), '1200p-fsr4p' = 1200p from 960x600 by FSR 4 (2x), '1000p' = "
                       "1600x1000, '2000p' = 3200x2000 on the host (1000p with every render target drawn at 2x2: "
                       "about 4x the GPU load, less with its sun-shadow map 320 and VRS level 2 base). "
+                      "NVIDIA DLSS (RTX; SDK patch 0770): '2000p-dlssq' / '-dlssb' / '-dlssp' / '-dlssu' = 2000p with the "
+                      "scene at 2133x1333 / 1856x1160 / 1600x1000 / 1067x667 upscaled to 3200x2000, '2000p-dlaa' = DLSS "
+                      "anti-aliasing at 3200x2000, '1080p-dlssq' = 1080p from 1280x720, '1080p-dlaa' = DLAA at 1080p, '2000p-fg' / "
+                      "'2000p-dlaa-fg' = 2000p / DLAA with DLSS Frame Generation (SDK patch 0780: 60 rendered, 120 shown, G-Sync; needs "
+                      "swap_post_effect=none on the command line: the gfx presets' FXAA outranks a profile). "
                       "Read once, in OnPreSetup")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -444,6 +449,58 @@ constexpr CvarDefault k2000pDefaults[] = {
     {"mcla_gfx_env_res", "256"},
 };
 
+// DLSS (SDK patch 0770, NVIDIA Streamline; RTX GPUs). The same squeeze as FSR (temporal_aa=fsr, the scene drawn into the
+// top-left of the output-size render targets, stretched resolves, the pass at the motion blur draw) with
+// temporal_aa_upscaler=dlss; where DLSS can't run, FSR runs (logged). At 2000p the output is the 3200x2000 the 2x draw
+// scale gives (guest 1600x1000 x 2): Quality 2133x1333, Balanced 1856x1160, Performance 1600x1000, Ultra Performance
+// 1067x667; DLAA draws the scene at 3200x2000 and only anti-aliases. The post-processing, the HUD and the resolves stay at
+// 3200x2000: DLSS saves the scene's shading, not the 2x path's emulation floor (ROADMAP R1).
+static_assert(3200 * 2 / 3 == 2133 && 2000 * 2 / 3 == 1333 && 3200 / 2 == 1600 && 2000 / 2 == 1000,
+              "the 2000p DLSS render sizes");
+// FXAA after DLSS only softens its output (and the HUD): off, as an app default (a player's own setting wins).
+constexpr CvarDefault k2000pDlssQDefaults[] = {
+    {"temporal_aa", "fsr"},
+    {"temporal_aa_upscaler", "dlss"},
+    {"temporal_aa_upscale", "1.5"},
+    {"swap_post_effect", "none"},
+};
+constexpr CvarDefault k2000pDlssBDefaults[] = {
+    {"temporal_aa_upscale", "1.724"},
+};
+// Performance: the automatic model is M, which costs about 1 ms more than K on the RTX 4060 Laptop at 3200x2000 (runs cm-p 13.52 ms, cm-p-k 12.43).
+constexpr CvarDefault k2000pDlssPDefaults[] = {
+    {"temporal_aa_upscale", "2.0"},
+    {"dlss_preset", "k"},
+};
+constexpr CvarDefault k2000pDlssUDefaults[] = {
+    {"temporal_aa_upscale", "3.0"},
+};
+// DLAA: the scene isn't squeezed, so the sampler's DLSS bias (SDK 0770, TaaLodBias) doesn't apply; NVIDIA's -1 here.
+constexpr CvarDefault k2000pDlaaDefaults[] = {
+    {"temporal_aa_upscale", "1.0"},
+    {"texture_lod_bias", "-1.0"},
+};
+// DLSS Frame Generation (SDK patch 0780): 60 rendered frames shown as 120 (G-Sync / a 120 Hz mode; the world still steps at 60). It needs Reflex
+// through Streamline and the engine frame markers (mcla_low_latency_frames), and the guest picture shown 1:1 (2000p on the 3200x2000 panel).
+constexpr CvarDefault kDlssFgDefaults[] = {
+    {"frame_generation", "dlss"},
+    {"dlssg_frames", "1"},
+    {"mcla_low_latency_frames", "true"},
+    {"low_latency_limiter", "fork"},
+};
+
+constexpr CvarDefault k1080pDlssQDefaults[] = {
+    {"temporal_aa", "fsr"},
+    {"temporal_aa_upscaler", "dlss"},
+    {"temporal_aa_upscale", "1.5"},
+    {"mcla_ws_single_tile", "true"},
+    {"swap_post_effect", "none"},
+};
+constexpr CvarDefault k1080pDlaaDefaults[] = {
+    {"temporal_aa_upscale", "1.0"},
+    {"texture_lod_bias", "-1.0"},
+};
+
 // 1200p-fsr / 1200p-fsr4p: the 1200p render with the scene drawn at 1280x800 (1.5x) or 960x600 (2x) and upscaled to
 // 1920x1200, FSR as in the 1080p-fsr family below (1.5x with RCAS 0.3; the FSR 4 Performance preset with RCAS 0.2).
 static_assert(1920 * 2 / 3 == 1280 && 1200 * 2 / 3 == 800 && 1920 / 2 == 960 && 1200 / 2 == 600,
@@ -563,6 +620,24 @@ constexpr Preset kPresets[] = {
      "the game still sees 1600x1000; sun-shadow map 320 (host 640, mcla_gfx_shadow_res) and environment map 256x128 (host "
      "512x256, mcla_gfx_env_res)",
      k2000pDefaults, sizeof(k2000pDefaults) / sizeof(k2000pDefaults[0]), "1000p"},
+    {"2000p-dlssq", "2000p with the scene drawn at 2133x1333 and upscaled to 3200x2000 by NVIDIA DLSS (Quality, 1.5x)",
+     k2000pDlssQDefaults, sizeof(k2000pDlssQDefaults) / sizeof(k2000pDlssQDefaults[0]), "2000p"},
+    {"2000p-dlssb", "2000p with the scene at 1856x1160 upscaled by DLSS (Balanced, 1.72x)", k2000pDlssBDefaults,
+     sizeof(k2000pDlssBDefaults) / sizeof(k2000pDlssBDefaults[0]), "2000p-dlssq"},
+    {"2000p-dlssp", "2000p with the scene at 1600x1000 upscaled by DLSS (Performance, 2x)", k2000pDlssPDefaults,
+     sizeof(k2000pDlssPDefaults) / sizeof(k2000pDlssPDefaults[0]), "2000p-dlssq"},
+    {"2000p-dlssu", "2000p with the scene at 1067x667 upscaled by DLSS (Ultra Performance, 3x)", k2000pDlssUDefaults,
+     sizeof(k2000pDlssUDefaults) / sizeof(k2000pDlssUDefaults[0]), "2000p-dlssq"},
+    {"2000p-dlaa", "2000p anti-aliased by DLSS at 3200x2000 (DLAA, no upscaling)", k2000pDlaaDefaults,
+     sizeof(k2000pDlaaDefaults) / sizeof(k2000pDlaaDefaults[0]), "2000p-dlssq"},
+    {"2000p-fg", "2000p with NVIDIA DLSS Frame Generation (60 rendered, 120 shown; Reflex on)", kDlssFgDefaults,
+     sizeof(kDlssFgDefaults) / sizeof(kDlssFgDefaults[0]), "2000p"},
+    {"2000p-dlaa-fg", "2000p-dlaa with DLSS Frame Generation (60 rendered, 120 shown; Reflex on)", kDlssFgDefaults,
+     sizeof(kDlssFgDefaults) / sizeof(kDlssFgDefaults[0]), "2000p-dlaa"},
+    {"1080p-dlssq", "the 1080p render with the scene at 1280x720 upscaled by DLSS (Quality, 1.5x)", k1080pDlssQDefaults,
+     sizeof(k1080pDlssQDefaults) / sizeof(k1080pDlssQDefaults[0]), "1080p"},
+    {"1080p-dlaa", "the 1080p render anti-aliased by DLSS at 1920x1080 (DLAA: the TV's quality AA)", k1080pDlaaDefaults,
+     sizeof(k1080pDlaaDefaults) / sizeof(k1080pDlaaDefaults[0]), "1080p-dlssq"},
 };
 
 // ---- frame-rate targets (W4.1) --------------------------------------------------------------------------------
