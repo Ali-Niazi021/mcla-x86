@@ -487,6 +487,10 @@ struct CpuTopology {
   std::vector<ULONG> high_ids;  // CPU set ids of the highest efficiency class
   std::vector<ULONG> low_ids;   // CPU set ids of the lowest efficiency class
   std::vector<PROCESSOR_NUMBER> high_cores;  // first SMT sibling of each physical core of the highest class
+  // Every logical processor of each of those cores (high_core_siblings[i] for high_cores[i], the first one first). Windows
+  // refuses an ideal processor that is parked at that moment (SetThreadIdealProcessorEx: ERROR_GEN_FAILURE, 31, once the
+  // thread has CPU sets; measured on a 6P+8E Intel laptop in Balanced mode), so the placement falls back to a sibling.
+  std::vector<std::vector<PROCESSOR_NUMBER>> high_core_siblings;
   size_t low_core_count = 0;
 
   void Load() {
@@ -529,10 +533,12 @@ struct CpuTopology {
     heterogeneous = high_class != low_class;
     // One entry per physical core of the highest class: its first (lowest) logical processor.
     std::map<std::pair<WORD, BYTE>, Processor> first_of_core;
+    std::map<std::pair<WORD, BYTE>, std::vector<Processor>> all_of_core;
     std::map<std::pair<WORD, BYTE>, bool> low_cores;
     for (const Processor& p : processors) {
       if (p.efficiency_class == high_class) {
         high_ids.push_back(p.id);
+        all_of_core[{p.group, p.core}].push_back(p);
         auto [it, inserted] = first_of_core.try_emplace({p.group, p.core}, p);
         if (!inserted && p.index < it->second.index) {
           it->second = p;
@@ -549,6 +555,17 @@ struct CpuTopology {
       number.Group = p.group;
       number.Number = p.index;
       high_cores.push_back(number);
+      std::vector<Processor> members = all_of_core[key];
+      std::sort(members.begin(), members.end(),
+                [](const Processor& a, const Processor& b) { return a.index < b.index; });
+      std::vector<PROCESSOR_NUMBER> siblings;
+      for (const Processor& m : members) {
+        PROCESSOR_NUMBER sibling{};
+        sibling.Group = m.group;
+        sibling.Number = m.index;
+        siblings.push_back(sibling);
+      }
+      high_core_siblings.push_back(std::move(siblings));
     }
   }
 
@@ -1267,14 +1284,51 @@ class Monitor {
       if (!same && a.ideal_fail != slot) {
         RememberIdeal(t);
         PROCESSOR_NUMBER target = *want_ideal;
-        if (SetThreadIdealProcessorEx(h, &target, nullptr)) {
+        BOOL placed = SetThreadIdealProcessorEx(h, &target, nullptr);
+        if (!placed && GetLastError() == ERROR_GEN_FAILURE) {
+          // A parked logical processor: the same physical core's other ones.
+          for (const std::vector<PROCESSOR_NUMBER>& siblings : topology_.high_core_siblings) {
+            if (siblings.empty() || siblings.front().Group != want_ideal->Group ||
+                siblings.front().Number != want_ideal->Number) {
+              continue;
+            }
+            for (size_t i = 1; i < siblings.size() && !placed; ++i) {
+              target = siblings[i];
+              placed = SetThreadIdealProcessorEx(h, &target, nullptr);
+            }
+            break;
+          }
+          // The whole core is parked: any logical processor of the class that is not parked right now.
+          for (const std::vector<PROCESSOR_NUMBER>& siblings : topology_.high_core_siblings) {
+            for (size_t i = 0; i < siblings.size() && !placed; ++i) {
+              target = siblings[i];
+              placed = SetThreadIdealProcessorEx(h, &target, nullptr);
+            }
+            if (placed) {
+              break;
+            }
+          }
+          if (!placed) {
+            SetLastError(ERROR_GEN_FAILURE);
+          }
+        }
+        if (placed) {
           a.ideal_active = true;
           a.ideal_set = *want_ideal;
           a.ideal_fail = kNoValue;
           log.Add(Label(t, Dim::kIdeal, k, false, 0), false, t);
         } else {
+          const DWORD error = GetLastError();
           a.ideal_fail = slot;
-          Warn(t, Label(t, Dim::kIdeal, k, false, 0), "SetThreadIdealProcessorEx", GetLastError());
+          if (error == ERROR_GEN_FAILURE) {
+            // Every processor of the class parked at this moment: the ideal processor is only a hint and the CPU sets
+            // (the class) still hold, so this is not worth a warning. Tried again when the slot changes.
+            REXLOG_INFO("[mcla-threads] t={:.1f} {} on {} tid {}: ideal processor left to Windows (the cores of the "
+                        "class are parked right now; the CPU sets still apply)",
+                        SecondsSinceProcessStart(), Label(t, Dim::kIdeal, k, false, 0), t.name, t.tid);
+          } else {
+            Warn(t, Label(t, Dim::kIdeal, k, false, 0), "SetThreadIdealProcessorEx", error);
+          }
           if (!a.ideal_active && a.cpuset_kind == 0) {
             a.ideal_orig_valid = false;
           }

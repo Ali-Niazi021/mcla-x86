@@ -790,6 +790,23 @@ bool Enabled() { return REXCVAR_GET(mcla_gov); }
 
 bool CompileBurstActive() { return g_compile_active.load(std::memory_order_relaxed); }
 
+GpuCounters ReadGpuCounters() {
+  static const CompileSymbols compile = ResolveCompile();
+  static const Symbols gpu = Resolve();
+  GpuCounters c;
+  if (compile.Found()) {
+    c.compile = true;
+    c.pipelines = compile.pipelines->load(std::memory_order_relaxed);
+    c.shaders = compile.shaders->load(std::memory_order_relaxed);
+    c.pending = compile.pending->load(std::memory_order_relaxed);
+  }
+  if (gpu.gpu_us) {
+    c.gpu = true;
+    c.gpu_us = gpu.gpu_us->load(std::memory_order_relaxed);
+  }
+  return c;
+}
+
 double CompileExcuseS() { return CompileExcuseSeconds(); }
 
 int Level() { return g_level.load(std::memory_order_relaxed); }

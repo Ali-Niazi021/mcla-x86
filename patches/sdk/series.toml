@@ -998,6 +998,15 @@ purpose = "Exports rexgpu_pipeline_creations / rexgpu_shader_translations / rexg
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0750-present-stats"
+source = "local"
+path = "patches/sdk/0750-present-stats.patch"
+sha256 = "9d17d45517df4981f22dc92f2c4bd4c4fe0cba84fbff27e3dda4110db6d306da"
+purpose = "D3D12 presenter: samples DXGI frame statistics after every Present and logs '[present-stats]' every 10 s (presents, frames shown, dropped, refreshes and the measured rate, how many refreshes each shown frame stayed against the cadence = refresh rate / present rate: repeats and hitches; a window the display statistics cannot vouch for (hidden or covered window, mode change) prints UNRELIABLE with the reason) plus per-hitch lines. Diagnostics only; no behaviour change."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]

@@ -12,6 +12,7 @@
 #endif
 #include <windows.h>
 #include <dxgi.h>
+#include <dxgi1_5.h>
 #include <wrl/client.h>
 
 #include <cstdio>
@@ -19,6 +20,7 @@
 #include <string>
 #include <string_view>
 
+#include <fmt/format.h>
 #include <rex/cvar.h>
 #include <rex/input/device_assignment.h>
 #include <rex/input/input_system.h>
@@ -103,12 +105,155 @@ void LogAdapters() {
     if (FAILED(adapter->GetDesc1(&desc))) {
       continue;
     }
-    REXLOG_INFO("[mcla] adapter {}: {} vendor=0x{:04X} device=0x{:04X} vram={} MiB shared={} MiB{}", index,
-                Utf8FromWide(desc.Description), desc.VendorId, desc.DeviceId,
+    // The displays each GPU drives: on a hybrid laptop (NVIDIA Optimus, AMD switchable) the fast GPU often has none,
+    // and every frame it renders is copied to the other GPU to be shown.
+    std::string outputs;
+    for (UINT o = 0;; ++o) {
+      Microsoft::WRL::ComPtr<IDXGIOutput> output;
+      if (adapter->EnumOutputs(o, &output) == DXGI_ERROR_NOT_FOUND) {
+        break;
+      }
+      DXGI_OUTPUT_DESC od{};
+      if (SUCCEEDED(output->GetDesc(&od))) {
+        outputs += fmt::format("{}{} {}x{}", outputs.empty() ? "" : ", ", Utf8FromWide(od.DeviceName),
+                               od.DesktopCoordinates.right - od.DesktopCoordinates.left,
+                               od.DesktopCoordinates.bottom - od.DesktopCoordinates.top);
+      }
+    }
+    REXLOG_INFO("[mcla] adapter {}: {} vendor=0x{:04X} device=0x{:04X} vram={} MiB shared={} MiB{}; displays: {}",
+                index, Utf8FromWide(desc.Description), desc.VendorId, desc.DeviceId,
                 static_cast<uint64_t>(desc.DedicatedVideoMemory) >> 20,
                 static_cast<uint64_t>(desc.SharedSystemMemory) >> 20,
-                (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? " (software)" : "");
+                (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? " (software)" : "", outputs.empty() ? "none" : outputs);
   }
+}
+
+// Which GPU drives the monitor the game window is on, against the one that renders (the SDK's d3d12_adapter rule: -1 =
+// the first hardware adapter). A different one means every frame crosses to the other GPU before it is shown (a copy
+// over PCIe plus a composition by the DWM: no independent flip, more latency, and a frame that misses the copy waits a
+// whole refresh). Laptops with a MUX switch can wire the panel to the fast GPU ("dGPU only" / "Ultimate" mode).
+void LogDisplayPath(HWND hwnd) {
+  HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+  MONITORINFOEXW mi{};
+  mi.cbSize = sizeof(mi);
+  if (!monitor || !GetMonitorInfoW(monitor, &mi)) {
+    return;
+  }
+  const std::string monitor_name = Utf8FromWide(mi.szDevice);
+  Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+  if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+    return;
+  }
+  const int32_t wanted = rex::cvar::Query<int32_t>("d3d12_adapter");
+  int render_index = -1, display_index = -1;
+  std::string render_name, display_name;
+  for (UINT index = 0;; ++index) {
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    if (factory->EnumAdapters1(index, &adapter) == DXGI_ERROR_NOT_FOUND) {
+      break;
+    }
+    DXGI_ADAPTER_DESC1 desc{};
+    if (FAILED(adapter->GetDesc1(&desc))) {
+      continue;
+    }
+    const bool software = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+    if (render_index < 0 && ((wanted >= 0 && int32_t(index) == wanted) || (wanted == -1 && !software))) {
+      render_index = int(index);
+      render_name = Utf8FromWide(desc.Description);
+    }
+    for (UINT o = 0; display_index < 0; ++o) {
+      Microsoft::WRL::ComPtr<IDXGIOutput> output;
+      if (adapter->EnumOutputs(o, &output) == DXGI_ERROR_NOT_FOUND) {
+        break;
+      }
+      DXGI_OUTPUT_DESC od{};
+      if (SUCCEEDED(output->GetDesc(&od)) && od.Monitor == monitor) {
+        display_index = int(index);
+        display_name = Utf8FromWide(desc.Description);
+      }
+    }
+  }
+  if (display_index < 0 || render_index < 0) {
+    REXLOG_INFO("[mcla-display] the game window is on {}; its GPU could not be matched (render adapter {})",
+                monitor_name, render_index);
+  } else if (display_index == render_index) {
+    REXLOG_INFO("[mcla-display] the game window is on {}, driven by the rendering GPU ({}): direct path",
+                monitor_name, render_name);
+  } else {
+    REXLOG_WARN("[mcla-display] HYBRID PATH: the game renders on {} but the window is on {}, driven by {}: every "
+                "frame is copied to that GPU and composed by Windows before it is shown (adds latency; a copy that "
+                "misses a refresh repeats the previous frame). If the laptop has a MUX switch, the dGPU-only mode "
+                "(NVIDIA Control Panel / vendor app) removes the copy; an external monitor on a port wired to the "
+                "fast GPU does too",
+                render_name, monitor_name, display_name);
+  }
+}
+
+// A panel whose refresh rate is not a whole multiple of the frame-rate target (60 fps on 165, 144, 100 or 75 Hz)
+// cannot show the frames evenly: each stays a whole number of refreshes (2.75 on average at 60 on 165, so 3, 3, 3, 2),
+// a beat that is judder by design: no frame-time counter and no [present-stats] hitch line will point at a fault,
+// and no setting of the game fixes it. Only variable refresh (the panel follows the presents: G-Sync / FreeSync, which
+// needs tearing allowed) or a panel mode that is a multiple of the target (120 or 60 Hz) does. Said once, plainly,
+// when variable refresh cannot be used; with it allowed the [present-stats] lines show what the display really did.
+void LogRefreshCadence(void* native_window, bool tearing_allowed) {
+  const int target_fps = rex::cvar::Query<int32_t>("mcla_fps_target");
+  const mcla_host::SystemStatus status = mcla_host::QuerySystemStatus(native_window);
+  if (target_fps <= 0 || status.display_hz <= 0 || mcla_host::RefreshIsMultipleOf(status.display_hz, target_fps)) {
+    return;
+  }
+  // DXGI's own answer: can this system present with tearing, which variable refresh needs in a window or borderless?
+  bool tearing_supported = false;
+  Microsoft::WRL::ComPtr<IDXGIFactory5> factory;
+  BOOL allow_tearing = FALSE;
+  if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) &&
+      SUCCEEDED(factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing,
+                                             sizeof(allow_tearing)))) {
+    tearing_supported = allow_tearing != FALSE;
+  }
+  const int lower = status.display_hz / target_fps;  // frames last `lower` or `lower + 1` refreshes
+  const double per_frame = double(status.display_hz) / double(target_fps);
+  if (!tearing_allowed || !tearing_supported) {
+    const std::string multiples = lower >= 2 ? fmt::format("{} Hz or {} Hz", lower * target_fps, target_fps)
+                                             : fmt::format("{} Hz", target_fps);
+    REXLOG_WARN("[mcla-display] {} fps cannot be shown evenly on this panel: it refreshes at {} Hz, {:.2f} refreshes a "
+                "frame, so the frames stay {} or {} refreshes on screen in a repeating beat (judder by design, not a "
+                "slow game), and variable refresh cannot be used here ({}). What fixes it: a G-Sync / FreeSync panel "
+                "with variable refresh on in the GPU driver and d3d12_allow_variable_refresh_rate_and_tearing=true, or "
+                "the panel set to {} in Windows (Settings, System, Display, Advanced display)",
+                target_fps, status.display_hz, per_frame, lower, lower + 1,
+                !tearing_allowed ? "d3d12_allow_variable_refresh_rate_and_tearing=false"
+                                 : "the system does not allow tearing presents (DXGI_FEATURE_PRESENT_ALLOW_TEARING)",
+                multiples);
+  } else {
+    REXLOG_INFO("[mcla-display] {} fps on a {} Hz panel is {:.2f} refreshes a frame: the frames stay {} or {} refreshes "
+                "on screen (judder by design) unless the panel runs variable refresh. Tearing is allowed, so G-Sync / "
+                "FreeSync can work; it has to be on for this panel in the GPU driver. The '[present-stats]' lines "
+                "say which it was ('cadence', 'refresh clock': a clock below the display mode's rate is variable "
+                "refresh)",
+                target_fps, status.display_hz, per_frame, lower, lower + 1);
+  }
+}
+
+// The settings that decide whether the frames are locked to the display. vsync=false does NOT change how the frames
+// are presented here (the presenter always presents at once): it only stops the guest vblank from following the
+// display (it free-runs at 1 kHz) and turns the command processor's waits into spins. The 60 fps pacer then holds the
+// rate on a timer of its own that drifts against the panel's refresh: every frame lands at an arbitrary, slowly moving
+// point of the refresh, and the ones that cross the composition deadline are shown a refresh late (a repeat, then a
+// skip: judder the game's own frame-time counters cannot see).
+void LogPresentSettings(void* native_window) {
+  const bool vsync = rex::cvar::Query<bool>("vsync");
+  const std::string tearing = rex::cvar::GetFlagByName("d3d12_allow_variable_refresh_rate_and_tearing");
+  const std::string lock = rex::cvar::GetFlagByName("guest_vblank_display_lock");
+  REXLOG_INFO("[mcla-display] present settings: vsync={} (guest vblank {}), tearing allowed={}, guest_vblank_display_lock={}",
+              vsync ? "true" : "false", vsync ? "on the display's refresh" : "FREE-RUNNING at 1 kHz",
+              tearing.empty() ? "?" : tearing, lock.empty() ? "?" : lock);
+  if (!vsync) {
+    REXLOG_WARN("[mcla-display] vsync=false: the game is NOT locked to the display. The frames keep 60 fps on a timer "
+                "but drift against the panel's refresh, so some are shown a refresh late (judder), and the GPU command "
+                "thread spins instead of sleeping. It lowers no latency here. Set Vertical sync back on (launcher: "
+                "Advanced) or remove --vsync=false");
+  }
+  LogRefreshCadence(native_window, tearing != "false");
 }
 
 }  // namespace
@@ -148,6 +293,8 @@ void McLaApp::OnPostInitLogging() {
   REXLOG_INFO("[mcla] {} {} built {} {} with clang {}", GetName(), REXGLUE_BUILD_CONFIG, __DATE__, __TIME__,
               __clang_version__);
   REXLOG_INFO("[mcla] SDK rexglue {} (patch series {})", REXGLUE_VERSION_STRING, MCLA_SDK_SERIES);
+  // The exact command line (the launcher builds it from its settings): which options this run had.
+  REXLOG_INFO("[mcla] command line: {}", Utf8FromWide(GetCommandLineW()));
   if (timer_resolution_active_) {
     REXLOG_INFO("[mcla] timer resolution 1 ms{}",
                 timer_throttling_opt_out_ ? ", kept while the window is hidden"
@@ -220,7 +367,9 @@ std::optional<rex::PathConfig> McLaApp::OnFinalizePaths(const rex::PathConfig& d
     mcla_host::GuestVideoModeSize(guest_width, guest_height);
     mcla_host::LogSystemStatus(mcla_host::QuerySystemStatus(window()->GetNativeWindowHandle()),
                                rex::cvar::Query<int32_t>("mcla_fps_target"), guest_height);
+    LogDisplayPath(static_cast<HWND>(window()->GetNativeWindowHandle()));
   }
+  LogPresentSettings(window() ? window()->GetNativeWindowHandle() : nullptr);
   return defaults;
 }
 

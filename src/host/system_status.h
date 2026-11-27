@@ -87,7 +87,16 @@ void LogSystemStatus(const SystemStatus& status, int target_fps, int guest_heigh
 // reason applies. (The plan's boost mode and maximum state are logged but are not reasons.)
 std::string SystemStatusWarning(const SystemStatus& status, int target_fps, int guest_height);
 
+// True when `refresh` is, within 1 Hz (59.94 reports as 59 or 60), a whole multiple of `target` (also when either is
+// unknown, <= 0). 60 on 120 or 60 is; 60 on 165, 144, 100 or 75 is not: frames then last 2 or 3 refreshes in a beat.
+bool RefreshIsMultipleOf(int refresh, int target);
+
 // One compact line, e.g. `AC power | mode Best performance | 120 Hz 2880x1800 | cpu 20 logical`.
 std::string SystemStatusOneLine(const SystemStatus& status);
+
+// One `[mcla-sys] sample:` line (the watchdog writes one every 30 s): power source, the clock of each CPU efficiency class
+// against its maximum and its current limit (a limit under the maximum = CAPPED: thermal, power or a quiet mode), the
+// process' CPU use in cores, page faults and reads a second, its memory, and the system's memory load. One caller.
+void LogSystemSample();
 
 }  // namespace mcla_host

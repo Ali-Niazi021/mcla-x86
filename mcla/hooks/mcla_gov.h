@@ -108,6 +108,19 @@ bool CameraFeedActive();
 // cvars on its next frame), and keeps the governor from writing the tier again for 2 s so the save sees the original values; the
 // governor then writes its tier back. Nothing calls it today: it needs an SDK patch (a pre-save callback in cvar.cpp's SaveConfig /
 // SaveConfigValues, or a call in settings_overlay.cpp) and one line in McLaApp::OnPreSetup to register it.
+// The GPU plugin's counters, read now (SDK exports; zero / false where a symbol is missing): cumulative pipelines created
+// and shaders translated at run time, pipelines in flight (0590), and the GPU busy time of the last frame read back
+// (04f0/0510, 2-4 frames late). For the hitch lines (mcla_hitch.cpp); resolved once, on the first call.
+struct GpuCounters {
+  bool compile = false;
+  uint32_t pipelines = 0;
+  uint32_t shaders = 0;
+  int32_t pending = 0;
+  bool gpu = false;
+  uint32_t gpu_us = 0;
+};
+GpuCounters ReadGpuCounters();
+
 void BeforeConfigSave();
 // Process end: mcla_gfx_tier and rexgpu_vrs_level back to what they were, and the governor stays quiet. Registered with std::atexit
 // when the governor first runs; the window-close path of the SDK (ReXApp::OnClosing) leaves through std::_Exit, which runs no atexit

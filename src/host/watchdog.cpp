@@ -31,6 +31,7 @@
 
 // mcla/hooks/nfsc_progress.h (GAME slice): the frame heartbeat the game's per-frame hook bumps.
 #include "nfsc_progress.h"
+#include "system_status.h"
 
 namespace mcla_host {
 
@@ -204,6 +205,7 @@ struct SampleState {
   int since_last_dump = 0;
   int since_snapshot = 0;
   int since_heartbeat_line = 0;
+  int since_system_sample = 0;
   bool alarmed = false;
 };
 
@@ -214,6 +216,10 @@ void Sample(SampleState& s) {
   if (++s.since_heartbeat_line >= kSecondsBetweenHeartbeatLines) {
     s.since_heartbeat_line = 0;
     REXLOG_INFO("[mcla-heartbeat] frames={}", nfsc::ProgressBeats());
+  }
+  if (++s.since_system_sample >= 30) {
+    s.since_system_sample = 0;
+    LogSystemSample();  // system_status.h: power, CPU clocks and limits, the process' CPU and memory
   }
 
   auto* kernel = rex::system::kernel_state();

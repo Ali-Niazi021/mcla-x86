@@ -30,6 +30,7 @@
 #include "mcla_game_state.h"
 #include "mcla_gov.h"
 #include "mcla_guest.h"
+#include "mcla_hitch.h"
 #include "mcla_hooks.h"
 #include "mcla_t_common.h"
 #include "frame_cap.h"
@@ -170,6 +171,7 @@ int64_t g_tier_end_ns = 0;
 int g_tier_prev_hold_s = 0;
 uint64_t g_tier_drops = 0;
 int64_t g_last_frame_ns = 0;   // OnFrameStart: the previous engine frame (frame-time counters)
+double g_last_slept_ms = 0.0;  // OnFrameStart: what the pacer slept at the start of the previous frame (hitch lines)
 int g_last_grid = 0;           // NextStep: the grid of the previous frame (Hz x 10 + period quanta)
 // P1 end
 
@@ -626,6 +628,8 @@ int NextStep(int* substeps, int* quantum_hz) {
 void OnFrameStart(int64_t now_ns) {
   const bool on = Enabled();
   int64_t wake_ns = 0;  // the steady-clock time the pacer sleeps until (0 = no sleep this frame)
+  double hitch_frame_ms = 0.0;  // for mcla::hitch::OnFrame, after g_mutex
+  double hitch_slept_ms = 0.0;
   // The screen the player is on, before g_mutex (the classifier has its own lock): -1 unknown (counts as a drive), 0 a
   // drive, 1 a menu, pause or load. Pacer 2 judges drives only; the governor sheds load only in a drive.
   const int screen_mode = on ? mcla::gamestate::ProfileMode() : -1;
@@ -666,8 +670,11 @@ void OnFrameStart(int64_t now_ns) {
     // P1: the frame-time counters (real time between engine frames; a gap over 1 s is a load or a suspension).
     if (g_last_frame_ns != 0 && now_ns - g_last_frame_ns < 1'000'000'000) {
       g_win.frame_times.Add(double(now_ns - g_last_frame_ns) / 1e6);
+      hitch_frame_ms = double(now_ns - g_last_frame_ns) / 1e6;
+      hitch_slept_ms = g_last_slept_ms;
     }
     g_last_frame_ns = now_ns;
+    g_last_slept_ms = 0.0;
     // P1: the end of a 120 -> 60 tier: its time passed.
     if (g_tier60.load() && now_ns >= g_tier_until_ns) {
       g_tier60.store(false);
@@ -704,12 +711,15 @@ void OnFrameStart(int64_t now_ns) {
         wake_ns = deadline;
         ++g_win.sleeps;
         g_win.slept_ms += double(deadline - now_ns) / 1e6;
+        g_last_slept_ms = double(deadline - now_ns) / 1e6;
       }
       g_deadline_ns = deadline;
     }
   }
   // The GPU frame governor (mcla_gov.h): once per engine frame, outside g_mutex, before the pacer's sleep.
   mcla::gov::OnFrame(now_ns, g_last_n.load(std::memory_order_relaxed), screen_mode != 1);
+  // The hitch lines (mcla_hitch.h): what went on in a long frame.
+  mcla::hitch::OnFrame(now_ns, hitch_frame_ms, math::PacePeriodMs(EffectiveCap()), screen_mode, hitch_slept_ms);
   if (wake_ns > 0) {
     SleepUntil(wake_ns);
   }

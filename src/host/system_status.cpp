@@ -8,6 +8,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <psapi.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -19,6 +20,7 @@
 #include <string_view>
 #include <vector>
 
+#include <fmt/format.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
@@ -414,7 +416,8 @@ std::string DisplayText(const SystemStatus& status) {
   return text;
 }
 
-// True when `refresh` is, within 1 Hz (59.94 reports as 59 or 60), a whole multiple of `target`.
+}  // namespace
+
 bool RefreshIsMultipleOf(int refresh, int target) {
   if (refresh <= 0 || target <= 0) {
     return true;
@@ -422,8 +425,6 @@ bool RefreshIsMultipleOf(int refresh, int target) {
   const int multiples = std::max(1, (refresh + target / 2) / target);
   return std::abs(refresh - multiples * target) <= 1;
 }
-
-}  // namespace
 
 SystemStatus QuerySystemStatus(void* native_window) {
   SystemStatus status;
@@ -529,6 +530,132 @@ void LogSystemStatus(const SystemStatus& status, int target_fps, int guest_heigh
   if (!warning.empty()) {
     REXLOG_WARN("[mcla-sys] WARNING: {}", warning);
   }
+}
+
+
+// ---- the periodic sample (watchdog thread, every 30 s) --------------------------------------------------------------
+
+namespace {
+
+// CallNtPowerInformation(ProcessorInformation) fills one of these per logical processor (documented in the
+// CallNtPowerInformation reference; not in the SDK headers).
+struct ProcessorPowerInformation {
+  ULONG Number;
+  ULONG MaxMhz;
+  ULONG CurrentMhz;
+  ULONG MhzLimit;
+  ULONG MaxIdleState;
+  ULONG CurrentIdleState;
+};
+
+struct SampleState {
+  bool init = false;
+  std::vector<int> cls;  // efficiency class per logical processor index (-1 unknown)
+  ULONGLONG cpu_100ns = 0;
+  ULONGLONG wall_100ns = 0;
+  DWORD page_faults = 0;
+  ULONGLONG read_bytes = 0;
+  using CallNtPowerInformationFn = LONG(WINAPI*)(int, PVOID, ULONG, PVOID, ULONG);
+  CallNtPowerInformationFn call_power = nullptr;
+};
+
+ULONGLONG FileTime100ns(const FILETIME& t) { return (ULONGLONG(t.dwHighDateTime) << 32) | t.dwLowDateTime; }
+
+}  // namespace
+
+void LogSystemSample() {
+  static SampleState st;
+  SYSTEM_INFO si{};
+  GetSystemInfo(&si);
+  const DWORD count = si.dwNumberOfProcessors;
+  if (!st.init) {
+    st.init = true;
+    st.cls.assign(count, -1);
+    ULONG length = 0;
+    GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+    if (length) {
+      std::vector<uint8_t> buffer(length);
+      if (GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()), length, &length,
+                                     GetCurrentProcess(), 0)) {
+        for (size_t offset = 0; offset + 8 <= length;) {
+          const auto* entry = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+          if (entry->Size == 0) break;
+          if (entry->Type == CpuSetInformation && entry->CpuSet.Group == 0 &&
+              entry->CpuSet.LogicalProcessorIndex < count) {
+            st.cls[entry->CpuSet.LogicalProcessorIndex] = entry->CpuSet.EfficiencyClass;
+          }
+          offset += entry->Size;
+        }
+      }
+    }
+    if (HMODULE module = LoadLibraryExW(L"powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+      st.call_power = ProcAddress<SampleState::CallNtPowerInformationFn>(module, "CallNtPowerInformation");
+    }
+  }
+
+  // Power source.
+  SYSTEM_POWER_STATUS power{};
+  std::string source = "power ?";
+  if (GetSystemPowerStatus(&power)) {
+    source = power.ACLineStatus == 1 ? "AC" : power.ACLineStatus == 0 ? "BATTERY" : "power ?";
+    if (power.BatteryLifePercent <= 100) source += fmt::format(" {} %", power.BatteryLifePercent);
+    if (power.SystemStatusFlag & 1) source += ", battery saver ON";
+  }
+
+  // Clocks per efficiency class: average current MHz and the lowest limit against the maximum. A limit under the
+  // maximum is the firmware or Windows capping the clock (thermal, power, a quiet mode).
+  std::string clocks;
+  if (st.call_power && count > 0) {
+    std::vector<ProcessorPowerInformation> info(count);
+    constexpr int kProcessorInformation = 11;
+    if (st.call_power(kProcessorInformation, nullptr, 0, info.data(),
+                      ULONG(sizeof(ProcessorPowerInformation) * count)) == 0) {
+      std::map<int, std::vector<const ProcessorPowerInformation*>, std::greater<int>> by_class;
+      for (DWORD i = 0; i < count; ++i) by_class[i < st.cls.size() ? st.cls[i] : -1].push_back(&info[i]);
+      for (const auto& [cls, list] : by_class) {
+        uint64_t sum = 0;
+        ULONG max_mhz = 0, min_limit = ~0u;
+        for (const ProcessorPowerInformation* p : list) {
+          sum += p->CurrentMhz;
+          max_mhz = std::max(max_mhz, p->MaxMhz);
+          min_limit = std::min(min_limit, p->MhzLimit);
+        }
+        clocks += fmt::format("{}class{} {} MHz (max {}, limit {}{})", clocks.empty() ? "" : ", ", cls,
+                              sum / std::max<size_t>(1, list.size()), max_mhz, min_limit,
+                              min_limit < max_mhz ? " CAPPED" : "");
+      }
+    }
+  }
+
+  // The process: cores' worth of CPU used since the last sample, memory, paging and reads.
+  FILETIME create{}, exit{}, kernel{}, user{}, now_ft{};
+  GetProcessTimes(GetCurrentProcess(), &create, &exit, &kernel, &user);
+  GetSystemTimeAsFileTime(&now_ft);
+  const ULONGLONG cpu = FileTime100ns(kernel) + FileTime100ns(user);
+  const ULONGLONG wall = FileTime100ns(now_ft);
+  PROCESS_MEMORY_COUNTERS_EX pmc{};
+  pmc.cb = sizeof(pmc);
+  K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
+  IO_COUNTERS io{};
+  GetProcessIoCounters(GetCurrentProcess(), &io);
+  MEMORYSTATUSEX mem{};
+  mem.dwLength = sizeof(mem);
+  GlobalMemoryStatusEx(&mem);
+  std::string usage = "process: first sample";
+  if (st.wall_100ns && wall > st.wall_100ns) {
+    const double seconds = double(wall - st.wall_100ns) / 1e7;
+    usage = fmt::format("process: {:.2f} cores, {} page faults/s, reads {:.1f} MiB/s",
+                        double(cpu - st.cpu_100ns) / 1e7 / seconds,
+                        uint64_t(double(pmc.PageFaultCount - st.page_faults) / seconds),
+                        double(io.ReadTransferCount - st.read_bytes) / seconds / (1024.0 * 1024.0));
+  }
+  st.cpu_100ns = cpu;
+  st.wall_100ns = wall;
+  st.page_faults = pmc.PageFaultCount;
+  st.read_bytes = io.ReadTransferCount;
+  REXLOG_INFO("[mcla-sys] sample: {} | cpu {} | {}, working set {} MiB, private {} MiB | system memory {} % used",
+              source, clocks.empty() ? std::string("clocks ?") : clocks, usage, uint64_t(pmc.WorkingSetSize >> 20),
+              uint64_t(pmc.PrivateUsage >> 20), uint32_t(mem.dwMemoryLoad));
 }
 
 }  // namespace mcla_host

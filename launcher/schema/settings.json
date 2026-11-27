@@ -1507,17 +1507,6 @@
       "emit": "nondefault"
     },
     {
-      "id": "vsync",
-      "label": "Vertical sync (keep on)",
-      "help": "WARNING: turning this off makes the game's vblank free-run at about 1 kHz, so the game runs far too fast. The 60 fps timing paces itself; leave this on.",
-      "category": "advanced",
-      "type": "bool",
-      "cvar": "vsync",
-      "default": true,
-      "advanced": true,
-      "emit": "nondefault"
-    },
-    {
       "id": "log_level",
       "label": "Log level",
       "help": "How much the game writes to its log. Info is normal; trace and debug are very verbose.",
