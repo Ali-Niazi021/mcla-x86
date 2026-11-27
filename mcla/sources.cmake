@@ -60,6 +60,11 @@
 #             VIS_MOTION_BLUR (mid-asm hooks 0x822E85F8 + 0x822E88E0, entries in hooks_vis.toml, cvar mcla_vis_motion_blur): the
 #             length of the motion blur streaks at 60 fps (1 = as the game does, -1 = the streak of a 30 fps frame, > 0 = a multiplier)
 #
+# cheat     mcla_cheat.cpp (no flag, no [[midasm_hook]] entry, no codegen run: the glob below picks it up): the classic cheats of the mod
+#           menu's Cheats tab, done through the game's own cheat bytes and parameter words and the engine timer's scale; one
+#           mcla::cheat::OnFrame() call per engine frame from the heartbeat hook; cvars mcla_cheat_*, all transient, all inert unless
+#           mcla_overlay_cheats is on (pure logic in mcla_cheat_math.h, unit-tested in mcla/tests/test_cheat.cpp; docs/CHEATS.md)
+#
 # Not hooks, always compiled (no flag, no [[midasm_hook]] entry; the glob below picks them up): the shared state of a hook
 # group (mcla_t_common.cpp, mcla_ws_common.cpp, mcla_cpu_common.cpp, mcla_gfx_tune.cpp) and the LOCK60 GPU frame governor
 # mcla_gov.cpp (pure logic in mcla_gov_math.h, unit-tested in mcla/tests/test_gov.cpp), called once per engine frame from

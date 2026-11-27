@@ -61,6 +61,7 @@
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
 
+#include "mcla_cheat.h"
 #include "mcla_game_state.h"
 #include "overlay.h"
 #include "overlay_feed.h"
@@ -188,6 +189,12 @@ constexpr ImVec4 kWarn{1.00f, 0.80f, 0.30f, 1.0f};
 constexpr ImVec4 kBad{1.00f, 0.40f, 0.35f, 1.0f};
 constexpr ImVec4 kDim{0.62f, 0.64f, 0.68f, 1.0f};
 constexpr ImVec4 kAccent{0.45f, 0.78f, 1.00f, 1.0f};
+
+// overlay_items.h numbers the classic cheats by mcla::cheat::Which (Item::state).
+static_assert(int(mcla::cheat::Which::kNitro) == 0 && int(mcla::cheat::Which::kSpecial) == 1 && int(mcla::cheat::Which::kDamage) == 2 &&
+                  int(mcla::cheat::Which::kCops) == 3 && int(mcla::cheat::Which::kTimeScale) == 4 &&
+                  int(mcla::cheat::Which::kNoSave) == 5 && int(mcla::cheat::Which::kUnlock) == 6,
+              "Item::state in overlay_items.h follows mcla::cheat::Which");
 
 enum Tab { kTabDisplay, kTabGraphics, kTabGame, kTabCheats, kTabAbout, kTabCount };
 constexpr const char* kTabNames[kTabCount] = {"Display", "Graphics", "Game", "Cheats / mods", "About"};
@@ -1187,6 +1194,11 @@ void Overlay::Row(const Item& it) {
     if (disabled_why) tip += fmt::format("\n({})", disabled_why);
     Tooltip(tip.c_str());
   }
+  if (it.note && *it.note) {  // the classic cheats: what it does and how sure we are, always visible
+    ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+    ImGui::TextWrapped("%s", it.note);
+    ImGui::PopStyleColor();
+  }
 
   ImGui::TableNextColumn();
   ImGui::SetNextItemWidth(-FLT_MIN);
@@ -1438,6 +1450,16 @@ void Overlay::Row(const Item& it) {
       break;
     }
   }
+  if (it.state >= 0 && !disabled_why) {  // the classic cheats: what the game thread is doing with it (holding, waiting, refused)
+    const mcla::cheat::Which which = mcla::cheat::Which(it.state);
+    const mcla::cheat::State st = mcla::cheat::StateOf(which);
+    if (st != mcla::cheat::State::kOff) {
+      const std::string text = mcla::cheat::StateText(which);
+      ImGui::PushStyleColor(ImGuiCol_Text, st == mcla::cheat::State::kOn ? kGood : st == mcla::cheat::State::kRefused ? kBad : kWarn);
+      ImGui::TextWrapped("%s", text.c_str());
+      ImGui::PopStyleColor();
+    }
+  }
   ImGui::PopID();
   if (disabled_why) ImGui::EndDisabled();
 
@@ -1557,14 +1579,70 @@ void Overlay::DrawTabGame() {
 
 void Overlay::DrawTabCheats() {
   using namespace mcla_overlay::items;
-  ImGui::TextWrapped("Cheats and mods change the running game. They are all OFF by default, switch off again when you "
-                     "press the button below or restart, and are never saved. Nothing here touches your save file.");
+  ImGui::TextWrapped("Cheats and mods change the running game. They are all OFF by default and at every start, switch off when you "
+                     "press the button below or restart, and are never saved as settings. The time, weather, traffic and driving rows "
+                     "do not touch your save file; the money, unlock and save rows can: read the coloured notes.");
   Section("", {&kCheatsGate});
   if (!cheats_allowed_) {
     ImGui::TextColored(kDim, "Switch on \"Allow cheats and mods\" to use the settings below.");
   }
   Section("Time and weather", {&kTod, &kClock, &kWeather, &kWeatherSnap});
   Section("Traffic", {&kRoadDensity});
+
+  Section("While you drive", {&kCheatNitro, &kCheatSpecial, &kCheatDamage, &kCheatCops, &kCheatSlow});
+  ImGui::TextColored(kDim, "These act only in free roam and in races: in a menu, a loading screen, a cutscene or the garage the game's own "
+                           "values are back. While one of the first four is on, the game itself counts the drive as cheating: it pays no "
+                           "reputation and no money for it. Confidence: A = the game's own cheat, read at several places of its code; B = "
+                           "one consistent reading, not yet watched in a run.");
+
+  Section("Money (can end up in your save)", {&kCheatMoneyAmount});
+  {
+    auto dollars = [](int64_t v) {
+      std::string digits = std::to_string(v < 0 ? -v : v);
+      std::string out;
+      for (size_t i = 0; i < digits.size(); ++i) {
+        if (i > 0 && (digits.size() - i) % 3 == 0) out += ',';
+        out += digits[i];
+      }
+      return v < 0 ? "-" + out : out;
+    };
+    int32_t now = 0;
+    if (mcla::cheat::CurrentMoney(&now)) {
+      ImGui::TextColored(kDim, "The career's money now: $%s", dollars(now).c_str());
+    } else {
+      ImGui::TextColored(kDim, "The career's money now: not available (no career is loaded).");
+    }
+    const int64_t amount = int64_t(mcla_overlay::CvarNumber("mcla_cheat_money_amount"));
+    auto press = [&](int op, const char* verb) {
+      mcla_overlay::SetCvarNumber("mcla_cheat_money_request", double(op), false);
+      status_ = fmt::format("Money: {} asked for; the game does it on its next frame (the line below says what happened).", verb);
+    };
+    if (!cheats_allowed_) ImGui::BeginDisabled();
+    if (ImGui::Button(fmt::format("Give ${}", dollars(amount)).c_str())) press(1, "give");
+    ImGui::SameLine();
+    if (ImGui::Button(fmt::format("Take ${}", dollars(amount)).c_str())) press(2, "take");
+    ImGui::SameLine();
+    if (ImGui::Button(fmt::format("Set the money to ${}", dollars(amount)).c_str())) press(3, "set");
+    if (!cheats_allowed_) ImGui::EndDisabled();
+    const std::string last = mcla::cheat::LastMoneyMessage();
+    if (!last.empty()) ImGui::TextWrapped("%s", last.c_str());
+    ImGui::TextColored(kDim, "Works in a drive, the pause menu, the garage and the map; once per press; the old amount is in the log "
+                             "([mcla-cheat] money).");
+  }
+
+  Section("Unlocks (can end up in your save)", {&kCheatUnlock});
+  Section("Protect your save", {&kCheatNoSave});
+  {
+    std::string root = mcla_overlay::CvarString("user_data_root");
+    if (root.empty()) root = "Documents\\mcla_x86";
+    ImGui::PushStyleColor(ImGuiCol_Text, kWarn);
+    ImGui::TextWrapped("Money and unlocks, and what you do with them, are written to your profile the next time the game saves (it saves "
+                       "by itself). To keep them out: switch on \"Don't write saves this session\" first, or back up the folder %s\\<your "
+                       "xuid>\\545407F8 and put it back afterwards.",
+                       root.c_str());
+    ImGui::PopStyleColor();
+  }
+
   const bool any = mcla_overlay::AnyCheatActive();
   if (!any) ImGui::BeginDisabled();
   if (ImGui::Button("Switch every cheat off")) {
@@ -1576,12 +1654,12 @@ void Overlay::DrawTabCheats() {
   ImGui::TextColored(any ? kWarn : kGood, any ? "a cheat is ON" : "no cheat is on");
 
   if (ImGui::CollapsingHeader("Not available yet")) {
-    ImGui::TextColored(kDim, "These need the game's code studied first; nothing is guessed and nothing is written:");
-    ImGui::BulletText("Money, unlock all cars and parts: the career economy and the save's inventory.");
-    ImGui::BulletText("Infinite nitro: the vehicle's nitro state (an offset from another project's HUD hook, never tried here).");
-    ImGui::BulletText("No damage: the vehicle damage and collision response.");
-    ImGui::BulletText("No police: cop spawning and the pursuit AI (two traffic functions are named, no way to call them yet).");
-    ImGui::BulletText("Freeze the AI, slow motion: the AI update loops and the time scale of the game's timer.");
+    ImGui::TextColored(kDim, "These need a look at a running game first; nothing is guessed and nothing is written:");
+    ImGui::BulletText("Reputation points (RP): the career's experience systems are not mapped to a field yet.");
+    ImGui::BulletText("Unlock all cars: there is no unlock switch for cars in the game; they are bought (use the money row).");
+    ImGui::BulletText("Freeze the traffic or the opponents: a candidate switch exists, its effect on cars already on the road is unknown.");
+    ImGui::BulletText("Instant escape from the police: the No police row stops them; ending a pursuit already running needs a call into the game.");
+    ImGui::BulletText("Earn money and reputation while a cheat is on: the game withholds it on purpose (its own rule, kept).");
   }
 }
 

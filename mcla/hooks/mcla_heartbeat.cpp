@@ -44,6 +44,7 @@
 #include <rex/ui/low_latency.h>
 
 #include "game_profile.h"
+#include "mcla_cheat.h"
 #include "mcla_gfx_tune.h"
 #include "mcla_hooks.h"
 #include "mcla_t_common.h"
@@ -114,6 +115,10 @@ void mcla_hook_heartbeat(PPCRegister& r3) {
   }
   // The game's own quality knobs (mcla_gfx_tune.cpp, NATIVE_RENDERER.md section 22): live writes.
   mcla::gfxtune::OnFrame();
+  // The classic cheats of the mod menu (mcla_cheat.cpp): the game's own cheat bytes, the timer's scale, the money button. Writes guest
+  // memory only while one is on (and the gate mcla_overlay_cheats with it); one cvar read each otherwise. Here, before the timer
+  // reads its scale (+0x54) in the update this hook is the first instruction of.
+  mcla::cheat::OnFrame();
   // The 60 fps timing: pacer, substep reset, check line (mcla_t_common.cpp). It may sleep.
   mcla::sim::OnFrameStart(now);
   // The SDK's low-latency frame (SDK patch low-latency; 0780 for DLSS-G): after the pacer, so the driver's wait (Reflex)

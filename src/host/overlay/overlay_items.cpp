@@ -30,7 +30,7 @@ std::set<std::string> g_changed;  // UI thread only
 // Never written by Save: the cheats (their cvars are the game's dev scene switches: a held hour or weather must not come back
 // at the next start), the gate that unlocks them, and the run-time tier (transient anyway).
 bool NeverSaved(const std::string& name) {
-  return name.rfind("mcla_dev_", 0) == 0 || name == "mcla_overlay_cheats" || name == "mcla_gfx_tier";
+  return name.rfind("mcla_dev_", 0) == 0 || name.rfind("mcla_cheat_", 0) == 0 || name == "mcla_overlay_cheats" || name == "mcla_gfx_tier";
 }
 
 const std::vector<const char*> kDetailKnobs = {
@@ -44,7 +44,22 @@ const std::vector<const char*> kCheats = {
     "mcla_dev_tod_freeze",
     "mcla_dev_weather",
     "mcla_dev_road_density",
+    // the classic cheats (mcla/hooks/mcla_cheat.cpp); the money amount is a setting of the buttons, not a cheat, and stays
+    "mcla_cheat_nitro",
+    "mcla_cheat_special",
+    "mcla_cheat_nodamage",
+    "mcla_cheat_nocops",
+    "mcla_cheat_timescale",
+    "mcla_cheat_nosave",
+    "mcla_cheat_unlock",
+    "mcla_cheat_money_request",
 };
+
+// A cheat cvar is off at its app default: -1 for the scene cvars (their own value), false for a switch, 1 for the time scale, 0 for the
+// money request. Judged by the registry's own default, so a new cheat needs no table of "off" values.
+bool CheatIsOn(const char* name) {
+  return rex::cvar::HasNonDefaultValue(name);
+}
 
 }  // namespace
 
@@ -195,7 +210,7 @@ const std::vector<const char*>& CheatCvars() { return kCheats; }
 
 bool AnyCheatActive() {
   for (const char* name : kCheats) {
-    if (CvarNumber(name) >= 0.0) return true;  // -1 = off for every one of them
+    if (CheatIsOn(name)) return true;
   }
   return false;
 }

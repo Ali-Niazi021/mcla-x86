@@ -11,6 +11,23 @@ Owner: ORC (merges what tasks report). One entry per non-obvious finding, newest
 
 Native PC work (2026-11-27, new machine: RTX 4060 Laptop, 6P+8E Intel, panel 3200x2000 @ 165 Hz):
 
+### NATIVE-CHEATS The game ships its own cheats: find them before writing any
+**Symptom** The Cheats tab listed money, nitro, damage and police as "needs the game's code studied" (no addresses). **Cause** The game's
+string table names its cheat system (`cheat_Unlimited_Nitro`, `unlimitednitrous`, `nosave`, `unlockraces`, `mcExperienceManager_AddMoney`
+...), and a cross-reference index of the generated code (every `lis` + `addi` / load / store address, 3.7 s in one Python pass) leads from a
+name to its 540 sysParam nodes (`+4` = the value word), to the cheat-byte block `0x8288E5A7..0x8288E5BE` and to every reader. The pause
+menu's Cheats page flips the same bytes. A drive with one on is "cheating" (`sub_82387A98`): no reputation, no money. **Fix** Hold the game's
+own bytes / words from the heartbeat hook only while a drive is on screen and give the original back (`mcla_cheat.cpp`, no mid-asm hook,
+no codegen run); multiply the timer's scale (`+0x54`) instead of replacing it; money is one s32 at `[[0x8287484C]+0x1FC]`. **Evidence**
+`docs/CHEATS.md`; method: strings, xrefs, then read the consumers. **Cost** a static session; nothing was built or run.
+**First run (2026-11-27, `docs/CHEATS.md` "Results of the first run")** The bytes, the timer word and the parameter words were right the first time; one
+static misreading was caught only by the running game: the money row's vtable check (`sub_822BFE30` runs the base constructor `sub_826BA578`,
+which sets `0x820BBDC4`, and then stores the derived class's `0x82039058`; no object with `0x820BBDC4` exists), so money would always have been
+refused. A constructor's vtable store is not the object's final vtable when a caller overwrites it. How it was found and checked without any
+in-game tool: a read-only Python probe (`ReadProcessMemory` on the game process; the 4 GiB guest mapping is found by testing candidate bases
+against a known pointer, `[0x8286D874]` -> the string "nosave"; base `0x100000000` here) logging the cheat bytes, the timer word, the money
+field and the nitro objects (found by their vtable `0x82046F90`, bars = s16 at `+18`) four times a second next to the screenshots.
+
 ### NATIVE-A vsync=false unlocked the guest vblank: judder with flawless game-thread frame times
 **Symptom** The game thread was flawless (p99 19 ms, no missed frame) while every swap was late on the RTX 4060
 laptop, and the picture judders. **Cause** vsync=false makes the guest vblank free-run at 1 kHz, so the 60 fps pacer
