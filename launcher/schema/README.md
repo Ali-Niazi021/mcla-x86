@@ -12,7 +12,8 @@ Conventions used by this file:
 - `default` is what the launcher starts with: the "Recommended (1080p)" preset (native 1080p, single tile, MSAA off, 60 fps profile, Performance scene detail). Where that differs from the
   cvar's own default (or from what `mcla/profile/pc_profile.cpp` applies), the setting uses `emit: always`, so the command
   line fully decides the run. Everything else uses `emit: nondefault` and its default equals the game's effective default
-  (the cvar's, or the profile's: `anisotropic_override` 5 and `mnk_mode` true).
+  (the cvar's, or the profile's: `anisotropic_override` 5, `mnk_mode` true and `d3d12_allow_variable_refresh_rate_and_tearing`
+  false: the SDK's default is on, the profile turns it off so a TV or an ordinary monitor does not tear).
 - `requires` follows how the game works: FSR needs MSAA off, the single-tile scene and Direct3D 12 (`temporal_aa`), its
   version/quality/sharpness need FSR, the 60 fps timing options need `mcla_fps_target` 60, keyboard bindings need
   `mnk_mode`, the window size needs windowed mode. A hidden setting is never emitted.

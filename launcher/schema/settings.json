@@ -299,12 +299,12 @@
     },
     {
       "id": "d3d12_allow_variable_refresh_rate_and_tearing",
-      "label": "Allow tearing / variable refresh rate",
-      "help": "Direct3D 12 presents with tearing allowed, so G-Sync / FreeSync work and a late frame is not held to the next refresh. Turn off if you see tearing you dislike.",
+      "label": "Allow tearing (G-Sync / FreeSync only)",
+      "help": "Off (recommended): no tearing. Each frame waits for the display's next refresh, which is right for TVs and ordinary monitors, 60 Hz ones included. On: a frame may reach the screen at once, in the middle of a refresh. That is for G-Sync / FreeSync displays (variable refresh on in the graphics driver); on a TV or an ordinary monitor it tears.",
       "category": "display",
       "type": "bool",
       "cvar": "d3d12_allow_variable_refresh_rate_and_tearing",
-      "default": true,
+      "default": false,
       "advanced": true,
       "emit": "nondefault"
     },

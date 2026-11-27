@@ -513,7 +513,9 @@ Reports in `$WORK/scratch/{S2,S3,S4,S5,R2,R3,R4,R5,R6}/REPORT.md`.
   generated identity stays `nfsmw`.
 - **No GPU-backend cvar in the SDK:** host cvar `mcla_gpu_backend` (`d3d12` default, `vulkan`).
 - **`vsync` stays true.** `vsync=false` makes the guest vblank fire at ~1 kHz.
-- **Tearing cvar** is `d3d12_allow_variable_refresh_rate_and_tearing` (default on). **Guest vblank rate** cvar is
+- **Tearing cvar** is `d3d12_allow_variable_refresh_rate_and_tearing` (the SDK's default is on; the PC profile sets it OFF,
+  and the launcher's "Allow tearing (G-Sync / FreeSync only)" is off by default: with it on, every frame flips mid-refresh, which
+  tears on a TV or ordinary monitor; only a G-Sync / FreeSync display wants it). **Guest vblank rate** cvar is
   `video_mode_refresh_rate` (no `guest_vblank_rate`). **Video mode**: `resolution=WxH`.
 - **`nfsmw_cp_event_seq` export lives in `rexgpu-xenos.dll`** (the command processor is in the GPU plugin), not
   `rexruntime.dll`. W3.2 exports it; `mcla_fence_spin` resolves it there with a bounded fallback.

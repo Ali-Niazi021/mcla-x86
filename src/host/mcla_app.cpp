@@ -189,27 +189,30 @@ void LogDisplayPath(HWND hwnd) {
   }
 }
 
+// DXGI's own answer: can this system present with tearing, which variable refresh needs in a window or borderless?
+bool DxgiSupportsTearing() {
+  Microsoft::WRL::ComPtr<IDXGIFactory5> factory;
+  BOOL allow_tearing = FALSE;
+  return SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) &&
+         SUCCEEDED(factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing,
+                                                sizeof(allow_tearing))) &&
+         allow_tearing != FALSE;
+}
+
 // A panel whose refresh rate is not a whole multiple of the frame-rate target (60 fps on 165, 144, 100 or 75 Hz)
 // cannot show the frames evenly: each stays a whole number of refreshes (2.75 on average at 60 on 165, so 3, 3, 3, 2),
 // a beat that is judder by design: no frame-time counter and no [present-stats] hitch line will point at a fault,
 // and no setting of the game fixes it. Only variable refresh (the panel follows the presents: G-Sync / FreeSync, which
-// needs tearing allowed) or a panel mode that is a multiple of the target (120 or 60 Hz) does. Said once, plainly,
-// when variable refresh cannot be used; with it allowed the [present-stats] lines show what the display really did.
+// needs tearing allowed; off by default, because on a TV or an ordinary monitor it tears) or a panel mode that is a
+// multiple of the target (120 or 60 Hz) does. Said once, plainly, when variable refresh is not in use; with it allowed
+// the [present-stats] lines show what the display really did.
 void LogRefreshCadence(void* native_window, bool tearing_allowed) {
   const int target_fps = rex::cvar::Query<int32_t>("mcla_fps_target");
   const mcla_host::SystemStatus status = mcla_host::QuerySystemStatus(native_window);
   if (target_fps <= 0 || status.display_hz <= 0 || mcla_host::RefreshIsMultipleOf(status.display_hz, target_fps)) {
     return;
   }
-  // DXGI's own answer: can this system present with tearing, which variable refresh needs in a window or borderless?
-  bool tearing_supported = false;
-  Microsoft::WRL::ComPtr<IDXGIFactory5> factory;
-  BOOL allow_tearing = FALSE;
-  if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) &&
-      SUCCEEDED(factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing,
-                                             sizeof(allow_tearing)))) {
-    tearing_supported = allow_tearing != FALSE;
-  }
+  const bool tearing_supported = DxgiSupportsTearing();
   const int lower = status.display_hz / target_fps;  // frames last `lower` or `lower + 1` refreshes
   const double per_frame = double(status.display_hz) / double(target_fps);
   if (!tearing_allowed || !tearing_supported) {
@@ -217,11 +220,12 @@ void LogRefreshCadence(void* native_window, bool tearing_allowed) {
                                              : fmt::format("{} Hz", target_fps);
     REXLOG_WARN("[mcla-display] {} fps cannot be shown evenly on this panel: it refreshes at {} Hz, {:.2f} refreshes a "
                 "frame, so the frames stay {} or {} refreshes on screen in a repeating beat (judder by design, not a "
-                "slow game), and variable refresh cannot be used here ({}). What fixes it: a G-Sync / FreeSync panel "
-                "with variable refresh on in the GPU driver and d3d12_allow_variable_refresh_rate_and_tearing=true, or "
+                "slow game), and variable refresh is not in use ({}). What fixes it: a G-Sync / FreeSync panel "
+                "with variable refresh on in the GPU driver and \"Allow tearing (G-Sync / FreeSync only)\" on in the "
+                "launcher (Display, Advanced; command line --d3d12_allow_variable_refresh_rate_and_tearing=true), or "
                 "the panel set to {} in Windows (Settings, System, Display, Advanced display)",
                 target_fps, status.display_hz, per_frame, lower, lower + 1,
-                !tearing_allowed ? "d3d12_allow_variable_refresh_rate_and_tearing=false"
+                !tearing_allowed ? "tearing is off, which is the default: no tearing on a TV or an ordinary monitor"
                                  : "the system does not allow tearing presents (DXGI_FEATURE_PRESENT_ALLOW_TEARING)",
                 multiples);
   } else {
@@ -235,11 +239,14 @@ void LogRefreshCadence(void* native_window, bool tearing_allowed) {
 }
 
 // The settings that decide whether the frames are locked to the display. vsync=false does NOT change how the frames
-// are presented here (the presenter always presents at once): it only stops the guest vblank from following the
-// display (it free-runs at 1 kHz) and turns the command processor's waits into spins. The 60 fps pacer then holds the
-// rate on a timer of its own that drifts against the panel's refresh: every frame lands at an arbitrary, slowly moving
-// point of the refresh, and the ones that cross the composition deadline are shown a refresh late (a repeat, then a
-// skip: judder the game's own frame-time counters cannot see).
+// are presented here (the presenter always presents with sync interval 0): it only stops the guest vblank from
+// following the display (it free-runs at 1 kHz) and turns the command processor's waits into spins. The 60 fps pacer
+// then holds the rate on a timer of its own that drifts against the panel's refresh: every frame lands at an arbitrary,
+// slowly moving point of the refresh, and the ones that cross the composition deadline are shown a refresh late (a
+// repeat, then a skip: judder the game's own frame-time counters cannot see).
+// Whether a frame can tear is the other half, d3d12_allow_variable_refresh_rate_and_tearing (the PC profile turns it
+// off): with it off the presenter's sync-interval-0 present is held for the display's next refresh, with it on the frame
+// is flipped at once, in the middle of a refresh (clean only on a G-Sync / FreeSync display).
 void LogPresentSettings(void* native_window) {
   const bool vsync = rex::cvar::Query<bool>("vsync");
   const std::string tearing = rex::cvar::GetFlagByName("d3d12_allow_variable_refresh_rate_and_tearing");
@@ -247,13 +254,32 @@ void LogPresentSettings(void* native_window) {
   REXLOG_INFO("[mcla-display] present settings: vsync={} (guest vblank {}), tearing allowed={}, guest_vblank_display_lock={}",
               vsync ? "true" : "false", vsync ? "on the display's refresh" : "FREE-RUNNING at 1 kHz",
               tearing.empty() ? "?" : tearing, lock.empty() ? "?" : lock);
+  // The same pair in player terms, once. Tearing only happens when it is allowed AND the system can present with it.
+  const bool tearing_asked = tearing != "false";
+  const bool tearing_possible = tearing_asked && DxgiSupportsTearing();
+  const bool locked = vsync && lock != "false";
+  const char* tearing_text =
+      tearing_possible
+          ? "tearing allowed: a frame can reach the screen in the middle of a refresh (clean on a G-Sync / FreeSync "
+            "display with variable refresh on in the GPU driver, tearing on a TV or an ordinary monitor)"
+          : (tearing_asked ? "no tearing (tearing is allowed but this system cannot present with it): each frame "
+                             "waits for the display's next refresh"
+                           : "no tearing: each frame waits for the display's next refresh (right for a TV or an "
+                             "ordinary monitor)");
+  if (locked) {
+    REXLOG_INFO("[mcla-display] effective: locked to the display, {}", tearing_text);
+  } else {
+    REXLOG_INFO("[mcla-display] effective: NOT locked to the display (the frames follow a timer of their own and drift "
+                "against the refresh), {}",
+                tearing_text);
+  }
   if (!vsync) {
     REXLOG_WARN("[mcla-display] vsync=false: the game is NOT locked to the display. The frames keep 60 fps on a timer "
                 "but drift against the panel's refresh, so some are shown a refresh late (judder), and the GPU command "
-                "thread spins instead of sleeping. It lowers no latency here. Set Vertical sync back on (launcher: "
-                "Advanced) or remove --vsync=false");
+                "thread spins instead of sleeping. It lowers no latency here. Remove --vsync=false (the launcher has "
+                "no switch for it)");
   }
-  LogRefreshCadence(native_window, tearing != "false");
+  LogRefreshCadence(native_window, tearing_asked);
 }
 
 }  // namespace

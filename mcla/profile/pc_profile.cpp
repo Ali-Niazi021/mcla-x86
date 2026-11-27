@@ -156,6 +156,20 @@ constexpr CvarDefault kProfileDefaults[] = {
     // W5.5 report section B.
     {"hid_mappings_file", ""},
 
+    // ---- Presentation: no tearing by default ---------------------------------------------------------------------
+    // The SDK's presenter always presents with sync interval 0 and, while this cvar is on, creates the swap chain with
+    // DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING and presents with DXGI_PRESENT_ALLOW_TEARING: a frame is flipped at once, in the
+    // middle of a refresh. Only a G-Sync / FreeSync display makes that clean; on a fixed-refresh TV or monitor (the
+    // owner's 1920x1080 60 Hz TV) it tears. Off, the same present is held for the display's next refresh (no tearing, no
+    // wait in the Present call), and with the guest vblank locked to the display (vsync, `[guest-vblank] display lock on`)
+    // the 60 fps frames land one to a refresh. Measured on a 1920x1080 60 Hz mode of the laptop panel (runs tv-t1-* and
+    // tv-t3-* in $WORK/runs): off = every one of ~4,150 frames of a drive shown for exactly one refresh, three boots out of
+    // three; the DxgKrnl ETW trace has every flip as FlipWaitVSync. On = every flip is FlipWaitHSync, i.e. taken at the next
+    // scan line, at 8-19 % of the picture height down in the run that was traced. SDK default true (d3d12_presenter.cpp).
+    // Read when the swap chain is created; the launcher's "Allow tearing (G-Sync / FreeSync only)" turns it back on, as
+    // does the command line (a value given there wins, like every entry of this table).
+    {"d3d12_allow_variable_refresh_rate_and_tearing", "false"},
+
     // ---- HOST stream: thread policy under foreign CPU load (src/host/thread_policy.h) ---------------------------
     // The frame-critical threads (GPU Commands, GPU Submission, Main XThread and the busy guest XThreads: the render
     // thread among them) at THREAD_PRIORITY_HIGHEST, each on its own physical Zen 5 core (CPU sets of the highest

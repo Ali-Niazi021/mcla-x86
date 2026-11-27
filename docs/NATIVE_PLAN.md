@@ -41,6 +41,7 @@ rewrite. Each track below removes one piece of emulation or makes it cost nothin
 | T4 CPU | command-processor cost (state dedupe, draw batching, upload hoisting), build flags (AVX2, LTO, PGO on the generated code), hot guest routines reimplemented natively, no spin waits | profile first (T1) | soldiers, commander for PGO/LTO design |
 | T5 Game systems | reimplement what is console-shaped: streaming I/O on native threads, load hitches, LOD and culling distances for PC, 16:10 and ultrawide HUD | after T1 names the hitches | soldiers |
 | T6 120 fps | the 1/120 world grid exists (`mcla_sim_cap`); make it a supported mode: timing checks, UI, physics, pacing on a 120 Hz mode | study, then runs on the panel at 120 Hz | soldier (own agent) |
+| T9 DLSS 4 | Super Resolution into the existing temporal-upscaler path, then Frame Generation with Reflex wired in; a second route to G2 and G3 (owner's order) | design and code on a copy of the SDK, then build and test | commander |
 | T7 Overlay and mod menu | fps counter, statistics screen, mod menu (F1) on the SDK's ImGui overlays; live cvars, presets, cheats | design + code, then build and test | soldier, grunt for the cvar inventory |
 | T8 Hardware matrix | auto preset by GPU class, hybrid-GPU and refresh-rate advice at start, Intel / AMD checks | after G1 and G2 | soldier |
 
@@ -55,12 +56,13 @@ work lands; T5 and T8 last. Nothing is called faster or fixed without a measured
 | Display-side statistics `[present-stats]` | done, agrees with PresentMon within 6 frames of 5,400 | runs `pm-win-nt`, `pm-win-vrr`, `pm-full` |
 | Hitch attribution `[mcla-hitch]`, `[mcla-sys] sample`, display path, command line | done | run `final-check` |
 | Thread placement on parked cores | fixed (0 warnings in 5 runs) | run `final-check` |
-| G1 TV test, "no tearing" default | running | - |
+| G1 on a 1920x1080 @ 60 Hz mode; "no tearing" is the default | done (118 s drives; the 5 min soak is open): vsync on + tearing off = every frame exactly one refresh, 0 dropped, 0 repeats over 4 boots (about 16,600 frames, max interval 17.6 ms), display lock on, PresentMon and `[present-stats]` agree. vsync off + tearing off (the owner's run 3): 5 and 8 repeated and dropped frames in 69 s, 0 swaps on time. Tearing on: every flip taken mid-frame (ETW `FlipWaitHSync`, the tear 8-34 % down the picture). `guest_vblank_display_offset_us` 0..8000 trades latency 1:1 (16.0 -> 8.1 ms) with no repeats; default left at 0 until tested under load | runs `tv-t1-a/b/c`, `tv-t1-default`, `tv-t2-*`, `tv-t3-*`, `tv-t4-*`, `tv-t1-off*` |
 | Run summaries for the new lines | done: display verdict per run, 50 parser tests | `tools/display_log.py` |
 | Cvar inventory for the mod menu | done: 509 cvars, 119 marked live | scratch `native/cvars.json` |
 | Claude usage watch (pause at 98 % of the 5-hour limit) | running | `tools/usage_watch.py` |
 | Pipeline cache misses at boot (176 ms menu hitches) | diagnosed: about 197 render-target transfer pipelines per run (`GetOrCreateTransferPipelines`, 8 stencil-bit variants + 1 per key on a GPU without pixel-shader stencil reference) are built on first use and never stored; draw pipelines persist correctly (created minus appended is constant: 203, 203, 197, 197, 197, 197, 204). Pipelines explain 45-115 ms of a 115-205 ms hitch; the rest follows about 73,000 page faults in the same frame (lead hypothesis: first touch of the game's 267 MiB physical pool, 68,480 pages). Fix queued for the machine: store and preload the transfer keys (proposed 0600), report line (0610), then find and pre-fault the faulting range | scratch `pipeline-cache/DIAGNOSIS.md` |
 | Native roadmap study (T2, T3, T4, G3 bounds, T1 runs M1-M8) | done: `docs/native/ROADMAP.md`. Top five: the 2x path as cheap as 1x (dual write, direct present, transfer skips at draw scale 2), scale-aware off-screen targets at 2000p (shadow map first), VRS 2x2 on post at 2x, zero run-time compiles, resolve renaming. All gains are estimates from the 880M until M1-M3 run | lead spot-checked `overrides.toml` (native memcpy / memset ready but blocked by the SDK return path) |
 | Overlay and mod menu (T7) | design and first code running | - |
-| 120 fps (T6) | queued behind the TV test (both change the display mode) | - |
+| R1 (levers at draw scale 2), R2+R3 (2000p shadow size, VRS base), DLSS 4 (T9) | code being written without the machine; integration queued | scratch `r1/`, `r2r3/`, `dlss/` |
+| 120 fps (T6) | queued | - |
 | T1 measurement M1 (1080p uncapped), M2 (2000p uncapped), M3 (2000p bench) | next holder of the machine after the TV test | ROADMAP section 4 |
