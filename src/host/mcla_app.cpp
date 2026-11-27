@@ -21,6 +21,7 @@
 #include <string_view>
 
 #include <fmt/format.h>
+#include <imgui.h>
 #include <rex/cvar.h>
 #include <rex/input/device_assignment.h>
 #include <rex/input/input_system.h>
@@ -33,6 +34,7 @@
 #include "pc_profile.h"  // mcla/profile (GAME slice): mcla::ApplyPcProfileLogging(), mcla::ApplyPcProfile()
 #include "frame_cap.h"
 #include "gpu_priority.h"
+#include "overlay/overlay.h"
 #include "pf_probe.h"
 #include "power_boost.h"
 #include "system_status.h"
@@ -414,6 +416,18 @@ void McLaApp::OnPostSetup() {
   if (window()) {
     mcla_host::LogFocusState(*window(), "post-setup");
   }
+  // The input system exists: the overlay can silence it while the menu is open (the same cast ReXApp::ConstructRuntime makes).
+  mcla_host::overlay::OnRuntimeReady(runtime() ? static_cast<rex::input::InputSystem*>(runtime()->input_system()) : nullptr);
+}
+
+void McLaApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
+  // The window and the ImGui drawer exist (SetupOverlays): the overlay's key listener and cvar callbacks. Nothing is drawn, and
+  // no dialog exists, until something is shown (docs/OVERLAY.md, cost model).
+  mcla_host::overlay::Install(window(), drawer, "mcla_x86");
+}
+
+void McLaApp::OnConfigureFonts(ImFontAtlas* atlas) {
+  mcla_host::overlay::ConfigureFonts(atlas);
 }
 
 void McLaApp::OnGuestThreadExit(rex::system::XThread* /*thread*/) {
@@ -422,6 +436,7 @@ void McLaApp::OnGuestThreadExit(rex::system::XThread* /*thread*/) {
 }
 
 void McLaApp::OnShutdown() {
+  mcla_host::overlay::Shutdown();
   watchdog_.Stop();
   input_.Stop();
   thread_policy_.Stop();

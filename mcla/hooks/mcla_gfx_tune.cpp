@@ -830,6 +830,43 @@ void EnsurePreset() {
   std::call_once(once, ApplyPreset);
 }
 
+// The overlay's live preset: the same name -> knobs choice as ApplyPreset (keep the two in step), handed to a callback instead of
+// being written. "default" / "" = quality's list without its FXAA (as shipped).
+bool ForEachPresetKnob(const char* preset, void (*fn)(const char* cvar, const char* value, void* user), void* user) {
+  std::string name = Lower(preset ? preset : "");
+  if (name == "perfplus" || name == "perf_plus" || name == "perf-plus") {
+    name = "perf+";
+  }
+  std::vector<PresetKnob> knobs;
+  if (name.empty() || name == "default" || name == "none" || name == "shipped" || name == "quality" || name == "ultra") {
+    knobs.assign(std::begin(kPresetQuality), std::end(kPresetQuality));
+    if (name == "ultra") {
+      for (const PresetKnob& over : kPresetUltra) {
+        for (PresetKnob& knob : knobs) {
+          if (std::strcmp(knob.cvar, over.cvar) == 0) knob.value = over.value;
+        }
+      }
+    } else if (name != "quality") {
+      for (PresetKnob& knob : knobs) {
+        if (std::strcmp(knob.cvar, "swap_post_effect") == 0) knob.value = "none";
+      }
+    }
+  } else if (name == "perf" || name == "perf+" || name == "lowest") {
+    knobs.assign(std::begin(kPresetPerf), std::end(kPresetPerf));
+    if (name == "perf+") {
+      knobs.insert(knobs.end(), std::begin(kPresetPerfPlus), std::end(kPresetPerfPlus));
+    } else if (name == "lowest") {
+      knobs.insert(knobs.end(), std::begin(kPresetLowest), std::end(kPresetLowest));
+    }
+  } else {
+    return false;
+  }
+  for (const PresetKnob& knob : knobs) {
+    fn(knob.cvar, knob.value, user);
+  }
+  return true;
+}
+
 const TierInfo* Tiers(int* count) {
   static const TierInfo kTiers[] = {
       {0, "emergency: no sun shadows", -3.0f, false,

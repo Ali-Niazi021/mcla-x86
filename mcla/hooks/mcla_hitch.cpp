@@ -19,6 +19,8 @@
 
 #include "mcla_gov.h"
 #include "mcla_hitch.h"
+#include "overlay/overlay_feed.h"  // the statistics screen's hitch count and last cause
+#include "overlay/overlay_math.h"
 
 REXCVAR_DEFINE_DOUBLE(mcla_hitch_ms, 0.0, "MCLA",
                       "A frame longer than this (real time between engine frames, ms) gets a '[mcla-hitch]' line that "
@@ -133,13 +135,15 @@ void OnFrame(int64_t now_ns, double frame_ms, double period_ms, int screen_mode,
   if (g_lines >= REXCVAR_GET(mcla_hitch_lines)) {
     ++g_unlogged;
     g_unlogged_worst_ms = std::max(g_unlogged_worst_ms, frame_ms);
+    mcla_overlay::NoteHitch(now_ns, frame_ms, screen_mode, "not analysed (line limit of the window)");
     return;
   }
   ++g_lines;
 
   std::string cpu;
+  double on_cpu_ms = -1.0;  // the overlay's phrase for the cause needs it too
   if (tsc_per_ms > 0.0 && now.thread_cycles >= prev.thread_cycles) {
-    const double on_cpu_ms = double(now.thread_cycles - prev.thread_cycles) / tsc_per_ms;
+    on_cpu_ms = double(now.thread_cycles - prev.thread_cycles) / tsc_per_ms;
     cpu = fmt::format("game thread on CPU {:.1f} ms (waiting {:.1f} ms, of which pacer sleep {:.1f} ms)", on_cpu_ms,
                       std::max(0.0, frame_ms - on_cpu_ms), slept_ms);
   } else {
@@ -153,6 +157,20 @@ void OnFrame(int64_t now_ns, double frame_ms, double period_ms, int screen_mode,
   const std::string gpu_time = gpu.gpu && gpu.gpu_us ? fmt::format("GPU frame {:.1f} ms", gpu.gpu_us / 1000.0)
                                                      : std::string("GPU frame ?");
   const uint64_t read = now.read_bytes >= prev.read_bytes ? now.read_bytes - prev.read_bytes : 0;
+  {
+    // The same numbers as one phrase for the overlay's statistics screen (overlay_feed.h NoteHitch).
+    mcla_overlay::math::HitchFacts facts;
+    facts.frame_ms = frame_ms;
+    facts.on_cpu_ms = on_cpu_ms;
+    facts.slept_ms = slept_ms;
+    facts.pipelines = int32_t(now.pipelines - prev.pipelines);
+    facts.shaders = int32_t(now.shaders - prev.shaders);
+    facts.gpu_ms = gpu.gpu && gpu.gpu_us ? gpu.gpu_us / 1000.0 : -1.0;
+    facts.page_faults = int32_t(now.page_faults - prev.page_faults);
+    facts.read_mib = double(read) / (1024.0 * 1024.0);
+    facts.menu = screen_mode == 1;
+    mcla_overlay::NoteHitch(now_ns, frame_ms, screen_mode, mcla_overlay::math::ClassifyHitch(facts).c_str());
+  }
   REXLOG_INFO("[mcla-hitch] {:.1f} ms between engine frames ({:.1f} periods of {:.1f}) in {} | {} | {} | {} | "
               "page faults +{}, read +{:.1f} MiB",
               frame_ms, frame_ms / period, period,

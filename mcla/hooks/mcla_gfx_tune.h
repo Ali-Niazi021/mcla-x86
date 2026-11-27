@@ -21,6 +21,11 @@ namespace mcla::gfxtune {
 // and the hooks' announce lines call it, so a knob read at any time already carries the preset.
 void EnsurePreset();
 
+// The knobs of a preset, for the overlay's live preset: calls fn(cvar, value, user) for each knob the preset sets (the names of
+// mcla_gfx_preset; "default" / "" = as shipped: quality's list with swap_post_effect "none"). False, with nothing called, for a
+// name this build does not know. Nothing is written here: the caller decides how (the real preset writes app defaults).
+bool ForEachPresetKnob(const char* preset, void (*fn)(const char* cvar, const char* value, void* user), void* user);
+
 // Applies the cvars (named knobs and mcla_gfx_poke) and, when asked, logs the dump. Cheap when
 // nothing is set: a few cvar reads.
 void OnFrame();

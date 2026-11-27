@@ -9,8 +9,10 @@
 //   OnPreSetup         input system (scripted pad, every pad is player 1), the GPU plugin loaded with the backend
 //                      of --mcla_gpu_backend, the PC profile of cvar defaults (the GPU cvars must be set before the
 //                      plugin's Runtime::Setup reads them: edram_tiles, render_target_max_height)
-//   OnPostSetup        hang watchdog, input script clock
-//   OnShutdown         stops both, gives the timer resolution back
+//   OnPostSetup        hang watchdog, input script clock, the overlay learns the runtime exists (overlay/overlay.h)
+//   OnShutdown         stops both, gives the timer resolution back, removes the overlay
+//   OnCreateDialogs    the overlay's key listener and cvar callbacks (F1 mod menu, F2 FPS counter, F5 statistics)
+//   OnConfigureFonts   the overlay's baked text sizes
 //
 // Host cvars, all in mcla_app.cpp: mcla_gpu_backend (d3d12 | vulkan | any), mcla_watchdog (bool), and the frame cap's
 // mcla_fps_cap (0 | 30 | 60 | 120), mcla_fps_cap_spin, mcla_fps_cap_tail_us (frame_cap.h explains the limiter).
@@ -46,6 +48,8 @@ class McLaApp : public rex::ReXApp {
   void OnPostSetup() override;
   void OnGuestThreadExit(rex::system::XThread* thread) override;
   void OnShutdown() override;
+  void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override;
+  void OnConfigureFonts(ImFontAtlas* atlas) override;
 
  private:
   // Logs and exits with `exit_code` (after a message box, unless a script drives the run). For start-up failures

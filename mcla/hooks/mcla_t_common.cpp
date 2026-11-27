@@ -34,6 +34,7 @@
 #include "mcla_hooks.h"
 #include "mcla_t_common.h"
 #include "frame_cap.h"
+#include "overlay/overlay_feed.h"  // NoteEngineFrame: the overlay's frame ring
 
 REXCVAR_DEFINE_BOOL(mcla_sim60, false, "MCLA",
                     "MCLA 60 fps timing master switch (docs/mcla/TIMING.md). Off (default) = the game's "
@@ -626,6 +627,14 @@ int NextStep(int* substeps, int* quantum_hz) {
 }
 
 void OnFrameStart(int64_t now_ns) {
+  // The overlay's frame ring (src/host/overlay/overlay_feed.h): before the `on` test below, so the FPS counter works at the shipped
+  // 30 fps too. One relaxed load while nothing is shown.
+  mcla_overlay::NoteEngineFrame(now_ns);
+  if (mcla_overlay::Demand()) {
+    // The game timer's total with the same instant, for the overlay's world speed.
+    float world_total = 0.0f;
+    if (ImageF32(kTimerTotal, &world_total)) mcla_overlay::NoteWorldTime(now_ns, world_total);
+  }
   const bool on = Enabled();
   int64_t wake_ns = 0;  // the steady-clock time the pacer sleeps until (0 = no sleep this frame)
   double hitch_frame_ms = 0.0;  // for mcla::hitch::OnFrame, after g_mutex

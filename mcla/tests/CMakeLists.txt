@@ -20,6 +20,10 @@
 #                                                              restore, enrichment, learned costs, back-off, pop hiding, camera
 #                                                              cut / speed, pin and caps, HoldAllowed, closed loops against a toy GPU)
 #
+#   mcla_overlay_test          test_overlay.cpp                src/host/overlay/overlay_math.h (frame-time statistics, world speed,
+#                                                              rates, graph bars, font choice, hitch phrases), overlay_json.h (the
+#                                                              launcher.json merge) and overlay_feed.cpp (the lock-free frame ring)
+#
 # `mcla_unit_tests` is the aggregate target (`cmake --build <dir> --target mcla_unit_tests`). The six executables
 # are also part of ALL, so a normal full build is followed by `ctest` (multi-config generators: `ctest -C <config>`).
 # Each test is one executable and exits 1 on the first failed check, which is what CTest looks at.
@@ -85,3 +89,7 @@ target_include_directories(mcla_swap_target_test PRIVATE "${_mcla_tests_hooks_di
 
 mcla_add_unit_test(mcla_gov_test 23 test_gov.cpp)
 target_include_directories(mcla_gov_test PRIVATE "${_mcla_tests_hooks_dir}")
+
+# The overlay's pure parts live with the host (src/host/overlay), not with the hooks: found by path, not by MCLA_HOOKS_DIR.
+mcla_add_unit_test(mcla_overlay_test 23 test_overlay.cpp "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/overlay/overlay_feed.cpp")
+target_include_directories(mcla_overlay_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/overlay")

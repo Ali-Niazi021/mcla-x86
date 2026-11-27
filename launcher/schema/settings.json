@@ -209,6 +209,66 @@
       "emit": "nondefault"
     },
     {
+      "id": "mcla_overlay_fps",
+      "label": "FPS counter",
+      "help": "Show the frames-per-second readout in a corner from the start. In the game F2 shows or hides it (and F1 opens the mod menu, F5 the statistics screen). While it is shown the picture is composed with an overlay layer, about 0.2 ms of GPU time at 1080p; hidden it costs nothing.",
+      "category": "display",
+      "type": "bool",
+      "cvar": "mcla_overlay_fps",
+      "default": false,
+      "advanced": false,
+      "emit": "nondefault"
+    },
+    {
+      "id": "mcla_overlay_fps_corner",
+      "label": "FPS counter: corner",
+      "help": "Which corner of the screen the FPS counter sits in.",
+      "category": "display",
+      "type": "enum",
+      "cvar": "mcla_overlay_fps_corner",
+      "default": 1,
+      "options": [
+        {"value": 0, "label": "Top left", "help": "Top left corner."},
+        {"value": 1, "label": "Top right", "help": "Top right corner."},
+        {"value": 2, "label": "Bottom left", "help": "Bottom left corner."},
+        {"value": 3, "label": "Bottom right", "help": "Bottom right corner."}
+      ],
+      "advanced": true,
+      "requires": {"mcla_overlay_fps": true},
+      "emit": "nondefault"
+    },
+    {
+      "id": "mcla_overlay_fps_detail",
+      "label": "FPS counter: what it shows",
+      "help": "How much the counter says: just the rate, the rate with the frame time, or also the 1 % low and the GPU time.",
+      "category": "display",
+      "type": "enum",
+      "cvar": "mcla_overlay_fps_detail",
+      "default": 1,
+      "options": [
+        {"value": 0, "label": "Frames per second", "help": "Only the rate."},
+        {"value": 1, "label": "With the frame time", "help": "The rate and the average frame time."},
+        {"value": 2, "label": "With 1 % low and GPU time", "help": "The rate, the frame time, the rate of the slowest 1 % of frames and the GPU busy time."}
+      ],
+      "advanced": true,
+      "requires": {"mcla_overlay_fps": true},
+      "emit": "nondefault"
+    },
+    {
+      "id": "mcla_overlay_scale",
+      "label": "Overlay size",
+      "help": "The size of the in-game overlay's text and windows (FPS counter, statistics, mod menu), on top of the automatic size that follows the window's height.",
+      "category": "display",
+      "type": "float",
+      "cvar": "mcla_overlay_scale",
+      "default": 1.0,
+      "min": 0.5,
+      "max": 3.0,
+      "step": 0.1,
+      "advanced": true,
+      "emit": "nondefault"
+    },
+    {
       "id": "fullscreen_mode",
       "label": "Fullscreen mode",
       "help": "How fullscreen is done: scale the picture on the desktop, switch the display to the game's video mode, or switch it to a fixed mode.",
@@ -1390,6 +1450,53 @@
       "default": "X,Return",
       "advanced": true,
       "requires": {"mnk_mode": true},
+      "emit": "nondefault"
+    },
+    {
+      "id": "mcla_overlay",
+      "label": "In-game overlay (mod menu, FPS counter, statistics)",
+      "help": "The overlay's keys: F1 mod menu (display, graphics and game settings that change at once, optional cheats), F2 FPS counter, F5 statistics screen. Off: no key is listened to and nothing is created. Takes effect at the next start.",
+      "category": "controls",
+      "type": "bool",
+      "cvar": "mcla_overlay",
+      "default": true,
+      "advanced": true,
+      "emit": "nondefault"
+    },
+    {
+      "id": "mcla_overlay_key_menu",
+      "label": "Keyboard: mod menu",
+      "help": "Key that opens and closes the in-game mod menu. Names as above (F1-F24, A-Z, ...). While the menu is open the game gets no input.",
+      "category": "controls",
+      "type": "string",
+      "cvar": "mcla_overlay_key_menu",
+      "default": "F1",
+      "advanced": true,
+      "requires": {"mcla_overlay": true},
+      "emit": "nondefault"
+    },
+    {
+      "id": "mcla_overlay_key_fps",
+      "label": "Keyboard: FPS counter",
+      "help": "Key that shows or hides the FPS counter.",
+      "category": "controls",
+      "type": "string",
+      "cvar": "mcla_overlay_key_fps",
+      "default": "F2",
+      "advanced": true,
+      "requires": {"mcla_overlay": true},
+      "emit": "nondefault"
+    },
+    {
+      "id": "mcla_overlay_key_stats",
+      "label": "Keyboard: statistics screen",
+      "help": "Key that shows or hides the statistics screen.",
+      "category": "controls",
+      "type": "string",
+      "cvar": "mcla_overlay_key_stats",
+      "default": "F5",
+      "advanced": true,
+      "requires": {"mcla_overlay": true},
       "emit": "nondefault"
     },
     {

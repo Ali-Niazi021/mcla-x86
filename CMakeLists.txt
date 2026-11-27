@@ -90,7 +90,11 @@ else()
       src/host/gpu_priority.cpp
       src/host/thread_policy.cpp
       src/host/power_boost.cpp
-      src/host/pf_probe.cpp)
+      src/host/pf_probe.cpp
+      src/host/overlay/overlay_feed.cpp
+      src/host/overlay/overlay_sample.cpp
+      src/host/overlay/overlay_items.cpp
+      src/host/overlay/overlay_ui.cpp)
 
   # The hook and profile sources are objects of the executable itself, not a library: a hook is a strong definition
   # that must replace the weak default inside the generated code, and an archive member nothing references is never
