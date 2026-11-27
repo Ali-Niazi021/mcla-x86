@@ -123,6 +123,8 @@ struct ParamDef {
   const char* name;  // the parameter's name: node+0 points to this string
   uint32_t node;     // the parameter node; its value word is node+4 (non-zero = given)
   math::Hold32 hold;
+  bool verified = false;   // the node's name has been read and is `name`
+  uint32_t name_ptr = 0;   // that name pointer (what the cheat stores as the argument)
 };
 
 // The unlock parameters: each is read live by one small "is it unlocked" function (sub_826BDA38 races, sub_826BCDD8 parts,
@@ -382,19 +384,24 @@ void RunTimeScale(Cheats& c, bool raw, bool gate, Screen screen) {
 
 // ---- parameter words (no save, unlock) -----------------------------------------------------------------------------------------------
 
-// Returns false when the node is not what it should be (nothing written).
+// Returns false when the node is not what it should be (nothing written). A parameter that is neither wanted nor held costs nothing.
 bool RunParam(ParamDef& p, bool want) {
+  if (!want && !p.hold.held) return true;
   uint32_t current = 0;
-  if (!ParamNodeOk(p, &current)) {
+  const bool ok = p.verified ? mcla::guest::U32(p.node + 4, &current) : ParamNodeOk(p, &current);
+  if (!ok) {
+    p.verified = false;
     if (p.hold.held) {
       REXLOG_WARN("[mcla-cheat] {}: the parameter node 0x{:08X} cannot be read now: dropped the hold without writing", p.name, p.node);
       p.hold = {};
     }
     return false;
   }
-  uint32_t name_ptr = 0;
-  mcla::guest::U32(p.node, &name_ptr);
-  const math::Step32 step = math::StepParam(p.hold, want, current, math::ParamArgument(name_ptr));
+  if (!p.verified) {
+    p.verified = true;  // the name matched once: the node is where it was found
+    mcla::guest::U32(p.node, &p.name_ptr);
+  }
+  const math::Step32 step = math::StepParam(p.hold, want, current, math::ParamArgument(p.name_ptr));
   if (step.write && !WriteWord(p.node + 4, step.value)) return false;
   switch (step.act) {
     case math::Act::kTake:
@@ -557,7 +564,12 @@ std::string StateText(Which which) {
     case State::kOff:
       return "off";
     case State::kOn:
-      return "ON: holding the game's own switch";
+      switch (which) {
+        case Which::kTimeScale: return "ON: the game's time scale is multiplied";
+        case Which::kNoSave: return "ON: the game skips every save";
+        case Which::kUnlock: return "ON: the game's own unlock checks say yes";
+        default: return "ON: holding the game's own cheat switch";
+      }
     case State::kWaiting:
       return std::string("waiting for ") + NeedText(which) + " (the game is on: " + mcla::gamestate::ScreenName(screen) + ")";
     case State::kRefused:
