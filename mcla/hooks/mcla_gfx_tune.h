@@ -56,10 +56,20 @@ bool ShadowAtlasPrivate();
 // 0 = as shipped plus a statistics line (mcla_gfx_impostors.cpp). Clamped to 0..8.
 uint32_t ImpostorInterval();
 
-// The edge, in texels, of the sun-shadow map the CShadowMap constructor sub_825F6940 stores into its width and
-// height fields: 640 as shipped, 512 or 384 with mcla_gfx_shadow_res (or a preset). Called by the shadow-res hook
-// (mcla_gfx_shadow_res.cpp) once per shadow map created.
+// The edge, in GUEST texels, of the sun-shadow map the CShadowMap constructor sub_825F6940 stores into its width and
+// height fields: 640 as shipped, 512, 384, 320, 256 or 192 with mcla_gfx_shadow_res (or a preset; at draw resolution scale 2 the
+// 2000p profile's 320, whose host target is the shipped 640). Called by the shadow-res hook (mcla_gfx_shadow_res.cpp) once per
+// shadow map created.
 uint32_t ShadowMapSize();
+
+// The width and height, in GUEST texels, of the environment map (the dual-paraboloid car reflection map) the constructor sub_8233A648
+// is called with from sub_8233AB18: 512x256 as shipped, 384x192 or 256x128 with mcla_gfx_env_res. Called by the env-res hook
+// (mcla_gfx_env_res.cpp) once, when the environment map system is created.
+struct EnvMapDimensions {
+  uint32_t width;
+  uint32_t height;
+};
+EnvMapDimensions EnvMapSize();
 
 // False when the tree-impostor system is switched off (mcla_gfx_impostors=false): the overrides of
 // mcla_gfx_impostors.cpp read it on every call.

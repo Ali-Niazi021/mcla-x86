@@ -617,7 +617,8 @@
       "options": [
         {"value": 0, "label": "640 (as shipped)", "help": "The game's own size."},
         {"value": 512, "label": "512", "help": "About a third less shadow fill."},
-        {"value": 384, "label": "384", "help": "Cheapest; softer shadows (at 2x2 resolution, the 3200x2000 size, it is drawn as 768 texels, close to the shipped 640)."}
+        {"value": 384, "label": "384", "help": "Cheaper; softer shadows (at 2x2 resolution, the 3200x2000 size, it is drawn as 768 texels, close to the shipped 640)."},
+        {"value": 320, "label": "320", "help": "Cheapest; soft shadows at 1920x1080 and below. At 2x2 resolution (the 3200x2000 size) it is drawn as 640 texels, the shipped map's size on screen, and the 3200x2000 profile chooses it by itself."}
       ],
       "advanced": true,
       "emit": "nondefault"

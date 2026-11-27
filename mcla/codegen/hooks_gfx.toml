@@ -63,3 +63,13 @@ registers = ["r10"]
 address = 0x8230DE50
 name = "mcla_hook_gfx_impostor_throttle"
 registers = ["r10", "r11", "r31"]
+
+# [G8] mcla_gfx_env_res: sub_8233AB18 (the environment map system's creation), BEFORE `bl 0x8233a648` at 0x8233AB3C: r4 = 512
+# (`li r4,512` at 0x8233AB38) and r5 = 256 (`li r5,256` at 0x8233AB34) are the constructor's width and height, untouched since; the
+# constructor stores them as the map's fields (+216 / +220) from which the render targets and viewports are made (384x192 or 256x128;
+# 512x256 = as shipped). Read once, when the system is created. NEEDS A RE-CODEGEN (new entry).
+# mcla/hooks/mcla_gfx_env_res.cpp, cvar mcla_gfx_env_res.
+[[midasm_hook]]
+address = 0x8233AB3C
+name = "mcla_hook_gfx_env_res"
+registers = ["r4", "r5"]
