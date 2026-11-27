@@ -173,6 +173,21 @@ traffic LOD 0.7, FXAA off) plus VRS: it costs picture quality. **Evidence** runs
 own value is `PowerGetActualOverlayScheme` (ded574b5 = Best performance here, `ActiveOverlayAcPowerScheme` in the registry). **Fix** The line now reads "Balanced in effect (the slider says Best performance, but the High performance plan switches it off)",
 and the warning only asks for Best performance when the plan is not High / Ultimate performance. **Evidence** `system_status_rules.h`, `test_system_status.cpp`.
 
+### NATIVE-S The front-end hitch was the first use of 94 tile-heap windows and 35 render targets, not 19 windows; the 256 MiB budget missed half, and what is left is page faults of upload pages
+**Symptom** After 0790 and the guest pre-fault the first 1080p scene still took 89-127 ms (median 113), with 13k-35k page faults, 7 compute pipelines and 64+ tile heaps made inside the frame. **Cause** (1) The direct resolve compute pipelines
+were made on first use but cost only 0.7-1 ms each (5-7 ms for the 7 in all, not the 4-8 ms each that was assumed), so storing them (0793) is worth about 5 ms. (2) The shared memory's 4 MiB tile heaps and the host render targets are made on the first
+request of each: a 118 s drive needs 94 windows (376 MiB) and 35 render targets (236 MiB), not the 19 windows the logs of the first scene named (uploads allocate windows too, not only resolves); they cost 27-37 ms in the first 64 heap lines plus
+the render target clears, and are created again every run. (3) What is left is page faults: the frame is 21 ms + 2.1 us per fault when warm (n = 10, R2 0.83; cold 70 ms + 1.85 us, n = 12) and the fault count (11k-35k) is the number of fresh
+upload-buffer pages (2 MiB, written for the first time by the command processor: shared-memory upload pool, constant-buffer pool) that the frame needs because the GPU has not finished earlier submissions; the scene also creates about 600
+textures (`tex_n` 22 -> 590-664, 126-132 MiB) in that frame. **Fix** SDK 0793 (the 7 pipelines made at start from the key file, 5-7 ms) and 0794 (kinds 5-7 of the same file: render targets, shared-memory windows, scaled-resolve heaps; made at start
+within `d3d12_warmup_mib`, default 1024 MiB x the draw-scale area and at most a quarter of the free video memory; `d3d12_warmup_seed` lets a first run start from a key file of a warm run). Results (3 runs each, same day and power mode): worst
+front-end frame 113 -> 109.5 (0793 alone) -> 81 ms (53-87); 129 objects / 612 MiB in 31-35 ms at start; run-time heap lines 64+ -> 0; boot +37-40 ms; video memory +126 MiB (1080p), +682 MiB (2000p, 3.56 of 7.19 GB). The first draft of 0794 had a
+256 MiB default budget (sized for the 19 windows): it made 51 of 125 objects and left the frame at 117 ms; the cost of making everything is so small (31 ms) that the budget only needs to be a guard. **Not fixed, measured** The first engine
+frame (60-80 ms: game thread waiting, GPU 0.3 ms, +83 faults, same windowed) and the load (42-57 ms, game thread on the CPU for 38-42 ms) are not allocations. Pre-growing and pre-touching the two upload pools at start (experiment only, 96 + 48 pages,
++46-54 ms at boot) made the scene frame 40.7 / 40.0 ms with 2k faults; with only the shared-memory pool 52.5 / 68.6 ms, because the constant-buffer pool made 21 more pages inside the frame: that is the next lever (record the pool high-water marks in the
+key file, make and touch the pages at start), and the 600 textures are what would remain. **Evidence** runs `h2-o1..3`, `h2-k1..3`, `h2-r1b / r2 / r3`, `h2-p0 / p1` (`[mcla-pf]`: 173 MiB newly committed in 8 resource-sized ranges, 41k faults), `h2-g0 / g1`, `h2-2k0 / 2k1 / 2koff`, `h2-s0 / s1`,
+`h2-x1..6` (upload pool page log and the pre-grow experiment); METRICS 'Menu and loading hitches: SDK 0793 and 0794'. **Cost** 3 full rebuilds of the SDK series (2-5 min each) and 3 incremental ones for the experiment, 37 runs of 2.5 min.
+
 ### Sprint2-Process A commander that waits with a shell sleep loop can stall on a coder that already finished
 **Symptom** One LOCK60 stall: the commander sat waiting for a coder whose work was done. **Cause** It polled with a shell
 sleep loop instead of taking the coder's completion message. **Fix** Wait on the completion notification; no sleep loops.

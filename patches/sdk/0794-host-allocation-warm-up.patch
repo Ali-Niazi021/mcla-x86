@@ -1,0 +1,669 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Fri, 27 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0794: warm-up at start of the host allocations the first frames of a scene make (shared memory and scaled resolve tile heaps, host render targets), from the keys of earlier runs, with a budget; a seed key file for a first run
+
+Source: Ours, written for this SDK (hitch work of 2026-11-27, scratch/hitch2/DESIGN.md; extends 0790 and 0793)
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: The first 3D frame of a run commits about 35 MiB of new private memory and the first 1080p scene about 70-80 MiB (the host's
+  mcla_pf_probe_ms bursts of runs b-p5..b-p8), in frames of 66-73 ms and 82-159 ms. The shared memory is a 512 MB tiled buffer whose 4 MB
+  tile heaps are made on the first request of each part of the guest's memory (D3D12SharedMemory::AllocateSparseHostGpuMemoryRange: a
+  CreateHeap, a wait for the submission thread, UpdateTileMappings; every resolve's RequestRange does it for its destination, also when
+  nothing is uploaded). The 4 MB windows the logs name (the destinations of resolves and direct texture loads) are the same in every run:
+  8 in the first engine frame (32 MiB; the bursts commit 33.6-35.5) and 11 in the first 1080p frame (44 MiB; the bursts of that frame
+  commit 68-81, 14-28k page faults a frame; the rest is by arithmetic the host render targets, which are zeroed committed resources);
+  at a draw resolution scale above 1 the scaled resolve buffer's 16 MB tile heaps are made the same way. This keeps the keys of what is made, in
+  0790's file: kind 5 a host render target (RenderTargetKey::key, appended by D3D12RenderTargetCache::CreateRenderTarget), 6 a shared
+  memory tile heap window (granularity log2 << 24 | index, by AllocateSparseHostGpuMemoryRange), 7 a scaled resolve tile heap (draw scale
+  x << 28 | y << 24 | heap index, by EnsureScaledResolveMemoryCommitted). D3D12CommandProcessor::WarmUpHostAllocations, called by
+  InitializeShaderStorage after the pipelines, makes the ones this run's layout can ask for, in the order the earlier run needed them
+  in, within d3d12_warmup_mib (0 = 1024 MiB times the draw resolution scale's area, and never more than a quarter of the free video
+  memory the OS reports): the shared memory windows first (neighbours in one heap, up to 8 windows each), then the scaled resolve
+  heaps, then the render targets (new RenderTargetCache::PrecreateRenderTarget: a failure is not remembered, so the draw that needs the
+  render target tries itself, and its last use is the time of the warm-up, so render_target_trim_seconds treats it as made at start).
+  It logs '[warm-up] N host allocations (M MiB) made in X ms from the key file: ...' with the time and size of each kind and what it
+  left to the first use (over the budget, not for this layout, failed). The tile heaps still made while the game runs are logged with
+  what they cost (the first 64: 'Shared memory: a 4 MB tile heap for the guest memory at 0x... made while the game runs: heap N us,
+  wait for the submission thread and tile mapping M us'; the same for the scaled resolve heaps), which settles how much of a hitch they
+  are. cvars: d3d12_warmup (true), d3d12_warmup_mib (0), d3d12_warmup_seed (default empty: the path of a key file made on the same kind
+  of GPU, which a run with no key file of its own starts from, so a first run makes at start what that run made; the key files hold
+  only numbers). The first run on a cache, with no seed, behaves as before. Left lazy on purpose: textures (their keys are guest
+  addresses; they are placed in the 256 MB heap the first texture makes), the upload buffer pool pages, descriptor heaps and the EDRAM
+  buffer (made at start already), readback buffers, HDR / temporal AA / frame generation resources (features off). The key file
+  context (its header) is unchanged, so an existing file stays valid.
+  Needs 0790, 0791, 0792, 0760 and 0793.
+  Measured (2026-11-27, RTX 4060 Laptop, runs h2-*): the key file of a long drive holds 94 shared memory windows (376 MiB) and 35 host
+  render targets (236 MiB) at 1080p, not the 19 windows of the first estimate, so the default budget is 1024 MiB times the draw
+  scale's area (a 256 MiB budget made 51 of 125 objects and left 74 to the first use: worst front-end frame 117 ms). At 1080p it makes
+  129 objects (612 MiB) in 31-35 ms (windows 16-20 ms, render targets 15 ms); at 2000p 154 objects (1723 MiB, the cap of a quarter of the
+  free video memory) in 67 ms. Worst 1080p front-end frame, median of 3: 109.5 ms without the warm-up (0793 alone), 81 ms with it
+  (53-87); the run-time tile heap lines go from 64+ to 0. Process video memory at 1080p 1.21 GB against 1.09 GB, at 2000p 3.56 GB against
+  2.88 GB of a 7.19 GB budget. Not removed: the first engine frame (60-80 ms) and the loading frame (42-57 ms) are not allocations; what
+  is left of the front-end frame is the first creation and touch of about 30 to 80 upload buffer pages (2 MiB each) and the scene's
+  600 textures (see docs/LEARNINGS NATIVE-S).
+Bucket: REDO
+
+0794-host-allocation-warm-up.patch (mcla-x86 native stream, T0/T2).
+
+---
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -70,6 +70,17 @@ class D3D12CommandProcessor : public CommandProcessor {
+   std::string ShaderStorageReport(bool shutdown) override;
+   void FlushShaderStorage(uint32_t timeout_ms) override;  // LOCAL PATCH - MCLA (0792)
+ 
++  // LOCAL PATCH - MCLA (0794): the host allocations that the first frames of a scene make on first use (the shared
++  // memory's and the scaled resolve buffer's tile heaps, the host render targets) are made at start, from the keys of
++  // the earlier runs (<title>.rtv.d3d12.xrtp, kinds 5 to 7), up to a budget; called by InitializeShaderStorage after the
++  // pipelines. RecordWarmupKey is what the shared memory and the texture cache keep their keys with.
++  void RecordWarmupKey(uint32_t kind, uint32_t key) {
++    if (render_target_cache_) {
++      render_target_cache_->RecordWarmupKey(kind, key);
++    }
++  }
++  void WarmUpHostAllocations();
++
+   ui::d3d12::D3D12Provider& GetD3D12Provider() const {
+     return *static_cast<ui::d3d12::D3D12Provider*>(graphics_system_->provider());
+   }
+diff --git a/include/rex/graphics/d3d12/render_target_cache.h b/include/rex/graphics/d3d12/render_target_cache.h
+--- a/include/rex/graphics/d3d12/render_target_cache.h
++++ b/include/rex/graphics/d3d12/render_target_cache.h
+@@ -73,6 +73,23 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+   void InitializeRuntimePipelineStorage(const std::filesystem::path& cache_root,
+                                         uint32_t title_id);
+ 
++  // LOCAL PATCH - MCLA (0794): the host allocations made on first use, kept in the same file (the keys of kinds 5 to
++  // 7), for D3D12CommandProcessor::WarmUpHostAllocations to make at start. The key of a render target is its
++  // RenderTargetKey::key, of a shared memory tile heap (kWarmupKindSharedMemoryWindow) the granularity's log2 << 24 |
++  // its index, of a scaled resolve tile heap the draw resolution scale x << 28 | y << 24 | the heap index.
++  static constexpr uint32_t kWarmupKindRenderTarget = 5;
++  static constexpr uint32_t kWarmupKindSharedMemoryWindow = 6;
++  static constexpr uint32_t kWarmupKindScaledResolveHeap = 7;
++  // For the shared memory and the texture cache, which make the other two kinds, through the command processor.
++  void RecordWarmupKey(uint32_t kind, uint32_t key) { RecordRuntimePipelineKey(kind, key); }
++  // The records of the three kinds in the file, in the order the earlier runs made them in (and so needed them in);
++  // moves them out.
++  std::vector<uint64_t> TakeWarmupRecords() { return std::move(warmup_records_); }
++  // The host memory the render target of the key takes, 0 if it is not one this cache can make.
++  uint64_t EstimateWarmupRenderTargetBytes(uint32_t key_value) const;
++  // Makes the render target of the key now (see RenderTargetCache::PrecreateRenderTarget).
++  bool WarmUpRenderTarget(uint32_t key_value, uint64_t& host_memory_bytes_out);
++
+   void CompletedSubmissionUpdated();
+   void BeginSubmission();
+ 
+@@ -838,8 +855,14 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+     // A record made with another draw resolution scale stays in the file and isn't made at another scale.
+     kRuntimePipelineKeyDirectResolveDual = 3,
+     kRuntimePipelineKeyDirectResolveStretch = 4,
+-    kRuntimePipelineKeyLast = kRuntimePipelineKeyDirectResolveStretch,
++    // LOCAL PATCH - MCLA (0794): the host allocations (see RecordWarmupKey), not pipelines.
++    kRuntimePipelineKeyRenderTarget = kWarmupKindRenderTarget,
++    kRuntimePipelineKeySharedMemoryWindow = kWarmupKindSharedMemoryWindow,
++    kRuntimePipelineKeyScaledResolveHeap = kWarmupKindScaledResolveHeap,
++    kRuntimePipelineKeyLast = kRuntimePipelineKeyScaledResolveHeap,
+   };
++  // The records of kinds 5 to 7 read from the file, until TakeWarmupRecords.
++  std::vector<uint64_t> warmup_records_;
+   // Appends the key to the file (and flushes: a few dozen records a run, and the process ends with _Exit) unless it
+   // is already there or the keys are being made from the file.
+   void RecordRuntimePipelineKey(uint32_t kind, uint32_t key);
+diff --git a/include/rex/graphics/d3d12/shared_memory.h b/include/rex/graphics/d3d12/shared_memory.h
+--- a/include/rex/graphics/d3d12/shared_memory.h
++++ b/include/rex/graphics/d3d12/shared_memory.h
+@@ -122,6 +122,14 @@ class D3D12SharedMemory : public SharedMemory {
+   void WriteUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,
+                                   uint32_t element_size_bytes_pow2);
+ 
++  // LOCAL PATCH - MCLA (0794): the tile heaps of the sparse shared memory are made on the first request of each 4 MB
++  // of the guest's memory (the textures a resolve writes, the vertex data uploaded): 19 of them in the first frames of
++  // the game's front end, 8 to 11 of them in each of the first frame and the first 1080p frame, each a CreateHeap, a
++  // wait for the submission thread and a tile mapping. UINT32_MAX when the memory isn't sparse.
++  uint32_t GetSparseAllocationGranularityLog2() const { return host_gpu_memory_sparse_granularity_log2(); }
++  // Makes the heaps behind the range now, at start (EnsureRangeAllocated; not logged as a run-time creation).
++  bool WarmUpHostGpuMemory(uint32_t start, uint32_t length);
++
+  protected:
+   bool AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
+                                         uint32_t length_allocations) override;
+@@ -131,6 +139,11 @@ class D3D12SharedMemory : public SharedMemory {
+  private:
+   D3D12CommandProcessor& command_processor_;
+ 
++  // LOCAL PATCH - MCLA (0794): inside WarmUpHostGpuMemory; the heaps made then are not logged one by one.
++  bool warming_up_ = false;
++  // Run-time tile heaps logged so far (the first few are, with what they cost).
++  uint32_t runtime_heaps_logged_ = 0;
++
+   // The 512 MB tiled buffer.
+   ID3D12Resource* buffer_ = nullptr;
+   D3D12_GPU_VIRTUAL_ADDRESS buffer_gpu_address_ = 0;
+diff --git a/include/rex/graphics/d3d12/texture_cache.h b/include/rex/graphics/d3d12/texture_cache.h
+--- a/include/rex/graphics/d3d12/texture_cache.h
++++ b/include/rex/graphics/d3d12/texture_cache.h
+@@ -139,6 +139,11 @@ class D3D12TextureCache final : public TextureCache {
+   // Ensures the tiles backing the range in the buffers are allocated.
+   bool EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled, uint32_t length_unscaled,
+                                           uint32_t length_scaled_alignment_log2 = 0) override;
++  // LOCAL PATCH - MCLA (0794): at a draw resolution scale above 1 the tile heaps of the scaled resolve buffer (16 MB
++  // each, 4 times the shared memory's at 2x2) are made on the first resolve or load of each part of it, like the shared
++  // memory's. Makes the heap of the index now, at start (the key of an earlier run); not logged as a run-time creation.
++  bool WarmUpScaledResolveHeap(uint32_t heap_index);
++  static constexpr uint64_t GetScaledResolveHeapBytes() { return uint64_t(1) << kScaledResolveHeapSizeLog2; }
+   // Makes the specified range of up to 1-2 GB currently accessible on the GPU.
+   // One draw call can access only at most one range - the same memory is
+   // accessible through different buffers based on the range needed, so aliasing
+@@ -883,6 +888,9 @@ class D3D12TextureCache final : public TextureCache {
+   std::vector<Microsoft::WRL::ComPtr<ID3D12Heap>> scaled_resolve_heaps_;
+   // Number of currently resident portions of the tiled buffer, for profiling.
+   uint32_t scaled_resolve_heap_count_ = 0;
++  // LOCAL PATCH - MCLA (0794): inside WarmUpScaledResolveHeap; and how many run-time heaps are logged so far.
++  bool warming_up_scaled_resolve_ = false;
++  uint32_t runtime_scaled_resolve_heaps_logged_ = 0;
+   // Current scaled resolve state.
+   // For aliasing barrier placement, last owning buffer index for each of 1 GB.
+   size_t scaled_resolve_1gb_buffer_indices_[(uint64_t(SharedMemory::kBufferSize) *
+diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -575,6 +575,13 @@ class RenderTargetCache {
+ 
+   virtual RenderTarget* CreateRenderTarget(RenderTargetKey key) = 0;
+ 
++  // LOCAL PATCH - MCLA (0794): makes the host render target of the key now unless it exists (the key of an earlier
++  // run, at start, so the first frame that draws to it doesn't make it) on the host render targets path. Returns
++  // whether it exists after the call, and how much host memory a new one takes in host_memory_bytes_out (0 if it
++  // existed). Unlike GetOrCreateRenderTarget, a failure isn't remembered: the draw that needs the render target
++  // tries to make it itself. Its last use is now, as if a draw had made it.
++  bool PrecreateRenderTarget(RenderTargetKey key, uint64_t* host_memory_bytes_out = nullptr);
++
+   // Whether depth buffer is encoded differently on the host, thus after
+   // aliasing naively, precision may be lost - host depth must only be
+   // overwritten if the new guest value is different than the current host depth
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -95,6 +95,20 @@ REXCVAR_DEFINE_BOOL(d3d12_hoist_shared_memory_uploads_stats, false, "GPU/D3D12",
+                     "were, every 5 seconds (with d3d12_hoist_shared_memory_uploads)")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// LOCAL PATCH - MCLA (0794): the warm-up of the host allocations.
++REXCVAR_DEFINE_BOOL(d3d12_warmup, true, "GPU/D3D12",
++                    "At start, make the host allocations the first frames of a scene would make on first use (the shared "
++                    "memory's and the scaled resolve buffer's tile heaps, the host render targets), from the keys the "
++                    "earlier runs kept in <title>.rtv.d3d12.xrtp; the first run on a cache makes them on first use as "
++                    "before. Logs '[warm-up] ...'")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_UINT32(d3d12_warmup_mib, 0, "GPU/D3D12",
++                      "The most host memory (MiB) d3d12_warmup may allocate, spent in the order the earlier run needed the "
++                      "objects in; 0: 1024 MiB times the draw resolution scale's area, and never more than a quarter "
++                      "of the video memory the OS lets the process still have (the first 1080p front end and a drive "
++                      "of the game's first minutes need about 600 MiB at scale 1)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ REXCVAR_DECLARE(bool, gpu_regwrite_bulk);
+ REXCVAR_DECLARE(bool, gpu_batch_perf_counters);
+ // HDR output's trims (defined in graphics/command_processor.cpp).
+@@ -479,7 +493,150 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
+   // threads are done by now with a blocking preload.
+   if (render_target_cache_) {
+     render_target_cache_->InitializeRuntimePipelineStorage(cache_root, title_id);
++    WarmUpHostAllocations();  // LOCAL PATCH - MCLA (0794)
++  }
++}
++
++// LOCAL PATCH - MCLA (0794): see the declaration. What the earlier runs made on first use, in the order they needed it in,
++// made now within the budget, grouped by kind (the shared memory's tile heaps first, neighbours in one heap each run of
++// up to 8, then the scaled resolve buffer's, then the render targets). Nothing is guessed: a key that this run's layout
++// (the sparse granularity, the draw resolution scale) can't ask for stays in the file, unused.
++void D3D12CommandProcessor::WarmUpHostAllocations() {
++  if (!render_target_cache_ || !shared_memory_ || !texture_cache_) {
++    return;
++  }
++  std::vector<uint64_t> records = render_target_cache_->TakeWarmupRecords();
++  if (!REXCVAR_GET(d3d12_warmup)) {
++    return;
++  }
++  if (records.empty()) {
++    REXGPU_INFO("[warm-up] no host allocations stored yet in the key file: they are made on first use in this run");
++    return;
++  }
++  const auto start = std::chrono::steady_clock::now();
++  const uint32_t scale_x = render_target_cache_->draw_resolution_scale_x();
++  const uint32_t scale_y = render_target_cache_->draw_resolution_scale_y();
++  uint64_t budget_bytes = REXCVAR_GET(d3d12_warmup_mib)
++                              ? uint64_t(REXCVAR_GET(d3d12_warmup_mib)) << 20
++                              : (uint64_t(1024) << 20) * scale_x * scale_y;
++  // Never more than a quarter of the video memory the OS lets the process still have.
++  bool budget_capped = false;
++  GpuMemoryInfo memory_info;
++  if (QueryGpuMemoryInfo(memory_info) && memory_info.budget_bytes) {
++    const uint64_t headroom_quarter =
++        (memory_info.budget_bytes > memory_info.usage_bytes ? memory_info.budget_bytes - memory_info.usage_bytes
++                                                            : 0) /
++        4;
++    if (headroom_quarter < budget_bytes) {
++      budget_bytes = headroom_quarter;
++      budget_capped = true;
++    }
++  }
++  const uint32_t window_log2 = shared_memory_->GetSparseAllocationGranularityLog2();
++  const uint64_t scaled_heap_bytes = D3D12TextureCache::GetScaledResolveHeapBytes();
++
++  // Choose, in the order of the file (the order the objects were first needed in), what fits the budget.
++  std::vector<uint32_t> windows, heaps, render_targets;
++  uint64_t spent = 0;
++  size_t over_budget = 0, not_for_this_run = 0;
++  for (const uint64_t record : records) {
++    const uint32_t kind = uint32_t(record >> 32);
++    const uint32_t key = uint32_t(record);
++    uint64_t bytes = 0;
++    if (kind == D3D12RenderTargetCache::kWarmupKindSharedMemoryWindow) {
++      if (window_log2 != UINT32_MAX && (key >> 24) == window_log2 &&
++          (uint64_t(key & 0xFFFFFF) << window_log2) < SharedMemory::kBufferSize) {
++        bytes = uint64_t(1) << window_log2;
++      }
++    } else if (kind == D3D12RenderTargetCache::kWarmupKindScaledResolveHeap) {
++      if (texture_cache_->IsDrawResolutionScaled() && (key >> 28) == scale_x &&
++          ((key >> 24) & 15) == scale_y) {
++        bytes = scaled_heap_bytes;
++      }
++    } else if (kind == D3D12RenderTargetCache::kWarmupKindRenderTarget) {
++      bytes = render_target_cache_->EstimateWarmupRenderTargetBytes(key);
++    }
++    if (!bytes) {
++      ++not_for_this_run;
++      continue;
++    }
++    if (spent + bytes > budget_bytes) {
++      ++over_budget;
++      continue;
++    }
++    spent += bytes;
++    if (kind == D3D12RenderTargetCache::kWarmupKindSharedMemoryWindow) {
++      windows.push_back(key & 0xFFFFFF);
++    } else if (kind == D3D12RenderTargetCache::kWarmupKindScaledResolveHeap) {
++      heaps.push_back(key & 0xFFFFFF);
++    } else {
++      render_targets.push_back(key);
++    }
++  }
++
++  using Clock = std::chrono::steady_clock;
++  auto milliseconds_since = [](Clock::time_point from) {
++    return double(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - from).count()) / 1000.0;
++  };
++  size_t failed = 0;
++
++  // The shared memory's tile heaps: neighbours together, a heap for each run of at most 8 windows (32 MB).
++  size_t windows_made = 0;
++  const auto windows_start = Clock::now();
++  if (!windows.empty()) {
++    std::sort(windows.begin(), windows.end());
++    windows.erase(std::unique(windows.begin(), windows.end()), windows.end());
++    for (size_t i = 0; i < windows.size();) {
++      size_t run = 1;
++      while (i + run < windows.size() && run < 8 && windows[i + run] == windows[i] + run) {
++        ++run;
++      }
++      if (shared_memory_->WarmUpHostGpuMemory(windows[i] << window_log2, uint32_t(run) << window_log2)) {
++        windows_made += run;
++      } else {
++        ++failed;
++      }
++      i += run;
++    }
+   }
++  const double windows_ms = milliseconds_since(windows_start);
++
++  size_t heaps_made = 0;
++  const auto heaps_start = Clock::now();
++  for (const uint32_t heap_index : heaps) {
++    if (texture_cache_->WarmUpScaledResolveHeap(heap_index)) {
++      ++heaps_made;
++    } else {
++      ++failed;
++    }
++  }
++  const double heaps_ms = milliseconds_since(heaps_start);
++
++  size_t render_targets_made = 0;
++  uint64_t render_target_bytes = 0;
++  const auto render_targets_start = Clock::now();
++  for (const uint32_t key : render_targets) {
++    uint64_t bytes;
++    if (render_target_cache_->WarmUpRenderTarget(key, bytes)) {
++      ++render_targets_made;
++      render_target_bytes += bytes;
++    } else {
++      ++failed;
++    }
++  }
++  const double render_targets_ms = milliseconds_since(render_targets_start);
++
++  const uint64_t windows_bytes = window_log2 != UINT32_MAX ? uint64_t(windows_made) << window_log2 : 0;
++  const uint64_t heaps_bytes = uint64_t(heaps_made) * scaled_heap_bytes;
++  REXGPU_INFO(
++      "[warm-up] {} host allocations ({} MiB) made in {:.1f} ms from the key file: {} shared memory tile heap windows "
++      "({} MiB, {:.1f} ms), {} scaled resolve tile heaps ({} MiB, {:.1f} ms), {} render targets ({} MiB, {:.1f} ms); "
++      "left to the first use: {} over the {} MiB budget{}, {} that this run's layout can't ask for, {} that failed",
++      windows_made + heaps_made + render_targets_made,
++      (windows_bytes + heaps_bytes + render_target_bytes) >> 20, milliseconds_since(start), windows_made,
++      windows_bytes >> 20, windows_ms, heaps_made, heaps_bytes >> 20, heaps_ms, render_targets_made,
++      render_target_bytes >> 20, render_targets_ms, over_budget, budget_bytes >> 20,
++      budget_capped ? " (a quarter of the video memory left)" : "", not_for_this_run, failed);
+ }
+ 
+ void D3D12CommandProcessor::FlushShaderStorage(uint32_t timeout_ms) {
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -92,6 +92,14 @@ REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
+ 
+ REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native stencil value output");
+ 
++// LOCAL PATCH - MCLA (0794): a first run on a cache has no key file (<title>.rtv.d3d12.xrtp), so everything it keys is
++// made on first use, with the hitches of the first frames of each scene. With this set to the path of a key file made by
++// a run on the same kind of GPU (the file's header says which: the options that change the pipelines), the new key file
++// starts as a copy of it, and the first run makes what that run made at start. The key files hold only numbers.
++REXCVAR_DEFINE_STRING(d3d12_warmup_seed, "", "GPU/D3D12",
++                      "Path of a render target key file (.xrtp) a run with no key file of its own starts from")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ REXCVAR_DECLARE(bool, resolve_dual_write);
+ REXCVAR_DECLARE(bool, resolve_dual_write_msaa);  // LOCAL PATCH - MCLA (0530): resolve_dual_write_msaa
+ // LOCAL PATCH - MCLA (0560): resolve_defer_memory_write (defined in resolve_defer.cpp)
+@@ -2882,6 +2890,8 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
+   render_target->set_host_memory_bytes(uint64_t(resource_desc.Width) * resource_desc.Height *
+                                        resource_desc.SampleDesc.Count *
+                                        GetRenderTargetBytesPerSample(resource_desc.Format));
++  // LOCAL PATCH - MCLA (0794): kept for the next runs (D3D12CommandProcessor::WarmUpHostAllocations).
++  RecordRuntimePipelineKey(kRuntimePipelineKeyRenderTarget, key.key);
+   return render_target;
+ }
+ 
+@@ -7214,6 +7224,40 @@ void D3D12RenderTargetCache::InitializeRuntimePipelineStorage(
+   if (!header_valid) {
+     fwrite(&header_wanted, sizeof(header_wanted), 1, file);
+     fflush(file);
++    // LOCAL PATCH - MCLA (0794): d3d12_warmup_seed - the records of a key file of the same kind start this one.
++    const std::string seed_path = REXCVAR_GET(d3d12_warmup_seed);
++    if (!seed_path.empty()) {
++      FILE* seed_file = rex::filesystem::OpenFile(rex::to_path(seed_path), "rb");
++      size_t seeded = 0;
++      bool seed_header_matches = false;
++      if (seed_file) {
++        RuntimePipelineKeysHeader seed_header;
++        seed_header_matches = fread(&seed_header, sizeof(seed_header), 1, seed_file) == 1 &&
++                              std::memcmp(&seed_header, &header_wanted, sizeof(seed_header)) == 0;
++        std::unordered_set<uint64_t> seeded_records;
++        uint64_t record;
++        while (seed_header_matches && fread(&record, sizeof(record), 1, seed_file) == 1) {
++          const uint32_t kind = uint32_t(record >> 32);
++          if (kind < kRuntimePipelineKeyTransfer || kind > kRuntimePipelineKeyLast) {
++            break;
++          }
++          if (seeded_records.insert(record).second) {
++            stored.push_back(record);
++            fwrite(&record, sizeof(record), 1, file);
++            ++seeded;
++          }
++        }
++        fclose(seed_file);
++        fflush(file);
++      }
++      REXGPU_INFO(
++          "D3D12RenderTargetCache: the new render target key file starts from {} ({}): {} keys",
++          seed_path,
++          !seed_file ? "can't be opened"
++                     : (seed_header_matches ? "made for the same GPU options"
++                                            : "made for other GPU options, not used"),
++          seeded);
++    }
+   }
+   runtime_pipeline_keys_file_ = file;
+ 
+@@ -7225,6 +7269,10 @@ void D3D12RenderTargetCache::InitializeRuntimePipelineStorage(
+     const uint32_t kind = uint32_t(record >> 32);
+     const uint32_t key_value = uint32_t(record);
+     runtime_pipeline_keys_known_.insert(record);
++    if (kind >= kRuntimePipelineKeyRenderTarget) {  // LOCAL PATCH - MCLA (0794): made by the warm-up
++      warmup_records_.push_back(record);
++      continue;
++    }
+     if (kind == kRuntimePipelineKeyTransfer) {
+       TransferShaderKey key;
+       key.key = key_value;
+@@ -7336,6 +7384,45 @@ void D3D12RenderTargetCache::ShutdownRuntimePipelineStorage() {
+   }
+   runtime_pipeline_keys_known_.clear();
+   runtime_pipeline_keys_preloading_ = false;
++  warmup_records_.clear();  // LOCAL PATCH - MCLA (0794)
++}
++
++// LOCAL PATCH - MCLA (0794): the host memory a render target of the key takes (what CreateRenderTarget sets), 0 if the key
++// can't be one this cache makes (a stored key is checked, not trusted).
++uint64_t D3D12RenderTargetCache::EstimateWarmupRenderTargetBytes(uint32_t key_value) const {
++  RenderTargetKey key;
++  key.key = key_value;
++  if (path_ != Path::kHostRenderTargets || !key.pitch_tiles_at_32bpp ||
++      uint32_t(key.msaa_samples) > uint32_t(xenos::MsaaSamples::k4X)) {
++    return 0;
++  }
++  const DXGI_FORMAT format = key.is_depth ? GetDepthResourceDXGIFormat(key.GetDepthFormat())
++                                          : GetColorResourceDXGIFormat(key.GetColorFormat());
++  if (format == DXGI_FORMAT_UNKNOWN) {
++    return 0;
++  }
++  const uint64_t width = uint64_t(key.GetWidth()) * draw_resolution_scale_x();
++  const uint64_t height =
++      uint64_t(GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples)) * draw_resolution_scale_y();
++  if (!width || !height || width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
++      height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION) {
++    return 0;
++  }
++  const uint32_t samples =
++      (key.msaa_samples == xenos::MsaaSamples::k2X && !msaa_2x_supported())
++          ? 4
++          : (uint32_t(1) << uint32_t(key.msaa_samples));
++  return width * height * samples * GetRenderTargetBytesPerSample(format);
++}
++
++bool D3D12RenderTargetCache::WarmUpRenderTarget(uint32_t key_value, uint64_t& host_memory_bytes_out) {
++  host_memory_bytes_out = 0;
++  if (!EstimateWarmupRenderTargetBytes(key_value)) {
++    return false;
++  }
++  RenderTargetKey key;
++  key.key = key_value;
++  return PrecreateRenderTarget(key, &host_memory_bytes_out);
+ }
+ 
+ bool D3D12RenderTargetCache::GetDirectResolveSourceConversion(
+diff --git a/src/graphics/d3d12/shared_memory.cpp b/src/graphics/d3d12/shared_memory.cpp
+--- a/src/graphics/d3d12/shared_memory.cpp
++++ b/src/graphics/d3d12/shared_memory.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <chrono>  // LOCAL PATCH - MCLA (0794)
+ #include <cstring>
+ #include <utility>
+ #include <vector>
+@@ -282,6 +283,7 @@ bool D3D12SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocat
+   ID3D12Device* device = provider.GetDevice();
+   ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
+ 
++  const auto heap_start_time = std::chrono::steady_clock::now();  // LOCAL PATCH - MCLA (0794)
+   D3D12_HEAP_DESC heap_desc = {};
+   heap_desc.SizeInBytes = length_bytes;
+   heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+@@ -292,6 +294,7 @@ bool D3D12SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocat
+     return false;
+   }
+   buffer_tiled_heaps_.push_back(heap);
++  const auto heap_made_time = std::chrono::steady_clock::now();  // LOCAL PATCH - MCLA (0794)
+ 
+   D3D12_TILED_RESOURCE_COORDINATE region_start_coordinates;
+   region_start_coordinates.X = offset_bytes / D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+@@ -308,9 +311,34 @@ bool D3D12SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocat
+                                    &range_flags, &heap_range_start_offset, &region_size.NumTiles,
+                                    D3D12_TILE_MAPPING_FLAG_NONE);
+   command_processor_.NotifyQueueOperationsDoneDirectly();
++  // LOCAL PATCH - MCLA (0794): kept for the next runs (D3D12CommandProcessor::WarmUpHostAllocations), and, for
++  // the ones made while the game runs (the cost of each is what the warm-up saves), logged with what they cost.
++  for (uint32_t i = 0; i < length_allocations; ++i) {
++    command_processor_.RecordWarmupKey(
++        D3D12RenderTargetCache::kWarmupKindSharedMemoryWindow,
++        (host_gpu_memory_sparse_granularity_log2() << 24) | (offset_allocations + i));
++  }
++  if (!warming_up_ && runtime_heaps_logged_ < 64) {
++    ++runtime_heaps_logged_;
++    const auto done_time = std::chrono::steady_clock::now();
++    REXGPU_INFO(
++        "Shared memory: a {} MB tile heap for the guest memory at 0x{:08X} made while the game runs: heap {} us, "
++        "wait for the submission thread and tile mapping {} us ({} so far)",
++        length_bytes >> 20, offset_bytes,
++        std::chrono::duration_cast<std::chrono::microseconds>(heap_made_time - heap_start_time).count(),
++        std::chrono::duration_cast<std::chrono::microseconds>(done_time - heap_made_time).count(),
++        runtime_heaps_logged_);
++  }
+   return true;
+ }
+ 
++bool D3D12SharedMemory::WarmUpHostGpuMemory(uint32_t start, uint32_t length) {
++  warming_up_ = true;
++  const bool made = EnsureRangeAllocated(start, length);
++  warming_up_ = false;
++  return made;
++}
++
+ bool D3D12SharedMemory::UploadRanges(
+     const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
+   if (upload_page_ranges.empty()) {
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cfloat>
++#include <chrono>  // LOCAL PATCH - MCLA (0794)
+ #include <cmath>
+ #include <cstddef>
+ #include <cstring>
+@@ -1433,6 +1434,7 @@ bool D3D12TextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscal
+       continue;
+     }
+     auto direct_queue = provider.GetDirectQueue();
++    const auto heap_start_time = std::chrono::steady_clock::now();  // LOCAL PATCH - MCLA (0794)
+     D3D12_HEAP_DESC heap_desc = {};
+     heap_desc.SizeInBytes = kScaledResolveHeapSize;
+     heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+@@ -1444,6 +1446,7 @@ bool D3D12TextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscal
+     }
+     scaled_resolve_heaps_[i] = scaled_resolve_heap;
+     ++scaled_resolve_heap_count_;
++    const auto heap_made_time = std::chrono::steady_clock::now();  // LOCAL PATCH - MCLA (0794)
+     COUNT_profile_set("gpu/texture_cache/scaled_resolve_buffer_used_mb",
+                       scaled_resolve_heap_count_ << (kScaledResolveHeapSizeLog2 - 20));
+     D3D12_TILED_RESOURCE_COORDINATE region_start_coordinates;
+@@ -1473,10 +1476,51 @@ bool D3D12TextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscal
+           &range_tile_count, D3D12_TILE_MAPPING_FLAG_NONE);
+     }
+     command_processor_.NotifyQueueOperationsDoneDirectly();
++    // LOCAL PATCH - MCLA (0794): kept for the next runs (D3D12CommandProcessor::WarmUpHostAllocations), and, for the
++    // ones made while the game runs, logged with what they cost.
++    command_processor_.RecordWarmupKey(D3D12RenderTargetCache::kWarmupKindScaledResolveHeap,
++                                       (draw_resolution_scale_x() << 28) |
++                                           (draw_resolution_scale_y() << 24) | i);
++    if (!warming_up_scaled_resolve_ && runtime_scaled_resolve_heaps_logged_ < 64) {
++      ++runtime_scaled_resolve_heaps_logged_;
++      const auto done_time = std::chrono::steady_clock::now();
++      REXGPU_INFO(
++          "D3D12TextureCache: scaled resolve tile heap {} ({} MB) made while the game runs: heap {} us, wait for "
++          "the submission thread and tile mapping {} us ({} so far)",
++          i, kScaledResolveHeapSize >> 20,
++          std::chrono::duration_cast<std::chrono::microseconds>(heap_made_time - heap_start_time).count(),
++          std::chrono::duration_cast<std::chrono::microseconds>(done_time - heap_made_time).count(),
++          runtime_scaled_resolve_heaps_logged_);
++    }
+   }
+   return true;
+ }
+ 
++// LOCAL PATCH - MCLA (0794): see the declaration. The unscaled range the heap is the scaled image of (EnsureScaled
++// ResolveMemoryCommitted multiplies the unscaled addresses by the area of the draw resolution scale); at a scale whose
++// area is not a power of two it also makes a neighbour of the heap, which is harmless.
++bool D3D12TextureCache::WarmUpScaledResolveHeap(uint32_t heap_index) {
++  if (!IsDrawResolutionScaled() || heap_index >= scaled_resolve_heaps_.size()) {
++    return false;
++  }
++  if (scaled_resolve_heaps_[heap_index]) {
++    return true;
++  }
++  const uint64_t area = uint64_t(draw_resolution_scale_x()) * draw_resolution_scale_y();
++  const uint64_t first_scaled = uint64_t(heap_index) << kScaledResolveHeapSizeLog2;
++  const uint64_t last_scaled = first_scaled + kScaledResolveHeapSize - 1;
++  const uint64_t start_unscaled = first_scaled / area;
++  const uint64_t end_unscaled = last_scaled / area;  // Inclusive.
++  if (end_unscaled >= SharedMemory::kBufferSize) {
++    return false;
++  }
++  warming_up_scaled_resolve_ = true;
++  const bool made = EnsureScaledResolveMemoryCommitted(
++      uint32_t(start_unscaled), uint32_t(end_unscaled - start_unscaled + 1), 0);
++  warming_up_scaled_resolve_ = false;
++  return made && scaled_resolve_heaps_[heap_index];
++}
++
+ bool D3D12TextureCache::MakeScaledResolveRangeCurrent(uint32_t start_unscaled,
+                                                       uint32_t length_unscaled,
+                                                       uint32_t length_scaled_alignment_log2) {
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -25,6 +25,7 @@
+ #include <utility>
+ 
+ #include <rex/assert.h>
++#include <rex/chrono/clock.h>  // LOCAL PATCH - MCLA (0794)
+ #include <rex/cvar.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/pipeline/render_target/cache.h>
+@@ -2615,6 +2616,32 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(Rend
+   return render_target;
+ }
+ 
++// LOCAL PATCH - MCLA (0794): see the declaration.
++bool RenderTargetCache::PrecreateRenderTarget(RenderTargetKey key, uint64_t* host_memory_bytes_out) {
++  if (host_memory_bytes_out) {
++    *host_memory_bytes_out = 0;
++  }
++  if (GetPath() != Path::kHostRenderTargets) {
++    return false;
++  }
++  auto it_rt = render_targets_.find(key);
++  if (it_rt != render_targets_.end()) {
++    return it_rt->second != nullptr;
++  }
++  RenderTarget* render_target = CreateRenderTarget(key);
++  if (!render_target) {
++    return false;
++  }
++  // The clock of IsTrimDue: a render target nobody has used since this is trimmed like any other, after
++  // render_target_trim_seconds (not at the first check, as one with no time at all would be).
++  render_target->set_last_used_ms(rex::chrono::Clock::QueryHostUptimeMillis());
++  if (host_memory_bytes_out) {
++    *host_memory_bytes_out = render_target->host_memory_bytes();
++  }
++  render_targets_.emplace(key, render_target);
++  return true;
++}
++
+ bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(RenderTargetKey dest,
+                                                              uint32_t start_tiles_base_relative,
+                                                              uint32_t length_tiles) const {

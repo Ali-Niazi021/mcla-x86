@@ -1052,6 +1052,24 @@ purpose = "D3D12 (R1): cvar scaled_copy_levers (int bits, default 0 = unchanged,
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0793-direct-resolve-pipeline-keys"
+source = "local"
+path = "patches/sdk/0793-direct-resolve-pipeline-keys.patch"
+sha256 = "1bbd98f749f7505ca760e73e8bb7b67617705e953f4c11cff901b529f11cc641"
+purpose = "D3D12 (hitch2): the direct resolve compute pipelines made on first use (dual-write: 4 plain + 8 with the texel origin, the scaled members at a draw scale above 1; stretching: 4) are kept as kinds 3 and 4 of 0790's <title>.rtv.d3d12.xrtp key file and made at start ('Created N direct resolve compute pipelines for D dual-write and S stretching keys from the storage in X milliseconds'), so the first 1080p scene no longer makes about 7 of them in its frame. No cvar; keys of another draw scale stay in the file. Needs 0790-0792 and 0760."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0794-host-allocation-warm-up"
+source = "local"
+path = "patches/sdk/0794-host-allocation-warm-up.patch"
+sha256 = "7792a9ef4db530060ff1eca72829d3c6df9e33295aa17ff7874e3db4d7108ce1"
+purpose = "D3D12 (hitch2): the host allocations of the first frames are kept in the same key file (kind 5 host render target, 6 shared memory 4 MiB tile heap window, 7 scaled resolve tile heap) and made at start by D3D12CommandProcessor::WarmUpHostAllocations within a budget (cvars d3d12_warmup default true, d3d12_warmup_mib default 0 = 1024 MiB x the draw scale's area and at most a quarter of the free video memory, d3d12_warmup_seed = a key file of the same kind of GPU that a run with no file of its own starts from); logs '[warm-up] N host allocations (M MiB) made in X ms ...' and, for what is still made while the game runs, 'a 4 MB tile heap ... made while the game runs: heap N us, wait M us'. Needs 0790-0792, 0760 and 0793."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]

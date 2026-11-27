@@ -1,0 +1,161 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Fri, 27 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0793: the direct resolve compute pipelines made on first use (dual-write, stretching) are kept in <title>.rtv.d3d12.xrtp and made at start
+
+Source: Ours, written for this SDK (hitch work of 2026-11-27, scratch/hitch2/DESIGN.md; extends 0790)
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: The render target cache makes the compute pipelines of the direct resolves on first use, on the command processor thread: the
+  dual-write ones (GetDirectResolveDualPipeline: 4 without and 8 with the texel origin, the scaled members of the shaders at a draw
+  resolution scale above 1) and the stretching ones (GetDirectResolveStretchPipeline: 4). The game's front end asks for 7 of the 8 with
+  the origin in the frame of its first 1080p scene ('the dual-write direct <shader> pipeline is made ...' x 7 in that frame, in 89 of
+  the 92 logs of the work folder that have the lines, x 5 in the other 3; never a plain one and never a stretching one in the 102 run
+  logs), about 30 ms of the frame by the previous integrator's count (2-6 ms each), and they are in no storage. 0790's key file gets 2
+  kinds: 3 (dual-write: final copy shader index | origin << 4 | multisampled << 5 | scaled << 6) and 4 (stretching: index | scaled << 6
+  | batched loads << 7), appended and flushed when GetDirectResolveDualPipeline / GetDirectResolveStretchPipeline makes a pipeline;
+  InitializeRuntimePipelineStorage makes the stored ones at start, after the transfer and dump pipelines, only those the settings and
+  the draw resolution scale of the run can ask for (resolve_dual_write, resolve_dual_write_msaa, scaled_copy_levers bit 1,
+  IsDrawResolutionScaled): a key made at another scale stays in the file unused. It logs 'Created N direct resolve compute pipelines
+  for D dual-write and S stretching keys from the storage in X milliseconds (F failed, R rejected, U not used by the settings or the
+  draw resolution scale)', and the 'the dual-write direct ... pipeline is made' lines now come at start. The file's header is
+  unchanged, so an existing file is kept and gets the new kinds appended; the pipelines are the same objects as before, made earlier.
+  No cvar. Left lazy on purpose (no evidence, features off in every profile): resolve_defer's materialize pipelines (2), the
+  temporal AA pipelines (5, FSR presets), the HDR restore pipelines (2).
+  Needs 0790, 0791, 0792 and 0760 (the code it edits).
+  Measured (2026-11-27, RTX 4060 Laptop, runs h2-*): the 7 pipelines are made at start in 5-7 ms (0.7-1 ms each, not the 4-8 ms
+  of the earlier estimate), so the gain is at most that much of the front-end frame: not separable from the +/-20 ms run to run noise
+  (worst 1080p front-end frame, median of 3: 113 ms before, 109.5 ms with this patch alone). resolve_dual_write_verify=7: 0 differ in
+  27,181 checked textures (run h2-v1). At 2000p the 7 scaled pipelines are made at start in 6 ms. Kept because it costs nothing and a slower
+  driver may need more than 1 ms a pipeline (not measured: the Radeon / Intel machines).
+Bucket: REDO
+
+0793-direct-resolve-pipeline-keys.patch (mcla-x86 native stream, T0/T2).
+
+---
+diff --git a/include/rex/graphics/d3d12/render_target_cache.h b/include/rex/graphics/d3d12/render_target_cache.h
+--- a/include/rex/graphics/d3d12/render_target_cache.h
++++ b/include/rex/graphics/d3d12/render_target_cache.h
+@@ -829,6 +829,16 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+   enum : uint32_t {
+     kRuntimePipelineKeyTransfer = 1,  // TransferShaderKey::key
+     kRuntimePipelineKeyDump = 2,      // DumpPipelineKey::key
++    // LOCAL PATCH - MCLA (0793): the compute pipelines of the direct resolves made on first use (about 7 a run, 2-4 ms
++    // each, in the frame of the first resolve of each kind), which are not counted in rexgpu_pipeline_creations.
++    //   kDirectResolveDual:    the final copy shader index (GetDirectResolveCopyShader, below 9) | origin << 4 |
++    //                          multisampled << 5 | scaled << 6 (the arguments of GetDirectResolveDualPipeline, and
++    //                          IsDrawResolutionScaled(): the scaled members of the shaders are other pipelines).
++    //   kDirectResolveStretch: the final copy shader index | scaled << 6 | batched loads << 7.
++    // A record made with another draw resolution scale stays in the file and isn't made at another scale.
++    kRuntimePipelineKeyDirectResolveDual = 3,
++    kRuntimePipelineKeyDirectResolveStretch = 4,
++    kRuntimePipelineKeyLast = kRuntimePipelineKeyDirectResolveStretch,
+   };
+   // Appends the key to the file (and flushes: a few dozen records a run, and the process ends with _Exit) unless it
+   // is already there or the keys are being made from the file.
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -1871,6 +1871,10 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetDirectResolveDualPipeline(
+               origin ? (multisampled ? " (with the texel origin, multisampled source)" : " (with the texel origin)")
+                      : "",
+               scaled ? " (scaled)" : "");  // LOCAL PATCH - MCLA (0530): resolve_dual_write_msaa; (0760)
++  // LOCAL PATCH - MCLA (0793): kept for the next runs (InitializeRuntimePipelineStorage).
++  RecordRuntimePipelineKey(kRuntimePipelineKeyDirectResolveDual,
++                           uint32_t(index) | (uint32_t(origin) << 4) | (uint32_t(multisampled) << 5) |
++                               (uint32_t(scaled) << 6));
+   return pipeline;
+ }
+ 
+@@ -2044,6 +2048,9 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetDirectResolveStretchPipeline(
+       REXGPU_INFO("D3D12RenderTargetCache: the stretching direct {} pipeline is made ({} loads)",
+                   draw_util::resolve_copy_shader_info[index].debug_name,
+                   batched ? "batched" : "one at a time");
++      // LOCAL PATCH - MCLA (0793): kept for the next runs (InitializeRuntimePipelineStorage).
++      RecordRuntimePipelineKey(kRuntimePipelineKeyDirectResolveStretch,
++                               uint32_t(index) | (uint32_t(scaled) << 6) | (uint32_t(batched) << 7));
+     } else {
+       direct_resolve_stretch_failed_ = true;
+       REXGPU_ERROR("D3D12RenderTargetCache: Failed to create the stretching direct {} pipeline",
+@@ -7191,7 +7198,7 @@ void D3D12RenderTargetCache::InitializeRuntimePipelineStorage(
+     uint64_t record;
+     while (fread(&record, sizeof(record), 1, file) == 1) {
+       const uint32_t kind = uint32_t(record >> 32);
+-      if (kind != kRuntimePipelineKeyTransfer && kind != kRuntimePipelineKeyDump) {
++      if (kind < kRuntimePipelineKeyTransfer || kind > kRuntimePipelineKeyLast) {  // LOCAL PATCH - MCLA (0793)
+         break;  // Corrupted: keep what's before.
+       }
+       stored.push_back(record);
+@@ -7232,7 +7239,7 @@ void D3D12RenderTargetCache::InitializeRuntimePipelineStorage(
+       } else {
+         ++failed;
+       }
+-    } else {
++    } else if (kind == kRuntimePipelineKeyDump) {  // LOCAL PATCH - MCLA (0793): the later kinds are made below
+       DumpPipelineKey key;
+       key.key = key_value;
+       ++dump_keys;
+@@ -7250,6 +7257,64 @@ void D3D12RenderTargetCache::InitializeRuntimePipelineStorage(
+       created, transfer_keys, dump_keys,
+       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count(),
+       failed, rejected);
++
++  // LOCAL PATCH - MCLA (0793): the compute pipelines of the direct resolves (the dual-write ones and the stretching
++  // ones), made on first use before: 7 of the 8 dual-write ones with the texel origin in each run of the game's front
++  // end, in the frame of the first resolve of each kind. Only the keys the settings and the draw resolution scale of this
++  // run can ask for are made: a key of another scale stays in the file.
++  {
++    const auto direct_start = std::chrono::steady_clock::now();
++    const bool dual_write = REXCVAR_GET(resolve_dual_write);
++    const bool dual_msaa = REXCVAR_GET(resolve_dual_write_msaa);
++    const bool scaled_now = IsDrawResolutionScaled();
++    const bool scaled_dual_write = (REXCVAR_GET(scaled_copy_levers) & 1) != 0;
++    size_t dual_keys = 0, stretch_keys = 0, direct_made = 0, direct_failed = 0, direct_rejected = 0,
++           direct_unused = 0;
++    runtime_pipeline_keys_preloading_ = true;
++    for (uint64_t record : stored) {
++      const uint32_t kind = uint32_t(record >> 32);
++      const uint32_t key_value = uint32_t(record);
++      if (kind != kRuntimePipelineKeyDirectResolveDual && kind != kRuntimePipelineKeyDirectResolveStretch) {
++        continue;
++      }
++      const bool dual = kind == kRuntimePipelineKeyDirectResolveDual;
++      const uint32_t index = key_value & 15;
++      const bool origin = dual && (key_value & (1u << 4)) != 0;
++      const bool multisampled = dual && (key_value & (1u << 5)) != 0;
++      const bool scaled = (key_value & (1u << 6)) != 0;
++      const draw_util::ResolveCopyShaderIndex copy_shader = draw_util::ResolveCopyShaderIndex(index);
++      // The spare bits must be clear, the index the final one (what GetDirectResolveCopyShader returns), and the
++      // dual-write shaders of a multisampled source or of a scaled draw all have the texel origin.
++      if (index >= uint32_t(draw_util::ResolveCopyShaderIndex::kCount) ||
++          GetDirectResolveCopyShader(copy_shader) != copy_shader ||
++          (dual ? (key_value >> 7) != 0 || ((multisampled || scaled) && !origin)
++                : (key_value & 0x30) != 0 || (key_value >> 8) != 0)) {
++        ++direct_rejected;
++        continue;
++      }
++      if (scaled != scaled_now || !direct_resolve_root_signature_ ||
++          (dual && (!dual_write || (scaled && !scaled_dual_write) || origin != (dual_msaa || scaled_now) ||
++                    (multisampled && !dual_msaa)))) {
++        ++direct_unused;
++        continue;
++      }
++      (dual ? dual_keys : stretch_keys) += 1;
++      if (dual ? GetDirectResolveDualPipeline(copy_shader, origin, multisampled) != nullptr
++               : GetDirectResolveStretchPipeline(copy_shader) != nullptr) {
++        ++direct_made;
++      } else {
++        ++direct_failed;
++      }
++    }
++    runtime_pipeline_keys_preloading_ = false;
++    REXGPU_INFO(
++        "Created {} direct resolve compute pipelines for {} dual-write and {} stretching keys from the storage in {} "
++        "milliseconds ({} failed, {} rejected, {} not used by the settings or the draw resolution scale)",
++        direct_made, dual_keys, stretch_keys,
++        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - direct_start)
++            .count(),
++        direct_failed, direct_rejected, direct_unused);
++  }
+ }
+ 
+ void D3D12RenderTargetCache::RecordRuntimePipelineKey(uint32_t kind, uint32_t key) {
