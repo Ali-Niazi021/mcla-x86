@@ -106,6 +106,32 @@ Sprint 2 (2026-11-26, streams LOCK60, HOST, VISUALS, HDR, MENUS60): the first bl
 has one entry (the CMake preset trap, the dead PresentMon GPU column). Run ids `lk-*`, `h*run*`, `vis*`, `hdr*`/`h2-*`,
 `mn*` are in the stream work trees' `runs/`; `gate*` and `q0-base` are the orchestrator's (METRICS).
 
+### NATIVE-M A blind pad script can drive this save: reverse pulses, a 0.7 throttle, and B before A
+**Symptom** The drive flows (`quick_drive` / `bench_drive`) leave the motorbike nose-first against the wall across the street after 3 s
+(0 mph in every screenshot of every run): all drive numbers so far were a static scene. **Cause** Nothing in the script reverses or steers
+away from an obstacle. Trying variants (about 50 runs, the speedometer read in the screenshots) showed: full throttle (65-90 mph) wedges the
+bike for good at a building corner (reverse gear shows 0 mph, rear wheel spinning, 40+ s) and speeding past police starts a pursuit and an
+arrest (ARRESTED screen, ~20 s); rt=0.45 only creeps (2-9 mph, gear 1); rt=0.7 gives 40-46 mph (the HUD shows `CR` at the speed limit);
+no button resets the bike (X is nitrous); the DELIVERY job dialog the bike opens by riding over a job marker freezes the drive and is closed
+by B (BACK), but A on it ACCEPTS the job, so a B tap goes before every A tap; reverse pulses shorter than 2 s do not free the bike and the
+forward start after a pulse needs a 1.2 s counter-lock to slide along the obstacle; the title screen shows 20 s after the start in one boot and
+28 s in the next, so the Start taps stay at 28..34 s. **Fix** `tools/flows/quick_drive2.txt` / `bench_drive2.txt`: 11 s of full throttle onto
+Selma Ave with a left tap against the Food Mart corner, then 6.2 s units (2.0 s reverse with the stick locked to alternating sides, 4.0 s at
+rt=0.7 with a 1.2 s counter-lock, B at +0.6 s, A every second unit). Speed above 0 mph in 93 / 86 / 86 % of the 5 s samples in three 2000p runs;
+a police pursuit starts in about one run in two and an arrest in about one in four (10-20 s lost), so check the speedometer in the screenshots.
+**Evidence** runs `dr-*`, `dr-v12-1..3`, `c-2000u-s`; header of `quick_drive2.txt`; scratch `drive/`.
+
+### NATIVE-N The RTX 4060 Laptop's clock moves 1800-2500 MHz between runs: lock it for A/B, read group deltas
+**Symptom** The same configuration read 9.7 ms GPU busy in one run and 10.8 in the next (tone map group, a fixed full-screen pass: 0.54, 0.69,
+0.77, 1.05 ms in different runs); a lever table from runs minutes apart was wrong by more than the levers. **Cause** The GPU is power-capped at
+55 W (clocks_event_reasons 0x4): under load it runs 1900-2000 MHz when the chassis is hot (73-82 C) and 2500 MHz when cool or lightly loaded; at
+the 60 fps cap the clock is 2200-2330 MHz and a capped frame costs more than a saturated one. No NVIDIA telemetry was captured before.
+**Fix** For A/B: `nvidia-smi -lgc 1800,1800` through the broker (accepted on this laptop; reset with `-rgc`), an `nvidia-smi -l 1` sampler per run
+(`scratch/r2r3/runit.py` writes `scratch/r2r3/nv/<run>.csv`), at least two replicates, and the groups a lever touches (shadow, pre, env, post)
+rather than the frame p50: the `scene` group alone varies 2.7-3.7 ms between identical runs because the route differs after the first 15 s.
+Absolute numbers for the product (Part C) are taken with the clock free. **Evidence** METRICS rows `k-*` (locked) against `dr-v12-*` / `r23-*`
+(free), `scratch/r2r3/nv/`.
+
 ### Sprint2-Process A commander that waits with a shell sleep loop can stall on a coder that already finished
 **Symptom** One LOCK60 stall: the commander sat waiting for a coder whose work was done. **Cause** It polled with a shell
 sleep loop instead of taking the coder's completion message. **Fix** Wait on the completion notification; no sleep loops.
@@ -429,6 +455,24 @@ hold reads 55–100 % missed, which starts a 12 s hold. **Fix** Open (PORT_STATE
 `2000p`: the `1000p` guest with `draw_resolution_scale_x/y=2` (`resolution_scale` is ignored as a default: it is only read
 when set by hand). The picture is correct (HUD, Vert+); 23–26 fps on the 880M, GPU 100 % busy; dual-write resolves and
 the direct present fall back at a scale above 1. **Evidence** runs `orc-native-n2000`, `orc-native2-*`, `orc-flk-n2000`.
+
+### R2 / R3 2000p: off-screen targets double with the draw scale, VRS as the base (2026-11-27, static work, not run)
+**Symptom** At draw scale 2 every render target is 4x the pixels, also the ones the game sizes from a constant: the 640x640 4x-MSAA
+sun-shadow target is 1280x1280 on the host (shadow group 1.75 ms, environment map 0.99, post 2.23, composite 1.17 in the T1 M2 run
+`t1-m2-2000u`, RTX 4060, governor off). **Fix** Game side: `mcla_gfx_shadow_res=320` in the `2000p` profile (host 640, the 1080p look; the
+audit is in `mcla_gfx_shadow_res.cpp`), a gfx preset's shadow size halved at scale 2, `mcla_gfx_env_res` for the environment map
+(0x8233AB3C), `vrs_level=2` as the profile's VRS base (see the outcome below: the base was dropped, the env size is now on). **Outcome 2026-11-27
+(runs `k-*`, quick_drive2, 1800 MHz locked, 2 replicates)** shadow 320: -0.6 ms (shadow group -0.4, pre -0.2), picture clean (slightly wider
+penumbra); env 256: -0.5 to -0.6 ms, the paint reflection as soft as at 1080p, no seam; VRS level 2: -0.1 ms and the distant tree masses get 4-8 px
+stair steps (5 of 5 runs with VRS, 0 of 5 without): off. **Findings** (1) The SDK's VRS selection reads the GUEST
+surface pitch (`RB_SURFACE_INFO`) and the guest phase markers, never the scaled width: `vrs_min_target_width` 640 selects the same targets at
+scale 2 as at 1x (1600 and 800 shaded, 400 not), no SDK change needed. (2) The governor wrote its VRS rungs as absolute levels 1 and 2, so with
+`vrs_level=2` a shed would have walked the shading rate back to level 1: the rungs now sit above the base (`mcla_gfx_res_math.h VrsRungs`,
+none left with two levels). (3) A gfx preset applied at first use replaces a profile's app default of the same knob (`SetDefaultValue` keeps the
+source at default), so `--mcla_gfx_preset=ultra` would have restored 640. (4) The shadow texel-size constants (pixel shader register 5) follow
+the guest edge: the penumbra at 320 is about twice as wide as at 640 / 1x. (5) Every other off-screen target (reflection 256, impostors,
+fast collector 256 / 512, 960x640 `self`) is sized by literals at several sites with no size field: addresses and blockers in
+`docs/native/R2_TARGETS.md`. **Evidence** static: `$WORK/scratch/r2r3/`; run pending (integrator).
 
 ### Sprint P1/R6 Where the 880M's time goes
 **Symptom** 1080p single tile ~17.8 ms GPU; game-side detail cuts barely moved it. **Cause** (1) the package is capped at

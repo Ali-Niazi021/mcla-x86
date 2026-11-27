@@ -564,6 +564,12 @@ Reports in `$WORK/scratch/{S2,S3,S4,S5,R2,R3,R4,R5,R6}/REPORT.md`.
 - **Native 3200x2000:** `mcla_profile=2000p` = the 1600x1000 guest at `draw_resolution_scale` 2x2: correct picture,
   23–26 fps, GPU 100 % busy (Radeon 880M); dual-write resolves and the direct present fall back at a scale above 1.
   [Correction 2026-11-27, RTX 4060 Laptop: the dual-write resolves run at a scale above 1 with `scaled_copy_levers` bit 1 (9 in the 2000p profile); the direct present still falls back.]
+  Since 2026-11-27 (R2 / R3 of `docs/native/ROADMAP.md`, measured on the RTX 4060 with `quick_drive2`, runs `k-*` at a locked 1800 MHz):
+  the profile also sets `mcla_gfx_shadow_res=320` (the host shadow map is the shipped 640, not 1280; a gfx preset's shadow size is
+  halved at scale 2; -0.6 ms) and `mcla_gfx_env_res=256` (the cars' reflection map 512x256 -> 256x128 guest, the 1080p look; -0.5 to
+  -0.6 ms). `vrs_level=2` as a base was measured and left OFF: it saves only 0.1 ms and stair-steps the distant tree masses (5 of 5 runs
+  with it, 0 of 5 without), and the governor's VRS rungs share that look. Targets and addresses: `docs/native/R2_TARGETS.md`. A/B:
+  `--mcla_gfx_shadow_res=640`, `--mcla_gfx_env_res=0`, `--vrs_level=2`.
 - **Fullscreen is Hardware: Independent Flip** now that the SuperDisplay virtual display is detached; a window is
   Composed: Flip (the desktop is 3200x2000).
 

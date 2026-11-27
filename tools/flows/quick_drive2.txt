@@ -1,0 +1,119 @@
+# MCLA quick flow 2 (iteration runs): boot, free roam, one minute of REAL driving, stop. 118 s in all.
+# Replaces quick_drive.txt for every measurement of the drive (that one holds a parked bike against a wall, see below):
+# the drive window is T+52..118 (66 s), the same window as before, and the bike is already moving when it opens.
+# The boot (first 49 s) is the one of quick_drive.txt, so `-> free-roam` and the windows compare with the old rows.
+# Use: python tools/run_game.py --flow quick_drive2 --config Release [--cvar k=v]... [--screenshot-every 5]
+#      python tools/bench.py --flow quick_drive2 --no-warmup --window-skip 16 [--variant ...]
+# Format: <second>:<button>[+<button>...][/<hold ms>], '#' comments; seconds count from process start.
+#
+# WHY THE OLD FLOWS DID NOT MOVE (quick_drive.txt / bench_drive.txt, fixture after_intro, a motorbike): the save parks the
+# bike on a pavement facing the street, with a low wall on the far side. The old flows hold rt for 14 s with a half-second
+# steer at the end of the slice: the bike is at 38 mph two seconds in, hits the wall about 3 s ahead and then sits against it
+# with the rear wheel smoking: 0 mph on the speedometer in every screenshot of every run (t60 / t80 / t100 of t1-m2-2000u,
+# ov-*, r1-*). Nothing in the script ever reverses or steers away from an obstacle.
+#
+# WHAT THIS FLOW DOES (a pad script cannot read the game, so it is open loop and built to recover from what it hits):
+#   boot  = the old timeline, unchanged: Start/300 at 28, 30, 32, 34, B taps at 40..49 (close a pause a late Start opened).
+#           Kept on purpose: the title shows 20 s after the process start in one boot and 28 s in the next (legals and logos
+#           of varying length), so a Start before 28 s is lost in some boots. `-> free-roam` comes at 35-37 s.
+#   open  = T+49.5, 11.1 s at full throttle: a 1.0 s right turn out of the spawn onto Selma Ave, a 0.4 s left tap at 52.3 that
+#           keeps the bike on the road side of the Food Mart corner (without it the bike clips that corner and wedges),
+#           then Highland Ave north at 70-75 mph to the Hollywood Blvd crossing. The first 15 s are the same streets at the
+#           same speeds in every run (9-18 mph at t50, 47-61 at t55, 70-74 at t60, 11-29 at t65).
+#   units = 6.2 s each, from 60.6: a 2.0 s reverse pulse (lt=1 with the stick locked to alternating sides, right first), then
+#           4.0 s of throttle at rt=0.7 with a 1.2 s counter-lock at its start. Moving, the bike brakes and reverses a little;
+#           against a wall, a car or a kerb it backs off and the full-lock forward start slides it along the obstacle, which
+#           is what frees it; the next unit turns the other way. The end of a pulse is in reverse gear (1-12 mph).
+#   modals= b/300 0.6 s into every reverse pulse closes a BACK-type modal (the DELIVERY job dialog the bike opens by riding
+#           over a job marker: BACK = B, ACCEPT = A; it freezes the drive until closed). Every second unit an a/200 follows
+#           0.7 s later for the 'DAMAGED OUT / QUICK FIX' modal that only A answers (a long blind drive reaches it, ~282 s
+#           in W2.1) and for the 'ARRESTED' summary: the B before it keeps A from landing on a DELIVERY dialog (A = accept).
+#
+# WHAT WAS TRIED AND REJECTED (runs dr-* in the work folder, 1080p and 2000p; speedometer read in the screenshots):
+#   * full throttle in the units (65-90 mph): the bike wedges for good at the Food Mart corner or a building wall (reverse gear
+#     shows 0 mph, rear wheel spinning, 40+ s), and speeding past a police car starts a pursuit and an arrest: 1 of 4 runs held.
+#   * rt=0.45: never wedged and never arrested, but a 2-9 mph crawl (gear 1). rt=0.6-0.7 gives 25-45 mph ('CR' lights up at
+#     the speed limit). rt=0.52-0.6 in 8 s units: police in every run by t80, 43-93 % of the samples above zero.
+#   * 1.2 s and 1.8 s reverse pulses (stuck 12 s at a diner wall; a standstill at the end of every pulse), a 0.7 s counter-lock
+#     (the bike stays pinned), first reverse pulse locked to the left (the forward start then turns right into the Hollywood
+#     & Highland forecourt, a pedestrian dead end: police pull the bike over and arrest it, ~20 s lost; seen in 1 of 3 runs).
+#   * no button frees a wedged bike: X is the nitrous (a flash and a camera kick); Y, LB, RB, L3, R3 and A do nothing.
+#
+# MEASURED (2000p, shadow 640, vrs 0, saturated cvars of docs/native NOTES: r23-base runs; speedometer read in the t50, t55
+# ... t115 screenshots, 14 samples a run): above 0 mph in 93 %, 86 %, 86 % of the samples (above 10 mph: 64 %, 64 %, 71 %).
+# After the first reverse pulse the path differs from run to run (traffic, pedestrians) but stays on the streets of Hollywood
+# (Selma Ave, Highland Ave, Hollywood Blvd, Wilcox Ave). A police pursuit starts in about one run in three.
+# LIMITS: open loop, so a run can still end wedged or arrested for 10-20 s: read the speedometer in the screenshots
+# (python tools/run_game.py --flow quick_drive2 --screenshot-every 5 ...; shots/t55.png, t60.png ...) before trusting a number.
+#
+# expect: free-roam
+# seconds: 118
+# fixture: after_intro
+# --- boot (as quick_drive.txt) ---
+28:start/300
+30:start/300
+32:start/300
+34:start/300
+40:b/300
+43:b/300
+46:b/300
+49:b/300
+# --- open: right onto Selma Ave at full throttle; a left tap keeps the bike clear of the Food Mart corner ---
+49.5:rt=1/11100
+49.5:ls_right/1000
+52.3:ls_left/400
+# unit 1: reverse pulse locked right, then throttle with a left counter-lock
+60.6:lt=1+ls_right/2000
+61.2:b/300
+62.8:rt=0.7/4000
+62.9:ls_left/1200
+# unit 2: reverse pulse locked left, then throttle with a right counter-lock
+66.8:lt=1+ls_left/2000
+67.4:b/300
+68.1:a/200
+69:rt=0.7/4000
+69.1:ls_right/1200
+# unit 3: reverse pulse locked right, then throttle with a left counter-lock
+73:lt=1+ls_right/2000
+73.6:b/300
+75.2:rt=0.7/4000
+75.3:ls_left/1200
+# unit 4: reverse pulse locked left, then throttle with a right counter-lock
+79.2:lt=1+ls_left/2000
+79.8:b/300
+80.5:a/200
+81.4:rt=0.7/4000
+81.5:ls_right/1200
+# unit 5: reverse pulse locked right, then throttle with a left counter-lock
+85.4:lt=1+ls_right/2000
+86:b/300
+87.6:rt=0.7/4000
+87.7:ls_left/1200
+# unit 6: reverse pulse locked left, then throttle with a right counter-lock
+91.6:lt=1+ls_left/2000
+92.2:b/300
+92.9:a/200
+93.8:rt=0.7/4000
+93.9:ls_right/1200
+# unit 7: reverse pulse locked right, then throttle with a left counter-lock
+97.8:lt=1+ls_right/2000
+98.4:b/300
+100:rt=0.7/4000
+100.1:ls_left/1200
+# unit 8: reverse pulse locked left, then throttle with a right counter-lock
+104:lt=1+ls_left/2000
+104.6:b/300
+105.3:a/200
+106.2:rt=0.7/4000
+106.3:ls_right/1200
+# unit 9: reverse pulse locked right, then throttle with a left counter-lock
+110.2:lt=1+ls_right/2000
+110.8:b/300
+112.4:rt=0.7/4000
+112.5:ls_left/1200
+# unit 10: reverse pulse locked left, then throttle with a right counter-lock
+116.4:lt=1+ls_left/2000
+117:b/300
+117.7:a/200
+118.6:rt=0.7/4000
+118.7:ls_right/1200

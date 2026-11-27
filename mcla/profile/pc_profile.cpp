@@ -27,6 +27,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
+#include "mcla_gfx_res_math.h"  // mcla/hooks: the 2000p entries (shadow edge, VRS level) are checked against the maths the hooks use
 #include "mcla_ws_sizing.h"  // mcla/hooks: the presets' numbers are checked against the same maths the hooks use
 
 REXCVAR_DEFINE_STRING(mcla_profile, "", "MCLA",
@@ -45,7 +46,7 @@ REXCVAR_DEFINE_STRING(mcla_profile, "", "MCLA",
                       "1280x800, '900p16' = 1440x900, '1200p' = 1920x1200, '1200p-fsr' = 1200p with the scene at "
                       "1280x800 upscaled by FSR (1.5x), '1200p-fsr4p' = 1200p from 960x600 by FSR 4 (2x), '1000p' = "
                       "1600x1000, '2000p' = 3200x2000 on the host (1000p with every render target drawn at 2x2: "
-                      "about 4x the GPU load). "
+                      "about 4x the GPU load, less with its sun-shadow map 320 and VRS level 2 base). "
                       "Read once, in OnPreSetup")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -389,6 +390,34 @@ constexpr CvarDefault k1000pDefaults[] = {
     {"mcla_ws_ui_squeeze", "268"},
     {"mcla_ws_ui_probe", "false"},
 };
+// The levers that keep 2x2 drawing from costing 4x everywhere (docs/native/ROADMAP.md R2 and R3), each behind its own cvar, so
+// `--mcla_gfx_shadow_res=640` / `--mcla_gfx_env_res=0` / `--vrs_level=2` on the command line (or in the config file) is the A/B and wins
+// over these defaults. Measured on the RTX 4060 Laptop with quick_drive2 (the bike really driving, runs `k-*`, graphics clock locked
+// at 1800 MHz so that runs compare; two replicates of each, group medians of the GPU timing, frame p50 12.4 ms for the old 2000p):
+//   mcla_gfx_shadow_res=320   ON. The SDK draws every render target at the draw scale and the guest does not know, so the 640x640 4x-MSAA
+//                             sun-shadow target would be 1280x1280 on the host: 4x the shadow pixels for no visible gain. A guest map of 320
+//                             is the host 640 of the 1080p look (mcla_gfx_shadow_res.cpp: the audit of the size, read at a world load). A
+//                             gfx preset (mcla_gfx_preset) does not undo it: its shadow size is halved at scale 2 (mcla_gfx_tune.cpp).
+//                             -0.6 ms (shadow group 2.03 -> 1.66, pre 0.63 -> 0.43, whose screen-space collector reads the map). Picture:
+//                             the penumbra is a little wider (a filter tap is 2 host texels), no acne, no peter-panning, no shimmer or
+//                             missing quadrant seen on the parked and driven bike.
+//   mcla_gfx_env_res=256      ON. The cars' paint reflection map (dual paraboloid, guest 512x256, 1024x512 on the host at 2x2) at guest
+//                             256x128 = the host 512x256 of the 1080p look (mcla_gfx_env_res.cpp). -0.5 to -0.6 ms (env group 1.25 ->
+//                             0.64-0.69 ms). Picture: the paint reflection of the bike is softer exactly as at 1080p (side by side
+//                             with a 1080p run), no seam at the border of the two hemispheres, no mirroring, shifting or black.
+//   vrs_level=2               OFF (the SDK default 0; the lever stays available). Variable rate shading of the post, composite,
+//                             translucent and pre phases at 2x2 saves only 0.1 ms here (post 1.87 -> 1.83, composite 1.07 -> 1.02; a
+//                             paired A/B inside one run, `--schedule` toggling vrs_level every 10 s, gave frame p50 9.33 vs 9.32 ms) and
+//                             it is visible: the distant tree masses (foliage drawn in the translucent phase) get stair-stepped blocks of
+//                             4-8 pixels in 5 of 5 runs with it and in 0 of 5 without it (runs k-vrs-1/2, k-all-1/2, k-allenv-1 against
+//                             k-base-1/2, k-shadow-1/2, k-env-1, shots/t55.png). The governor's VRS rungs (mcla_gov) use the same levels.
+static_assert(mcla::gfxres::ShadowEdgeOf(320) == 320 && mcla::gfxres::ShadowEdgeIsTiled(320) && mcla::gfxres::ShadowFitsEdram(320) &&
+                  2 * mcla::gfxres::ShadowEdgeOf(320) == mcla::gfxres::kShadowShippedEdge,
+              "the 2000p shadow edge is an edge the hook accepts and its host target is the shipped 640");
+static_assert(mcla::gfxres::EnvSizeOf(256).width == 256 && mcla::gfxres::EnvSizeOf(256).height == 128 &&
+                  mcla::gfxres::EnvSizeIsTiled(mcla::gfxres::EnvSizeOf(256)) &&
+                  2 * mcla::gfxres::EnvSizeOf(256).width == mcla::gfxres::kEnvShippedWidth,
+              "the 2000p environment map size is one the hook accepts and its host target is the shipped 512x256");
 constexpr CvarDefault k2000pDefaults[] = {
     {"draw_resolution_scale_x", "2"},
     {"draw_resolution_scale_y", "2"},
@@ -407,6 +436,8 @@ constexpr CvarDefault k2000pDefaults[] = {
     // host). Without the rule the rain is not drawn at 2000p (r1-rain0: stormy weather, no streak; r1-rain1: the same with the
     // rule, streaks); the 1x path needs none.
     {"resolve_unscaled_copy_rules", "len=131072,pitch=128,height=128,fmt=37"},
+    {"mcla_gfx_shadow_res", "320"},
+    {"mcla_gfx_env_res", "256"},
 };
 
 // 1200p-fsr / 1200p-fsr4p: the 1200p render with the scene drawn at 1280x800 (1.5x) or 960x600 (2x) and upscaled to
@@ -525,7 +556,8 @@ constexpr Preset kPresets[] = {
      k1000pDefaults, sizeof(k1000pDefaults) / sizeof(k1000pDefaults[0]), nullptr},
     {"2000p",
      "16:10 3200x2000 on the host: the 1000p render with every render target drawn at 2x2 (draw_resolution_scale_x/y=2); "
-     "the game still sees 1600x1000",
+     "the game still sees 1600x1000; sun-shadow map 320 (host 640, mcla_gfx_shadow_res) and environment map 256x128 (host "
+     "512x256, mcla_gfx_env_res)",
      k2000pDefaults, sizeof(k2000pDefaults) / sizeof(k2000pDefaults[0]), "1000p"},
 };
 

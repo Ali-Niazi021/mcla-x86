@@ -35,8 +35,12 @@
 //                              cascade's light matrices held (sub_825F61F0 override) and the shadow atlas in memory of its own
 //                              (mcla_gfx_shadow_private; sub_825F4EF8 override): mcla_gfx_far_cascades.cpp
 //   mcla_gfx_impostor_interval  N >= 2: a tree-impostor type is regenerated at most every N-th frame (mid-asm hook 0x8230DE50)
-//   mcla_gfx_shadow_res       0 = shipped 640; 512 or 384 = the edge of the sun-shadow map (mid-asm hook 0x825F69A0 in the CShadowMap
-//                              constructor, mcla_gfx_shadow_res.cpp). Read when the shadow map is created: a world load
+//   mcla_gfx_shadow_res       0 = shipped 640; 512, 384, 320, 256 or 192 = the edge of the sun-shadow map in guest texels (mid-asm hook
+//                              0x825F69A0 in the CShadowMap constructor, mcla_gfx_shadow_res.cpp). Read when the shadow map is created:
+//                              a world load. The 2000p profile (draw resolution scale 2) sets 320: host 640, the 1080p look
+//   mcla_gfx_env_res          0 = shipped 512x256; 384 or 256 = the width of the environment map (the cars' paint reflection, dual
+//                              paraboloid, height = width / 2; mid-asm hook 0x8233AB3C, mcla_gfx_env_res.cpp). Read once, when the
+//                              environment map system is created (a world load)
 //   mcla_gfx_impostors        false = no tree impostors (the game's own `noimpostors` switch, plus the guard of the refresh loop
 //                              the switch alone would hang in: mcla_gfx_impostors.cpp). Applies to impostors created after the change
 //   mcla_gfx_preset           "" = as shipped, perf, perf+, lowest, quality, ultra: bundles of the knobs above and below (quality =
@@ -63,9 +67,11 @@
 
 #include "nfsmw_pch.h"
 
+#include <fmt/format.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
+#include "mcla_gfx_res_math.h"
 #include "mcla_gfx_tune.h"
 #include "mcla_vis.h"
 #include "mcla_guest.h"
@@ -136,10 +142,18 @@ REXCVAR_DEFINE_INT32(mcla_gfx_reflection_interval, 1, "MCLA",
                      "mcla_gfx_env_interval)")
     .range(0, 8);
 REXCVAR_DEFINE_INT32(mcla_gfx_shadow_res, 0, "MCLA",
-                     "MCLA quality knob: the edge of the sun-shadow map in texels (the game's 640; the cascades are drawn into one "
-                     "square render target and resolved from it): 0 or 640 = as shipped, 512 or 384. Read when the shadow map is "
-                     "created (a world load; mid-asm hook 0x825F69A0, mcla_gfx_shadow_res.cpp)")
-    .allowed({"0", "384", "512", "640"});
+                     "MCLA quality knob: the edge of the sun-shadow map in GUEST texels (the game's 640; the cascades are drawn into one "
+                     "square render target and resolved from it): 0 or 640 = as shipped, 512, 384, 320, 256 or 192. At draw "
+                     "resolution scale N the host map is N times that (the 2000p profile sets 320: host 640, the 1080p look; a gfx "
+                     "preset's value is halved at scale 2). Read when the shadow map is created (a world load; mid-asm hook "
+                     "0x825F69A0, mcla_gfx_shadow_res.cpp)")
+    .allowed({"0", "192", "256", "320", "384", "512", "640"});
+REXCVAR_DEFINE_INT32(mcla_gfx_env_res, 0, "MCLA",
+                     "MCLA quality knob: the width in GUEST texels of the environment map (the cars' paint reflection, a dual-paraboloid "
+                     "map of two square hemispheres side by side; the game's 512x256, height = width / 2): 0 or 512 = as shipped, 384 or "
+                     "256. At draw resolution scale 2, 256 draws the shipped 512x256 on the host. Read once, when the environment map "
+                     "system is created (a world load; mid-asm hook 0x8233AB3C, mcla_gfx_env_res.cpp)")
+    .allowed({"0", "256", "384", "512"});
 REXCVAR_DEFINE_BOOL(mcla_gfx_impostors, true, "MCLA",
                     "MCLA quality knob: false = no tree impostors (the game's own noimpostors switch; with it the game's refresh "
                     "loop would never end, so mcla_gfx_impostors.cpp guards it). Applies to impostors created after the change. "
@@ -712,15 +726,33 @@ void ApplyPreset() {
                 requested);
     return;
   }
+  // The draw resolution scale of the run (the 2000p profile draws every render target at 2x2): the presets name the HOST look of the
+  // sun-shadow map (perf 512, quality 640), so at scale 2 the guest edge is half of it and the host map is the one of the same
+  // preset at scale 1 (mcla_gfx_res_math.h ShadowEdgeAtScale). A cvar the GPU plugin does not define reads 0 = no scale.
+  const int32_t scale_x = rex::cvar::Query<int32_t>("draw_resolution_scale_x");
+  const int32_t scale_y = rex::cvar::Query<int32_t>("draw_resolution_scale_y");
   std::string line;
   for (const PresetKnob& knob : knobs) {
     // Set by hand (anything but the compiled-in default, an app default of the profile included) = the user's value stays.
     const bool by_hand = rex::cvar::GetFlagSource(knob.cvar) != rex::cvar::Source::kDefault;
-    const bool ok = rex::cvar::SetDefaultValue(knob.cvar, knob.value);
+    std::string value = knob.value;
+    bool at_scale = false;
+    if (std::strcmp(knob.cvar, "mcla_gfx_shadow_res") == 0) {
+      const int32_t preset_value = int32_t(std::strtol(knob.value, nullptr, 10));
+      const int32_t guest = mcla::gfxres::ShadowEdgeAtScale(preset_value, scale_x, scale_y);
+      if (guest != preset_value) {
+        value = std::to_string(guest);
+        at_scale = true;
+      }
+    }
+    const bool ok = rex::cvar::SetDefaultValue(knob.cvar, value);
     line += ' ';
     line += ShortName(knob.cvar);
     line += '=';
     line += Pretty(rex::cvar::GetFlagByName(knob.cvar));
+    if (at_scale && !by_hand) {
+      line += fmt::format("(draw scale {}x{}: the preset's {} halved)", scale_x, scale_y, knob.value);
+    }
     if (by_hand) {
       line += "(yours)";
     }
@@ -978,8 +1010,13 @@ uint32_t ImpostorInterval() {
 
 uint32_t ShadowMapSize() {
   EnsurePreset();
-  const int32_t size = REXCVAR_GET(mcla_gfx_shadow_res);
-  return (size == 384 || size == 512) ? uint32_t(size) : 640u;
+  return mcla::gfxres::ShadowEdgeOf(REXCVAR_GET(mcla_gfx_shadow_res));
+}
+
+EnvMapDimensions EnvMapSize() {
+  EnsurePreset();
+  const mcla::gfxres::EnvSize size = mcla::gfxres::EnvSizeOf(REXCVAR_GET(mcla_gfx_env_res));
+  return {size.width, size.height};
 }
 
 bool ImpostorsEnabled() {

@@ -12,7 +12,10 @@
 //                         cumulative shaders translated at run time, asynchronous creations in flight: the COMPILE-BURST signal below
 // Outputs:
 //   rexgpu_vrs_level      WRITTEN here: -1 = not governed (the SDK's own cvar decides), 1..N coarser. -1 whenever the governor is off or
-//                         the ladder is at VRS 0, so a user's own VRS cvar keeps working at the base.
+//                         the ladder is at VRS 0, so a user's own VRS cvar keeps working at the base. The SDK's cvar vrs_level IS the
+//                         base level (the 2000p profile sets 2): the VRS rungs sit above it (rung r writes base + r, and there are
+//                         only as many rungs as the SDK's table has levels above the base: mcla_gfx_res_math.h VrsRungs), so a shed
+//                         never walks the shading rate back to a finer one.
 //   mcla_gfx_tier         WRITTEN here with SetFlagByName (mcla_gfx_tune.cpp applies it on its next engine frame and logs '[mcla-gfx] tier
 //                         N: ...'; CurrentTier() reads back what it applied). Put back to what it was (-1, or the tier the user
 //                         configured) when the governor turns off, around a config save (BeforeConfigSave) and at process exit.
@@ -64,6 +67,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
+#include "mcla_gfx_res_math.h"
 #include "mcla_gfx_tune.h"
 #include "mcla_gov.h"
 #include "mcla_gov_math.h"
@@ -112,7 +116,9 @@ REXCVAR_DEFINE_DOUBLE(mcla_gov_restore_s, 4.0, "MCLA",
                       "doubling decays 30 s after the wait it lengthened. Live");
 REXCVAR_DEFINE_INT32(mcla_gov_vrs_levels, 2, "MCLA",
                      "MCLA governor: how many variable-rate-shading levels the ladder uses, 1..N coarser (invisible, ~0.4 / ~0.6 ms for "
-                     "1 / 2); 0 = none. At most what the GPU / SDK has (rexgpu_vrs_levels). These are the first rungs below the base. Live");
+                     "1 / 2); 0 = none. At most what the GPU / SDK has (rexgpu_vrs_levels) ABOVE the SDK's base level vrs_level (the "
+                     "2000p profile sets vrs_level=2, the table's last level: no VRS rung is left there). These are the first rungs "
+                     "below the base. Live");
 REXCVAR_DEFINE_INT32(mcla_gov_tier_floor, -1, "MCLA",
                      "MCLA governor: the floor F, the tier of the base rung (1 = perf ... 5). -1 = auto: the tier mcla_gfx_tier was set to "
                      "(>= 1) before the governor first ran, else that of the preset mcla_gfx_preset: perf = 2 (perf + FXAA: normal play "
@@ -326,6 +332,7 @@ struct State {
   bool seq_valid = false;
   uint32_t last_seq = 0;
   int32_t vrs_written = -1;
+  int vrs_base = 0;  // the SDK's vrs_level cvar (the base level the VRS rungs sit above), read once per engine frame
   int tier_state = kTierUnset;  // the tier written to the cvar, kTierReleased, or kTierUnset
   int floor_auto = 1;           // the floor with mcla_gov_tier_floor = -1
   std::string floor_why;        // where floor_auto came from, for the start line
@@ -359,10 +366,10 @@ void WarnOnce(State& s, const std::string& key, const std::string& text) {
 
 // ---- the actuators -----------------------------------------------------------------------------------------------------------
 
-// The VRS level of the state: 0 = full rate = not governed (-1: the SDK's own cvar decides), K >= 1 = level K.
+// The VRS rung of the state: 0 = the base = not governed (-1: the SDK's own cvar, vrs_level, decides), K >= 1 = the level K above the base.
 void WriteVrs(State& s, int vrs) {
   if (!s.sym.vrs_level) return;
-  const int32_t want = vrs >= 1 ? vrs : -1;
+  const int32_t want = gfxres::VrsWriteLevel(vrs, s.vrs_base);
   if (want == s.vrs_written) return;
   s.sym.vrs_level->store(want, std::memory_order_release);
   s.vrs_written = want;
@@ -429,7 +436,7 @@ math::Params MakeParams(const State& s) {
   p.tier_floor = floor >= math::kMinTier ? std::min(floor, math::kMaxTier) : s.floor_auto;
   p.tier_ceiling = std::clamp<int32_t>(REXCVAR_GET(mcla_gov_tier_ceiling), 0, math::kMaxTier);
   const int sdk_vrs = s.sym.vrs_level && s.sym.vrs_levels ? std::max<int32_t>(0, s.sym.vrs_levels->load(std::memory_order_relaxed)) : 0;
-  p.vrs_levels = std::min(std::clamp<int32_t>(REXCVAR_GET(mcla_gov_vrs_levels), 0, 8), sdk_vrs);
+  p.vrs_levels = gfxres::VrsRungs(std::clamp<int32_t>(REXCVAR_GET(mcla_gov_vrs_levels), 0, 8), sdk_vrs, s.vrs_base);
   p.max_level = REXCVAR_GET(mcla_gov_max_level);
   p.force_level = REXCVAR_GET(mcla_gov_force_level);
   p.enrich_s = std::clamp(REXCVAR_GET(mcla_gov_enrich_s), 0.1, 600.0);
@@ -569,13 +576,13 @@ void LogWindow(const math::Window& w, const math::Controller& c) {
 void LogStart(const State& s, const math::Params& p) {
   const math::Ladder lad = math::Ladder::Of(p);
   REXLOG_INFO("[mcla-gov] on: shed above {:.1f} ms (median of 4; or {} of the last 30 samples; or 2 of the last 30 frames missed; a shed under the floor tier needs the median held over {} GPU frames or the 2 missed frames, never the tail), restore below {:.1f} ms for {:.1f} s, {} GPU frames between sheds; ladder: floor tier {} ({}), "
-              "ceiling tier {} ({}), vrs levels {} (rexgpu_vrs_levels {}), rungs {}..{} (cap {}, pin {}); enrich over {:.1f} s with a {:.1f} ms "
+              "ceiling tier {} ({}), vrs rungs {} above the base level vrs_level={} (rexgpu_vrs_levels {}), rungs {}..{} (cap {}, pin {}); enrich over {:.1f} s with a {:.1f} ms "
               "margin, hold {:.0f} s, learn {:.1f} s; pop hiding: cut > {:.0f} m, speed > {:.0f} km/h, shed waits <= {:.1f} s, camera feed {}; screen grace {} frames; "
               "compile bursts: excuse {:.1f} s per 20 s (quiet {} ms; rexgpu_pipeline_creations / rexgpu_shader_translations / rexgpu_pipelines_pending {}); "
               "symbols ({}): rexgpu_gpu_frame_us {}, rexgpu_gpu_frame_seq {}, rexgpu_gpu_frame_lag {}, rexgpu_vrs_level {}, rexgpu_vrs_levels {}{}",
               p.shed_ms, p.shed_over_count, p.floor_shed_frames, p.restore_ms, p.restore_s, p.shed_frames, lad.floor,
               REXCVAR_GET(mcla_gov_tier_floor) >= math::kMinTier ? std::string("mcla_gov_tier_floor") : s.floor_why,
-              lad.ceiling, lad.enrich > 0 ? "enrichment on" : "no enrichment", lad.vrs,
+              lad.ceiling, lad.enrich > 0 ? "enrichment on" : "no enrichment", lad.vrs, s.vrs_base,
               s.sym.vrs_levels ? s.sym.vrs_levels->load(std::memory_order_relaxed) : 0, -lad.enrich, lad.shed, p.max_level, p.force_level,
               p.enrich_s, p.enrich_margin_ms, p.enrich_hold_s, p.learn_s, REXCVAR_GET(mcla_gov_cut_m), p.pop_speed_kmh, p.pop_wait_s,
               g_cam_seq.load(std::memory_order_relaxed) != 0 ? "active" : "none yet (only the driving flag hides a pop)", p.screen_grace_frames,
@@ -730,6 +737,8 @@ void OnFrame(int64_t now_ns, int last_n, bool driving) {
   }
   if (!s.active) Activate(s);
 
+  // The base level of variable rate shading: the SDK's own cvar (the 2000p profile's 2, or a hand-set value); the VRS rungs go above it.
+  s.vrs_base = std::max<int32_t>(0, rex::cvar::Query<int32_t>("vrs_level"));
   const math::Params p = MakeParams(s);
   if (s.start_line) {
     s.start_line = false;

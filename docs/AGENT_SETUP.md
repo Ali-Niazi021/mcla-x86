@@ -43,8 +43,10 @@ says: "Read docs/AGENT_SETUP.md and docs/NATIVE_PLAN.md before any work; follow 
    `--kill ID`; every command is logged in `$WORK/elevate/broker.log`). It lasts until reboot, logoff or `--stop`. While
    it runs, any program of that user can run administrator commands: do not start it on a machine that matters.
    Agents never stop or kill the broker and never run the game itself elevated.
-6. Scripted run: `python tools/run_game.py --flow quick_drive --config Release --work <WORK> --game <WORK> --run-id <id>
-   --cvar k=v ...` (118 s; `--summarize <log>` re-reads a log). Bench: `tools/bench.py`. Run from PowerShell, not Git
+6. Scripted run: `python tools/run_game.py --flow quick_drive2 --config Release --work <WORK> --game <WORK> --run-id <id>
+   --cvar k=v ...` (118 s; `--summarize <log>` re-reads a log). Use `quick_drive2` / `bench_drive2` for any drive number: the old `quick_drive` / `bench_drive`
+   leave the bike parked against a wall (header of `quick_drive2.txt`). Read the speedometer in `--screenshot-every 5` shots to see that it drives. The GPU clock
+   moves 1800-2500 MHz between runs (LEARNINGS NATIVE-N): for A/B lock it with `nvidia-smi -lgc 1800,1800` through the broker and reset with `-rgc`. Bench: `tools/bench.py`. Run from PowerShell, not Git
    Bash, for anything that configures CMake (a configure from Git Bash produced an SDK that does not link).
 
 ## 3. One PC, many agents: the machine rules

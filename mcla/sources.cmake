@@ -36,7 +36,8 @@
 #   gfx       GFX_CULL_MASK, GFX_SHADOW_MODE, GFX_DL_ENABLE, GFX_TRAFFIC_LOD, GFX_AMBIENT_ZONE (the mcla_gfx_* knobs), plus
 #             GFX_PHASES (the phase skip inside the sub_822E6408 override of mcla_fsr_markers.cpp, so it needs FSR_MARKERS
 #             too: mcla_gfx_env_interval / mcla_gfx_reflection_interval), GFX_SHADOW_RES (mid-asm hook 0x825F69A0, cvar
-#             mcla_gfx_shadow_res; its codegen entry goes in hooks_gfx.toml) and GFX_IMPOSTORS (function overrides of
+#             mcla_gfx_shadow_res; its codegen entry goes in hooks_gfx.toml), GFX_ENV_RES (mid-asm hook 0x8233AB3C, cvar
+#             mcla_gfx_env_res: the environment map's size; codegen entry in hooks_gfx.toml) and GFX_IMPOSTORS (function overrides of
 #             sub_8230B778 / sub_8230D988, cvar mcla_gfx_impostors, no codegen entry); mcla_gfx_preset (perf, perf+, lowest)
 #             is a bundle of these and the older knobs; GFX_FAR_CASCADES (R4: far shadow cascades on alternate frames: the schedule in
 #             PhasesToSkip, overrides of sub_825F61F0 / sub_825F4EF8; cvars mcla_gfx_far_cascades_interval / mcla_gfx_shadow_private;
@@ -113,6 +114,7 @@ set(MCLA_HOOK_DEFINITIONS
     MCLA_HOOK_GFX_AMBIENT_ZONE=1
     MCLA_HOOK_GFX_PHASES=1
     MCLA_HOOK_GFX_SHADOW_RES=1
+    MCLA_HOOK_GFX_ENV_RES=1
     MCLA_HOOK_GFX_IMPOSTORS=1
     MCLA_HOOK_GFX_FAR_CASCADES=1
     MCLA_HOOK_GFX_IMPOSTOR_THROTTLE=1

@@ -135,8 +135,8 @@
     },
     {
       "id": "panel_2000",
-      "label": "Native panel 3200x2000 (about 25 fps)",
-      "help": "A true 3200x2000 picture for the 3200x2000 laptop panel: the game renders 1600x1000 and draws every render target at 2x2, about 4x the GPU load (23-26 fps measured on a Radeon 880M, parked scene). The 60 fps profile runs unlocked below 60 with a variable simulation step, so the game's speed stays right (world/real 1.000). Sun-shadow map 384 (768 host texels, close to the shipped 640). Fullscreen uses the desktop size (borderless); do not switch the display mode, it would go to 1600x1000.",
+      "label": "Native panel 3200x2000 (60 fps on an RTX 4060 Laptop class GPU)",
+      "help": "A true 3200x2000 picture for the 3200x2000 laptop panel: the game renders 1600x1000 and draws every render target at 2x2, 4x the pixels of 1600x1000. Measured on a GeForce RTX 4060 Laptop (55 W) with this setup while driving through traffic: it holds 60 fps (GPU busy 10.5 ms of the 16.7 ms frame, 95th percentile 12.4 ms, no missed frame in 118 s); unlocked it reaches about 93 fps with the Ultra graphics preset, so a card about a third slower than that one is roughly the limit. Weaker graphics (an integrated Radeon 880M managed 23-26 fps in a parked scene, before the 2x copy and shadow savings) will not hold 60: use 1080p there. The 60 fps profile runs unlocked below 60 with a variable simulation step, so the game's speed stays right (world/real 1.000). Sun-shadow map 320 (host 640 texels, the 1080p look) and the environment map 256x128 (host 512x256) are the 3200x2000 profile's own choices. Fullscreen uses the desktop size (borderless); do not switch the display mode, it would go to 1600x1000.",
       "set": {
         "mcla_profile": "2000p",
         "mcla_noaa": true,
@@ -144,7 +144,7 @@
         "mcla_fps_target": 60,
         "mcla_present_immediate": -1,
         "mcla_gfx_preset": "perf",
-        "mcla_gfx_shadow_res": 384,
+        "mcla_gfx_shadow_res": 320,
         "present_effect": "bilinear",
         "fullscreen_mode": "desktop",
         "temporal_aa": "off",
@@ -192,7 +192,7 @@
         {"value": "1000p", "label": "1600x1000 (16:10)", "help": "16:10 at 1000 rows. Vert+ camera, HUD in a 16:9 band."},
         {"value": "1080p", "label": "1920x1080 (16:9)", "help": "True 1920x1080 render, MSAA off. On a Radeon 880M in Performance mode with the Performance scene-detail preset: 60 fps most of the time, with occasional holds at 30 fps in the heaviest streets."},
         {"value": "1200p", "label": "1920x1200 (16:10)", "help": "16:10 at 1200 rows. Vert+ camera, HUD in a 16:9 band. Fills a 16:10 panel with no black bars; on a Radeon 880M it measured the same as 1920x1080 (60 fps most of the time, occasional holds at 30 fps)."},
-        {"value": "2000p", "label": "3200x2000 (16:10, native laptop panel)", "help": "The game renders 1600x1000 and every render target is drawn at 2x2, so the picture is a true 3200x2000 (Vert+ camera, HUD in a 16:9 band); about 4x the GPU load of 1600x1000, measured 23-26 fps on a Radeon 880M (parked scene). Use Fullscreen mode \"Desktop size (borderless)\": with \"Switch the display to the game's mode\" the display would go to 1600x1000."}
+        {"value": "2000p", "label": "3200x2000 (16:10, native laptop panel)", "help": "The game renders 1600x1000 and every render target is drawn at 2x2, so the picture is a true 3200x2000 (Vert+ camera, HUD in a 16:9 band); 4x the pixels of 1600x1000 (measured: holds 60 fps while driving on a GeForce RTX 4060 Laptop, about 93 fps unlocked; 23-26 fps on a Radeon 880M in a parked scene, before the 2x copy and shadow savings). Use Fullscreen mode \"Desktop size (borderless)\": with \"Switch the display to the game's mode\" the display would go to 1600x1000."}
       ],
       "advanced": false,
       "emit": "always"
@@ -677,7 +677,8 @@
       "options": [
         {"value": 0, "label": "640 (as shipped)", "help": "The game's own size."},
         {"value": 512, "label": "512", "help": "About a third less shadow fill."},
-        {"value": 384, "label": "384", "help": "Cheapest; softer shadows (at 2x2 resolution, the 3200x2000 size, it is drawn as 768 texels, close to the shipped 640)."}
+        {"value": 384, "label": "384", "help": "Cheaper; softer shadows (at 2x2 resolution, the 3200x2000 size, it is drawn as 768 texels, close to the shipped 640)."},
+        {"value": 320, "label": "320", "help": "Cheapest; soft shadows at 1920x1080 and below. At 2x2 resolution (the 3200x2000 size) it is drawn as 640 texels, the shipped map's size on screen, and the 3200x2000 profile chooses it by itself."}
       ],
       "advanced": true,
       "emit": "nondefault"
