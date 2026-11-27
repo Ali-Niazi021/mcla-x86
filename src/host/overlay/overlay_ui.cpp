@@ -480,7 +480,8 @@ void PadTap(int64_t now_ns) {
   if (!reported || sample.connected != was_connected) {
     reported = true;
     was_connected = sample.connected;
-    REXLOG_INFO("[mcla-overlay] pad: {}", sample.connected ? "a controller is connected (guest user 0)" : "no controller (guest user 0)");
+    REXLOG_INFO("[mcla-overlay] pad: {}", sample.connected ? "a controller is connected (guest user 0: a pad, the keyboard emulation or the script pad)"
+                                                          : "no controller (guest user 0)");
   }
 
   // The game's pad: quiet until the inputs held at the chord / at the close are up.

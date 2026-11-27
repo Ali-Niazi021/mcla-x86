@@ -152,7 +152,7 @@ The keyboard's rule is unchanged (`Gate`).
 
 | step (s) | pad | log lines (`[mcla-overlay]`, `[mcla-sched]` marks) | picture |
 |---|---|---|---|
-| start-up | | `pad: on (chord L3 + R3, hold 500 ms)` (when the runtime is ready), `pad: a controller is connected (guest user 0)` (the first engine frame, ~4 s: the script pad counts) | |
+| start-up | | `pad: on (chord L3 + R3, hold 500 ms)` (when the runtime is ready), `pad: a controller is connected (guest user 0: ...)` (the first engine frame, ~4 s: the script pad and the keyboard emulation count) | |
 | 44.5 | L3 + R3 held 900 ms | `pad: chord L3 + R3 held 5xx ms: opening the menu`, `menu open: ...`, `pad: the menu answers the controller (last input: pad; 2 input(s) held at the open ...)` | t46: menu, pad legend, yellow ring on "FPS counter" |
 | 46.5 | A | `pad: FPS counter (mcla_overlay_fps) -> on` | t48: counter top right, box ticked |
 | 48.5, 49.5, 50.5 | down, right, left | `pad: Corner (mcla_overlay_fps_corner) -> Bottom left`, then `-> Top right` | t50: counter bottom left; t52: top right |
