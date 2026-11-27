@@ -1,0 +1,97 @@
+# MCLA overlay pad test: opens the mod menu with the controller chord, walks the tabs, changes a slider and a combo, resets, saves
+# and closes it, and checks that the game saw none of it. One boot, ~125 s. Written for docs/OVERLAY.md "Controller", section
+# "Test plan"; the expected log lines and what each screenshot must show are there.
+#
+# Use (the integrator holds the machine; nothing here is run by the agent that wrote it):
+#   python tools/run_game.py --flow overlay_pad_menu --config Release --screenshot-every 2 --run-id padnav-1
+# Save writes the launcher's settings and mcla_x86.toml next to the exe: run with LOCALAPPDATA pointed at a scratch folder (a copy of
+# launcher.json there is fine) and delete <exe dir>/mcla_x86.toml afterwards.
+# Screenshots are at even seconds (t46.png ...): every step below is at an odd second + .5 so the picture 1.5 s later shows its result.
+# Format: <second>:<button>[+<button>...][/<hold ms>] and schedule steps (mark); '#' comments.
+#
+# expect: free-roam
+# seconds: 125
+# fixture: after_intro
+0:mark boot
+# ---- boot, as menu_to_freeroam: Start at the title; free roam from ~37 s. NO Start after 36 s (it would open PAUSE).
+12:start/300
+16:start/300
+20:start/300
+24:start/300
+28:start/300
+32:start/300
+36:start/300
+# ---- 1. the chord: L3 + R3 held 900 ms; the menu opens when the 500 ms hold is up (~45.0 s) and the chord's buttons are not presses
+44:mark chord_open
+44.5:l3+r3/900
+# t46: menu open, pad legend (A B X Y glyphs), yellow ring on "FPS counter"
+# ---- 2. A switches the focused tick box: FPS counter ON
+46:mark a_toggle
+46.5:a/200
+# t48: counter at the top right, the box ticked
+# ---- 3. down to "Corner", right = next choice (Bottom left), left = back (Top right)
+48:mark combo_step
+48.5:down/200
+49.5:right/200
+# t50: counter at the bottom left
+50.5:left/200
+# t52: counter at the top right again
+# ---- 4. down twice to "Statistics screen", A: the statistics panel appears at the left
+52:mark stats_toggle
+52.5:down/200
+53.5:down/200
+54.5:a/200
+# t56: statistics panel, ring on "Statistics screen"
+# ---- 5. down twice to "Overlay background" (a slider): hold left 2.5 s (the value falls, faster the longer it is held), X resets it
+56:mark slider_hold
+56.5:down/200
+57.5:down/200
+58.5:left/2500
+# t60: the panels see-through (value about 0.4), the log shows the steps
+61:mark slider_reset
+61.5:x/200
+# t64: back to 0.75
+# ---- 6. Start while the menu is open does nothing in the game (the game's PAUSE would log `-> pause`)
+64:mark start_blocked
+64.5:start/300
+# ---- 7. tabs with RB (Graphics, Game, Cheats / mods, About, then Display again), LB back to About
+66:mark tabs
+66.5:rb/200
+68.5:rb/200
+70.5:rb/200
+72.5:rb/200
+74.5:rb/200
+76.5:lb/200
+# t68 Graphics, t70 Game, t72 Cheats, t74 About, t76 Display, t78 About
+# ---- 8. back to Display (RB), down to "Anti-aliasing" (past Fullscreen: do NOT press A there), A opens the list, B closes only the list
+78:mark combo_list
+78.5:rb/200
+80.5:down/200
+81.5:down/200
+82.5:down/200
+83.5:down/200
+84.5:down/200
+85.5:down/200
+86.5:down/200
+87.5:a/200
+# t90: the list is open (Off / FXAA / FXAA (extreme)) over the menu
+90.5:b/200
+91.5:right/200
+# t92: the list is closed, the menu is still open (no "B closes the menu" line), Anti-aliasing stepped to the next choice
+# ---- 9. Y saves
+92:mark save
+92.5:y/200
+# t94: the status line says what was saved
+# ---- 10. B closes the menu; Start is held across the close: it must NOT open PAUSE (a held button reaches the game only after release)
+94:mark close_with_start_held
+96.5:b+start/1200
+# t98: no menu, no PAUSE; the log says 2 inputs were held at the close and, ~1.2 s later, that they were released
+# ---- 11. the chord again, then the chord closes it
+100:mark chord_reopen
+100.5:l3+r3/900
+104.5:l3+r3/900
+# ---- 12. control: with the menu closed Start DOES open PAUSE (`free-roam -> pause`), B closes it
+108:mark control_start
+108.5:start/300
+112.5:b/300
+118:mark end

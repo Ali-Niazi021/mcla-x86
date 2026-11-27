@@ -260,8 +260,9 @@ class Overlay {
   uint32_t pad_bits_prev_ = 0;        // last frame's inputs after the hold-off (for the device tracker)
   uint32_t fed_ = 0;                  // ImGui gamepad keys held now (kFed* bits)
   float pad_scroll_ = 0.0f;           // the right stick: -1 (up) .. +1 (down), after the dead zone
-  bool focus_first_ = false;          // the first row of the tab takes the focus (after the open, after a tab change)
-  bool nav_init_ = false;             // show the navigation cursor in the next frame
+  int focus_first_ = 0;               // frames left in which the first row of the tab takes the focus (the open; a tab change)
+  int tab_focus_target_ = -1;         // a tab LB / RB asked for: its first row takes the focus once it is the one drawn
+  int nav_init_ = 0;                  // frames left in which the navigation cursor is made visible (after a pad open)
   bool nav_visible_ = false;          // ImGui draws the navigation cursor (a key or a pad was used last)
   ImGuiBackendFlags saved_backend_flags_ = 0;
   float saved_repeat_delay_ = 0.275f, saved_repeat_rate_ = 0.05f;
@@ -356,7 +357,9 @@ void Overlay::OpenMenu() {
     pad_scroll_ = 0.0f;
     focus_now_ = focus_last_ = pad::Focus::kOther;
     pad_out_ = pad::MenuOut();
-    focus_first_ = nav_init_ = devices_.last() == pad::Device::kPad;
+    nav_init_ = devices_.last() == pad::Device::kPad ? 6 : 0;
+    focus_first_ = nav_init_ > 0 ? 3 : 0;  // a tab bar draws its first content a frame late: a few frames to find the first row
+    tab_focus_target_ = -1;
     REXLOG_INFO("[mcla-overlay] pad: the menu answers the controller (last input: {}; {} input(s) held at the open are ignored until released)",
                 devices_.last() == pad::Device::kPad ? "pad" : "keyboard / mouse", std::popcount(menu_gate_.Mask()));
   }
@@ -909,8 +912,8 @@ void Overlay::Row(const Item& it) {
   bool row_focused = false;
   // The first row of a tab takes the focus (after the open, after LB / RB): FocusItem on its first widget. Not SetKeyboardFocusHere,
   // which would also activate a slider (it turns it into a text box).
-  bool take_focus = focus_first_ && !disabled_why;
-  if (take_focus) focus_first_ = false;
+  bool take_focus = focus_first_ > 0 && !disabled_why;
+  if (take_focus) focus_first_ = 0;
   auto focus_item = [&take_focus]() {
     if (!take_focus) return;
     take_focus = false;
@@ -1472,6 +1475,10 @@ void Overlay::DrawMenu(const ImGuiIO& io, float em) {
         FocusRing();
         if (tab_selected) {
           tab_ = t;
+          if (tab_focus_target_ == t) {  // LB / RB's tab is the one on show now (the switch takes a frame): its first row takes the focus
+            tab_focus_target_ = -1;
+            focus_first_ = 3;
+          }
           // NavFlattened: the tab bar, the rows and the footer buttons are one navigation space (without it the D-pad could not leave the
           // list for the Save button).
           if (ImGui::BeginChild("##scroll", ImVec2(0.0f, -footer), ImGuiChildFlags_NavFlattened)) {
@@ -1491,7 +1498,7 @@ void Overlay::DrawMenu(const ImGuiIO& io, float em) {
       ImGui::EndTabBar();
       select_tab_ = -1;
     }
-    focus_first_ = false;  // it was for the first row of this frame's tab, if it had one
+    if (focus_first_ > 0) --focus_first_;  // it was for the first row of this frame's tab, if it had one
     Footer();
   }
   ImGui::End();
@@ -1560,15 +1567,16 @@ void Overlay::PadFrame(ImGuiIO& io, int64_t now_ms) {
 
   // The focus rectangle shows from the first press (ImGui shows it for its own navigation keys; LB, RB, X and Y are ours), and from
   // the open when the pad opened the menu.
-  if (nav_init_ || pad_out_.pressed != 0) {
+  if (nav_init_ > 0 || pad_out_.pressed != 0) {
     ImGui::SetNavCursorVisible(true);
-    nav_init_ = false;
+    if (nav_init_ > 0) --nav_init_;
   }
 
   if (pad_out_.tab_step != 0) {
-    const int next = (tab_ + pad_out_.tab_step + kTabCount) % kTabCount;
+    const int from = tab_focus_target_ >= 0 ? tab_focus_target_ : tab_;  // two presses within a frame or two go on from the first
+    const int next = (from + pad_out_.tab_step + kTabCount) % kTabCount;
     select_tab_ = next;
-    focus_first_ = true;  // the new tab's first row takes the focus: the old row is gone
+    tab_focus_target_ = next;  // the new tab's first row takes the focus when that tab is drawn: the old row is gone
     REXLOG_INFO("[mcla-overlay] pad: {} -> tab {}", pad_out_.tab_step > 0 ? "RB" : "LB", kTabNames[next]);
   }
   if (pad_out_.save) {
