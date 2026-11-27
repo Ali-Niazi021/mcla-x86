@@ -5,7 +5,11 @@ It is built with the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk), a pa
 of game hooks (60 fps, widescreen, 1080p and more, a launcher, HDR output).
 
 Status: the game boots, drives, races and saves. On a Radeon 880M laptop it runs at 1080p and 60 fps with the
-Recommended preset. Details and measurements are in [docs/PORT_STATE.md](docs/PORT_STATE.md).
+Recommended preset. On an RTX 4060 Laptop (Intel 6P+8E, 3200x2000 panel at 165 Hz) the native panel preset (the
+3200x2000 profile) holds 60 fps in a scripted drive, at the Ultra and at the Performance scene detail, and 1080p Ultra
+needs about 5.3 ms of GPU time a frame. The scripted drive keeps the car parked, so these are lower bounds. Details
+and measurements are in [docs/PORT_STATE.md](docs/PORT_STATE.md); the native plan and its status board are in
+[docs/NATIVE_PLAN.md](docs/NATIVE_PLAN.md).
 
 > **You need your own copy of the game.** This repository contains no game files and no translated game code.
 > Everything is made on your PC from your own dump of a disc you own. Do not ask for, or share, game files here.
@@ -90,6 +94,11 @@ Finished steps are skipped, so this is much faster than the first setup.
 - **Adaptive detail** (on by default): keeps 60 fps by lowering detail where it is least visible, and raises it again
   when the GPU has room.
 - **Anti-aliasing:** automatic by default (FXAA).
+- **Vsync and tearing:** vsync is always on, and with tearing off each frame waits for the display's next refresh.
+  Tearing is off by default, which is right for TVs and ordinary monitors. The launcher's **Allow tearing (G-Sync /
+  FreeSync only)** (Display page, advanced settings) lets a frame reach the screen in the middle of a refresh. Turn it
+  on only with a G-Sync or FreeSync display that has variable refresh on in the graphics driver; on any other screen
+  it tears. The launcher has no VSync option.
 - **HDR output:** off by default. Set it to Auto on the Display page (advanced settings) if Windows HDR is on for your
   screen. It is experimental.
 - **Saves:** in `Documents\mcla_x86`. To move them (for example to a synced folder), set "User data folder" on the
@@ -110,6 +119,17 @@ You can also start the game without the launcher:
 - HDR has not been judged by eye on an HDR screen yet.
 - "CPU boost while playing" (advanced) changes the Windows power plan while the game runs. It is not tested: leave it
   off.
+- On a panel whose refresh rate is not a multiple of the frame rate, 60 fps is shown unevenly. On a 165 Hz laptop
+  panel each frame stays on the screen for 3, 3, 3 and then 2 refreshes. This is by design, not a fault, and no
+  setting in the game removes it. Variable refresh (G-Sync or FreeSync, with **Allow tearing** on) or a 60 or 120 Hz
+  mode of the panel does.
+- The first frames of menus and loading screens still hitch at each start: the worst frame is 107 to 121 ms on the RTX
+  4060 Laptop, down from 167 to 197 ms. What is left is the memory allocation of the first 3D frame and about 7
+  compute pipelines a run, which are not stored.
+- At 3200x2000 the game still makes some copies that it avoids at 1080p. Direct present stays off, because it leaves a
+  one-pixel stripe along the top and left edge. The pause backdrop, the vinyl editor and HDR are not covered by the
+  copy shortcuts yet.
+- The 60 Hz TV target has been checked on 118-second drives; the 5-minute soak is not done yet.
 
 ## Troubleshooting
 
@@ -151,7 +171,11 @@ repo: `git config core.hooksPath .githooks`.
 | `patches/sdk/` | The SDK patch series (`series.toml`): Renan's Windows series and this project's patches |
 | `launcher/` | The launcher (Dear ImGui + D3D11), driven by `launcher/schema/settings.json` |
 | `tools/` | Setup, dump tools, codegen, SDK preparation, run and bench harness, legal guard |
+| `tools/elevate/` | Owner-approved elevated command broker for test machines only (`start.ps1`, `broker.ps1`, `elevated.py`) |
+| `tools/usage_watch.py` | Reads the Claude 5-hour and weekly usage for the agent work; uses the local Claude Code login and never prints the token |
 | `docs/` | Plan, state, learnings, builds and metrics |
+| `docs/NATIVE_PLAN.md` | The native PC plan: targets, tracks and the status board |
+| `docs/AGENT_SETUP.md` | How the project is worked on by agents: roles, machine rules, briefs |
 
 ## Legal
 

@@ -15,6 +15,7 @@ Owner: ORC. The plan is [PLAN.md](PLAN.md); this file tracks where execution sta
 | ISO | 7,838,695,424 B, XGD2, game partition `0x0FD90000` |
 | Game files | 12 files, 6,561,615,524 B → `$GAME/game/` (G0) |
 | Machine | Ryzen AI 9 365 (20 threads), 31.1 GB RAM, Radeon 880M (driver 32.0.32029.2010), panel 3200x2000 @ 120 Hz |
+| Machine, 2026-11-27 | Intel 6P+8E (20 logical), RTX 4060 Laptop 8 GB (driver 621.40; Iris Xe present but unused), panel 3200x2000 @ 165 Hz |
 | Disk | C: ~209 GB free (2026-11-24) |
 | VS | 2022 Community 17.14.13 (MSVC 14.44.35207), Windows SDK 10.0.26100 |
 | CMake / Ninja / Python | 4.3.2 / 1.12.1 (VS-bundled) / 3.13.7 |
@@ -22,6 +23,67 @@ Owner: ORC. The plan is [PLAN.md](PLAN.md); this file tracks where execution sta
 | SDK pin | ReXGlue v0.10.0 = `f5337cdc947ff6d4c4196737e2c807a48f2a1fc2` |
 | Patch source | RenanQueiroz/mcla-recomp v0.3.17 = `0c3bbc9c1e369a7aebd8bbc8097ad823096f13ca` |
 | SDK series | 108 patches (72 Renan + 36 local), fingerprint `018391bf91544c45` (c7c4cc7; reset + build proven by LOCK60 wave 3) |
+
+2026-11-27: the RTX 4060 Laptop's checkout is `C:/Users/Ali/Dev/mcla-x86` and its work folder is `C:/Users/Ali/Dev/mcla-x86-work`. The paths in the table above were recorded on the Radeon 880M machine.
+
+## State on 2026-11-27 (native PC work)
+
+The plan and the status board are in [NATIVE_PLAN.md](NATIVE_PLAN.md); read the board first. The numbers here are from
+the RTX 4060 Laptop runs in `$WORK/scratch/t1/RESULTS.md` (the T1 build was `native-pc` @ 775ec0c). The Radeon 880M figures
+in the sections below are unchanged.
+
+**On by default now**
+
+- Vsync on, tearing off, in the launcher and the PC profile (775ec0c). The launcher has no vsync option (3fe81e5). The
+  `[mcla-display]` lines log the present settings and warn on `vsync=false`.
+- Thread placement falls back to an unparked sibling when an ideal processor is parked (3fe81e5).
+- 2000p profile: `scaled_copy_levers` = 9 (dual write and tone-map skip at draw scale 2, 0760) and the unscaled-copy
+  rule for the rain (6d2effe).
+- Render-target transfer pipelines are stored in `<title>.rtv.d3d12.xrtp` and made at start (0790; no cvar).
+- Guest memory is pre-faulted on a background thread at boot in the PC profile (`mcla_prefault_guest`,
+  `src/host/pf_probe.h`).
+- `[present-stats]` every 10 s (`present_stats_log_s`; 0 turns it off). The shipped way to run is the 60 fps cap with
+  the governor (`mcla_fps_target=60`).
+
+**Measured at 1080p** (120 Hz guest vblank as the cap in these runs, so the 1080p ceiling is not measured)
+
+- Ultra, saturated: 120.0 fps, GPU busy 5.32 ms a frame (mean) (`t1-m1-1080u`); 5.35 ms without the per-operation
+  brackets (`t1-m1n-1080u`).
+- Game thread 4.5 ms of the 8.3 ms budget (`t1-m1n-1080u`). No thread is over 8.3 ms in any run; the worst is 4.7 ms
+  (RESULTS §3).
+- Emulation (resolves, transfers, uploads) is 1.82 ms of the frame, 34 % (`t1-m1-1080u`).
+
+**Measured at 2000p** (3200x2000 at draw scale 2, 165 Hz panel)
+
+- Ultra capped at 60 with the governor (tier 5, no sheds): 60.00 fps, GPU busy p50 13.2 ms, p95 13.55 ms, 0 missed of
+  4,207 frames (`t1-c60-2000ultra`). 311 s bench drive: 60.00 fps, p50 12.9 ms, 1 missed of 18,939 (`t1-m3-2000u`).
+- Ultra saturated: 83.8 fps, GPU busy 11.71 ms (`t1-m2-2000u`). 120 fps is out of reach on this GPU in this scene.
+- Performance capped (tier 2): 60.00 fps, GPU busy p50 12.6 ms (`t1-c60-2000perf`).
+- After 0760 at 9: ultra capped, GPU busy p50 11.8 ms, was 13.2 (status board, R1 row, `r1-fin`); A/B -1.35 +/- 0.18
+  ms (`r1-ab1`, `r1-ab2`); dual write 0 differing bytes over about 8,450 textures (`r1-ver`). Direct present stays off
+  at 2x (`r1-sw2`).
+- Before 0760 the 2x resolve path cost about 2.8 ms over the 1x line (`t1-m2-2000u`, RESULTS §4).
+- 60 fps on the 165 Hz panel is a 3-3-3-2 beat by design: 1 % low 58 fps on the render side, 54 to 55 fps on the
+  display side (`t1-m3-2000u`).
+- Game thread tail: 11 frames over 20 ms and 2 over 34 ms in 6,306 (`t1-m2-2000u`), not chased.
+- Not explained yet: the guest vblank display lock was not on in the capped 2000p runs (period source `qpc`, RESULTS
+  §0), while the G1 runs had it on. The sources do not say why.
+
+**Limits**
+
+- The scripted drive keeps the car parked in every drive, so all drive numbers are a lower bound (RESULTS §0). The
+  next measurement is a real moving drive.
+- Not measured: GPU clocks, VRAM in use, the 5-minute soak (G1), 1080p capped at 60.
+
+**Open** (the full list is on the board)
+
+- G1: the 5-minute soak on the 60 Hz mode (118 s drives so far). G2: an even 60 on the 165 Hz panel needs VRR or a 120
+  Hz mode.
+- Menus and loading: the D3D12 allocations of the first 1080p frame and about 7 compute resolve pipelines a run remain
+  (about 30 ms, never stored).
+- `guest_vblank_display_offset_us` (0 to 8000) trades latency 1:1 (16.0 to 8.1 ms) with no repeats; the default stays
+  0 until tested under load.
+- Not covered by the 2x copy levers: the pause backdrop, the vinyl editor, HDR at 2x. 120 fps (T6) is queued.
 
 ## Current phase
 
@@ -33,7 +95,7 @@ at about 55 instead of 27 fps, and HDR output is available (not yet judged by ey
 was not re-run. The final tree (c7c4cc7) ran the one-minute gate twice: 60.00 fps, p99 22.65 ms, 0.05 % > 25 ms with 1.8
 cores of other load (gate3-base), and 59.49 fps, p99 26.15 ms, 1.25 % > 25 ms with 4.1 cores of the owner's own load
 (gate3b-base); no hold in either. With other programs busy the tail is not locked yet. 720p60 and 30 fps modes passed their gates
-earlier. Native 3200x2000 exists (`mcla_profile=2000p`, 23–26 fps). Launcher done. Resume from the task board's Todo
+earlier. Native 3200x2000 exists (`mcla_profile=2000p`, 23–26 fps). [Correction 2026-11-27: the 23–26 fps is the Radeon 880M's. On the RTX 4060 Laptop the 2000p profile holds 60 fps at the 60 fps cap; see the state section above.] Launcher done. Resume from the task board's Todo
 list; the owner's open decisions are listed there.
 
 ## Milestones
@@ -215,6 +277,10 @@ emulation and state floor:
 
 ### What is on by default now (PC profile blocks, `mcla/profile/pc_profile.cpp`)
 
+*Dated note 2026-11-27: this list predates the native PC work. Since then vsync has no launcher option and tearing is off by default,
+the 2000p profile has `scaled_copy_levers` = 9 and the rain rule, the transfer pipelines are stored, and the guest
+memory is pre-faulted. See the state section near the top.*
+
 - **LOCK60 block:** `tonemap_transfer_skip` (04e0), `mcla_gov` (the governor; it runs with the 60 fps target),
   `resolve_dual_write_msaa` (0530), `skip_overwritten_transfers` (0450 with 0540), `ui_overlay_active_when_drawn`
   (0580); pacer 2 (`mcla_sim_pacer` default 2); `gpu_timing_export` (SDK default: two timestamps and the list boundaries
@@ -275,6 +341,9 @@ the governor has shed everything; an offline replay reproduces all 9 logged hold
   THREAD_PRIORITY_HIGHEST, each on its own physical Zen 5 core; compile / storage / timer threads on Zen 5c; the process
   out of EcoQoS. It fixes the tail only: with 10–12 foreign spinner processes, 12 segments with the policy had 0 frames
   over 25 ms, 9 without had 4 segments with late frames (p99 up to 55 ms); average fps unchanged.
+- **Correction 2026-11-27 (Intel 6P+8E laptop):** the frame-critical threads are placed one per physical core of the
+  highest efficiency class (`high_cores`). When an ideal processor is parked, `SetThreadIdealProcessorEx` fails with
+  error 31 and the placement falls back to an unparked sibling (3fe81e5; `src/host/thread_policy.cpp`).
 - **What hurts is bandwidth and the GPU, not CPU time** (table below). Nothing host-side helps bandwidth or a foreign
   GPU user (GPU scheduling class HIGH changed nothing); the governor does (lk-gst1 above). CPU spinners cost the GPU its
   clock (1913 → 1374 MHz) at a flat 45 W package, because CPU boost takes the shared watts: the boost-cap question.
@@ -493,7 +562,8 @@ Reports in `$WORK/scratch/{S2,S3,S4,S5,R2,R3,R4,R5,R6}/REPORT.md`.
 - **Flicker test:** `$WORK/scratch/ORC/burst.py` + `flicker_ab.py` (24 window captures in 1 s of the parked scene;
   reference 0.2–0.4 % of pixels with a temporal std > 6). An empty `--mcla_gfx_preset=` swallows the next argument.
 - **Native 3200x2000:** `mcla_profile=2000p` = the 1600x1000 guest at `draw_resolution_scale` 2x2: correct picture,
-  23–26 fps, GPU 100 % busy; dual-write resolves and the direct present fall back at a scale above 1.
+  23–26 fps, GPU 100 % busy (Radeon 880M); dual-write resolves and the direct present fall back at a scale above 1.
+  [Correction 2026-11-27, RTX 4060 Laptop: the dual-write resolves run at a scale above 1 with `scaled_copy_levers` bit 1 (9 in the 2000p profile); the direct present still falls back.]
 - **Fullscreen is Hardware: Independent Flip** now that the SuperDisplay virtual display is detached; a window is
   Composed: Flip (the desktop is 3200x2000).
 

@@ -9,6 +9,99 @@ Owner: ORC (merges what tasks report). One entry per non-obvious finding, newest
 
 ---
 
+Native PC work (2026-11-27, new machine: RTX 4060 Laptop, 6P+8E Intel, panel 3200x2000 @ 165 Hz):
+
+### NATIVE-A vsync=false unlocked the guest vblank: judder with flawless game-thread frame times
+**Symptom** The game thread was flawless (p99 19 ms, no missed frame) while every swap was late on the RTX 4060
+laptop, and the picture judders. **Cause** vsync=false makes the guest vblank free-run at 1 kHz, so the 60 fps pacer
+drifts against the panel's refresh and frames are shown a refresh late. The cvar changes no presentation: the
+presenter always uses sync interval 0. **Fix** Launcher vsync toggle removed; the host warns on vsync=false (3fe81e5).
+**Evidence** logs `mcla_x86_001..003`; `src/host/mcla_app.cpp`, comment above `LogPresentSettings`. **Cost** three
+logged boots.
+
+### NATIVE-B Tearing allowed tears on a display without VRR; vsync on with tearing off is one refresh a frame
+**Symptom** With tearing allowed on a 60 Hz mode, each frame flipped mid-refresh and the tear sat 8 to 34 % down the
+picture (ETW FlipWaitHSync). **Cause** `d3d12_allow_variable_refresh_rate_and_tearing` lets a frame reach the screen
+at once; only a G-Sync or FreeSync display hides that. **Fix** Tearing off in the PC profile and by default in the
+launcher (775ec0c). **Evidence** Vsync on, tearing off: every frame exactly one refresh, 0 dropped, 0 repeats over
+four boots, about 16,600 frames, max interval 17.6 ms (PresentMon, ETW FlipWaitVSync; runs `tv-t1-a/b/c`,
+`tv-t1-default`). **Cost** 118 s drives; the 5-minute soak is open.
+
+### NATIVE-C SetThreadIdealProcessorEx fails with error 31 on a parked logical processor
+**Symptom** Thread placement on a 6P+8E Intel laptop in Balanced mode failed: SetThreadIdealProcessorEx returned error
+31. **Cause** Once a thread has CPU sets, Windows refuses an ideal processor that is parked at that moment. **Fix**
+The placement falls back to an unparked sibling of the core (`high_core_siblings`, `src/host/thread_policy.cpp`;
+3fe81e5). **Evidence** 0 placement warnings in 5 runs (run `final-check`). **Cost** a fallback in the placement code.
+
+### NATIVE-D DXGI frame statistics freeze while the window is covered: mark display statistics unreliable
+**Symptom** The display counters stopped while the window was covered or minimised, and the lag behind
+GetLastPresentCount grew. **Cause** PresentCount counts presents the compositor retired, replaced ones included.
+SyncRefreshCount and SyncQPCTime, the compositor's refresh clock, stop while the window is hidden. **Fix** A window
+that cannot be trusted is marked UNRELIABLE and its display numbers print '?' (0750). **Evidence** Judged against
+PresentMon at 60 and 300 presents a second: `[present-stats]` within 6 frames of 5,400 (runs `pm-win-nt`,
+`pm-win-vrr`, `pm-full`). **Cost** SDK patches 0750 and 0755 (the export).
+
+### NATIVE-E 60 fps on a 165 Hz panel without VRR is a 3-3-3-2 beat by design
+**Symptom** 60 fps on the 165 Hz panel looks uneven although every frame time is flat. **Cause** 165 / 60 = 2.75
+refreshes a frame, so each frame stays on screen for 3 refreshes (75 %) or 2 (25 %). In the 2000p drive 4,660 frames
+were held 2 refreshes and 13,903 three or more (`t1-m3-2000u`). **Fix** None in the game; the log says so once when
+VRR is off. Variable refresh (G-Sync or FreeSync with tearing allowed), or a 60 or 120 Hz mode, removes the beat.
+**Evidence** `src/host/mcla_app.cpp`, comment above `LogRefreshCadence`; `$WORK/scratch/t1/RESULTS.md` §1. **Cost** none.
+
+### NATIVE-F Render-target transfer pipelines were built at every launch because they were never stored
+**Symptom** About 200 pipelines were created at run time in every launch, and the first 1080p frame of a scene hitched
+114 to 205 ms. **Cause** The render-target transfer pipelines (`render_target_cache.cpp:4842`, `:4883`) were counted
+but never written to the storage, so every process made them again on the command processor thread. **Fix** SDK 0790
+stores their keys in `<title>.rtv.d3d12.xrtp` and makes the pipelines at start: run-time creations 197 to 0 on a warm
+run, 201 made at start in 21 ms. **Evidence** `$WORK/scratch/pipeline-cache/DIAGNOSIS.md` §2.1; runs `b-a1`, `b-b1..b-b3`.
+**Cost** 25 ms of the 148.5 ms worst frame (`b-a1`).
+
+### NATIVE-G The first 3D frame's page faults were first touches of committed guest memory
+**Symptom** The hitch frame took about 73,000 page faults (about 285 MiB), and the worst menu or loading frame took
+167 to 197 ms. **Cause** First touches of committed guest memory (+110 MiB in the front-end frame) and about 74 MiB of
+new D3D12 allocations. **Fix** `mcla_prefault_guest` reads one byte of every guest page on a background thread at
+boot: 1,530 MiB in 431 ms; faults 62k to 81k down to 20k to 28k; worst frame 107 to 121 ms (6d2effe). **Evidence**
+`src/host/pf_probe.h` (header); the status board, row 'Menu and loading hitches'. **Cost** 431 ms of background work
+at boot; no guest memory is written.
+
+### NATIVE-H At draw scale 2 every copy lever was off; dual write and the tone-map skip are back, direct present is not
+**Symptom** At 3200x2000 every resolve fell back as `scaled` (51.8 a frame), no swap went direct and no tone map was
+skipped: about 2.8 ms over the 1x line. **Cause** At a draw scale above 1 the dual write, the direct present and the
+tone-map skip were refused or wrong at the half-pixel gap. **Fix** SDK 0760: `scaled_copy_levers` = 9 in the 2000p
+profile (dual write and tone-map skip), 0 differing bytes over about 8,450 textures, GPU busy down 1.35 ms (+/- 0.18).
+Direct present stays off: a one-pixel stripe on row 0 and column 0 in 100 of 111 checks. **Evidence** runs `r1-ver`,
+`r1-sw2`, `r1-px9`, `r1-ab1/2`, `r1-fin`. **Cost** 8 DXBC shaders built with fxc.
+
+### NATIVE-I The rain was not drawn at 2000p: the profile had no unscaled-copy rule
+**Symptom** The rain was not drawn at 2000p. **Cause** The 2000p profile set no `resolve_unscaled_copy_rules`, so the
+rain's four 128x128 64-bit resolves reached no vertex fetch (the upstream default `mcla_rain_unscaled_copy` is not in
+this host). **Fix** Rule `resolve_unscaled_copy_rules=len=131072,pitch=128,height=128,fmt=37` in the 2000p profile
+(6d2effe). **Evidence** Runs `r1-rain0/1/9` (status board, R1 row); `$WORK/scratch/r1/DESIGN.md`, 'Not in the patch'.
+**Cost** one profile line.
+
+### NATIVE-J The scripted drive leaves the vehicle parked: drive numbers are a static scene
+**Symptom** Every drive run shows 0 mph in every screenshot: the motorbike ends against a wall with its rear wheel
+smoking. **Cause** The scripted flow's throttle slices leave the vehicle parked, with the owner's save (fixture
+`after_intro`). **Fix** None yet. Drive numbers are a lower bound for driving through traffic; a real moving drive is
+the next measurement. **Evidence** `$WORK/scratch/t1/RESULTS.md` §0 (runs `t1-m2-2000u`, `t1-c60-2000ultra`, `t1-m3-2000u`).
+**Cost** the T1 drive numbers are read as a static scene.
+
+### NATIVE-K A CMake configure from Git Bash produced an SDK that does not link: build from PowerShell
+**Symptom** An SDK reconfigured and built from Git Bash (MSYSTEM=UCRT64) failed at the link of `rexruntime.dll`:
+`lld-link: undefined symbol: __declspec(dllimport) isatty` (libavutil `log.c`) and `itoa` (SDL `SDL_string.c`); the
+same command line from PowerShell links. **Cause** Not identified: the configure's function checks come out differently
+in the MSYS environment (the old POSIX names resolve in the check but not in the DLL link). **Fix** Configure and build
+from PowerShell; after a bad configure, `prepare_sdk.py build --clean` (`docs/AGENT_SETUP.md` §2, item 6). **Evidence**
+`$WORK/logs/sdk-build-20261127-014811.log` (fails), `sdk-build-20261127-015116.log` (PowerShell, clean, links).
+**Cost** two SDK builds.
+
+### NATIVE-L The usage endpoint answers 429 to close requests
+**Symptom** A second usage read 28 s after the first was refused with HTTP 429. **Cause** The usage endpoint refuses
+requests that come close together. **Fix** `tools/usage_watch.py` (c9ab705): one watcher polls and writes
+`usage.json`; a plain read uses its last value if it is under 10 minutes old; a 429 is waited out for 5 minutes.
+**Evidence** `tools/usage_watch.py`, header. **Cost** if the usage cannot be read for 30 minutes, monitoring is off
+and the lead must say so.
+
 Sprint 2 (2026-11-26, streams LOCK60, HOST, VISUALS, HDR, MENUS60): the first block. A finding several streams reported
 has one entry (the CMake preset trap, the dead PresentMon GPU column). Run ids `lk-*`, `h*run*`, `vis*`, `hdr*`/`h2-*`,
 `mn*` are in the stream work trees' `runs/`; `gate*` and `q0-base` are the orchestrator's (METRICS).
