@@ -69,7 +69,7 @@ not blocked by it; they are the rows that can reach a save.
 ### The time scale
 
 `sub_822C1FA8` (the per-frame function) stores a scale into the timer (`0x827D7554`) before each update, from a global at `0x827E1C34`
-(0 in a pause, below 1 in a wipe-out's slow motion, 1.0 otherwise). The cheat runs from the update's first instruction, multiplies the
+(1.0 normally; the timing notes in `mcla_t_sim_step.cpp` say a pause and a slow motion go through the same scale, and a wipe-out's slow motion is the game's own use of it). The cheat runs from the update's first instruction, multiplies the
 word by the factor (0.05 to 1) and remembers what it wrote, so a frame the game did not refresh is not multiplied twice (unit tested)
 and a pause (0) stays a pause. The `mcla_sim60` step hooks come before the multiplication, so slow motion works with the 60 fps
 timing. Not looked at: the race clock and the audio. A replay recording stores the scaled value.
