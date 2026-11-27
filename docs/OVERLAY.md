@@ -14,7 +14,7 @@ are in "Results of the controller runs" at the end. Its design and its limits ar
 
 | Key (cvar, rebindable) | What |
 |---|---|
-| F1 (`mcla_overlay_key_menu`) | The mod menu. Tabs: **Display** (the overlay itself; fullscreen, anti-aliasing, HDR, texture sharpness, anisotropy, tearing / variable refresh, **Upscaling**: on / off and the upscaler (AMD FSR or NVIDIA DLSS) next start, the quality ratio (DLAA / Quality / Balanced / Performance / Ultra Performance) and the DLSS model live), **Graphics** (adaptive detail and its ceiling / floor, the detail preset, the individual knobs, motion blur, pedestrians), **Game** (frame-rate profile 30 / 60 / 120 fps, applied at the next start; frame cap; 60 / 120 fps fixes; HUD; mouse), **Cheats / mods** (time of day, weather, traffic; off by default and locked behind a switch), **About** (build, SDK series, GPU, display, keys, files). |
+| F1 (`mcla_overlay_key_menu`) | The mod menu. Tabs: **Display** (the overlay itself; fullscreen, anti-aliasing, HDR, texture sharpness, anisotropy, tearing / variable refresh, **Upscaling**: on / off and the upscaler (AMD FSR or NVIDIA DLSS) next start, the quality ratio (DLAA / Quality / Balanced / Performance / Ultra Performance) and the DLSS model live), **Graphics** (adaptive detail and its ceiling / floor, the detail preset, the individual knobs, motion blur, pedestrians), **Game** (frame-rate profile 30 / 60 / 120 fps, applied at the next start; frame cap; 60 / 120 fps fixes; HUD; mouse), **Cheats / mods** (time of day, weather, traffic, and the classic cheats: nitro, special abilities, damage, police, slow motion, money, unlocks, no-save; off by default and locked behind a switch), **About** (build, SDK series, GPU, display, keys, files). |
 | F2 (`mcla_overlay_key_fps`) | The FPS counter in a corner (`mcla_overlay_fps_corner`, `_detail`). |
 | F5 (`mcla_overlay_key_stats`) | The statistics screen. |
 
@@ -377,4 +377,22 @@ The log also gained the `pad: poll cost` line (below).
 the controller with a physical pad in hands (everything above is the scripted pad, which goes through the same poll, and real keys and mouse); the chord and
 L3 / R3 in a race start, the garage and the GPS map (the `after_intro` save does not reach them); help text of the focused row for the pad (a tooltip needs a
 mouse, and is off while the pad is used); per-thread CPU in the statistics (the thread
-monitor keeps it private); the classic cheats (money, unlocks, nitro, damage, police, AI: the systems are listed in the Cheats tab).
+monitor keeps it private); **the classic cheats are written but have never been run** (next section); the ones still open are reputation points, unlocking
+cars, freezing the traffic or the opponents and ending a pursuit (`CHEATS.md`, "Leads").
+
+## The classic cheats (written from the code, never run)
+
+The Cheats / mods tab has rows for infinite nitro, infinite special abilities, no damage, no police, slow motion, money (give / take / set buttons), an
+unlock switch for races, parts, upgrades and abilities, and a "don't write saves this session" switch. They use the game's own cheat bytes and
+parameter words (the ones its pause menu's Cheats page and its command line use) and the engine timer's scale, so no hook was added and no codegen run
+is needed. Every one is off at every start, behind "Allow cheats and mods", transient, never saved, and puts the game's own value back when it is
+switched off, when the drive ends or when the gate is locked. The five driving cheats act only in free roam and races; the game itself counts a
+drive with one of the first four on as cheating and pays no reputation or money for it. Money, unlocks and what is done with them can reach the
+save: the tab says so, and shows the folder to back up (`<user data>\<xuid>\545407F8`). Evidence, addresses, grades and the risk of each: `docs/CHEATS.md`.
+Log lines: `[mcla-cheat]` (one per change of a cheat's state; one per money press with the old and the new amount).
+
+By hand (two minutes, in free roam): F1, tab Cheats / mods, tick "Allow cheats and mods", tick "Infinite nitro", close the menu (F1), drive and
+fire the nitro: the bars stay where they are, and the log has `[mcla-cheat] nitro: ON`. The row's own line under the box says what the game thread
+is doing (holding, waiting for a drive, refused). A row that says "refused" or a cheat that does nothing: untick it (the game's value is written
+back at once) and send the log. Money: open the menu in free roam, pick an amount, press Give: the old and new amount are in the log and in the
+tab, the garage shows the new amount.

@@ -374,9 +374,9 @@ inline constexpr Item kCheatDamage{Kind::kToggle, "No damage", "mcla_cheat_nodam
                                    0, 0, "", nullptr, 0, kFlagCheat | kFlagNoSave | kFlagUntested, -1.0, 0.0, nullptr,
                                    "A: crashes do not damage the vehicle", 2};
 inline constexpr Item kCheatCops{Kind::kToggle, "No police", "mcla_cheat_nocops",
-                                 "No cop is spawned and the pursuit code does not run: holds the game's own no-cops cheat while you "
-                                 "drive. Only in free roam and races. Cops already out may stop where they are (the game's own switch does the "
-                                 "same). The game counts the drive as cheating: no reputation or money from it.",
+                                 "No cop is spawned and the pursuit stops: holds the game's own no-cops cheat while you "
+                                 "drive. Only in free roam and races. Cops already out are released by the game's own code while the switch is on. "
+                                 "The game counts the drive as cheating: no reputation or money from it.",
                                  0, 0, "", nullptr, 0, kFlagCheat | kFlagNoSave | kFlagUntested, -1.0, 0.0, nullptr,
                                  "A: the cops do not start or continue a pursuit", 3};
 inline constexpr Item kCheatSlow{Kind::kHoldFloat, "Slow motion", "mcla_cheat_timescale",
