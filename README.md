@@ -1,82 +1,163 @@
 # Midnight Club: Los Angeles, recompiled for x86-64 Windows
 
-**Midnight Club: Los Angeles (Xbox 360, Complete Edition), statically recompiled to native x86-64 Windows** with the
-[ReXGlue SDK](https://github.com/rexglue/rexglue-sdk), a patch series on top of it, and a game layer of hooks shared in
-spirit with the owner's iOS port. It boots, reaches free roam, drives and saves (races not yet tested). On a Radeon 880M
-laptop it holds 60 fps at 720p. At 1080p it held 60 fps in one-minute test runs when little else was running (60.00 fps average, 99th percentile
-17.3 to 22.7 ms, 0.05 % of frames over 25 ms); with other programs busy on the machine 1.25 % of frames ran late; the 5-minute fullscreen drives have not been re-run since the latest changes, and
-before them 1080p could drop to 30 fps for several seconds in the heaviest streets. Adaptive detail (on by default at 60
-fps) keeps the frame rate by lowering detail where it is least visible and raising it again when the GPU has room, FXAA
-is part of the default picture at 60 fps, and the pause menu runs at about 55 fps instead of 27. HDR output is available
-through the launcher's Auto setting; it has not been judged by eye on an HDR screen yet. A 30 fps console-like mode is
-also available (numbers in [docs/PORT_STATE.md](docs/PORT_STATE.md)).
+**Midnight Club: Los Angeles (Xbox 360, Complete Edition), statically recompiled to a native 64-bit Windows program.**
+It is built with the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk), a patch series on top of it, and a layer
+of game hooks (60 fps, widescreen, 1080p and more, a launcher, HDR output).
+
+Status: the game boots, drives, races and saves. On a Radeon 880M laptop it runs at 1080p and 60 fps with the
+Recommended preset. Details and measurements are in [docs/PORT_STATE.md](docs/PORT_STATE.md).
 
 > **You need your own copy of the game.** This repository contains no game files and no translated game code.
-> Everything is read from your own dump of a disc you own. Do not ask for, or share, game files here.
+> Everything is made on your PC from your own dump of a disc you own. Do not ask for, or share, game files here.
 
-Supported dump: Midnight Club: Los Angeles — Complete Edition (USA, Europe), title `545407F8`, media `5940C9DB`,
+Supported dump: Midnight Club: Los Angeles - Complete Edition (USA, Europe), title `545407F8`, media `5940C9DB`,
 `default.xex` SHA-256 `c386f4001fa569e6ad4b982f441f67412f00b3f47c166134555cd4b59854a432`. Other editions are different
-builds and won't work.
+builds and do not work. The setup checks this for you.
 
-## Build
+## Setup
 
-Requirements: Windows 10/11 x64, Visual Studio 2022 17.14 (C++ workload, Windows SDK 10.0.26100), CMake ≥ 3.25,
-Python 3.13, Git, and the portable LLVM 20.1.8 (`clang+llvm-20.1.8-x86_64-pc-windows-msvc.tar.xz`). Everything heavy
-lives in a work tree outside the repo, `$MCLA_WORK` (default `C:/Users/Ali/Development/mcla-x86-work`; see
-[docs/PLAN.md](docs/PLAN.md) §5). Put LLVM in `$MCLA_WORK/toolchain/llvm-20.1.8`.
+### 1. What you need
 
-```sh
-python tools/xiso.py verify "<your.iso>"                       # checks it is the supported dump
-python tools/xiso.py extract "<your.iso>" "<game folder>"       # 12 files, ~6.1 GiB
-python tools/prepare_sdk.py fetch && python tools/prepare_sdk.py apply && python tools/prepare_sdk.py build
-python tools/re/xex_image.py                                    # decrypted image for the tools ($MCLA_WORK/re)
-python tools/codegen.py                                         # recompiles default.xex into $MCLA_WORK/generated
-cmake --preset win-amd64-release && cmake --build --preset win-amd64-release
+- Windows 10 or 11, 64-bit. A GPU with Direct3D 12.
+- About 30 GB of free disk space (plus your `.iso`), and an internet connection.
+- Your game disc dump as an `.iso` file.
+- Four programs. Open a terminal (PowerShell) and paste the lines for the ones you do not have:
+
+```powershell
+winget install --id Git.Git -e
+winget install --id Kitware.CMake -e
+winget install --id Python.Python.3.13 -e
+winget install --id Microsoft.VisualStudio.2022.Community -e --override "--passive --add Microsoft.VisualStudio.Workload.NativeDesktop --add Microsoft.VisualStudio.Component.Windows11SDK.26100 --includeRecommended"
 ```
 
-The game and the launcher land in `$MCLA_WORK/build/bin/Release/` (`mcla.exe`, `mcla_launcher.exe`, the SDK DLLs).
+Visual Studio is large (about 10 GB) and asks for permission once. If you already have Visual Studio 2022 with
+"Desktop development with C++", you do not need to install it again. After installing, **close the terminal and open a
+new one**.
 
-## Play
+### 2. Download and build
 
-Start **`mcla_launcher.exe`**: pick the game folder (the extracted files), a preset (Recommended 1080p, 16:10 panel 60
-(1920x1200), Balanced 900p 60, Performance 720p 60, native panel 3200x2000 at about 25 fps, or console-like 30), adjust
-graphics, performance, gameplay and controls, and press **Launch**. Settings are saved in
-`%LOCALAPPDATA%/mcla_x86/launcher.json`. Controllers: XInput/Xbox, DualShock 4 and DualSense (through SDL), plus
-keyboard.
+```powershell
+git clone https://github.com/Ali-Niazi021/mcla-x86.git
+cd mcla-x86
+python tools/setup.py --iso "C:\path\to\your game.iso"
+```
 
-At the 60 fps presets the settings that matter most are on the Graphics and Performance pages:
-- **Adaptive detail** (on by default): keeps 60 fps by giving back extra detail first, then lowering the shading rate
-  where you cannot see it, and only last the visible detail; it raises detail again, one step at a time, when there is
-  headroom, up to the ceiling you choose. Settings you change yourself are left alone.
-- **Anti-aliasing**: automatic by default (FXAA is on with Adaptive detail); or choose Off or FXAA yourself. It costs
-  about 0.5 ms of GPU time at 1080p on a Radeon 880M.
-- **HDR output** (Display, advanced, experimental, off by default): Auto uses HDR when Windows HDR is on for the display
-  (Settings > System > Display > Use HDR). Fused HDR costs about 0.7 ms of GPU time at 1080p; the picture has not been
-  judged by eye yet.
-- **CPU boost while playing** (advanced, off by default) changes the active Windows power plan while the game runs and
-  puts it back afterwards; only a dry run of it has been done, so leave it off for now.
+That one command does everything. Expect about 30 to 60 minutes the first time, mostly for the SDK build; you do not
+have to watch it:
 
-Or run the game directly: `mcla.exe --game_data_root=<game folder> --mcla_profile=1080p --mcla_fps_target=60`
-(every setting is a `--name=value` command-line option; the launcher shows the exact command line it uses).
+| Step | What it does |
+|---|---|
+| 1 tools | Checks Git, CMake, Python, Visual Studio and the Windows SDK. If one is missing, it prints the command to install it. |
+| 2 compiler | Downloads Clang/LLVM 20.1.8 (940 MB, checksum verified) and unpacks it. No install, no admin rights. |
+| 3 game | Checks that your `.iso` is the supported dump and extracts the game files (6.1 GB). |
+| 4 sdk | Downloads the ReXGlue SDK, applies the patches, builds it. This is the long step. |
+| 5 codegen | Translates the game's `default.xex` to C++ on your PC. |
+| 6 build | Builds the game and the launcher. |
+| 7 launcher | Tells the launcher where your game files are. |
 
-## Layout
+If a step fails or you stop it, run the same command again. Finished steps are skipped and the download resumes.
+
+Everything large goes to a work folder named `mcla-x86-work` next to the repo, not into the repo. To use another
+place, add `--work D:\mcla-work` (a short path without spaces). To only check your PC without changing anything, run
+`python tools/setup.py --check`.
+
+### 3. Play
+
+When setup is done it prints the path of the launcher:
+
+```
+mcla-x86-work\build\bin\Release\mcla_launcher.exe
+```
+
+Start it, keep the **Recommended (1080p)** preset, and press **Launch**. The first minutes of play can stutter a
+little while the shader cache is built; it is saved and the next start is smooth.
+
+### Update later
+
+```powershell
+git pull
+python tools/setup.py
+```
+
+Finished steps are skipped, so this is much faster than the first setup.
+
+## Playing
+
+- **Controllers:** Xbox (XInput), DualShock 4 and DualSense work. Keyboard works too; the keys are on the launcher's
+  Controls page and you can change them.
+- **Presets:** Recommended 1080p, 16:10 panel (1920x1200), Balanced 900p, Performance 720p, native panel, and a
+  console-like 30 fps mode. If the game does not hold 60 fps, pick a lighter preset.
+- **Adaptive detail** (on by default): keeps 60 fps by lowering detail where it is least visible, and raises it again
+  when the GPU has room.
+- **Anti-aliasing:** automatic by default (FXAA).
+- **HDR output:** off by default. Set it to Auto on the Display page (advanced settings) if Windows HDR is on for your
+  screen. It is experimental.
+- **Saves:** in `Documents\mcla_x86`. To move them (for example to a synced folder), set "User data folder" on the
+  launcher's Paths page.
+- **Settings:** the launcher stores them in `%LOCALAPPDATA%\mcla_x86\launcher.json`.
+
+On a laptop: plug it in and select the vendor's performance mode. In a balanced or quiet mode the GPU is much slower
+and the game lowers detail to keep 60 fps.
+
+You can also start the game without the launcher:
+`mcla.exe --game_data_root=<game folder> --mcla_profile=1080p --mcla_fps_target=60`. Every setting is a
+`--name=value` option; the launcher shows the exact command line it uses.
+
+## Known problems
+
+- The `quality` preset stuttered for some minutes at a time in one long session on a Radeon 880M. The cause is not
+  known yet. The Recommended preset did not show it.
+- HDR has not been judged by eye on an HDR screen yet.
+- "CPU boost while playing" (advanced) changes the Windows power plan while the game runs. It is not tested: leave it
+  off.
+
+## Troubleshooting
+
+| Problem | What to do |
+|---|---|
+| `Missing tools` | Run the commands that setup prints, open a new terminal, run setup again. |
+| `this .iso is not the supported dump` | Only the Complete Edition (USA, Europe) works. Check that the file is a full disc image. |
+| The SDK build stops with a path-length error | Use a short work folder: `python tools/setup.py --work C:\mcla-work --iso ...` |
+| The SDK build runs out of memory | Limit the compiler jobs: add `--jobs 4`. |
+| The download stops | Run setup again; it continues where it stopped. |
+| Something looks half-done or broken | `python tools/setup.py --force` runs every step again. The SDK build log is in `mcla-x86-work\logs`. |
+| The game starts but is slow | Pick a lighter preset. On a laptop, plug it in and use the performance mode. |
+
+## For developers
+
+The steps that `tools/setup.py` runs, if you want to run them yourself (`MCLA_WORK` and `MCLA_GAME` are environment
+variables for the work folder and the game folder):
+
+```sh
+python tools/xiso.py verify "<your.iso>"                  # is it the supported dump?
+python tools/xiso.py extract "<your.iso>" "<game folder>"  # 12 files, 6.1 GiB
+python tools/prepare_sdk.py fetch                          # clone the SDK at the pinned commit
+python tools/prepare_sdk.py apply                          # apply patches/sdk/series.toml
+python tools/prepare_sdk.py build                          # build and install to $MCLA_WORK/sdk/install
+python tools/codegen.py                                    # default.xex -> C++ in $MCLA_WORK/generated
+cmake --preset local-release && cmake --build --preset local-release
+```
+
+`CMakePresets.json` holds the owner's paths; `tools/setup.py` writes a `CMakeUserPresets.json` (not in git) with the
+preset `local-release` for your machine. Before your first commit, turn on the guard that keeps game data out of the
+repo: `git config core.hooksPath .githooks`.
 
 | Path | What |
 |---|---|
 | `mcla/codegen/` | Codegen configuration: function hints and the mid-function hook sites (addresses only) |
-| `mcla/hooks/` | Game hooks: 60 fps timing, widescreen/1080p/16:10, GPU levers, input fixes |
-| `mcla/profile/` | PC defaults and presets (`mcla_profile`, `mcla_fps_target`, `mcla_gfx_preset`) |
-| `src/host/` | The Windows host: app, watchdog, frame cap, scripted input, window sizing |
-| `patches/sdk/` | The SDK patch series (`series.toml`): Renan's Windows series + our own patches |
+| `mcla/hooks/` | Game hooks: 60 fps timing, widescreen/1080p/16:10, GPU levers, adaptive detail, input fixes |
+| `mcla/profile/` | PC defaults and presets |
+| `src/host/` | The Windows host: app, watchdog, frame cap, thread policy, window sizing |
+| `patches/sdk/` | The SDK patch series (`series.toml`): Renan's Windows series and this project's patches |
 | `launcher/` | The launcher (Dear ImGui + D3D11), driven by `launcher/schema/settings.json` |
-| `tools/` | Dump tools, codegen, SDK preparation, run/bench harness, legal guard |
+| `tools/` | Setup, dump tools, codegen, SDK preparation, run and bench harness, legal guard |
 | `docs/` | Plan, state, learnings, builds and metrics |
 
 ## Legal
 
-Only this project's own code, configuration, scripts and documentation live in this repository. `.gitignore` and a
+Only this project's own code, configuration, scripts and documentation are in this repository. `.gitignore` and a
 pre-commit guard keep the game's files, generated code, builds, logs and dumps out. Third-party credits:
-[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Unofficial fan project; not affiliated with Rockstar San Diego,
-Rockstar Games, Take-Two, Sony or Microsoft.
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). This is an unofficial fan project; it is not affiliated with
+Rockstar San Diego, Rockstar Games, Take-Two, Sony or Microsoft.
 
 Licensed under GPL-3.0, see [LICENSE](LICENSE).
