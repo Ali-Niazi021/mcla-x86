@@ -60,7 +60,7 @@ are released (`HoldOff`; the keyboard's `Gate` rule for pads). See "Controller".
 |---|---|
 | hold the chord (default **L3 + R3**, 500 ms, nothing else pressed; the triggers and sticks do not count) | opens the menu; again, closes it |
 | D-pad, left stick up / down | moves the focus (ImGui's own gamepad navigation: the D-pad keys are fed as `ImGuiKey_GamepadDpad*`) |
-| D-pad, left stick left / right | on a slider: changes the value (a step of 1 %, 2 % of the range for a float; whole numbers for an integer slider); on a combo: previous / next choice; on a tick box: off / on. Held: the first repeat after 380 ms, then faster over 2.2 s, and the step grows (x2 after 1 s, x3 after 2 s, x5 after 3.5 s). On a button: moves the focus sideways |
+| D-pad, left stick left / right | on a slider: changes the value (a step is 2 % of the range for a float, never less than the last decimal it shows; 1 for an integer slider); on a combo: previous / next choice; on a tick box: off / on. Held: the first repeat after 380 ms, then faster over 2.2 s, and the step grows (x2 after 1 s, x3 after 2 s, x5 after 3.5 s). On a button: moves the focus sideways |
 | **A** | presses the focused button, switches a tick box, opens a combo and picks in its list (ImGui's `GamepadFaceDown`). On a slider it does nothing: the steps are the pad's way |
 | **B** | closes the open combo list; with none open it closes the menu (the same rule as Esc) |
 | **X** | puts the focused row back to its default (the "reset" button of the row) |
@@ -133,8 +133,10 @@ The keyboard's rule is unchanged (`Gate`).
   no poll, so the chord does nothing there. The keyboard still does.
 * The poll assumes the game polls its pad on the thread that counts the frame. If a second thread ever calls `GetState` together with `PadTap`,
   that is the SDK's `RefreshDevices` race; `--mcla_overlay_pad=false` removes it (no poll at all).
-* Cost on the game thread: one `GetState` per engine frame while the chord is on or the menu is open (microseconds); none with the chord `0` and
-  the menu closed.
+* Cost on the game thread: one `GetState` per engine frame while the chord is on or the menu is open (the game's own poll does the same work:
+  tens of microseconds at most; measure it with the counter on and off before leaving it on for good); none with the chord `0` and the menu closed.
+* With the keyboard emulation on (`mnk_mode`, the default) the keys F and K are the pad's L3 and R3 (`keybind_lstick_press`, `keybind_rstick_press`), so
+  holding F + K for half a second opens the menu too; the keys held when the menu opens are masked like pad buttons.
 * The pad's input goes through the engine's frame rate: at 30 fps a tap shorter than one frame can be missed.
 * **Pause while the menu is open: not done.** It would have to send the game its own Start (a synthetic input driver added to the input system in
   the factory, exempt from the mute, with a hold of 300 ms because the title polls every 2 to 4 updates), confirm the `free-roam -> pause`
