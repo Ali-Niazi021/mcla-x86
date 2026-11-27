@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Fri, 27 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0755: present_stats export: 0750's display counters as one exported struct (rex_present_stats), for the in-game statistics screen
+
+Source: Ours, written for this SDK (T7 overlay, 2026-11-27)
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: 0750 only logs what the display really showed (every present_stats_log_s seconds, from a private class of the D3D12
+  presenter). The title's in-game statistics screen needs the same numbers a few times a second. This mirrors the counters into
+  one exported struct of relaxed atomics, extern "C" rex_present_stats (size, version 1, then cumulative presents, retired, shown,
+  dropped, sync_refreshes, sync_qpc, qpf, held[4] = shown frames that stayed 1, 2, 3, 4+ refreshes, over_cadence = frames held
+  longer than the cadence allows, cadence_milli, valid). The reader subtracts two reads. Fed from the same places as 0750's own
+  counters (so only while present_stats_log_s > 0): six relaxed atomic adds per Present, no lock, no allocation. No behaviour
+  change. The reader's copy of the layout is src/host/overlay/present_stats_abi.h in mcla-x86.
+Bucket: REDO
+
+0755-present-stats-export.patch (mcla-x86 T7).
+
+---
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>  // LOCAL PATCH - MCLA (0755)
+ #include <climits>
+ #include <cmath>
+ #include <memory>
+@@ -80,6 +81,32 @@
+ // clock covered the window (0.9 to 1.1 of its time). Otherwise the display-side numbers are printed as '?', with the
+ // reason. Judged frames are compared with the cadence, the refreshes a frame is expected to last: the refresh rate
+ // over the present rate (1 at 60 fps on 60 Hz; 2.75 at 60 fps on 165 Hz, where 2 and 3 are normal, in a 3-3-3-2 beat).
++
++// LOCAL PATCH - MCLA (0755) begin: the same counters as one exported struct of relaxed atomics, for the title's in-game
++// statistics screen (src/host/overlay in mcla-x86 reads it with GetProcAddress; the layout is its present_stats_abi.h and
++// must stay in step with it). All counters are cumulative since the process started (a reader subtracts two reads). They
++// are fed only while present_stats_log_s > 0, like the log lines.
++struct RexPresentStatsAbi {
++  uint32_t size = 0;  // set below: sizeof(RexPresentStatsAbi)
++  uint32_t version = 1;
++  std::atomic<uint64_t> presents{0};        // Present calls made
++  std::atomic<uint64_t> retired{0};         // presents the compositor retired
++  std::atomic<uint64_t> shown{0};           // retired presents that got a refresh of their own
++  std::atomic<uint64_t> dropped{0};         // retired presents that never got one
++  std::atomic<uint64_t> sync_refreshes{0};  // refreshes the refresh clock counted
++  std::atomic<int64_t> sync_qpc{0};         // QPC ticks those refreshes span
++  std::atomic<int64_t> qpf{0};              // QueryPerformanceFrequency
++  std::atomic<uint64_t> held[4] = {};       // shown frames that stayed 1, 2, 3, 4 or more refreshes
++  std::atomic<uint64_t> over_cadence{0};    // frames that stayed longer than the cadence allows (the hitch rule)
++  std::atomic<uint32_t> cadence_milli{0};   // the last judgeable cadence x 1000, 0 = none
++  std::atomic<uint32_t> valid{0};           // 1 while GetFrameStatistics works
++  RexPresentStatsAbi() { size = uint32_t(sizeof(RexPresentStatsAbi)); }
++};
++static_assert(sizeof(RexPresentStatsAbi) == 8 + 8 * 5 + 8 * 2 + 8 * 4 + 8 + 4 + 4, "the layout of present_stats_abi.h");
++extern "C" __declspec(dllexport) RexPresentStatsAbi rex_present_stats;
++RexPresentStatsAbi rex_present_stats;
++// LOCAL PATCH - MCLA (0755) end
++
+ namespace {
+ 
+ constexpr int32_t kPresentStatsMaxInFlight = 8;
+@@ -99,11 +126,13 @@
+       LARGE_INTEGER f;
+       QueryPerformanceFrequency(&f);
+       qpf_ = f.QuadPart > 0 ? f.QuadPart : 1;
++      rex_present_stats.qpf.store(qpf_, std::memory_order_relaxed);  // LOCAL PATCH - MCLA (0755)
+     }
+     if (window_start_qpc_ == 0) {
+       window_start_qpc_ = start_qpc;
+     }
+     ++w_.presents;
++    rex_present_stats.presents.fetch_add(1, std::memory_order_relaxed);  // LOCAL PATCH - MCLA (0755)
+     if (FAILED(result)) {
+       ++w_.failed;
+     }
+@@ -136,10 +165,12 @@
+         have_prev_ = false;
+       } else {
+         have_valid_ = true;
++        rex_present_stats.valid.store(1, std::memory_order_relaxed);  // LOCAL PATCH - MCLA (0755)
+         OnStatistics(st, have_last ? int32_t(last_count - st.PresentCount) : 0);
+       }
+     } else {
+       ++w_.stats_failed;
++      rex_present_stats.valid.store(0, std::memory_order_relaxed);  // LOCAL PATCH - MCLA (0755)
+       if (sr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT) {
+         // The first call after the swap chain is made is always disjoint; a later one is a display or mode change.
+         if (have_valid_) {
+@@ -233,6 +264,9 @@
+     if (!slice_.broken && slice_.in_flight_max <= kPresentStatsMaxInFlight && coverage >= 0.9 && coverage <= 1.1) {
+       recent_ = MakeCadence(slice_.presents, secs, slice_.sync_refreshes, slice_.sync_qpc);
+     }
++    // LOCAL PATCH - MCLA (0755): 0 = none judgeable.
++    rex_present_stats.cadence_milli.store(recent_.value > 0.0 ? uint32_t(recent_.value * 1000.0 + 0.5) : 0,
++                                          std::memory_order_relaxed);
+     slice_ = Slice{};
+     slice_.start_qpc = now_qpc;
+   }
+@@ -253,14 +287,24 @@
+         w_.dropped += dp > dr ? dp - dr : 0;
+         w_.sync_refreshes += ds;
+         slice_.sync_refreshes += ds;
++        // LOCAL PATCH - MCLA (0755) begin
++        rex_present_stats.retired.fetch_add(dp, std::memory_order_relaxed);
++        rex_present_stats.shown.fetch_add(std::min(dp, dr), std::memory_order_relaxed);
++        rex_present_stats.dropped.fetch_add(dp > dr ? dp - dr : 0, std::memory_order_relaxed);
++        rex_present_stats.sync_refreshes.fetch_add(ds, std::memory_order_relaxed);
++        // LOCAL PATCH - MCLA (0755) end
+         if (ds > 0) {
+           w_.sync_qpc += st.SyncQPCTime.QuadPart - prev_.SyncQPCTime.QuadPart;
+           slice_.sync_qpc += st.SyncQPCTime.QuadPart - prev_.SyncQPCTime.QuadPart;
++          rex_present_stats.sync_qpc.fetch_add(st.SyncQPCTime.QuadPart - prev_.SyncQPCTime.QuadPart,
++                                               std::memory_order_relaxed);  // LOCAL PATCH - MCLA (0755)
+         }
+         if (dp == 1 && dr > 0 && in_flight <= kPresentStatsMaxInFlight) {
+           // The frame before the newly shown one stayed dr refreshes.
+           ++w_.held_hist[std::min(dr, kPresentStatsHeldBins - 1)];
+           w_.held_max = std::max(w_.held_max, dr);
++          // LOCAL PATCH - MCLA (0755): 1, 2, 3 or 4 and more refreshes.
++          rex_present_stats.held[std::min<uint32_t>(dr, 4) - 1].fetch_add(1, std::memory_order_relaxed);
+           OnHeld(dr);
+         } else if (dp > 1) {
+           // Sampled less often than frames were retired: dr refreshes for dp frames, not attributable one by one.
+@@ -287,6 +331,7 @@
+     if (c.allowed <= 0 || dr < uint32_t(c.allowed + extra)) {
+       return;
+     }
++    rex_present_stats.over_cadence.fetch_add(1, std::memory_order_relaxed);  // LOCAL PATCH - MCLA (0755)
+     if (w_.hitch_lines < 8) {
+       ++w_.hitch_lines;
+       REXLOG_INFO(

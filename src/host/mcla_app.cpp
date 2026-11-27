@@ -33,6 +33,7 @@
 #include "pc_profile.h"  // mcla/profile (GAME slice): mcla::ApplyPcProfileLogging(), mcla::ApplyPcProfile()
 #include "frame_cap.h"
 #include "gpu_priority.h"
+#include "pf_probe.h"
 #include "power_boost.h"
 #include "system_status.h"
 #include "win32_time.h"
@@ -408,6 +409,7 @@ void McLaApp::OnPostSetup() {
   input_.Start();
   mcla_host::StartGpuPriority();
   mcla_host::StartPowerBoost();  // also undoes a boost cap a crashed run left behind
+  mcla_host::StartPfProbe();     // page-fault probe and guest pre-fault (both off by default, pf_probe.h)
   thread_policy_.Start();
   if (window()) {
     mcla_host::LogFocusState(*window(), "post-setup");
@@ -425,6 +427,7 @@ void McLaApp::OnShutdown() {
   thread_policy_.Stop();
   mcla_host::StopGpuPriority();
   mcla_host::StopPowerBoost();
+  mcla_host::StopPfProbe();
   if (timer_resolution_active_) {
     mcla_host::EndTimerResolution(1);
     timer_resolution_active_ = false;

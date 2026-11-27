@@ -1007,6 +1007,51 @@ purpose = "D3D12 presenter: samples DXGI frame statistics after every Present an
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0755-present-stats-export"
+source = "local"
+path = "patches/sdk/0755-present-stats-export.patch"
+sha256 = "20b9e0c8874cd3a869ce6d833a0b7ba66c5ed7dc9c24902ff5a14e2fd0b94701"
+purpose = "Diagnostics export of 0750, no behaviour change: the display counters as one exported struct of relaxed atomics (extern \"C\" rex_present_stats: presents, retired, shown, dropped, refresh clock, held 1/2/3/4+ refreshes, over-cadence, cadence, valid) for the in-game statistics screen (src/host/overlay). Fed only while present_stats_log_s > 0."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0790-render-target-pipeline-keys"
+source = "local"
+path = "patches/sdk/0790-render-target-pipeline-keys.patch"
+sha256 = "3ac49fd8bc3ff4076a4e467400a5bc95829134c29024d96834b5058c119581eb"
+purpose = "D3D12: the render target cache's ownership transfer and dump pipelines (about 200 a run, built on the command processor thread in the first frames of each scene, never stored) are kept: their keys go to <title>.rtv.d3d12.xrtp and the pipelines are made at start (InitializeRuntimePipelineStorage, after the draw pipelines' preload), not counted as run-time creations. Log: 'Created N render target pipelines for K ownership transfer and M dump keys from the storage in X milliseconds'. No cvar."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0791-pipeline-storage-report"
+source = "local"
+path = "patches/sdk/0791-pipeline-storage-report.patch"
+sha256 = "12b55548d9ed29ff718520c55fd1b59d2ba81872f50b62df78e037f718edf95f"
+purpose = "Pipeline storage diagnostics, no behaviour change: a '[pipeline-storage]' line per start (descriptions, shaders, preloaded, every skip reason), the '[pipelines]' line split into render target transfer (with ms), new draw descriptions and stored ones, exports rexgpu_transfer_pipeline_creations / rexgpu_transfer_pipeline_us. Applies after 0790."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0792-storage-flush-at-exit"
+source = "local"
+path = "patches/sdk/0792-storage-flush-at-exit.patch"
+sha256 = "d0ca26364ae0379b0f0c3d1c5f4cb37e284e688b307ef40eb30941e921993a2a"
+purpose = "The shader and pipeline storage is flushed before ReXApp::OnClosing's std::_Exit (IGraphicsSystem::FlushShaderStorage, 500 ms bound, no wait on the command processor thread); the writer thread drains its queue on shutdown and the run's '[pipeline-storage] at exit' line says what was appended. Defensive: no loss was seen. No cvar."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0760-scaled-dual-write-direct-present"
+source = "local"
+path = "patches/sdk/0760-scaled-dual-write-direct-present.patch"
+sha256 = "04ad6e1bec7df902f30e4a8e64fa8d50ccb14f77b96cb3f81cb7cf88df4892d4"
+purpose = "D3D12 (R1): cvar scaled_copy_levers (int bits, default 0 = unchanged, hot reload, no effect at draw scale 1): 1 resolve_dual_write / resolve_dual_write_msaa also at a draw resolution scale above 1 (the direct resolve also writes the scaled_resolve texture the game samples, so it is not loaded from the scaled resolve buffer; 8 new DXBC built with fxc), 2 swap_direct_present at scale above 1 when the front-buffer resolve did not fill the half-pixel gap, 4 also when it did, 8 tonemap_transfer_skip's whole-screen test accepts the half-pixel-shifted quad. resolve_dual_write_verify and swap_direct_present_check work at scale; the 10 s [resolve-dual-write] line ends with 'scaled 2x2: N'. Applies after 0790-0792."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]

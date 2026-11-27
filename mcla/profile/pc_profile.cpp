@@ -155,6 +155,14 @@ constexpr CvarDefault kProfileDefaults[] = {
     // src/input/sdl/sdl_input_driver.cpp:23,98-113 (default "gamecontrollerdb.txt", empty skips the block);
     // W5.5 report section B.
     {"hid_mappings_file", ""},
+    // The guest's physical memory is read once, a page at a time, on a background thread right after start-up, so its
+    // first-touch page faults (the command processor's first reads of guest textures and render target memory through the
+    // raw physical view, and the aliased 64 KiB / 4 KiB physical views the game writes through) happen while nobody
+    // waits. Without it the front end's first 1080p frame took 49,000 page faults (+187 MiB of first touches, 110 MiB of
+    // them guest memory) and 126-132 ms; with it 13,000 faults (only the D3D12 driver's new allocations are left) and
+    // 82-87 ms (runs b-b1..b-b3 against b-f1, b-p6; src/host/pf_probe.h). 1.5 GiB of address space, 512 MiB of RAM
+    // resident (the views alias one memory), about 0.4 s of one background core at boot. Defined in src/host/pf_probe.cpp.
+    {"mcla_prefault_guest", "true"},
 
     // ---- Presentation: no tearing by default ---------------------------------------------------------------------
     // The SDK's presenter always presents with sync interval 0 and, while this cvar is on, creates the swap chain with
@@ -386,6 +394,19 @@ constexpr CvarDefault k2000pDefaults[] = {
     {"draw_resolution_scale_y", "2"},
     {"window_width", "3200"},
     {"window_height", "2000"},
+    // The copy levers of the 1x path at draw scale 2 (SDK patch 0760, D3D12; bits: 1 dual write, 2 / 4 direct present, 8
+    // tone-map transfer skip). 9 = dual write + tone-map skip: exact and they pay. Dual write: resolve_dual_write_verify
+    // compared ~8,450 scaled textures with 0 differing bytes (run r1-ver); -1.15 +- 0.09 ms GPU busy of 11.8 (paired A/B,
+    // runs r1-ab1 / r1-ab2); every resolve fell back `scaled` before (51.8 a frame, T1). Tone-map skip: 298 of 299 skipped, the
+    // poison fill never visible (r1-px9); -0.2 ms in the tone map group. Bits 2 and 4 stay OFF: this game's front-buffer resolve
+    // fills the half-pixel gap, so bit 2 never engages, and bit 4 leaves a one-pixel garbage stripe on the top row and left column
+    // of the 3200x2000 picture (5,199 pixels, swap_direct_present_check in r1-sw2; seen in r1-px) for -0.17 ms.
+    {"scaled_copy_levers", "9"},
+    // The rain: its four 128x128 render targets are resolved and then read as vertex data, which at a draw scale above 1 only
+    // works when the resolve is also written unscaled into the shared memory (Renan's mcla_rain_unscaled_copy, not in this
+    // host). Without the rule the rain is not drawn at 2000p (r1-rain0: stormy weather, no streak; r1-rain1: the same with the
+    // rule, streaks); the 1x path needs none.
+    {"resolve_unscaled_copy_rules", "len=131072,pitch=128,height=128,fmt=37"},
 };
 
 // 1200p-fsr / 1200p-fsr4p: the 1200p render with the scene drawn at 1280x800 (1.5x) or 960x600 (2x) and upscaled to
