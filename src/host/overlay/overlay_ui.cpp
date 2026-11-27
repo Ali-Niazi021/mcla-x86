@@ -46,6 +46,7 @@
 
 #include <fmt/format.h>
 #include <imgui.h>
+#include <imgui_internal.h>  // ImGui::FocusItem: focus the last item without activating it (SetKeyboardFocusHere also activates)
 #include <rex/cvar.h>
 #include <rex/input/input.h>
 #include <rex/input/input_system.h>
@@ -219,7 +220,7 @@ class Overlay {
   void Footer();
   // The controller (UI thread).
   void PadFrame(ImGuiIO& io, int64_t now_ms);
-  void FeedPadKeys(ImGuiIO& io, uint32_t want, float scroll);
+  void FeedPadKeys(ImGuiIO& io, uint32_t want);
   void SaveFromMenu();
   void FocusRing() const;
   void Legend();
@@ -258,7 +259,7 @@ class Overlay {
   pad::Focus focus_last_ = pad::Focus::kOther;  // ... and last frame's (what the pad's left / right does now)
   uint32_t pad_bits_prev_ = 0;        // last frame's inputs after the hold-off (for the device tracker)
   uint32_t fed_ = 0;                  // ImGui gamepad keys held now (kFed* bits)
-  float fed_scroll_ = 0.0f;
+  float pad_scroll_ = 0.0f;           // the right stick: -1 (up) .. +1 (down), after the dead zone
   bool focus_first_ = false;          // the first row of the tab takes the focus (after the open, after a tab change)
   bool nav_init_ = false;             // show the navigation cursor in the next frame
   bool nav_visible_ = false;          // ImGui draws the navigation cursor (a key or a pad was used last)
@@ -352,7 +353,7 @@ void Overlay::OpenMenu() {
     menu_pad_.Reset();
     pad_bits_prev_ = 0;
     fed_ = 0;
-    fed_scroll_ = 0.0f;
+    pad_scroll_ = 0.0f;
     focus_now_ = focus_last_ = pad::Focus::kOther;
     pad_out_ = pad::MenuOut();
     focus_first_ = nav_init_ = devices_.last() == pad::Device::kPad;
@@ -382,7 +383,7 @@ void Overlay::CloseMenu() {
   g_menu_open.store(false, std::memory_order_relaxed);
   ImGuiIO& io = drawer_->GetIO();
   if (pad_session_) {
-    FeedPadKeys(io, 0, 0.0f);  // nothing stays pressed inside ImGui
+    FeedPadKeys(io, 0);  // nothing stays pressed inside ImGui
     io.BackendFlags = saved_backend_flags_;
     io.KeyRepeatDelay = saved_repeat_delay_;
     io.KeyRepeatRate = saved_repeat_rate_;
@@ -906,14 +907,21 @@ void Overlay::Row(const Item& it) {
   const int steps = pad_out_.adjust;
   const int mult = pad_out_.adjust_mult;
   bool row_focused = false;
-  if (focus_first_ && !disabled_why) {
-    ImGui::SetKeyboardFocusHere();  // the first row of a tab takes the focus (after the open and after LB / RB)
-    focus_first_ = false;
-  }
-  // A line in the log for a change the pad made (one per 400 ms: a held button repeats).
-  auto pad_log = [&](const std::string& value) {
+  // The first row of a tab takes the focus (after the open, after LB / RB): FocusItem on its first widget. Not SetKeyboardFocusHere,
+  // which would also activate a slider (it turns it into a text box).
+  bool take_focus = focus_first_ && !disabled_why;
+  if (take_focus) focus_first_ = false;
+  auto focus_item = [&take_focus]() {
+    if (!take_focus) return;
+    take_focus = false;
+    ImGui::FocusItem();
+  };
+  // A line in the log for a change made while the pad is the device in use (by a step, or by A on a tick box or a list): what the
+  // test of a scripted pad reads. A slider's held repeats are limited to one line per 300 ms.
+  auto pad_log = [&](const std::string& value, bool limited) {
+    if (!pad_session_ || devices_.last() != pad::Device::kPad) return;
     const int64_t now = NowMs();
-    if (now - pad_log_ms_ < 400) return;
+    if (limited && now - pad_log_ms_ < 300) return;
     pad_log_ms_ = now;
     REXLOG_INFO("[mcla-overlay] pad: {} ({}) -> {}", it.label, it.cvar, value);
   };
@@ -921,17 +929,18 @@ void Overlay::Row(const Item& it) {
     case Kind::kToggle: {
       bool v = CvarBool(it.cvar);
       bool changed = ImGui::Checkbox("##v", &v);
+      focus_item();
       if (ImGui::IsItemFocused()) {
         row_focused = true;
         focus_now_ = pad::Focus::kToggle;
         if (!changed && steps != 0 && v != (steps > 0)) {
           v = steps > 0;
           changed = true;
-          pad_log(v ? "on" : "off");
         }
         FocusRing();
       }
       if (changed) {
+        pad_log(v ? "on" : "off", false);
         SetCvarBool(it.cvar, v, !is_cheat);
         if (std::strcmp(it.cvar, "mcla_overlay_fps") == 0 || std::strcmp(it.cvar, "mcla_overlay_stats") == 0) Refresh();
         if (std::strcmp(it.cvar, "mcla_overlay_cheats") == 0 && !v && AnyCheatActive()) {
@@ -945,6 +954,7 @@ void Overlay::Row(const Item& it) {
     case Kind::kInt: {
       int v = int(CvarNumber(it.cvar));
       bool changed = ImGui::SliderInt("##v", &v, int(it.min), int(it.max), it.format);
+      focus_item();
       if (ImGui::IsItemFocused()) {
         row_focused = true;
         focus_now_ = pad::Focus::kSlider;
@@ -953,17 +963,20 @@ void Overlay::Row(const Item& it) {
           if (nv != v) {
             v = nv;
             changed = true;
-            pad_log(std::to_string(v));
           }
         }
         FocusRing();
       }
-      if (changed) SetCvarNumber(it.cvar, double(v), !is_cheat);
+      if (changed) {
+        pad_log(std::to_string(v), true);
+        SetCvarNumber(it.cvar, double(v), !is_cheat);
+      }
       break;
     }
     case Kind::kFloat: {
       float v = float(CvarNumber(it.cvar));
       bool changed = ImGui::SliderFloat("##v", &v, float(it.min), float(it.max), it.format);
+      focus_item();
       if (ImGui::IsItemFocused()) {
         row_focused = true;
         focus_now_ = pad::Focus::kSlider;
@@ -972,12 +985,14 @@ void Overlay::Row(const Item& it) {
           if (std::fabs(nv - double(v)) > 1e-9) {
             v = float(nv);
             changed = true;
-            pad_log(fmt::format("{:.4g}", nv));
           }
         }
         FocusRing();
       }
-      if (changed) SetCvarNumber(it.cvar, double(v), !is_cheat);
+      if (changed) {
+        pad_log(fmt::format("{:.4g}", v), true);
+        SetCvarNumber(it.cvar, double(v), !is_cheat);
+      }
       break;
     }
     case Kind::kChoice: {
@@ -999,19 +1014,20 @@ void Overlay::Row(const Item& it) {
         for (int i = 0; i < it.choice_count; ++i) {
           const bool selected = current == it.choices[i].value;
           if (ImGui::Selectable(it.choices[i].label, selected)) {
+            pad_log(it.choices[i].label, false);
             SetCvar(it.cvar, it.choices[i].value, !is_cheat);
           }
           if (selected) ImGui::SetItemDefaultFocus();
         }
         ImGui::EndCombo();
-      } else if (ImGui::IsItemFocused()) {
+      } else if ((focus_item(), ImGui::IsItemFocused())) {
         row_focused = true;
         focus_now_ = pad::Focus::kChoice;
         if (steps != 0) {
           const int next = pad::StepChoice(current_index, steps, it.choice_count);
           if (next >= 0 && next != current_index) {
+            pad_log(it.choices[next].label, false);
             SetCvar(it.cvar, it.choices[next].value, !is_cheat);
-            pad_log(it.choices[next].label);
           }
         }
         FocusRing();
@@ -1023,17 +1039,18 @@ void Overlay::Row(const Item& it) {
       const double value = CvarNumber(it.cvar);
       bool held = std::fabs(value - it.off_value) > 1e-6;
       bool hold_changed = ImGui::Checkbox("##hold", &held);
+      focus_item();
       if (ImGui::IsItemFocused()) {
         row_focused = true;
         focus_now_ = pad::Focus::kToggle;
         if (!hold_changed && steps != 0 && held != (steps > 0)) {
           held = steps > 0;
           hold_changed = true;
-          pad_log(held ? "held" : "released");
         }
         FocusRing();
       }
       if (hold_changed) {
+        pad_log(held ? "held" : "released", false);
         SetCvarNumber(it.cvar, held ? it.on_value : it.off_value, !is_cheat);
       }
       ImGui::SameLine();
@@ -1052,12 +1069,12 @@ void Overlay::Row(const Item& it) {
             if (nv != iv) {
               iv = nv;
               changed = true;
-              pad_log(std::to_string(iv));
             }
           }
           FocusRing();
         }
         v = float(iv);
+        if (changed) pad_log(std::to_string(iv), true);
       } else {
         changed = ImGui::SliderFloat("##v", &v, float(it.min), float(it.max), it.format);
         if (ImGui::IsItemFocused()) {
@@ -1068,11 +1085,11 @@ void Overlay::Row(const Item& it) {
             if (std::fabs(nv - double(v)) > 1e-9) {
               v = float(nv);
               changed = true;
-              pad_log(fmt::format("{:.4g}", nv));
             }
           }
           FocusRing();
         }
+        if (changed) pad_log(fmt::format("{:.4g}", v), true);
       }
       if (changed) SetCvarNumber(it.cvar, double(v), !is_cheat);
       if (!held) ImGui::EndDisabled();
@@ -1099,19 +1116,22 @@ void Overlay::Row(const Item& it) {
       if (ImGui::BeginCombo("##v", kPresets[shown_index].label)) {
         for (const PresetOption& option : kPresets) {
           const bool selected = current == option.value;
-          if (ImGui::Selectable(option.label, selected)) apply(option);
+          if (ImGui::Selectable(option.label, selected)) {
+            pad_log(option.label, false);
+            apply(option);
+          }
           if (ImGui::IsItemHovered()) Tooltip(option.help);
           if (selected) ImGui::SetItemDefaultFocus();
         }
         ImGui::EndCombo();
-      } else if (ImGui::IsItemFocused()) {
+      } else if ((focus_item(), ImGui::IsItemFocused())) {
         row_focused = true;
         focus_now_ = pad::Focus::kChoice;
         if (steps != 0) {
           const int next = pad::StepChoice(shown_index, steps, count);
           if (next != shown_index) {
+            pad_log(kPresets[next].label, false);
             apply(kPresets[next]);
-            pad_log(kPresets[next].label);
           }
         }
         FocusRing();
@@ -1367,8 +1387,8 @@ void Overlay::Legend() {
       HintText(h.text);
     }
   } else {
-    ImGui::TextColored(kDim, "Arrow keys or mouse: move   Enter / Space or click: select   Left / Right: change   Ctrl+Tab: tabs   Esc or %s: close%s%s",
-                       REXCVAR_GET(mcla_overlay_key_menu).c_str(), pad_session_ ? "   Controller: hold " : "",
+    ImGui::TextColored(kDim, "Arrows or mouse: move   Enter: select   Left / Right: change   Ctrl+Tab: tab   Esc / %s: close%s%s",
+                       REXCVAR_GET(mcla_overlay_key_menu).c_str(), pad_session_ ? "   Pad: hold " : "",
                        pad_session_ ? pad::ChordText(REXCVAR_GET(mcla_overlay_pad_chord)) : "");
   }
 }
@@ -1424,6 +1444,8 @@ void Overlay::DrawMenu(const ImGuiIO& io, float em) {
     ImGui::SetNextWindowFocus();  // a window created after the menu is drawn over it: the menu comes back to the front
     focus_menu_ = false;
   }
+  // ImGui's own focus rectangle (2 px, blue by default) in the colour of the ring and the band, for the items that draw no ring.
+  ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4(1.0f, 0.84f, 0.25f, 1.0f));
   if (ImGui::Begin("MCLA mod menu###mcla_menu", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
     if (just_opened_) {
       ImGui::SetWindowFocus();
@@ -1441,12 +1463,19 @@ void Overlay::DrawMenu(const ImGuiIO& io, float em) {
                          ImGui::GetTextLineHeightWithSpacing() * float((status_.empty() ? 0 : 2) + (restart_pending_.empty() ? 0 : 1));
     if (ImGui::BeginTabBar("##tabs")) {
       for (int t = 0; t < kTabCount; ++t) {
+        // The pad changes tabs with LB / RB; the tabs themselves are not on its navigation path (ImGui selects a tab as soon as the focus
+        // lands on it, so Up from a row would switch to whichever tab sits above it). The mouse and Ctrl+Tab work as before.
+        if (pad_session_) ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
         const bool tab_selected =
             ImGui::BeginTabItem(kTabNames[t], nullptr, select_tab_ == t ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None);
+        if (pad_session_) ImGui::PopItemFlag();
         FocusRing();
         if (tab_selected) {
           tab_ = t;
-          if (ImGui::BeginChild("##scroll", ImVec2(0.0f, -footer), ImGuiChildFlags_None)) {
+          // NavFlattened: the tab bar, the rows and the footer buttons are one navigation space (without it the D-pad could not leave the
+          // list for the Save button).
+          if (ImGui::BeginChild("##scroll", ImVec2(0.0f, -footer), ImGuiChildFlags_NavFlattened)) {
+            if (pad_scroll_ != 0.0f) ImGui::SetScrollY(ImGui::GetScrollY() + pad_scroll_ * 38.0f * ImGui::GetFontSize() * io.DeltaTime);
             switch (t) {
               case kTabDisplay: DrawTabDisplay(); break;
               case kTabGraphics: DrawTabGraphics(); break;
@@ -1466,6 +1495,7 @@ void Overlay::DrawMenu(const ImGuiIO& io, float em) {
     Footer();
   }
   ImGui::End();
+  ImGui::PopStyleColor();
   popup_open_last_frame_ = ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
   if (escape || pad_back) {
     if (pad_back) REXLOG_INFO("[mcla-overlay] pad: B closes the menu");
@@ -1484,10 +1514,10 @@ constexpr uint32_t kFedUp = 1u << 0, kFedDown = 1u << 1, kFedLeft = 1u << 2, kFe
 }  // namespace
 
 // What ImGui is told: its gamepad keys for the directions, A (activate) and B (cancel) go in as key events (ImGui's navigation does
-// the rest: it moves the focus, presses buttons and tick boxes, opens and closes combos, scrolls to the focused item); the right
-// stick goes in as the "left stick" scroll axis, which ImGui turns into scrolling of the focused window. Events are queued and
-// processed at the next frame; only changes are sent.
-void Overlay::FeedPadKeys(ImGuiIO& io, uint32_t want, float scroll) {
+// the rest: it moves the focus, presses buttons and tick boxes, opens and closes combos, scrolls to the focused item). Events are
+// queued and processed at the next frame; only changes are sent. LB, RB, X, Y and the right stick are the menu's own (PadFrame, Row,
+// DrawMenu); ImGui's windowing mode (hold X) and its text input key (Y) are never fed.
+void Overlay::FeedPadKeys(ImGuiIO& io, uint32_t want) {
   struct Map {
     uint32_t bit;
     ImGuiKey key;
@@ -1499,11 +1529,6 @@ void Overlay::FeedPadKeys(ImGuiIO& io, uint32_t want, float scroll) {
     if ((want ^ fed_) & m.bit) io.AddKeyEvent(m.key, (want & m.bit) != 0);
   }
   fed_ = want;
-  if (scroll != fed_scroll_) {
-    io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickDown, scroll > 0.0f, scroll > 0.0f ? scroll : 0.0f);
-    io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickUp, scroll < 0.0f, scroll < 0.0f ? -scroll : 0.0f);
-    fed_scroll_ = scroll;
-  }
 }
 
 // One frame of the pad while the menu is open (UI thread, inside the ImGui frame): the newest look the game thread took, minus what
@@ -1530,8 +1555,8 @@ void Overlay::PadFrame(ImGuiIO& io, int64_t now_ms) {
   if (pad_out_.dirs & pad::kNavRight) want |= kFedRight;
   if (pad_out_.activate) want |= kFedActivate;
   if (pad_out_.cancel) want |= kFedCancel;
-  const float scroll = (gate & (pad::kRsUp | pad::kRsDown)) ? 0.0f : -pad::StickValue(sample.raw.ry);  // stick up = scroll up
-  FeedPadKeys(io, want, scroll);
+  pad_scroll_ = (gate & (pad::kRsUp | pad::kRsDown)) ? 0.0f : -pad::StickValue(sample.raw.ry);  // stick up = scroll up
+  FeedPadKeys(io, want);
 
   // The focus rectangle shows from the first press (ImGui shows it for its own navigation keys; LB, RB, X and Y are ours), and from
   // the open when the pad opened the menu.
