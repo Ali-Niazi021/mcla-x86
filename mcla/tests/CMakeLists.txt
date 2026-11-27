@@ -19,14 +19,18 @@
 #                                                              the tier / VRS ladder, shed rules (median, tail, missed frames),
 #                                                              restore, enrichment, learned costs, back-off, pop hiding, camera
 #                                                              cut / speed, pin and caps, HoldAllowed, closed loops against a toy GPU)
+#   mcla_gfx_res_test          test_gfx_res.cpp                hooks/mcla_gfx_res_math.h (the 2000p cost levers, R2 / R3: the sun-shadow
+#                                                              map's accepted edges and the preset compensation at draw scale 2, the
+#                                                              environment map sizes, the governor's VRS rungs above a base level).
+#                                                              constexpr tests: the compiler runs them (-fsyntax-only is a test run)
 #
-# `mcla_unit_tests` is the aggregate target (`cmake --build <dir> --target mcla_unit_tests`). The six executables
+# `mcla_unit_tests` is the aggregate target (`cmake --build <dir> --target mcla_unit_tests`). The seven executables
 # are also part of ALL, so a normal full build is followed by `ctest` (multi-config generators: `ctest -C <config>`).
 # Each test is one executable and exits 1 on the first failed check, which is what CTest looks at.
 #
 # Input, set by the root CMakeLists.txt before add_subdirectory(mcla/tests) or with -D on the command line:
 #   MCLA_HOOKS_DIR   directory with mcla_t_sim_math.h, frame_clock_policy.h, mcla_game_state.h, mcla_game_state.cpp,
-#                    mcla_ws_sizing.h, mcla_t_swap_target.h and mcla_gov_math.h.
+#                    mcla_ws_sizing.h, mcla_t_swap_target.h, mcla_gov_math.h and mcla_gfx_res_math.h.
 #                    Default: ../hooks (mcla/hooks). A relative value is taken from the top-level source directory.
 #
 # From the root: add_subdirectory(mcla/tests) (the root calls enable_testing()). Alone, with no SDK or toolchain
@@ -45,7 +49,7 @@ get_filename_component(_mcla_tests_hooks_dir "${MCLA_HOOKS_DIR}" ABSOLUTE BASE_D
 
 # Say so at configure time when the GAME slice's files are not where the tests expect them.
 foreach(_mcla_tests_input IN ITEMS mcla_t_sim_math.h frame_clock_policy.h mcla_game_state.h mcla_game_state.cpp
-                                   mcla_ws_sizing.h mcla_t_swap_target.h mcla_gov_math.h)
+                                   mcla_ws_sizing.h mcla_t_swap_target.h mcla_gov_math.h mcla_gfx_res_math.h)
   if(NOT EXISTS "${_mcla_tests_hooks_dir}/${_mcla_tests_input}")
     message(FATAL_ERROR "mcla/tests: ${_mcla_tests_input} not found in MCLA_HOOKS_DIR (${_mcla_tests_hooks_dir})")
   endif()
@@ -85,3 +89,6 @@ target_include_directories(mcla_swap_target_test PRIVATE "${_mcla_tests_hooks_di
 
 mcla_add_unit_test(mcla_gov_test 23 test_gov.cpp)
 target_include_directories(mcla_gov_test PRIVATE "${_mcla_tests_hooks_dir}")
+
+mcla_add_unit_test(mcla_gfx_res_test 23 test_gfx_res.cpp)
+target_include_directories(mcla_gfx_res_test PRIVATE "${_mcla_tests_hooks_dir}")
