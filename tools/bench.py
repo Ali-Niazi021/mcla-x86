@@ -136,6 +136,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 if str(HERE) not in sys.path:  # tools/ is on sys.path when run as a script; this lets `import bench` find its neighbours
     sys.path.insert(0, str(HERE))
+import display_log  # noqa: E402
 import heavy_lock  # noqa: E402
 import run_game  # noqa: E402
 
@@ -270,7 +271,10 @@ _MONTHS = {m: i + 1 for i, m in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "J
 def scan_log(path) -> Dict:
     """One pass over the log (rotated parts included): the facts the bench needs, with absolute epochs (local clock)."""
     out: Dict = {"first_ts": None, "last_ts": None, "fr_ts": None, "fr_from": None, "modes": [], "sim": [], "sim_ft": [],
-                 "sim_on_ts": None, "sim_on_cap": None, "sim_off": 0, "wide": None, "built": None, "lines": 0}
+                 "sim_on_ts": None, "sim_on_cap": None, "sim_off": 0, "wide": None, "built": None, "lines": 0,
+                 # display_log dicts with ts = epoch: `[present-stats]` windows and `hitch:` lines, `[mcla-hitch]` lines and
+                 # their `not logged` summaries; ps_unparsed counts window lines the format of which was not understood
+                 "ps_windows": [], "ps_hitches": [], "hitches": [], "hitch_unlogged": [], "ps_unparsed": 0}
     last_raw: Optional[bytes] = None
     for f in run_game.log_files(path):
         with open(f, "rb") as fh:
@@ -278,7 +282,7 @@ def scan_log(path) -> Dict:
                 out["lines"] += 1
                 if out["first_ts"] is None:
                     out["first_ts"] = run_game._parse_ts(raw[:25].decode("ascii", "replace"))
-                if b"[mcla" not in raw:
+                if b"[mcla" not in raw and b"[present-stats]" not in raw:
                     last_raw = raw
                     continue
                 last_raw = None
@@ -312,6 +316,32 @@ def scan_log(path) -> Dict:
                         out["sim_on_ts"], out["sim_on_cap"] = ts, int(m.group("cap"))
                     elif "[mcla-sim] off:" in line:
                         out["sim_off"] += 1
+                elif "[mcla-hitch]" in line:
+                    if ts is None:
+                        continue
+                    h = display_log.parse_hitch(line)
+                    if h is not None:
+                        h["ts"] = ts
+                        out["hitches"].append(h)
+                    else:
+                        u = display_log.parse_hitch_unlogged(line)
+                        if u is not None:
+                            u["ts"] = ts
+                            out["hitch_unlogged"].append(u)
+                elif "[present-stats]" in line:
+                    if ts is None:
+                        continue
+                    w = display_log.parse_present_stats(line)
+                    if w is not None:
+                        w["ts"] = ts
+                        out["ps_windows"].append(w)
+                        continue
+                    h = display_log.parse_present_hitch(line)
+                    if h is not None:
+                        h["ts"] = ts
+                        out["ps_hitches"].append(h)
+                    elif display_log.is_present_stats_window_line(line):
+                        out["ps_unparsed"] += 1
                 elif "[mcla-wide]" in line:
                     m = _RE_WIDE.search(line)
                     if m and out["wide"] is None:
@@ -327,6 +357,19 @@ def scan_log(path) -> Dict:
         if ts is not None:
             out["last_ts"] = ts
     return out
+
+
+def log_display(log: Dict, w0: float, w1: float) -> Dict:
+    """The `[present-stats]` and `[mcla-hitch]` lines of a scan_log() result that belong to the window [w0, w1] (epochs):
+    `raw` holds the parsed lines (for pooling), `display` / `hitches` their totals (display_log; None when there are none)."""
+    tol = SIM_TOLERANCE_S
+    wins = [e for e in log["ps_windows"] if e["ts"] - e["secs"] >= w0 - tol and e["ts"] <= w1 + tol]    # the whole interval inside
+    raw = {"windows": wins,
+           "ps_hitches": [e for e in log["ps_hitches"] if w0 < e["ts"] <= w1 + tol],
+           "hitches": [e for e in log["hitches"] if w0 < e["ts"] <= w1 + tol],
+           "unlogged": [e for e in log["hitch_unlogged"] if w0 < e["ts"] <= w1 + tol]}
+    return {"raw": raw, "display": display_log.aggregate_display(raw["windows"], raw["ps_hitches"], (), log["ps_unparsed"]),
+            "hitches": display_log.aggregate_hitches(raw["hitches"], raw["unlogged"])}
 
 
 def world_real(sim: List[Dict], w0: float, w1: float) -> Tuple[Optional[float], float, float, int]:
@@ -479,7 +522,8 @@ def analyse_run(csv_path, log_path, *, skip: float = WINDOW_SKIP_S, window_s: Op
     The result has valid, reasons, stats (frame_stats or None), world_real, sim, wide, built, window, ft, gpu."""
     res: Dict = {"valid": True, "reasons": [], "stats": None, "world_real": None, "world_s": 0.0, "real_s": 0.0,
                  "sim_lines": 0, "sim_ft": None, "sim_on": False, "sim_cap": None, "wide": None, "built": None,
-                 "ft": [], "gpu": [], "window": None, "pm_clock": None, "pm_rows": 0, "pm_skipped": 0, "fr_rel": None}
+                 "ft": [], "gpu": [], "window": None, "pm_clock": None, "pm_rows": 0, "pm_skipped": 0, "fr_rel": None,
+                 "raw": None, "display": None, "hitches": None}
     log = scan_log(log_path)
     res["wide"], res["built"] = log["wide"], log["built"]
     res["sim_on"], res["sim_cap"] = log["sim_on_ts"] is not None, log["sim_on_cap"]
@@ -553,6 +597,7 @@ def analyse_run(csv_path, log_path, *, skip: float = WINDOW_SKIP_S, window_s: Op
     wr, world_s, real_s, n_sim = world_real(log["sim"], w0, min(w1, last_in))
     res.update(world_real=wr, world_s=world_s, real_s=real_s, sim_lines=n_sim,
                sim_ft=sim_frame_times(log["sim_ft"], w0, min(w1, last_in)))
+    res.update(log_display(log, w0, min(w1, last_in)))      # keys raw, display, hitches
     cur = None
     for ts_, _, to in log["modes"]:
         if ts_ <= w0:
@@ -1276,6 +1321,13 @@ def detail_lines(res: Result) -> List[str]:
             "on" if a.get("sim_on") else "no `on:` line",
             "" if not ft else "; sim frame times p50 %.0f p99 %.0f worst %.1f ms (%d lines)" % (ft["p50"], ft["p99"],
                                                                                                ft["worst"], ft["lines"])))
+    if a.get("display") is not None or a.get("hitches") is not None:      # the window's `[present-stats]` / `[mcla-hitch]` lines
+        if a.get("display") is not None:
+            out.append("  " + display_log.display_line(a["display"], "window"))
+        out.append("  " + display_log.hitch_line(a["hitches"], "window"))
+        worst = display_log.hitch_worst_line(a["hitches"])
+        if worst:
+            out.append("  " + worst)
     tel = a.get("telemetry")
     if tel:
         cpu_part = ""
@@ -1314,6 +1366,7 @@ def make_row(res: Result, build_id: str, api: str, fixture: Optional[str], note:
         if a.get("sim_ft"):
             f = a["sim_ft"]
             notes.append("sim frame times p50 %.0f p99 %.0f worst %.1f ms" % (f["p50"], f["p99"], f["worst"]))
+        notes.extend(display_log.note_text(a.get("display"), a.get("hitches")))      # nothing for a log without those lines
         if any(k == "mcla_sim60" and v.lower() in ("1", "true", "yes", "on") for k, v in res.cvars):
             notes.append("sim on" if a.get("sim_on") else "WARNING: mcla_sim60 set but no `[mcla-sim] on:` line")
         if a.get("mode_warning"):
@@ -1398,11 +1451,17 @@ def pooled(results: Sequence[Result], run_id: str, kind: str, flow: str, variant
         real += r.analysis["real_s"]
         sim_lines += r.analysis["sim_lines"]
     first = results[0].analysis
+    raws = [r.analysis["raw"] for r in results if r.analysis.get("raw")]
+    raw = {k: [e for x in raws for e in x[k]] for k in ("windows", "ps_hitches", "hitches", "unlogged")} if raws else None
     taints = list(dict.fromkeys(t for r in results for t in (r.analysis.get("telemetry") or {}).get("taint", [])))
     analysis = {"valid": True, "reasons": [], "stats": frame_stats(ft, gpu), "world_real": world / real if real > 0 else None,
                 "world_s": world, "real_s": real, "sim_lines": sim_lines, "sim_ft": None, "sim_on": first.get("sim_on"),
                 "sim_cap": first.get("sim_cap"), "wide": first.get("wide"), "built": first.get("built"), "ft": ft, "gpu": gpu,
-                "window": first.get("window"), "pm_clock": first.get("pm_clock"), "pm_rows": 0, "pm_skipped": 0, "fr_rel": None}
+                "window": first.get("window"), "pm_clock": first.get("pm_clock"), "pm_rows": 0, "pm_skipped": 0, "fr_rel": None,
+                "raw": raw, "display": None, "hitches": None}
+    if raw:
+        analysis["display"] = display_log.aggregate_display(raw["windows"], raw["ps_hitches"])
+        analysis["hitches"] = display_log.aggregate_hitches(raw["hitches"], raw["unlogged"])
     analysis["telemetry"] = {"taint": taints} if taints else None
     return Result(run_id, kind, variant, flow, rep, results[0].cvars, True, [], analysis, results[0].power, results[0].warmup,
                   schedule=results[0].schedule)
@@ -1426,7 +1485,7 @@ def result_json(res: Result) -> Dict:
             "metrics": metrics_of(a), "world_s": a.get("world_s"), "real_s": a.get("real_s"), "sim_lines": a.get("sim_lines"),
             "sim_frame_times": a.get("sim_ft"), "sim_on": a.get("sim_on"), "wide": a.get("wide"), "built": a.get("built"),
             "window": a.get("window"), "free_roam_log_s": a.get("fr_rel"), "pm_clock": a.get("pm_clock"),
-            "pm_rows": a.get("pm_rows"), "power": res.power, "warmup": res.warmup, "telemetry": a.get("telemetry"),
+            "pm_rows": a.get("pm_rows"), "display": a.get("display"), "hitches": a.get("hitches"), "power": res.power, "warmup": res.warmup, "telemetry": a.get("telemetry"),
             "schedule": res.schedule, "burn_events": a.get("burn_events")}
 
 

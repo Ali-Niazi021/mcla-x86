@@ -53,7 +53,7 @@
   --config C       build config of $WORK/build/bin/<C>/mcla.exe (default RelWithDebInfo). --exe PATH overrides.
   --no-lock        do not take the heavy lock (use only when a parent already holds it or for a dry experiment).
   --check-flow     only validate the flow file (same grammar as the host) and print its steps; no lock, no run.
-  --summarize X    only parse an existing log and print the run line (re-analysis of a finished run).
+  --summarize X    only parse an existing log and print the display / hitch lines and the run line (re-analysis of a finished run).
   --work W / --game G   $WORK (default env MCLA_WORK, else C:/Users/Ali/Development/mcla-x86-work) and $GAME
                    (env MCLA_GAME, else C:/Users/Ali/Development/dumps/mcla-x360; the game files are in $GAME/game).
 
@@ -101,7 +101,8 @@ What a run does
   4. Tails the log live and prints the notable lines (first engine frame, reached states, [mcla-mode] changes,
      fatals, unregistered calls, watchdog alarms, save-backup lines, the first errors), takes the screenshots, and
      stops at --seconds (or at --stop-on-reach, or when the process exits by itself, which counts as one fatal).
-  5. Parses the whole log (rotated mcla.N.log files included), writes summary.json and prints, as the LAST line:
+  5. Parses the whole log (rotated mcla.N.log files included), writes summary.json, prints the display and hitch lines
+     (see "Display and hitch lines" below) and prints, as the LAST line:
          run <id>: reached=<none|title|menu|free-roam> fatal=<n> unregistered=<n> heartbeat_last=<s>
      Exit 0 iff fatal=0, unregistered=0 and `reached` is at least the flow's expected state. Exit 1: the run was
      done but failed that test. Exit 2: setup problem (no exe, flow, fixture, game files; nothing was run).
@@ -130,6 +131,33 @@ Definitions (log lines; the file log pattern is `[Y-m-d H:M:S.mmm] [level] [cate
   A log is read from its own clock: t = line time - process start time (when run by run_game) or - first line time
   (when summarising a bare log).
 
+Display and hitch lines (tools/display_log.py has the formats, the parsers and the classifier; tests: tools/test_log_parse.py)
+  Printed before the run line (`[run_game] ` prefixed in a run, bare with --summarize), each for the whole run and, once
+  `-> free-roam` has been seen, for the drive window (from that line to the end; a `[present-stats]` window counts when it started
+  at most 1 s before free roam):
+    display (...)   from the presenter's `[present-stats]` lines (every 10 s, SDK patch 0750). It starts with a one-phrase verdict:
+                    `even` (no frame held over the cadence, cadence within 0.02 of a whole number), `beat by design` (the cadence,
+                    refreshes a frame = refresh clock / present rate, is not a whole number: 60 fps on 165 Hz is 2.75, frames stay
+                    2 or 3 refreshes), `repeats` (frames held longer than ceil(cadence): the count and the count a minute) or
+                    `unknown` (no reliable window). Then `windows N reliable, M unreliable (most common: <reason>)`: a window the
+                    display statistics cannot vouch for (the window hidden / covered / minimised, the display off, a failed or
+                    restarted GetFrameStatistics, a counter jump) prints `?` in its display numbers and is `UNRELIABLE`. The display
+                    totals cover the reliable windows only: presents, shown, dropped, the measured refresh clock (median; the display
+                    mode and the windows where the clock differs from it, i.e. variable refresh), the cadence (median), shown frames
+                    held 1 / 2 / 3+ refreshes (raw: read them against the cadence) and the worst one, frames held over the cadence,
+                    the repeats lower bound, frames sampled together (not attributable one by one), display hitches (frames held
+                    present_stats_hitch_refreshes beyond what the cadence allows); the `hitch:` lines logged; and over every window
+                    the CPU side: the Present call max, the interval max, the present interval over 1.5 / 2.5 times the mean (and
+                    over 1.5 / 2.5 refreshes when the cadence is below 1.5). A log of the first version of the line (no cadence tail)
+                    is trusted only when its refresh clock equals its present rate (60 fps on 60 Hz); otherwise its windows count as
+                    unreliable with `old format: cadence unknown`.
+    hitches (...)   from the game's `[mcla-hitch]` lines (mcla_hitch.cpp): count (+ those its 5 s summary says were not logged),
+                    by screen (drive | menu | unknown) and by cause. Cause, first match wins: compile (pipelines or shaders created
+                    in the frame), cpu-bound (game thread on the CPU >= 60 % of the frame), paging/io (page faults >= 1000 or
+                    read >= 4 MiB), else blocked (the thread waited); `blocked (GPU frame >= 80 % of it: n)` is a sub-count of
+                    blocked. The cause counts cover the logged lines only. The worst hitch line follows.
+  A log without such lines (an older build) prints `no [present-stats] lines` / `no [mcla-hitch] lines`.
+
 summary.json keys: run_id, state (running|done), flow, flow_file, fixture, fixture_copied {files, bytes}, api, config,
   exe, args, window_pos, window_behind, schedule (the --schedule specs), schedule_steps (every schedule step of the run: the
   flow's and --schedule's, as written, sorted by time), burn_events [[t, kind, n]...], gpuload (the exe, only when the schedule
@@ -139,7 +167,10 @@ summary.json keys: run_id, state (running|done), flow, flow_file, fixture, fixtu
   heartbeat_lines, heartbeat_frames_last, t_title, t_menu, t_free_roam (seconds since process start), mode_changes
   [[t, from, to]...], error_lines, save_rewrite_start, save_closed, save_restored, user_saves [{path, bytes}], shots,
   shot_notes, shot_methods, log, log_files, log_missing, log_lines, log_last_s, t0_epoch (process start, epoch s), fatal_samples,
-  unregistered_samples, error_samples.
+  unregistered_samples, error_samples, display {run, drive, drive_from_s}, hitches {run, drive, drive_from_s} (run / drive: the totals
+  dicts of display_log.aggregate_display / aggregate_hitches, or null when the log has no such line or no free roam; display adds
+  reliable_windows, unreliable_windows, unreliable_reasons, cadence, held_over, display_hitches, verdict, verdict_text, ... and its
+  presents / shown / dropped / hz / held_* / repeats_min cover the reliable windows only; see display_log.aggregate_display).
 
 From Python (tools/bench.py later):
     import run_game
@@ -171,6 +202,7 @@ SCHEDULES_DIR = FLOWS_DIR / "schedules"    # schedule fragments for --schedule: 
 
 if str(HERE) not in sys.path:  # tools/ is on sys.path when run as a script; this lets `import run_game` find heavy_lock
     sys.path.insert(0, str(HERE))
+import display_log  # noqa: E402
 import heavy_lock  # noqa: E402
 
 DEFAULT_WORK = "C:/Users/Ali/Development/mcla-x86-work"
@@ -215,10 +247,13 @@ _RE_SAVE_CLOSED = re.compile(r"content: '.*' closed; the previous contents of sa
 _RE_SAVE_RESTORED = re.compile(r"content: saved game '.*' was being rewritten when the game ended")
 # A cheap byte test before any decoding: only these lines carry facts (a real log is mostly other lines). The level is
 # read from the first bytes of the line instead (`[2026-11-24 12:00:00.123] [error] ...`).
-_IMPORTANT = re.compile(rb"\[mcla-|\[FATAL\]|unregistered function|content: ")
+_IMPORTANT = re.compile(rb"\[mcla-|\[present-stats\]|\[FATAL\]|unregistered function|content: ")
 
 _SAMPLE_CAP = 10
 _MODE_CAP = 200
+_PRESENT_CAP = 20000     # `[present-stats]` window lines kept (10 s each) and hitch lines of either kind: far beyond any run
+_HITCH_CAP = 50000
+_DRIVE_TOL_S = 1.0       # a `[present-stats]` window counts in the drive window when it started this much before free roam or later
 _T0_ATTEMPTS = 50
 
 LogSource = Union[str, os.PathLike]
@@ -266,6 +301,15 @@ class LogScanner:
         self.save_start = 0
         self.save_closed = 0
         self.save_restored = 0
+        self.fr_ts: Optional[float] = None        # epoch of the first `-> free-roam` line: the drive window starts there
+        # `[present-stats]` window lines, its `hitch:` lines, `[mcla-hitch]` lines and their `not logged` summaries, as dicts
+        # from display_log (plus ts = epoch and t = seconds since t0); totals in display_result() / hitch_result().
+        self._ps_windows: List[Dict] = []
+        self._ps_hitches: List[Dict] = []
+        self._ps_warnings: List[str] = []
+        self._ps_unparsed = 0
+        self._hitches: List[Dict] = []
+        self._hitch_unlogged: List[Dict] = []
         self._last_ts: Optional[float] = None     # time of the last line that was examined
         self._last_raw: Optional[bytes] = None    # a later line that was skipped (its time is read at the end)
         self._t0_tries = 0
@@ -287,6 +331,26 @@ class LogScanner:
             if ts is not None:
                 return ts
         return self._last_ts
+
+    def display_result(self) -> Dict:
+        """{"run": totals of the `[present-stats]` lines, "drive": the same after the first free-roam line (None before it),
+        "drive_from_s": seconds since t0 of that line}. A totals dict is None when the log has no such line (display_log)."""
+        run = display_log.aggregate_display(self._ps_windows, self._ps_hitches, self._ps_warnings, self._ps_unparsed)
+        drive = None
+        if self.fr_ts is not None:
+            windows = [w for w in self._ps_windows if w["ts"] is not None and w["ts"] - w["secs"] >= self.fr_ts - _DRIVE_TOL_S]
+            hitches = [h for h in self._ps_hitches if h["ts"] is not None and h["ts"] >= self.fr_ts]
+            drive = display_log.aggregate_display(windows, hitches)
+        return {"run": run, "drive": drive, "drive_from_s": self.t_free_roam}
+
+    def hitch_result(self) -> Dict:
+        """Same shape for the `[mcla-hitch]` lines (counts by screen mode and by cause, the worst line)."""
+        run = display_log.aggregate_hitches(self._hitches, self._hitch_unlogged)
+        drive = None
+        if self.fr_ts is not None:
+            drive = display_log.aggregate_hitches([h for h in self._hitches if h["ts"] is not None and h["ts"] >= self.fr_ts],
+                                                  [h for h in self._hitch_unlogged if h["ts"] is not None and h["ts"] >= self.fr_ts])
+        return {"run": run, "drive": drive, "drive_from_s": self.t_free_roam}
 
     def result(self) -> Dict:
         end = self.last_ts()
@@ -315,6 +379,8 @@ class LogScanner:
             "save_rewrite_start": self.save_start,
             "save_closed": self.save_closed,
             "save_restored": self.save_restored,
+            "display": self.display_result(),
+            "hitches": self.hitch_result(),
         }
 
     # ------------------------------------------------------------------ feeding
@@ -387,7 +453,10 @@ class LogScanner:
                     if m.group("to") == "free-roam" and not self.free_roam_seen:
                         self.free_roam_seen = True
                         self.t_free_roam = rel
+                        self.fr_ts = ts
                     kind = kind or "mode"
+            elif "[mcla-hitch]" in line:
+                self._feed_hitch(line, ts, rel)
             if self.title_seen and rel is not None and _RE_LIVE.search(line):
                 self.hb_last = rel
                 self.hb_lines += 1
@@ -395,6 +464,8 @@ class LogScanner:
                     f = _RE_FRAMES.search(line)
                     if f:
                         self.hb_frames_last = int(f.group(1))
+        elif "[present-stats]" in line:
+            self._feed_present_stats(line, ts, rel)
         elif "content: " in line:
             if _RE_SAVE_START.search(line):
                 self.save_start += 1
@@ -410,6 +481,38 @@ class LogScanner:
                 self.hang_alarms += 1
             kind = kind or "watchdog"
         return kind
+
+
+    def _feed_present_stats(self, line: str, ts: Optional[float], rel: Optional[float]) -> None:
+        """The presenter's `[present-stats]` window lines, `hitch:` lines and the GetFrameStatistics warning."""
+        w = display_log.parse_present_stats(line)
+        if w is not None:
+            if len(self._ps_windows) < _PRESENT_CAP:
+                w["ts"], w["t"] = ts, rel
+                self._ps_windows.append(w)
+            return
+        h = display_log.parse_present_hitch(line)
+        if h is not None:
+            if len(self._ps_hitches) < _HITCH_CAP:
+                h["ts"], h["t"] = ts, rel
+                self._ps_hitches.append(h)
+        elif display_log.is_present_stats_window_line(line):
+            self._ps_unparsed += 1                      # the format changed: say so instead of reporting zeros
+        elif display_log.is_present_stats_warning(line) and len(self._ps_warnings) < 3:
+            self._ps_warnings.append(line[26:].strip()[:300] if ts is not None else line.strip()[:300])
+
+    def _feed_hitch(self, line: str, ts: Optional[float], rel: Optional[float]) -> None:
+        """The game's `[mcla-hitch]` lines (one per long frame) and their `N more hitch(es) ... not logged` summaries."""
+        h = display_log.parse_hitch(line)
+        if h is not None:
+            if len(self._hitches) < _HITCH_CAP:
+                h["ts"], h["t"] = ts, rel
+                self._hitches.append(h)
+            return
+        u = display_log.parse_hitch_unlogged(line)
+        if u is not None and len(self._hitch_unlogged) < _HITCH_CAP:
+            u["ts"], u["t"] = ts, rel
+            self._hitch_unlogged.append(u)
 
 
 def log_files(path: LogSource) -> List[Path]:
@@ -1867,6 +1970,8 @@ def _run_locked(opts: RunOptions, work: Path, game_root: Path, exe: Path, flow_f
     if shooter is not None:
         for note in shooter.final_notes():
             say("screenshots: " + note)
+    for text in display_log.summary_lines(summary["display"], summary["hitches"]):
+        say(text)
     say("summary %s" % posix(run_dir / "summary.json"))
     return summary
 
@@ -1895,6 +2000,8 @@ def _summarize(arg: str, opts: RunOptions) -> int:
             meta = {}
     expected = opts.expect or meta.get("expected") or "none"
     parsed = evaluate(parse_log(p, t0=meta.get("t0_epoch")), expected, int(meta.get("fatal_process", 0)))
+    for text in display_log.summary_lines(parsed["display"], parsed["hitches"]):    # before the run line: it stays the last
+        print(text)
     print(run_line(run_id, parsed))
     return 0 if parsed["ok"] else EXIT_FAILED
 
