@@ -1502,6 +1502,63 @@
       "emit": "nondefault"
     },
     {
+      "id": "mcla_overlay_pad",
+      "label": "Controller: use the mod menu with a pad",
+      "help": "Lets a controller open the in-game mod menu (hold the chord below) and use it: D-pad or left stick to move, left / right to change a value, A select, B back or close, X reset, Y save, LB / RB tabs. While it is open the game gets nothing from the pad. Off: the menu is for the keyboard and the mouse.",
+      "category": "controls",
+      "type": "bool",
+      "cvar": "mcla_overlay_pad",
+      "default": true,
+      "advanced": true,
+      "requires": {"mcla_overlay": true},
+      "emit": "nondefault"
+    },
+    {
+      "id": "mcla_overlay_pad_chord",
+      "label": "Controller: open the mod menu with",
+      "help": "The buttons that open and close the mod menu when they are held together (for the time below) with no other button down. Both stick clicks is the default: two clicks at once do not happen while driving. With Back + Start or LB + RB + Back the game sees the first press (Start opens its pause menu, Back its map) before the chord is complete.",
+      "category": "controls",
+      "type": "enum",
+      "cvar": "mcla_overlay_pad_chord",
+      "default": 1,
+      "options": [
+        {"value": 1, "label": "Both stick clicks (L3 + R3)", "help": "Click the left and the right stick together and hold."},
+        {"value": 2, "label": "Back + Start", "help": "Hold Back and Start together. The game sees the Start press first (its pause menu opens)."},
+        {"value": 3, "label": "LB + RB + Back", "help": "Hold both bumpers and Back. The game sees the Back press first (its map)."},
+        {"value": 0, "label": "Nothing (the keyboard opens it)", "help": "The pad cannot open the menu; with the menu open from the keyboard it still works."}
+      ],
+      "advanced": true,
+      "requires": {"mcla_overlay_pad": true},
+      "emit": "nondefault"
+    },
+    {
+      "id": "mcla_overlay_pad_hold_ms",
+      "label": "Controller: chord hold time (ms)",
+      "help": "How long the chord must be held to open or close the mod menu. Longer cannot be done by accident; shorter opens faster.",
+      "category": "controls",
+      "type": "int",
+      "cvar": "mcla_overlay_pad_hold_ms",
+      "default": 500,
+      "min": 200,
+      "max": 2000,
+      "step": 100,
+      "advanced": true,
+      "requires": {"mcla_overlay_pad": true, "mcla_overlay_pad_chord": [1, 2, 3]},
+      "emit": "nondefault"
+    },
+    {
+      "id": "mcla_overlay_pause",
+      "label": "Pause the game while the mod menu is open",
+      "help": "When the mod menu is opened in free roam, the game's own pause menu is opened with it (the overlay presses Start for you) and closed again just before the menu closes. Only free roam is paused: in a race, the garage, a loading screen or an open pause menu nothing is pressed, and when the game does not react within three seconds the overlay leaves it alone.",
+      "category": "controls",
+      "type": "bool",
+      "cvar": "mcla_overlay_pause",
+      "default": false,
+      "advanced": true,
+      "requires": {"mcla_overlay": true},
+      "emit": "nondefault"
+    },
+    {
       "id": "audio_mute",
       "label": "Mute audio",
       "help": "Silences all game audio output.",

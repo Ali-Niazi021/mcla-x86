@@ -1,0 +1,83 @@
+# MCLA overlay pad test, part 2 (written after the first run of overlay_pad_menu): what part 1 does not reach. A long tab walked with the
+# D-pad held (the list must scroll with the focus), the right stick scrolling it, the left stick as a D-pad, a tick box stepped with left /
+# right, the rows with a tick box AND a slider (the cheats "hold" rows), the Save and Close buttons reached with the D-pad, and A on Close.
+# One boot, ~125 s. Screenshots at even seconds (--screenshot-every 2); every step is at an odd second + .5, so the picture 1.5 s later shows it.
+#   python tools/run_game.py --flow overlay_pad_menu2 --config Release --activate --cvar fullscreen=true --cvar mcla_profile=1080p --screenshot-every 2 --run-id padnav2-1
+# Save writes mcla_x86.toml next to the exe and the launcher's settings: LOCALAPPDATA at a scratch folder, delete the toml afterwards.
+# Format: <second>:<button>[+<button>...][/<hold ms>] and schedule steps (mark); '#' comments.
+#
+# expect: free-roam
+# seconds: 125
+# fixture: after_intro
+0:mark boot
+12:start/300
+16:start/300
+20:start/300
+24:start/300
+28:start/300
+32:start/300
+36:start/300
+# a late Start can open PAUSE just as free roam begins (run padnav-2): two B taps close it (a B in free roam does nothing)
+40:b/300
+42:b/300
+# ---- open, RB to Graphics (a long tab: 3 + 1 + 8 + 2 rows), change the ceiling (so that Save is enabled)
+44:mark chord_open
+44.5:l3+r3/900
+46.5:rb/200
+# t48: Graphics, ring on "Adaptive detail"
+48.5:down/200
+49.5:right/200
+# t50: "Highest detail it may reach" one step on
+# ---- D-pad held down: the focus runs down the rows, the list scrolls; t54 = the bottom
+51:mark hold_down
+51.5:down/4500
+# t54 mid way, t56 bottom (ring on the last row or the Save settings button)
+# ---- Y saves, then up held: back at the top
+57:mark hold_up
+57.5:up/4500
+# t60 mid way, t62 the top
+# ---- right stick scrolls the list without moving the focus
+63:mark rs_scroll
+63.5:rs_down/1500
+# t66: the list scrolled down, the ring still where it was (maybe off the screen)
+66.5:rs_up/1500
+# t68: scrolled back
+# ---- left stick as a D-pad: down twice, right once
+69:mark ls_nav
+69.5:ls_down/200
+70.5:ls_down/200
+71.5:ls_right/200
+# t72: ring two rows lower, the row's value stepped once
+# ---- Game tab: down to the camera smoothing tick box, left = off, X = back to the default
+73:mark game_tab
+73.5:rb/200
+75.5:down/200
+76.5:down/200
+77.5:down/200
+78.5:left/200
+# t80: "Camera smoothing fix" unticked (log: -> off)
+80.5:x/200
+# t82: ticked again, log: X reset
+# ---- Cheats: RB, A on the gate (on), down to "Hold the time of day" (tick box + slider), right = on, then what right / down do
+83:mark cheats
+83.5:rb/200
+85.5:a/200
+86.5:down/200
+87.5:right/200
+88.5:right/200
+89.5:right/200
+# t90: the gate is on; t88 .. t90: the hold box ticked; where did the extra rights go (slider?)
+90.5:down/200
+91.5:up/200
+# ---- footer: down held to the bottom, A on Save settings, right, A on Close
+93:mark footer
+93.5:down/3000
+97.5:a/200
+99.5:right/200
+101.5:a/200
+# t102: Save pressed (status line), t104: the menu is closed (log: menu closed), no pause
+# ---- control: Start opens PAUSE with the menu closed, B closes it
+108:mark control_start
+108.5:start/300
+112.5:b/300
+118:mark end

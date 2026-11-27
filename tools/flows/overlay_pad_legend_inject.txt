@@ -1,0 +1,23 @@
+# real keyboard and mouse for the run padlegend-*: tools/inject_input.py, process clock. Coordinates: screenshot pixels of the 3200x2000 capture.
+# Menu rows (Display tab, 1080p capture): FPS counter box (1445, 562), Statistics screen box (1445, 715).
+47 key DOWN
+54 move 1500 700
+54.4 rel 24 24 4 200
+57 click 1445 715
+62 key ESC
+66 key F1
+69 key DOWN
+70 key RETURN
+71 key X
+72 key SPACE
+74 key F1
+76 key RETURN
+80 key BACK
+84 down F
+84 down K
+84.9 up F
+84.9 up K
+90 down F
+90 down K
+90.9 up F
+90.9 up K

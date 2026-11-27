@@ -1,0 +1,31 @@
+# MCLA overlay pad: the chord at the title and during the loading screen. Does the menu open there (the pad is read once per engine frame:
+# a frame loop that is not running means no chord), and does it leave the boot intact (Start still starts the game, the game gets its pad
+# back)? Log lines to read: `[mcla-overlay] pad: chord ...` with the `[mcla-mode]` transitions around them, `menu open` / `menu closed`.
+#   python tools/run_game.py --flow overlay_pad_boot --config Release --activate --cvar fullscreen=true --cvar mcla_profile=1080p
+#          --screenshot-every 1 --run-id padboot-1      (LOCALAPPDATA at a scratch folder; nothing is saved)
+# Timeline: title from ~5 s (front-end); 8.5 chord (900 ms): opens at the title?; 10.5 chord: closes. Start at 12 .. 28 as the other flows
+# (the load begins ~30.7 s, free roam ~36.1 s). 32.5 chord held 1.5 s DURING the loading screen. 36 Start. 40.5 chord (closes it if it
+# opened). 46 the menu is closed by the schedule whatever happened (`mcla_overlay_menu=false`), 50 Start must open PAUSE (the game has its
+# pad), 54 B closes it.
+#
+# expect: free-roam
+# seconds: 62
+# fixture: after_intro
+0:mark boot
+8:mark title_chord
+8.5:l3+r3/900
+10.5:l3+r3/900
+12:start/300
+16:start/300
+20:start/300
+24:start/300
+28:start/300
+31:mark loading_chord
+32.5:l3+r3/1500
+36:start/300
+40.5:l3+r3/900
+46:set mcla_overlay_menu=false
+48:mark control_start
+50:start/300
+54:b/300
+58:mark end

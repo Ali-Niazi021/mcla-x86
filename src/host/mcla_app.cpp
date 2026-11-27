@@ -358,6 +358,7 @@ void McLaApp::OnPreSetup(rex::RuntimeConfig& config) {
     if (input && !tool_mode) {
       input->SetDeviceAssignment(std::make_unique<rex::input::SharedAssignment>());
       input_.AttachTo(*input);
+      mcla_host::overlay::AttachInjector(*input);
     }
     return input;
   };

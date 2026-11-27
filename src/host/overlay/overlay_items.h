@@ -113,6 +113,10 @@ inline constexpr Choice kChoicesFpsTarget[] = {{"0", "Shipped timing (the game's
 inline constexpr Choice kChoicesWeather[] = {{"-1", "The game's own"}, {"0", "Nice"}, {"1", "Cloudy"}, {"2", "Stormy (rain)"},
                                              {"3", "Foggy"}};
 inline constexpr Choice kChoicesClock[] = {{"-1", "The game decides"}, {"1", "Stopped"}, {"0", "Forced to run"}};
+inline constexpr Choice kChoicesPadChord[] = {{"1", "Both stick clicks (L3 + R3)"},
+                                              {"2", "Back + Start"},
+                                              {"3", "LB + RB + Back"},
+                                              {"0", "Nothing (the keyboard opens it)"}};
 
 // The presets, as the launcher and mcla_gfx_preset name them.
 struct PresetOption {
@@ -250,6 +254,22 @@ inline constexpr Item kOverlayOn{Kind::kToggle, "In-game overlay (this menu, cou
                                  "Turns the whole overlay off: no key is listened to and nothing is created. Takes effect at the "
                                  "next start.",
                                  0, 0, "", nullptr, 0, kFlagRestart};
+
+inline constexpr Item kPadChord{Kind::kChoice, "Controller: open the menu with", "mcla_overlay_pad_chord",
+                                "The buttons that open and close this menu from a controller when they are held together for half "
+                                "a second (nothing else pressed; the hold time is mcla_overlay_pad_hold_ms). Both stick clicks is "
+                                "the default: two clicks at once do not happen while driving. With Back + Start the game sees the "
+                                "Start press first (its pause menu opens). While the menu is open the game gets nothing from the "
+                                "pad, and a button held at the close does not reach it until it is let go.",
+                                0, 0, "", kChoicesPadChord, CountOf(kChoicesPadChord)};
+
+inline constexpr Item kPauseGame{Kind::kToggle, "Pause the game while this menu is open", "mcla_overlay_pause",
+                                 "Off by default. On: when this menu is opened in free roam the overlay opens the game's own pause menu "
+                                 "with it (it presses Start for you) and closes it again just before the menu closes, so the car does not "
+                                 "drive on while you look at a setting. Only free roam is paused: in a race, the garage, a loading screen "
+                                 "or an open pause menu nothing is pressed, and when the game does not react within three seconds the "
+                                 "overlay lets go and leaves it as it is.",
+                                 0, 0, "", nullptr, 0};
 
 // Cheats and mods.
 inline constexpr Item kCheatsGate{Kind::kToggle, "Allow cheats and mods", "mcla_overlay_cheats",

@@ -89,6 +89,18 @@ Finished steps are skipped, so this is much faster than the first setup.
 
 - **Controllers:** Xbox (XInput), DualShock 4 and DualSense work. Keyboard works too; the keys are on the launcher's
   Controls page and you can change them.
+- **Overlay and mod menu:** **F1** opens the mod menu (Display, Graphics, Game, Cheats / mods, About): a change applies
+  at once, each row says whether it is `live`, `next load` or `next start`, and **Save settings** keeps what you changed
+  for the next start. **F2** shows an FPS counter in a corner, **F5** a statistics screen (frame times, GPU time, display
+  cadence, adaptive detail, hitches). With a controller, hold both stick clicks (**L3 + R3**) for half a second to open
+  the menu (the same chord closes it, and so does B); the D-pad or left stick moves, left / right change a value (hold to
+  speed up), **A** selects, **X** puts the row back to its default, **Y** saves, **LB / RB** switch tabs and the right
+  stick scrolls. The last device you touched decides the hint line at the bottom of the menu. While the menu is open the
+  game gets no input from the keyboard, mouse or pad, and it keeps running: open it from the pause menu or when parked,
+  or switch on **Pause the game while this menu is open** (Game tab, off by default; free roam only).
+  The cheats (time of day, weather, traffic) are off at every start. The chord is a row of the Game tab (L3 + R3, Back +
+  Start or LB + RB + Back) and the keys are rebound in the launcher; `--mcla_overlay=false` removes the whole thing,
+  `--mcla_overlay_pad=false` leaves it to the keyboard and mouse.
 - **Presets:** Recommended 1080p, 16:10 panel (1920x1200), Balanced 900p, Performance 720p, native panel, and a
   console-like 30 fps mode. If the game does not hold 60 fps, pick a lighter preset.
 - **Adaptive detail** (on by default): keeps 60 fps by lowering detail where it is least visible, and raises it again

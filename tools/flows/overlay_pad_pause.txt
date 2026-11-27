@@ -1,0 +1,40 @@
+# MCLA overlay: "pause the game while the mod menu is open" (mcla_overlay_pause, off by default). Run with the option on:
+#   python tools/run_game.py --flow overlay_pad_pause --config Release --activate --cvar fullscreen=true --cvar mcla_profile=1080p
+#          --cvar mcla_overlay_pause=true --screenshot-every 2 --run-id padpause-1      (LOCALAPPDATA at a scratch folder)
+# Read the `[mcla-overlay] pause:` lines and `[mcla-mode]`:
+#   44.5  chord opens the menu in free roam      -> `pause: the menu opened in free roam: Start sent`, `free-roam -> pause`, `the game is paused`
+#   52.5  chord closes it                        -> `giving the game back`, `pause -> free-roam`, `the game is back ... closing the menu`, `menu closed`
+#   58.5  the player's own Start (PAUSE)         -> `free-roam -> pause`
+#   62.5  chord opens the menu in PAUSE          -> `pause: nothing sent: the game is on screen 'pause'`
+#   66.5  chord closes it                        -> `menu closed` and NO `pause -> free-roam` (the player's pause stays), 70.5 B closes it
+#   76    menu opened by the cvar in free roam   -> Start sent, paused;  80: closed by the cvar -> given back, then `menu closed`
+#
+# expect: free-roam
+# seconds: 92
+# fixture: after_intro
+0:mark boot
+12:start/300
+16:start/300
+20:start/300
+24:start/300
+28:start/300
+32:start/300
+36:start/300
+# a late Start can open PAUSE just as free roam begins (run padnav-2): two B taps close it (a B in free roam does nothing)
+40:b/300
+42:b/300
+44:mark open_in_roam
+44.5:l3+r3/900
+48:mark paused
+52:mark close_gives_back
+52.5:l3+r3/900
+58:mark players_pause
+58.5:start/300
+62:mark open_in_pause
+62.5:l3+r3/900
+66.5:l3+r3/900
+70.5:b/300
+74:mark cvar_open
+76:set mcla_overlay_menu=true
+80:set mcla_overlay_menu=false
+86:mark end

@@ -44,6 +44,10 @@ void Install(rex::ui::Window* window, rex::ui::ImGuiDrawer* drawer, const char* 
 // missing). Call from ReXApp::OnConfigureFonts, which runs before the atlas is built.
 void ConfigureFonts(ImFontAtlas* atlas);
 
+// Adds the overlay's own pad (a synthetic gamepad that presses Start for "pause the game while the menu is open"; it exists as a device
+// only while mcla_overlay_pause is on). Call from the input factory, before the guest starts polling (OnPreSetup).
+void AttachInjector(rex::input::InputSystem& input);
+
 // The runtime exists: the input system can be told to go quiet while the menu is open (null = no input system: no mute), and
 // whatever the cvars ask to be shown at start (mcla_overlay_fps) is shown now.
 void OnRuntimeReady(rex::input::InputSystem* input);

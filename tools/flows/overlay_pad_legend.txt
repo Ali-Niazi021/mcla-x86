@@ -1,0 +1,35 @@
+# MCLA overlay pad test, part 3: the pad half of the "last device" test. Run together with tools/flows/overlay_pad_legend_inject.txt (real keyboard and
+# mouse, tools/inject_input.py): the legend line at the bottom of the menu has to follow the last device used, the keyboard and the mouse have
+# to work as before, and nothing may reach the game while the menu is open (the PAUSE detector) - see docs/OVERLAY.md "Controller", "Test plan".
+#   Start-Process python -ArgumentList "-I","tools/inject_input.py","tools/flows/overlay_pad_legend_inject.txt","--log","legend-inject.log" -WindowStyle Hidden
+#   python tools/run_game.py --flow overlay_pad_legend --config Release --activate --cvar fullscreen=true --cvar mcla_profile=1080p --screenshot-every 2 --run-id padlegend-1
+# (LOCALAPPDATA at a scratch folder; delete mcla_x86.toml afterwards). The keyboard's steps are in the inject file; both use the process clock.
+#
+# expect: free-roam
+# seconds: 112
+# fixture: after_intro
+0:mark boot
+12:start/300
+16:start/300
+20:start/300
+24:start/300
+28:start/300
+32:start/300
+36:start/300
+# a late Start can open PAUSE just as free roam begins (run padnav-2): two B taps close it (a B in free roam does nothing)
+40:b/300
+42:b/300
+44:mark chord_open
+44.5:l3+r3/900
+# keyboard: Down at 47 (legend -> keys). pad: Down at 50.5 (legend -> pad glyphs)
+50.5:down/200
+# mouse: moves at 54, clicks "Statistics screen" at 57 (legend -> keys). pad: A at 58.5 on the focused row (legend -> pad glyphs again)
+58.5:a/200
+# keyboard: Esc closes at 62; F1 opens at 66 (legend = keys, with the pad hint); Return / X / Space / Down inside the menu at 69-72 (none may
+# open PAUSE); F1 closes at 74; Return at 76 with the menu closed opens PAUSE (control), Backspace at 80 closes it.
+# keyboard emulation: F + K held 0.9 s at 84 and again at 90 must NOT open the menu (mnk_mode: they are the pad's L3 and R3; the chord ignores the
+# emulation: before that fix the first opened it and the second could not close it, run padlegend-1)
+# the pad's chord still works after all of that: 96.5 opens, 100.5 closes
+96.5:l3+r3/900
+100.5:l3+r3/900
+108:mark end

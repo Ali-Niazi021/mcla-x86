@@ -26,6 +26,7 @@ struct Slot {
 Slot g_ring[kRing];
 std::atomic<uint64_t> g_head{0};       // frames written; slot i is g_ring[i & (kRing - 1)]
 std::atomic<bool> g_demand{false};
+std::atomic<FrameTap> g_tap{nullptr};
 std::atomic<int64_t> g_last_ns{0};     // the previous frame's start; written by the game thread only
 
 struct HitchEvent {
@@ -46,7 +47,10 @@ int64_t NowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+void SetFrameTap(FrameTap tap) { g_tap.store(tap, std::memory_order_release); }
+
 void NoteEngineFrame(int64_t now_ns) {
+  if (const FrameTap tap = g_tap.load(std::memory_order_acquire)) tap(now_ns);
   if (!g_demand.load(std::memory_order_relaxed)) {
     // Nobody is looking: the next frame after the overlay is shown must not measure from a stale instant.
     g_last_ns.store(0, std::memory_order_relaxed);

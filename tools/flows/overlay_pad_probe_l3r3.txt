@@ -1,0 +1,47 @@
+# MCLA overlay pad probe: does the GAME react to the stick clicks (L3, R3)? They are the default chord of the mod menu (L3 + R3 held for
+# half a second): until the chord is complete the game sees the two clicks, so a click that does something in the game is a side effect of
+# opening the menu. Run it with the overlay's pad switched off, so that nothing here is muted or taken by the overlay:
+#   python tools/run_game.py --flow overlay_pad_probe_l3r3 --config Release --activate --audio --cvar fullscreen=true --cvar mcla_profile=1080p
+#          --cvar mcla_overlay_pad=false --screenshot-every 1 --run-id padprobe-1
+# and, at the same time, tools/audio_meter.py (the game's WASAPI session peak, wall clock) for a horn. Read: shots/t<s>.png around each step
+# and `[mcla-mode]` in the log. Each press is 500 ms (the chord's hold time), at an odd second + .5.
+# Timeline: parked in free roam (46.5 L3, 50.5 R3, 54.5 both), driving at 45 - 60 mph (60.0 start; 66.5 L3, 70.5 R3, both at 74.5 once braking),
+# PAUSE (80.0 Start; 83.5 L3, 87.5 R3, 91.5 both on the first tab; 95.5 RB to the next tab and L3 + R3 there), closed with B.
+#
+# expect: free-roam
+# seconds: 112
+# fixture: after_intro
+0:mark boot
+12:start/300
+16:start/300
+20:start/300
+24:start/300
+28:start/300
+32:start/300
+36:start/300
+# a late Start can open PAUSE just as free roam begins (run padnav-2): two B taps close it (a B in free roam does nothing)
+40:b/300
+42:b/300
+44:mark parked
+46.5:l3/500
+50.5:r3/500
+54.5:l3+r3/500
+58:mark drive
+60:rt=1/11100
+60:ls_right/1000
+62.8:ls_left/400
+66.5:l3/500
+70.5:r3/500
+72:lt=1/4000
+74.5:l3+r3/500
+78:mark pause
+80:start/300
+83.5:l3/500
+87.5:r3/500
+91.5:l3+r3/500
+95.5:rb/200
+97.5:l3/500
+100.5:r3/500
+104:b/300
+106:b/300
+108:mark end
