@@ -132,6 +132,47 @@ rather than the frame p50: the `scene` group alone varies 2.7-3.7 ms between ide
 Absolute numbers for the product (Part C) are taken with the clock free. **Evidence** METRICS rows `k-*` (locked) against `dr-v12-*` / `r23-*`
 (free), `scratch/r2r3/nv/`.
 
+### NATIVE-O The RTX 4060 Laptop was held to 55 W of its 100 W by Lenovo's default thermal mode; Extreme Performance lifts it (+23 % fps) and no NVIDIA tool can
+**Symptom** 2000p ultra uncapped sat at 85 fps, GPU-bound: 54.8 W mean (p95 55.0), `clocks_event_reasons` 0x4 (software power cap) in every sample, 1920-2250 MHz at 67-75 C; `nvidia-smi -q` said
+power limit 55 W (default 55, enforced 55, min 5, max 100) and `nvidia-smi -pl` answered "not supported in current scope". The charger was not the limit (battery discharge 1.1 W under load), nor the
+Windows side. **Cause** The machine is a Lenovo IdeaPad Slim Pro 9 16IRP8 (83C0). Lenovo's Intelligent Cooling (the "Lenovo Notebook ITS Service", `LNBITSSvc`, ITS v5) was in its default mode (auto) and
+the platform (NVIDIA Dynamic Boost, `nvpcf`) gives the dGPU 55 W there. Windows' power plan and the Windows power-mode slider do nothing to it: with the High performance plan the slider is switched off
+(`PowerGetEffectiveOverlayScheme` reads Balanced although the AC slider says Best performance; the game's `[mcla-sys]` line printed "Balanced"), and a Balanced plan with Best performance changed neither
+the GPU's power nor its clock (p2-bal). **Fix** Switch Lenovo's mode to Extreme Performance. There is no WMI class for it on this machine (`LENOVO_GAMEZONE_DATA` only has the hybrid-GPU methods), so it is
+set through the vendor's own addin: the managed `IdeaNotebookAddin.PowerAgent.SetITSMode` of Lenovo Vantage (`...\Vantage\Addins\IdeaNotebookAddin\1.0.13.114\IdeaPowerAgent.dll`, a C++/CLI mixed assembly: Windows PowerShell
+5.1 only, elevated, on a thread with a 256 MB stack, else StackOverflowException), `scratch/power/its_get.ps1 get | all | set <1 auto | 2 battery saving | 3 extreme performance>` through the broker. The registry mirrors it
+(`HKLM\SYSTEM\CurrentControlSet\Services\LITSSVC\LNBITS\IC\MMC`: CurrentSetting 0 = auto, 1 = battery saving, 3 = extreme performance; the game reads it). Result with nothing else changed: enforced limit 100 W, 2000p ultra
+uncapped **105.6 / 108.0 fps** (+23.5 / +26 %), GPU busy 11.5 -> 9.4 ms, 82.7 / 84.6 W, 2682 MHz (was 2096), 69-75 C; 6 minutes (bench_drive2) 112.7 fps, 87 W, 2684 MHz, 71-76 C, no thermal throttle reason in 614
+samples. Cost: about 30 W more at the wall, a louder fan (not measured), and battery discharge up to 5-8 W on peaks (the charger's wattage is not readable: the vendor API returns none for it; the battery assists when the load peaks above it). The enforced limit moves with the CPU load (Dynamic Boost): 93.7 W at start,
+71-77 W at 1080p, 87-91 W at 2000p. The game now logs it: `[mcla-sys] gpu: ... power limit N W enforced (board default, range)`, the Lenovo mode, and a WARNING when the limit is under 70 % of the maximum
+(`system_status_rules.h`, 50 unit checks). The mode is also what Fn+Q cycles; it survives a reboot (registry) but was not tested across one. **Evidence** runs `p0-base`, `p1-perf`, `p1-perf-b`, `p2-bal`, `p1-perf-bench`,
+METRICS rows `p*`, `scratch/power/ORIGINAL.md` (the original state and the restore command). **Cost** About 12 runs, one elevated PowerShell script.
+
+### NATIVE-P 120 fps on the 165 Hz panel needs variable refresh: there is no 120 Hz mode, and with tearing allowed G-Sync shows it evenly
+**Symptom** T6 asked for a 120 Hz display mode for the 120 fps checks. **Cause** The panel (Lenovo LEN8BA2) lists only 165 Hz and 60 Hz modes at every resolution (EnumDisplaySettings; `ChangeDisplaySettingsEx` with 120 Hz returns
+DISP_CHANGE_BADMODE, -2, at 1920x1080 and 3200x2000); its EDID range limits are 48-165 Hz vertical, so it is an adaptive-sync panel. 120 on 165 is 1.375 refreshes a frame: with vsync and tearing off every frame stays 1 or 2
+refreshes (`[present-stats]` cadence 1.38, MsBetweenDisplayChange p50 6.07 p99 12.19 ms). **Fix** None needed in the game: with `d3d12_allow_variable_refresh_rate_and_tearing=true` (launcher: Allow tearing) the display followed the presents:
+refresh clock 124.25 Hz against the 165 Hz mode, cadence 1.04, MsBetweenDisplayChange p50 8.33 p99 10.26, no tearing seen in PresentMon (G-Sync is on for this panel in the NVIDIA driver; it was only observed through the SDK's own statistics, no screen
+capture of the panel). 7.4 % of presents were dropped (replaced before display) and 12 % of frames stayed 2 refreshes: even, not perfect. A 120 Hz custom mode (NVIDIA Control Panel or an EDID override) was not tried: persistent
+driver change, left to the owner. `mcla_fps_target=120` sets mcla_sim_cap=120, video_mode_refresh_rate=120, the 60 fps rows (UI at 30 Hz, k(dt) smoothing, race clock, pacer), motion blur x2 and the governor budget scaling.
+At 1080p ultra: 119.93 fps, world x0.9999, n1 8397 of 8402 frames, 1 % low 110.8, 5 minutes (b8) 119.97 fps, 9 missed frames of 37821; the CPU threads need 4.4 / 4.3 / 3.4 ms a frame (guest, GPU Commands, Main XThread), GPU 6 ms.
+`mcla_cpu_pump_wake` does nothing measurable at 1080p (ring waits 17 -> 5 in 70 s, frame times equal), so it is not in the profile. **Evidence** runs `b1-1080-120`, `b2-1080-120-vrr`, `b3-1080-120-wake`, `b8-1080-120-bench`,
+`scratch/power/dispmode.py` (list / hold / edid), `bsum.py`.
+
+### NATIVE-Q The governor's budget was written for 16.7 ms; at 120 it never sheds on GPU time and restores into a miss. 2000p at 120 is only reached at tier 1
+**Symptom** At a 120 target the adaptive-detail governor shed only on "2 of the last 30 frames missed" and then restored a rung every 8-10 s (busy p90 8.3 ms < its restore line 15.0), missed, and shed again: 13 tier changes and 3
+restores in a 70 s drive (b6). **Cause** `mcla_gov_shed_ms` 15.6, `mcla_gov_restore_ms` 15.0 and `mcla_gov_enrich_margin_ms` 1.5 are the 60 fps frame's numbers and nothing derived them from the world's cap. **Fix** `mcla_gov_math.h`:
+`BudgetScale(cap)` = 60 / cap above a cap of 60 (1 at 60 and below, so 60 fps is bit for bit unchanged), `ScaleThresholdMs` keeps the 0.7 ms presenter paint (shed 7.45, restore 7.15 ms at 120), the margin halves; `MakeParams` applies it
+with `mcla::sim::EffectiveCap()`, so a 120 -> 60 tier or a 30 hold puts the 60 fps budget back while it lasts. 25 new checks in `test_gov.cpp` (a 9.5 ms GPU: nothing at cap 60, sheds within 2 s at 120; 7.0 and 7.3 ms hold; 6.0 ms restores).
+Result at 2000p ultra / 120 (b4): the ladder goes 6 rungs in 0.6 s to tier 1 + VRS 2 and stays (6 changes, 0 restores), 118.4 fps, 1 % low 91.4, GPU busy 8.1-8.3 ms. Without the governor (b5) the GPU (9.4 ms at ultra) is 1.1 ms over the
+budget: 90.3 fps, the swap gate turns slow frames into 16.7 ms ones, and the world falls to its 60 tier three times. So 2000p at 120 is reachable only at the lowest detail tier (reflections and far cascade every 2nd frame, shadow distance 0.6, city LOD 0.67,
+traffic LOD 0.7, FXAA off) plus VRS: it costs picture quality. **Evidence** runs `b4-2000-120-gov`, `b5-2000-120-nogov`, `b6-2000-120-gov60thr`, `b7-2000-60` (60 fps unchanged: shed above 15.6 ms, 0 missed), `test_gov.cpp` `TestBudgetFollowsCap`.
+
+### NATIVE-R PowerGetEffectiveOverlayScheme says Balanced under the High performance plan: the log named the wrong mode
+**Symptom** The `[mcla-sys]` line printed "Windows power mode: Balanced; plan: High performance" while Settings showed Best performance. **Cause** The effective overlay is 00000000 (none) whenever the active plan is not Balanced; the slider's
+own value is `PowerGetActualOverlayScheme` (ded574b5 = Best performance here, `ActiveOverlayAcPowerScheme` in the registry). **Fix** The line now reads "Balanced in effect (the slider says Best performance, but the High performance plan switches it off)",
+and the warning only asks for Best performance when the plan is not High / Ultimate performance. **Evidence** `system_status_rules.h`, `test_system_status.cpp`.
+
 ### Sprint2-Process A commander that waits with a shell sleep loop can stall on a coder that already finished
 **Symptom** One LOCK60 stall: the commander sat waiting for a coder whose work was done. **Cause** It polled with a shell
 sleep loop instead of taking the coder's completion message. **Fix** Wait on the completion notification; no sleep loops.

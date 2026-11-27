@@ -345,6 +345,25 @@ void ResolveRequires(Report& r, Schema& schema) {
         r.Error(where, "\"requires\" names the setting itself");
         continue;
       }
+      // A list means "any of these values" (a setting value is never an array, so it is unambiguous).
+      if (want.is_array()) {
+        if (want.empty()) {
+          r.Error(where, "\"requires\" \"" + dep_id + "\": the list of values is empty");
+          continue;
+        }
+        bool all_ok = true;
+        for (Json& one : want) {
+          std::string why;
+          if (!CheckValue(*dep, one, &why)) {
+            r.Error(where, "\"requires\" \"" + dep_id + "\": " + Show(one) + ": " + why);
+            all_ok = false;
+            break;
+          }
+          one = CanonicalValue(*dep, one);
+        }
+        (void)all_ok;
+        continue;
+      }
       std::string why;
       if (!CheckValue(*dep, want, &why)) {
         r.Error(where, "\"requires\" \"" + dep_id + "\": " + Show(want) + ": " + why);

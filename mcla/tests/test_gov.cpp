@@ -11,6 +11,7 @@
 // And sustained overload below the floor (a scene tour of single 18-19 ms snaps never takes the tier under the floor 2, an 18 ms load
 // takes the whole ladder in about a second, 2 missed frames of 30 still shed there, the 30 s bounce window of a restore from a rung under the
 // floor) and the learning windows with a spike (discarded, the EMA only fed by clean ones).
+// And the budget following the frame-rate target (BudgetScale / ScaleParamsForCap: the 60 fps thresholds halve on the 1/120 grid).
 // Standalone: no SDK, no game, no clock.
 //
 // Built and run by CTest (mcla/tests/CMakeLists.txt, test mcla_gov_test). By hand:
@@ -2568,6 +2569,80 @@ void TestClosedLoopDvfs() {
   std::printf(" s\n");
 }
 
+// T6: the budget follows the frame-rate target. The cvars hold the 60 fps thresholds (shed 15.6, restore 15.0, margin 1.5 ms); on
+// the 1/120 grid (a cap above 60) they are scaled so that a 9.5 ms GPU frame is over budget at 120 and fine at 60.
+void TestBudgetFollowsCap() {
+  CHECK(m::BudgetScale(0) == 1.0 && m::BudgetScale(30) == 1.0 && m::BudgetScale(60) == 1.0, "no scale at 60 and below");
+  CHECK(std::fabs(m::BudgetScale(120) - 0.5) < 1e-12, "0.5 at 120: %.6f", m::BudgetScale(120));
+  CHECK(std::fabs(m::BudgetScale(90) - 2.0 / 3.0) < 1e-12, "2/3 at 90");
+  CHECK(std::fabs(m::BudgetScale(240) - 0.25) < 1e-12 && std::fabs(m::BudgetScale(1000) - 0.25) < 1e-12, "0.25 floor");
+
+  // The thresholds: the frame budget scales, the 0.7 ms paint outside the measured frame stays.
+  CHECK(m::ScaleThresholdMs(15.6, 60) == 15.6 && m::ScaleThresholdMs(15.6, 0) == 15.6 && m::ScaleThresholdMs(15.6, 30) == 15.6,
+        "bit for bit at 60 and below");
+  CHECK(std::fabs(m::ScaleThresholdMs(15.6, 120) - 7.45) < 1e-9, "shed at 120: %.4f", m::ScaleThresholdMs(15.6, 120));
+  CHECK(std::fabs(m::ScaleThresholdMs(15.0, 120) - 7.15) < 1e-9, "restore at 120: %.4f", m::ScaleThresholdMs(15.0, 120));
+  CHECK(std::fabs(m::ScaleMarginMs(1.5, 120) - 0.75) < 1e-12, "margin at 120");
+  CHECK(m::ScaleThresholdMs(15.6, 120) < 8.33 && m::ScaleThresholdMs(15.6, 120) > 8.33 - 1.5, "shed line just under the 120 fps frame");
+  CHECK(m::ScaleThresholdMs(1.2, 120) >= 1.0, "never under 1 ms");
+  // Shed stays above restore (the slack between them is the hysteresis).
+  CHECK(m::ScaleThresholdMs(15.6, 120) > m::ScaleThresholdMs(15.0, 120), "shed above restore at 120");
+
+  m::Params base;
+  base.shed_ms = 15.6;
+  base.restore_ms = 15.0;
+  base.enrich_margin_ms = 1.5;
+  m::Params at60 = base, at120 = base;
+  m::ScaleParamsForCap(at60, 60);
+  m::ScaleParamsForCap(at120, 120);
+  CHECK(at60.shed_ms == 15.6 && at60.restore_ms == 15.0 && at60.enrich_margin_ms == 1.5, "Params unchanged at 60");
+  CHECK(std::fabs(at120.shed_ms - 7.45) < 1e-9 && std::fabs(at120.restore_ms - 7.15) < 1e-9 &&
+            std::fabs(at120.enrich_margin_ms - 0.75) < 1e-12,
+        "Params at 120: %.3f %.3f %.3f", at120.shed_ms, at120.restore_ms, at120.enrich_margin_ms);
+
+  // Closed loop, a GPU that needs 9.5 ms a frame: at 60 it is at 57 % of the budget and nothing happens; at 120 it is 14 % over
+  // and the governor sheds within a second.
+  {
+    Rig r60 = ProdRig(1, 1)  /* no enrichment: ceiling = floor */;
+    m::ScaleParamsForCap(r60.p, 60);
+    r60.Seconds(20, 9.5);
+    CHECK(r60.Changes() == 0, "9.5 ms at a cap of 60 changes nothing: %d changes", r60.Changes());
+    Rig r120 = ProdRig(1, 1)  /* no enrichment: ceiling = floor */;
+    m::ScaleParamsForCap(r120.p, 120);
+    const int first = r120.Seconds(5, 9.5);
+    CHECK(first >= 0 && first < 120, "9.5 ms at a cap of 120 sheds within 2 s: first change at frame %d", first);
+    CHECK(r120.Changes() >= 1 && r120.events[0].change.reason != m::Reason::kRestore, "the first change is a shed");
+  }
+  // A GPU that needs 7.0 ms is inside the 120 budget and above the restore line 7.15?  No: 7.0 < 7.15 (restore) < 7.45 (shed).
+  // 7.0 ms: no shed; 7.3 ms: no shed and nothing restored (the dead band); 6.0 ms after a shed: a restore.
+  {
+    Rig r = ProdRig(1, 1)  /* no enrichment: ceiling = floor */;
+    m::ScaleParamsForCap(r.p, 120);
+    r.Seconds(10, 7.0);
+    CHECK(r.Changes() == 0, "7.0 ms at 120: nothing to do, %d changes", r.Changes());
+    Rig dead = ProdRig(1, 1)  /* no enrichment: ceiling = floor */;
+    m::ScaleParamsForCap(dead.p, 120);
+    dead.Seconds(10, 7.3);
+    CHECK(dead.Changes() == 0, "7.3 ms at 120 sits in the dead band: %d changes", dead.Changes());
+    Rig up = ProdRig(1, 1)  /* no enrichment: ceiling = floor */;
+    m::ScaleParamsForCap(up.p, 120);
+    up.Seconds(3, 9.5);  // sheds
+    const int shed_changes = up.Changes();
+    CHECK(shed_changes >= 1, "shed first");
+    up.Seconds(40, 6.0);  // headroom: restores
+    int restores = 0;
+    for (const Rig::Event& e : up.events) restores += e.change.reason == m::Reason::kRestore ? 1 : 0;
+    CHECK(restores >= 1, "6.0 ms at 120 restores a rung after a shed: %d restores", restores);
+  }
+  // The same 9.5 ms stream judged by the 60 fps thresholds while the world is held at 60 (the 120 -> 60 tier): back to nothing.
+  {
+    Rig tier = ProdRig(1, 1)  /* no enrichment: ceiling = floor */;
+    m::Params p = tier.p;
+    m::ScaleParamsForCap(p, 60);
+    CHECK(p.shed_ms == tier.p.shed_ms, "a world at 60 uses the 60 fps thresholds");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -2618,6 +2693,7 @@ int main() {
   TestCompileExcuse();
   TestClosedLoopConverges();
   TestClosedLoopDvfs();
+  TestBudgetFollowsCap();
   std::printf("%d checks, %d failed\n", g_checks, g_failed);
   return g_failed ? 1 : 0;
 }

@@ -15,7 +15,7 @@ Conventions used by this file:
   (the cvar's, or the profile's: `anisotropic_override` 5, `mnk_mode` true and `d3d12_allow_variable_refresh_rate_and_tearing`
   false: the SDK's default is on, the profile turns it off so a TV or an ordinary monitor does not tear).
 - `requires` follows how the game works: FSR needs MSAA off, the single-tile scene and Direct3D 12 (`temporal_aa`), its
-  version/quality/sharpness need FSR, the 60 fps timing options need `mcla_fps_target` 60, keyboard bindings need
+  version/quality/sharpness need FSR, the 60 fps timing options need `mcla_fps_target` 60 or 120 (`"requires": {"mcla_fps_target": [60, 120]}`: a list is "any of these values"), keyboard bindings need
   `mnk_mode`, the window size needs windowed mode. A hidden setting is never emitted.
 - `mcla_profile` values are the presets of `pc_profile.cpp` (`default`, `800p`, `900p16`, `900p`, `1000p`, `1080p`, `1200p`, `2000p`); the FSR
   variants (`1080p-fsr`, `1080p-fsr4p`, ...) are the base size plus `temporal_aa*` cvars, so the upscaler is a separate
@@ -30,7 +30,7 @@ Conventions used by this file:
   and presets (`SetDefaultValue`) never override it.
 - Adaptive detail (`mcla_gov`, `emit: always` because the code default is off and the profile switches it on) and its ceiling
   (`mcla_gov_tier_ceiling`: 2 Performance, 4 Shipped look, 5 Beyond console; shown only with Adaptive detail on) sit in the
-  Performance category and need the 60 fps target.
+  Performance category and need the 60 or 120 fps target.
 - Presets (`presets`) list every setting they own, so applying one is deterministic; a preset that no longer matches the
   current values shows as "Custom".
 

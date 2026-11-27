@@ -396,9 +396,40 @@ void TestSchemaErrors() {
                          Set("b", R"("type":"bool","default":true,"requires":{"a":true})"))),
             "\"requires\" cycle: a -> b -> a");
   CHECK_HAS(MustFail(Doc(Set("a", R"("type":"bool","default":true,"requires":[1])"))), "\"requires\" must be an object");
+  // A list of values is "any of": an empty list and a bad member are errors.
+  CHECK_HAS(MustFail(Doc(Set("a", R"("type":"bool","default":true)") + "," +
+                         Set("b", R"("type":"bool","default":true,"requires":{"a":[]})"))),
+            "the list of values is empty");
+  CHECK_HAS(MustFail(Doc(Set("a", R"("type":"bool","default":true)") + "," +
+                         Set("b", R"("type":"bool","default":true,"requires":{"a":[true,"yes"]})"))),
+            "expected true or false, got a string");
+
+  // A list in requires is "any of the values": active for 60 and for 120 (the 60 fps timing options), not for 0, and a stored value
+  // that is not an option falls back to the default (60: active).
+  {
+    std::string error;
+    const Schema any = ParseSchema(
+        Doc(Set("fps", R"("type":"enum","default":60,"options":[{"value":60,"label":"60"},{"value":120,"label":"120"},{"value":0,"label":"0"}])") +
+            "," + Set("tick", R"("type":"bool","default":false,"cvar":"tick","requires":{"fps":[60,120]})")),
+        &error, "t");
+    CHECK(error.empty());
+    const SettingDef* tick = any.FindSetting("tick");
+    CHECK(tick != nullptr);
+    if (tick) {
+      Values v;
+      v["fps"] = 60;
+      CHECK(IsActive(any, v, *tick));
+      v["fps"] = 120;
+      CHECK(IsActive(any, v, *tick));
+      v["fps"] = 0;
+      CHECK(!IsActive(any, v, *tick));
+      v["fps"] = 30;
+      CHECK(IsActive(any, v, *tick));
+    }
+  }
 
   // cvars shared by two settings: allowed only when both are conditional.
-  const std::string bools = Set("sw", R"("type":"bool","default":false,"cvar":"mode")");
+  const std::string bools =Set("sw", R"("type":"bool","default":false,"cvar":"mode")");
   CHECK_HAS(MustFail(Doc(Set("a", R"("type":"bool","default":false,"cvar":"same")") + "," +
                          Set("b", R"("type":"bool","default":false,"cvar":"same")"))),
             "cvar \"same\" is also set by 'a'");
@@ -1005,7 +1036,7 @@ void TestRealSchema() {
       case SettingType::Path: changed = "x y"; break;
     }
     v[d.id] = changed;
-    for (const auto& [dep, want] : d.requires_) v[dep] = want;  // make it visible (one level is enough for a check)
+    for (const auto& [dep, want] : d.requires_) v[dep] = want.is_array() ? want.front() : want;  // make it visible (one level is enough for a check)
     if (d.cvar && d.emit != EmitMode::Never && IsActive(s, v, d) && !SameValue(changed, d.default_value)) {
       const Args args = BuildArgs(s, v);
       bool found = false;

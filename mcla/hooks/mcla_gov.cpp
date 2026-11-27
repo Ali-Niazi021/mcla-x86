@@ -71,6 +71,7 @@
 #include "mcla_gfx_tune.h"
 #include "mcla_gov.h"
 #include "mcla_gov_math.h"
+#include "mcla_t_common.h"  // mcla::sim::EffectiveCap: the world's frame cap (the budget follows it)
 
 REXCVAR_DECLARE(int32_t, mcla_gfx_tier);
 
@@ -449,6 +450,9 @@ math::Params MakeParams(const State& s) {
   p.compile_excuse_s = CompileExcuseSeconds();
   p.tier_est_ms = s.tier_est;
   p.tier_pop_free = s.tier_pop_free;
+  // The thresholds above are the 60 fps frame's: on the 1/120 grid (the 120 fps target) the budget is half (T6). The cap read here
+  // is the world's now, so a 120 -> 60 tier or a 30 hold puts the 60 fps budget back for as long as it lasts.
+  math::ScaleParamsForCap(p, mcla::sim::EffectiveCap());
   return p;
 }
 

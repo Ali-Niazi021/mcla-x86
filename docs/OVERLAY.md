@@ -8,7 +8,7 @@ mute, the cheats, the live changes and Save were tested with real input. The res
 
 | Key (cvar, rebindable) | What |
 |---|---|
-| F1 (`mcla_overlay_key_menu`) | The mod menu. Tabs: **Display** (the overlay itself; fullscreen, anti-aliasing, HDR, texture sharpness, anisotropy, tearing / variable refresh), **Graphics** (adaptive detail and its ceiling / floor, the detail preset, the individual knobs, motion blur, pedestrians), **Game** (frame cap, 60 fps fixes, HUD, mouse), **Cheats / mods** (time of day, weather, traffic; off by default and locked behind a switch), **About** (build, SDK series, GPU, display, keys, files). |
+| F1 (`mcla_overlay_key_menu`) | The mod menu. Tabs: **Display** (the overlay itself; fullscreen, anti-aliasing, HDR, texture sharpness, anisotropy, tearing / variable refresh), **Graphics** (adaptive detail and its ceiling / floor, the detail preset, the individual knobs, motion blur, pedestrians), **Game** (frame-rate profile 30 / 60 / 120 fps, applied at the next start; frame cap; 60 / 120 fps fixes; HUD; mouse), **Cheats / mods** (time of day, weather, traffic; off by default and locked behind a switch), **About** (build, SDK series, GPU, display, keys, files). |
 | F2 (`mcla_overlay_key_fps`) | The FPS counter in a corner (`mcla_overlay_fps_corner`, `_detail`). |
 | F5 (`mcla_overlay_key_stats`) | The statistics screen. |
 

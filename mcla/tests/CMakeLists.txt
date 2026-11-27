@@ -27,6 +27,9 @@
 #   mcla_overlay_test          test_overlay.cpp                src/host/overlay/overlay_math.h (frame-time statistics, world speed,
 #                                                              rates, graph bars, font choice, hitch phrases), overlay_json.h (the
 #                                                              launcher.json merge) and overlay_feed.cpp (the lock-free frame ring)
+#   mcla_system_status_test    test_system_status.cpp          src/host/system_status_rules.h (the `[mcla-sys]` rules: refresh multiple, Windows
+#                                                              power mode, GPU power limit against its maximum, Lenovo mode names,
+#                                                              the warning text)
 #
 # `mcla_unit_tests` is the aggregate target (`cmake --build <dir> --target mcla_unit_tests`). The eight executables
 # are also part of ALL, so a normal full build is followed by `ctest` (multi-config generators: `ctest -C <config>`).
@@ -99,3 +102,7 @@ mcla_add_unit_test(mcla_overlay_test 23 test_overlay.cpp "${CMAKE_CURRENT_SOURCE
 target_include_directories(mcla_overlay_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/overlay")
 mcla_add_unit_test(mcla_gfx_res_test 23 test_gfx_res.cpp)
 target_include_directories(mcla_gfx_res_test PRIVATE "${_mcla_tests_hooks_dir}")
+
+# The host system-status rules (src/host/system_status_rules.h): standard library only, found by path.
+mcla_add_unit_test(mcla_system_status_test 23 test_system_status.cpp)
+target_include_directories(mcla_system_status_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host")

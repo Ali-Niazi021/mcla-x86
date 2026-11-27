@@ -35,17 +35,8 @@ constexpr const char* kSubProcessor = "54533251-82be-4824-96c1-47b60b740d00";
 constexpr const char* kPerfBoostMode = "be337238-0d82-4146-a960-4f3749d470c7";
 constexpr const char* kProcThrottleMax = "bc5038f7-23e0-4960-96da-33abaf5935ec";
 
-// Windows power modes (the "overlay schemes" behind the power mode slider of Settings > System > Power).
-struct OverlayName {
-  const char* guid;
-  const char* name;
-};
-constexpr OverlayName kOverlays[] = {
-    {"961cc777-2547-4f9d-8174-7d86181b8a7a", "Best power efficiency"},
-    {"00000000-0000-0000-0000-000000000000", "Balanced"},
-    {"3af9b8d9-7c97-431d-ad78-34a8bfea439f", "Better performance"},
-    {"ded574b5-45a0-4f42-8737-46345c09c238", "Best performance"},
-};
+// Windows power modes (the "overlay schemes" behind the power mode slider of Settings > System > Power): the GUIDs and names
+// are in system_status_rules.h.
 
 // PERFBOOSTMODE values, as powercfg /qh prints them.
 const char* BoostModeName(uint32_t mode) {
@@ -68,6 +59,9 @@ const char* BoostModeName(uint32_t mode) {
       return "unknown mode";
   }
 }
+
+// Lenovo Intelligent Cooling (Lenovo Notebook ITS Service): the mode the vendor's own app / Fn+Q chose.
+constexpr wchar_t kLenovoMmc[] = L"SYSTEM\\CurrentControlSet\\Services\\LITSSVC\\LNBITS\\IC\\MMC";
 
 constexpr wchar_t kAsusRoot[] = L"SOFTWARE\\ASUS\\ASUS System Control Interface";
 constexpr wchar_t kAsusHotkeys[] = L"SOFTWARE\\ASUS\\ASUS System Control Interface\\AsusOptimization\\ASUS Keyboard Hotkeys";
@@ -172,12 +166,14 @@ Fn ProcAddress(HMODULE module, const char* name) {
 // powrprof.dll, loaded at run time: the host does not link powrprof.lib, and a missing export just leaves a field empty.
 struct PowerApi {
   using GetEffectiveOverlayScheme = DWORD(WINAPI*)(GUID*);
+  using GetActualOverlayScheme = DWORD(WINAPI*)(GUID*);
   using GetActiveScheme = DWORD(WINAPI*)(HKEY, GUID**);
   using ReadFriendlyName = DWORD(WINAPI*)(HKEY, const GUID*, const GUID*, const GUID*, PUCHAR, PDWORD);
   using ReadValueIndex = DWORD(WINAPI*)(HKEY, const GUID*, const GUID*, const GUID*, PDWORD);
 
   HMODULE module = nullptr;
   GetEffectiveOverlayScheme get_effective_overlay = nullptr;
+  GetActualOverlayScheme get_actual_overlay = nullptr;
   GetActiveScheme get_active_scheme = nullptr;
   ReadFriendlyName read_friendly_name = nullptr;
   ReadValueIndex read_ac_value_index = nullptr;
@@ -189,6 +185,7 @@ struct PowerApi {
       return;
     }
     get_effective_overlay = ProcAddress<GetEffectiveOverlayScheme>(module, "PowerGetEffectiveOverlayScheme");
+    get_actual_overlay = ProcAddress<GetActualOverlayScheme>(module, "PowerGetActualOverlayScheme");
     get_active_scheme = ProcAddress<GetActiveScheme>(module, "PowerGetActiveScheme");
     read_friendly_name = ProcAddress<ReadFriendlyName>(module, "PowerReadFriendlyName");
     read_ac_value_index = ProcAddress<ReadValueIndex>(module, "PowerReadACValueIndex");
@@ -253,13 +250,15 @@ void QueryPower(SystemStatus& status) {
   if (api.get_effective_overlay && api.get_effective_overlay(&overlay) == ERROR_SUCCESS) {
     status.overlay_known = true;
     status.overlay_guid = GuidToString(overlay);
-    status.overlay_name = status.overlay_guid;  // unknown GUIDs are printed as they are
-    for (const OverlayName& known : kOverlays) {
-      if (status.overlay_guid == known.guid) {
-        status.overlay_name = known.name;
-        break;
-      }
-    }
+    const char* known = OverlayName(status.overlay_guid);
+    status.overlay_name = known ? known : status.overlay_guid;  // unknown GUIDs are printed as they are
+  }
+  GUID actual{};
+  if (api.get_actual_overlay && api.get_actual_overlay(&actual) == ERROR_SUCCESS) {
+    status.overlay_actual_known = true;
+    status.overlay_actual_guid = GuidToString(actual);
+    const char* known = OverlayName(status.overlay_actual_guid);
+    status.overlay_actual_name = known ? known : status.overlay_actual_guid;
   }
 
   GUID* scheme_ptr = nullptr;
@@ -268,6 +267,7 @@ void QueryPower(SystemStatus& status) {
     LocalFree(scheme_ptr);
     status.scheme_guid = GuidToString(scheme);
     status.scheme_name = FriendlyName(api, scheme);
+    status.plan_is_performance = status.scheme_guid == kPlanHighPerformance || status.scheme_guid == kPlanUltimatePerformance;
     GUID subgroup{};
     GUID boost{};
     GUID throttle_max{};
@@ -291,6 +291,131 @@ void QueryAsus(SystemStatus& status) {
   if (!status.asus_fan_mode) {
     status.asus_fan_mode = ReadHklmDword(kAsusHotkeys, L"FanMode");
   }
+}
+
+void QueryLenovo(SystemStatus& status) {
+  status.lenovo_present = HklmKeyExists(kLenovoMmc);
+  if (!status.lenovo_present) {
+    return;
+  }
+  status.lenovo_mode = ReadHklmDword(kLenovoMmc, L"CurrentSetting");
+  status.lenovo_capability = ReadHklmDword(kLenovoMmc, L"Capability");
+}
+
+// --- NVML (nvml.dll from the NVIDIA driver, loaded at run time) -------------------------------------------------------------
+//
+// Questions only (nvmlDeviceGet*), never a setting. The library is loaded once and stays loaded (nvmlInit_v2 costs about
+// 100 ms and the 30 s sample asks again). On a hybrid laptop the first device is the NVIDIA one; a machine without the
+// driver, or one where a call is refused, leaves the field empty.
+struct NvmlApi {
+  using Result = int;  // nvmlReturn_t, 0 = NVML_SUCCESS
+  using DeviceHandle = void*;
+  HMODULE module = nullptr;
+  bool ok = false;
+  Result (*init)() = nullptr;
+  Result (*get_count)(unsigned*) = nullptr;
+  Result (*get_handle)(unsigned, DeviceHandle*) = nullptr;
+  Result (*get_name)(DeviceHandle, char*, unsigned) = nullptr;
+  Result (*get_enforced_limit)(DeviceHandle, unsigned*) = nullptr;
+  Result (*get_default_limit)(DeviceHandle, unsigned*) = nullptr;
+  Result (*get_constraints)(DeviceHandle, unsigned*, unsigned*) = nullptr;
+  Result (*get_power_usage)(DeviceHandle, unsigned*) = nullptr;
+  Result (*get_clock)(DeviceHandle, int, unsigned*) = nullptr;
+  Result (*get_max_clock)(DeviceHandle, int, unsigned*) = nullptr;
+  Result (*get_temperature)(DeviceHandle, int, unsigned*) = nullptr;
+  Result (*get_reasons)(DeviceHandle, unsigned long long*) = nullptr;
+  DeviceHandle device = nullptr;
+
+  NvmlApi() {
+    module = LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!module) {
+      // Older drivers keep it in C:\Program Files\NVIDIA Corporation\NVSMI. An absolute path only.
+      wchar_t base[MAX_PATH] = {};
+      const DWORD n = GetEnvironmentVariableW(L"ProgramW6432", base, MAX_PATH);
+      if (n > 0 && n < MAX_PATH - 48) {
+        const std::wstring path = std::wstring(base) + L"\\NVIDIA Corporation\\NVSMI\\nvml.dll";
+        module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+      }
+    }
+    if (!module) {
+      return;
+    }
+    init = ProcAddress<Result (*)()>(module, "nvmlInit_v2");
+    get_count = ProcAddress<Result (*)(unsigned*)>(module, "nvmlDeviceGetCount_v2");
+    get_handle = ProcAddress<Result (*)(unsigned, DeviceHandle*)>(module, "nvmlDeviceGetHandleByIndex_v2");
+    get_name = ProcAddress<Result (*)(DeviceHandle, char*, unsigned)>(module, "nvmlDeviceGetName");
+    get_enforced_limit = ProcAddress<Result (*)(DeviceHandle, unsigned*)>(module, "nvmlDeviceGetEnforcedPowerLimit");
+    get_default_limit = ProcAddress<Result (*)(DeviceHandle, unsigned*)>(module, "nvmlDeviceGetPowerManagementDefaultLimit");
+    get_constraints =
+        ProcAddress<Result (*)(DeviceHandle, unsigned*, unsigned*)>(module, "nvmlDeviceGetPowerManagementLimitConstraints");
+    get_power_usage = ProcAddress<Result (*)(DeviceHandle, unsigned*)>(module, "nvmlDeviceGetPowerUsage");
+    get_clock = ProcAddress<Result (*)(DeviceHandle, int, unsigned*)>(module, "nvmlDeviceGetClockInfo");
+    get_max_clock = ProcAddress<Result (*)(DeviceHandle, int, unsigned*)>(module, "nvmlDeviceGetMaxClockInfo");
+    get_temperature = ProcAddress<Result (*)(DeviceHandle, int, unsigned*)>(module, "nvmlDeviceGetTemperature");
+    get_reasons = ProcAddress<Result (*)(DeviceHandle, unsigned long long*)>(module, "nvmlDeviceGetCurrentClocksThrottleReasons");
+    if (!get_reasons) {
+      get_reasons = ProcAddress<Result (*)(DeviceHandle, unsigned long long*)>(module, "nvmlDeviceGetCurrentClocksEventReasons");
+    }
+    unsigned count = 0;
+    if (!init || !get_count || !get_handle || init() != 0 || get_count(&count) != 0 || count == 0 ||
+        get_handle(0, &device) != 0) {
+      device = nullptr;
+      return;
+    }
+    ok = true;
+  }
+  // The library stays loaded for the life of the process (the watchdog thread may still ask during shutdown).
+};
+
+NvmlApi& Nvml() {
+  static NvmlApi api;  // thread-safe initialisation
+  return api;
+}
+
+void QueryGpu(SystemStatus& status) {
+  NvmlApi& nv = Nvml();
+  if (!nv.ok) {
+    return;
+  }
+  char name[96] = {};
+  unsigned value = 0, low = 0, high = 0;
+  if (nv.get_name && nv.get_name(nv.device, name, sizeof(name)) == 0) {
+    status.gpu_name = name;
+  }
+  if (nv.get_enforced_limit && nv.get_enforced_limit(nv.device, &value) == 0) status.gpu_limit_mw = value;
+  if (nv.get_default_limit && nv.get_default_limit(nv.device, &value) == 0) status.gpu_default_mw = value;
+  if (nv.get_constraints && nv.get_constraints(nv.device, &low, &high) == 0) {
+    status.gpu_min_mw = low;
+    status.gpu_max_mw = high;
+  }
+  if (nv.get_power_usage && nv.get_power_usage(nv.device, &value) == 0) status.gpu_draw_mw = value;
+  if (nv.get_clock && nv.get_clock(nv.device, 0 /*NVML_CLOCK_GRAPHICS*/, &value) == 0) status.gpu_clock_mhz = value;
+  if (nv.get_max_clock && nv.get_max_clock(nv.device, 0, &value) == 0) status.gpu_clock_max_mhz = value;
+  if (nv.get_temperature && nv.get_temperature(nv.device, 0 /*NVML_TEMPERATURE_GPU*/, &value) == 0) status.gpu_temp_c = int(value);
+  unsigned long long reasons = 0;
+  if (nv.get_reasons && nv.get_reasons(nv.device, &reasons) == 0) {
+    status.gpu_reasons_known = true;
+    status.gpu_reasons = reasons;
+  }
+  status.gpu_known = status.gpu_limit_mw > 0 || status.gpu_draw_mw > 0 || !status.gpu_name.empty();
+}
+
+// NVML's clocks throttle reasons, as short words (nvml.h nvmlClocksThrottleReason*).
+std::string ThrottleReasonsText(uint64_t reasons) {
+  struct Bit {
+    uint64_t bit;
+    const char* name;
+  };
+  static constexpr Bit kBits[] = {{0x1, "idle"},          {0x2, "application clocks"}, {0x4, "software power cap"},
+                                  {0x8, "hardware slowdown"}, {0x10, "sync boost"},      {0x20, "software thermal"},
+                                  {0x40, "hardware thermal"}, {0x80, "power brake"},     {0x100, "display clock"}};
+  std::string text;
+  for (const Bit& b : kBits) {
+    if (reasons & b.bit) {
+      text += (text.empty() ? "" : "+") + std::string(b.name);
+    }
+  }
+  return text.empty() ? std::string("none") : text;
 }
 
 void QueryDisplay(SystemStatus& status, HWND hwnd) {
@@ -401,6 +526,58 @@ std::string BoostText(const SystemStatus& status) {
          "; max processor state AC " + percent(status.max_state_ac) + ", DC " + percent(status.max_state_dc);
 }
 
+std::string PowerModeText(const SystemStatus& status) {
+  std::string mode = status.overlay_known ? status.overlay_name : std::string("unknown");
+  // The slider and the plan: with the High performance plan active the slider is off, and the effective mode reads as
+  // Balanced although the slider (Settings > System > Power) may say Best performance.
+  if (status.overlay_known && status.overlay_actual_known && status.overlay_actual_guid != status.overlay_guid) {
+    mode += " in effect (the slider says " + status.overlay_actual_name + ", but " +
+            (status.scheme_name.empty() ? std::string("the active plan") : "the " + status.scheme_name + " plan") +
+            " switches it off)";
+  }
+  return mode;
+}
+
+std::string GpuText(const SystemStatus& status) {
+  if (!status.gpu_known) {
+    return "gpu: no NVIDIA driver library (nvml.dll) or no device: power limit unknown";
+  }
+  std::string text = "gpu: " + (status.gpu_name.empty() ? std::string("NVIDIA") : status.gpu_name) + ", power limit ";
+  text += status.gpu_limit_mw > 0 ? Watts(status.gpu_limit_mw) + " W enforced" : std::string("unknown");
+  if (status.gpu_default_mw > 0 || status.gpu_max_mw > 0) {
+    text += " (board default " + (status.gpu_default_mw > 0 ? Watts(status.gpu_default_mw) : std::string("?")) + " W, range " +
+            (status.gpu_min_mw > 0 ? Watts(status.gpu_min_mw) : std::string("?")) + "-" +
+            (status.gpu_max_mw > 0 ? Watts(status.gpu_max_mw) : std::string("?")) + " W)";
+  }
+  if (GpuPowerCapped(status)) {
+    text += " CAPPED to " + std::to_string(uint64_t(status.gpu_limit_mw) * 100 / status.gpu_max_mw) + " % of the maximum";
+  }
+  if (status.gpu_draw_mw > 0) {
+    text += "; drawing " + Watts(status.gpu_draw_mw) + " W now";
+  }
+  if (status.gpu_clock_mhz > 0) {
+    text += ", graphics clock " + std::to_string(status.gpu_clock_mhz) + (status.gpu_clock_max_mhz > 0 ? " of " + std::to_string(status.gpu_clock_max_mhz) : std::string()) + " MHz";
+  }
+  if (status.gpu_temp_c >= 0) {
+    text += ", " + std::to_string(status.gpu_temp_c) + " C";
+  }
+  if (status.gpu_reasons_known) {
+    text += ", throttle reasons: " + ThrottleReasonsText(status.gpu_reasons);
+  }
+  return text;
+}
+
+std::string LenovoText(const SystemStatus& status) {
+  std::string text = "lenovo: Intelligent Cooling mode ";
+  text += status.lenovo_mode ? std::string(LenovoModeName(*status.lenovo_mode)) + " (registry CurrentSetting " +
+                                   std::to_string(*status.lenovo_mode) + ")"
+                             : std::string("unreadable");
+  if (status.lenovo_capability) {
+    text += ", capability mask " + std::to_string(*status.lenovo_capability);
+  }
+  return text;
+}
+
 std::string DisplayText(const SystemStatus& status) {
   if (!status.display_known) {
     return "display: unknown";
@@ -418,14 +595,6 @@ std::string DisplayText(const SystemStatus& status) {
 
 }  // namespace
 
-bool RefreshIsMultipleOf(int refresh, int target) {
-  if (refresh <= 0 || target <= 0) {
-    return true;
-  }
-  const int multiples = std::max(1, (refresh + target / 2) / target);
-  return std::abs(refresh - multiples * target) <= 1;
-}
-
 SystemStatus QuerySystemStatus(void* native_window) {
   SystemStatus status;
   HWND hwnd = static_cast<HWND>(native_window);
@@ -434,38 +603,11 @@ SystemStatus QuerySystemStatus(void* native_window) {
   }
   QueryPower(status);
   QueryAsus(status);
+  QueryLenovo(status);
+  QueryGpu(status);
   QueryDisplay(status, hwnd);
   QueryCpu(status);
   return status;
-}
-
-std::string SystemStatusWarning(const SystemStatus& status, int target_fps, int guest_height) {
-  if (target_fps < 60 || guest_height < 1000) {
-    return {};
-  }
-  std::string reasons;
-  auto add = [&](const std::string& reason) {
-    if (!reasons.empty()) {
-      reasons += "; ";
-    }
-    reasons += reason;
-  };
-  if (status.power_source == PowerSource::kBattery) {
-    add("on battery");
-  }
-  if (status.battery_saver) {
-    add("battery saver on");
-  }
-  if (status.overlay_known && status.overlay_guid == kOverlays[0].guid) {
-    add("Windows power mode is Best power efficiency");
-  }
-  if (status.display_hz > 0 && !RefreshIsMultipleOf(status.display_hz, target_fps)) {
-    add("display refresh " + std::to_string(status.display_hz) + " Hz is not a multiple of " + std::to_string(target_fps));
-  }
-  if (reasons.empty()) {
-    return {};
-  }
-  return std::to_string(target_fps) + " fps at " + std::to_string(guest_height) + "p is unlikely: " + reasons;
 }
 
 std::string SystemStatusOneLine(const SystemStatus& status) {
@@ -493,6 +635,12 @@ std::string SystemStatusOneLine(const SystemStatus& status) {
   if (status.overlay_known) {
     add("mode " + status.overlay_name);
   }
+  if (status.lenovo_present && status.lenovo_mode) {
+    add(std::string("Lenovo ") + LenovoModeName(*status.lenovo_mode));
+  }
+  if (status.gpu_known && status.gpu_limit_mw > 0) {
+    add("GPU limit " + Watts(status.gpu_limit_mw) + (status.gpu_max_mw > 0 ? " of " + Watts(status.gpu_max_mw) : std::string()) + " W");
+  }
   if (status.display_known) {
     add((status.display_hz > 0 ? std::to_string(status.display_hz) + " Hz " : std::string()) +
         std::to_string(status.display_width) + "x" + std::to_string(status.display_height));
@@ -503,7 +651,7 @@ std::string SystemStatusOneLine(const SystemStatus& status) {
 
 void LogSystemStatus(const SystemStatus& status, int target_fps, int guest_height) {
   // 1: power source, Windows power mode and plan.
-  std::string mode = status.overlay_known ? status.overlay_name : std::string("unknown");
+  const std::string mode = PowerModeText(status);
   std::string plan = status.scheme_guid.empty() ? std::string("unknown")
                                                 : (status.scheme_name.empty() ? status.scheme_guid : status.scheme_name);
   REXLOG_INFO("[mcla-sys] power: {}; Windows power mode: {}; plan: {}", PowerSourceText(status), mode, plan);
@@ -511,13 +659,19 @@ void LogSystemStatus(const SystemStatus& status, int target_fps, int guest_heigh
   // 2: cpu layout and the plan's boost settings.
   REXLOG_INFO("[mcla-sys] {}; {}", CpuClassesText(status), BoostText(status));
 
-  // 3: ASUS fan values, raw.
-  if (!status.asus_present) {
-    REXLOG_INFO("[mcla-sys] asus: no ASUS System Control Interface key (not a MyASUS machine)");
-  } else {
+  // 3: the vendor's performance mode: ASUS fan values (raw), Lenovo Intelligent Cooling.
+  if (status.asus_present) {
     REXLOG_INFO("[mcla-sys] asus fan profile raw QuietFan={} FanMode={} QuietFanPowerMode={} (mapping unverified)",
                 Optional(status.asus_quiet_fan), Optional(status.asus_fan_mode), Optional(status.asus_quiet_fan_power_mode));
   }
+  if (status.lenovo_present) {
+    REXLOG_INFO("[mcla-sys] {}", LenovoText(status));
+  }
+  if (!status.asus_present && !status.lenovo_present) {
+    REXLOG_INFO("[mcla-sys] vendor mode: no ASUS System Control Interface or Lenovo Intelligent Cooling key found");
+  }
+  // 3b: the GPU's power limit against its maximum (NVML).
+  REXLOG_INFO("[mcla-sys] {}", GpuText(status));
 
   // 4: display and presentation mode. The swap chain is inside the SDK, so whether the present got independent flip is
   // not knowable from here.
@@ -653,8 +807,17 @@ void LogSystemSample() {
   st.wall_100ns = wall;
   st.page_faults = pmc.PageFaultCount;
   st.read_bytes = io.ReadTransferCount;
-  REXLOG_INFO("[mcla-sys] sample: {} | cpu {} | {}, working set {} MiB, private {} MiB | system memory {} % used",
-              source, clocks.empty() ? std::string("clocks ?") : clocks, usage, uint64_t(pmc.WorkingSetSize >> 20),
+  // The GPU: draw against the enforced limit, clock, temperature, what holds it back (NVML questions, a few microseconds).
+  SystemStatus gpu_status;
+  QueryGpu(gpu_status);
+  std::string gpu = "gpu ?";
+  if (gpu_status.gpu_known) {
+    gpu = "gpu " + Watts(gpu_status.gpu_draw_mw) + " W of " + (gpu_status.gpu_limit_mw > 0 ? Watts(gpu_status.gpu_limit_mw) : std::string("?")) +
+          " W, " + std::to_string(gpu_status.gpu_clock_mhz) + " MHz, " + std::to_string(gpu_status.gpu_temp_c) + " C, throttle " +
+          (gpu_status.gpu_reasons_known ? ThrottleReasonsText(gpu_status.gpu_reasons) : std::string("?"));
+  }
+  REXLOG_INFO("[mcla-sys] sample: {} | cpu {} | {} | {}, working set {} MiB, private {} MiB | system memory {} % used",
+              source, clocks.empty() ? std::string("clocks ?") : clocks, gpu, usage, uint64_t(pmc.WorkingSetSize >> 20),
               uint64_t(pmc.PrivateUsage >> 20), uint32_t(mem.dwMemoryLoad));
 }
 

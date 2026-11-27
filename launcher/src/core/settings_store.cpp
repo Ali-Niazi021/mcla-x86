@@ -84,7 +84,14 @@ bool IsActiveAt(const Schema& schema, const Values& values, const SettingDef& de
   for (const auto& [dep_id, want] : def.requires_) {
     const SettingDef* dep = schema.FindSetting(dep_id);
     if (!dep || !IsActiveAt(schema, values, *dep, depth + 1)) return false;
-    if (!SameValue(EffectiveValue(*dep, values), want)) return false;
+    const Json& have = EffectiveValue(*dep, values);
+    if (want.is_array()) {  // any of the listed values
+      bool any = false;
+      for (const Json& one : want) any = any || SameValue(have, one);
+      if (!any) return false;
+    } else if (!SameValue(have, want)) {
+      return false;
+    }
   }
   return true;
 }

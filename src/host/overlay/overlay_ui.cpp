@@ -395,6 +395,12 @@ void KeyValue(float column, const char* label, const char* fmt_text, ...) {
 
 // A tooltip that wraps (the help texts are sentences).
 // The frame cap the world runs at: the host's / the pacer's number, or what paces it when no cap is set.
+// What the world's time step is now: the shipped 1/30 s, the 60 fps profile (n/60 s), or the 120 fps one (n/120 s: a cap above 60).
+const char* TimingText(const mcla_overlay::Snapshot& s) {
+  if (!s.sim_on) return "as shipped (30 fps steps)";
+  return s.world_cap > 60 ? "120 fps timing (world n/120 s)" : "60 fps timing (world n/60 s)";
+}
+
 std::string CapText(const mcla_overlay::Snapshot& s) {
   if (s.world_cap > 0) return fmt::format("{} fps", s.world_cap);
   return s.sim_on ? "60 fps (the display's vblank paces it)" : "30 fps (the game's own pacing)";
@@ -552,7 +558,7 @@ void Overlay::DrawStats(const ImGuiIO& io, float em, bool interactive) {
     ImGui::TextColored(std::fabs(s.world_speed - 1.0) <= 0.005 ? kGood : kWarn, "x%.3f", s.world_speed);
   }
   KeyValue(col, "frame cap", "%s", CapText(s).c_str());
-  KeyValue(col, "timing", "%s", s.sim_on ? "60 fps timing (world n/60 s)" : "as shipped (30 fps steps)");
+  KeyValue(col, "timing", "%s", TimingText(s));
 
   // ---- hitches
   ImGui::SeparatorText("Hitches");
@@ -796,9 +802,9 @@ void Overlay::DrawTabGraphics() {
 void Overlay::DrawTabGame() {
   using namespace mcla_overlay::items;
   const mcla_overlay::Snapshot& s = sampler_.Latest();
-  ImGui::TextColored(kDim, "timing now: %s, frame cap %s", s.sim_on ? "60 fps profile" : "as shipped (30 fps)", CapText(s).c_str());
-  Section("Frame rate", {&kFpsCap});
-  Section("60 fps fixes", {&kSmoothing, &kUi30});
+  ImGui::TextColored(kDim, "timing now: %s, frame cap %s", TimingText(s), CapText(s).c_str());
+  Section("Frame rate", {&kFpsTarget, &kFpsCap});
+  Section("60 / 120 fps fixes", {&kSmoothing, &kUi30});
   Section("Screen", {&kHudAspect, &kSkipIntro});
   Section("Keyboard and mouse", {&kMouse, &kMouseSens});
   Section("Overlay", {&kOverlayOn});

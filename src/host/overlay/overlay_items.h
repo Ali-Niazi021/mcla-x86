@@ -106,6 +106,10 @@ inline constexpr Choice kChoicesInterval[] = {{"1", "Every frame (as shipped)"},
                                               {"4", "Every 4th frame"}};
 inline constexpr Choice kChoicesFpsCap[] = {
     {"0", "None (the game's own pacing)"}, {"30", "30 fps"}, {"60", "60 fps"}, {"120", "120 fps"}};
+inline constexpr Choice kChoicesFpsTarget[] = {{"0", "Shipped timing (the game's own 30 fps)"},
+                                               {"30", "30 fps (locked)"},
+                                               {"60", "60 fps"},
+                                               {"120", "120 fps (needs 120 Hz or variable refresh)"}};
 inline constexpr Choice kChoicesWeather[] = {{"-1", "The game's own"}, {"0", "Nice"}, {"1", "Cloudy"}, {"2", "Stormy (rain)"},
                                              {"3", "Foggy"}};
 inline constexpr Choice kChoicesClock[] = {{"-1", "The game decides"}, {"1", "Stopped"}, {"0", "Forced to run"}};
@@ -216,16 +220,24 @@ inline constexpr Item kMotionBlur{Kind::kFloat, "Motion blur", "mcla_vis_motion_
                                   -1.0, 4.0, "%.2f"};
 
 // Game.
+// The profile is read at start (the 120 fps one also sets the guest's video mode to 120 Hz, which cannot change under a running
+// game), so this row only queues the value: it applies at the next start, and Save keeps it for the launcher.
+inline constexpr Item kFpsTarget{Kind::kChoice, "Frame-rate profile (next start)", "mcla_fps_target",
+                                 "The whole frame-rate profile: the world's time step, the guest's present interval and video mode, the "
+                                 "30 Hz menus, the race clock. 120 needs a 120 Hz mode of the display (Windows display settings) or "
+                                 "variable refresh, and a GPU that renders a frame in under 8.3 ms. Applies at the next start.",
+                                 0, 0, "", kChoicesFpsTarget, CountOf(kChoicesFpsTarget), kFlagRestart};
 inline constexpr Item kFpsCap{Kind::kChoice, "Frame cap", "mcla_fps_cap",
-                              "A host limit on the frames at the game's swap. The frame-rate profile itself (30 or 60 fps) is "
-                              "chosen in the launcher and needs a restart. Changing this changes the speed the world is paced "
-                              "at: use it from a menu, not in a race.",
+                              "A host limit on the frames at the game's swap, lowered to what the world assumes (a 60 or 30 hold, the "
+                              "120 -> 60 tier). It cannot change the profile: 120 fps needs the 120 Hz guest vblank the profile sets "
+                              "at start (row above). Changing this changes the speed the world is paced at: use it from a menu, not "
+                              "in a race.",
                               0, 0, "", kChoicesFpsCap, CountOf(kChoicesFpsCap)};
-inline constexpr Item kSmoothing{Kind::kToggle, "Camera smoothing fix (60 fps)", "mcla_smoothing_fix",
+inline constexpr Item kSmoothing{Kind::kToggle, "Camera smoothing fix (60 / 120 fps)", "mcla_smoothing_fix",
                                  "Chase camera and chassis smoothing that behaves the same at any frame rate."};
-inline constexpr Item kUi30{Kind::kToggle, "Menus and HUD at 30 Hz (60 fps)", "mcla_ui_30hz",
+inline constexpr Item kUi30{Kind::kToggle, "Menus and HUD at 30 Hz (60 / 120 fps)", "mcla_ui_30hz",
                             "The Flash menus and HUD step 30 times a second whatever the frame rate. Off = every frame (twice "
-                            "as fast at 60)."};
+                            "as fast at 60, four times at 120)."};
 inline constexpr Item kHudAspect{Kind::kToggle, "HUD at 16:9 proportions", "mcla_ws_hud_aspect",
                                  "On a wider screen the HUD is drawn at 16:9 proportions in the middle."};
 inline constexpr Item kSkipIntro{Kind::kToggle, "Skip the legal screens", "mcla_skip_intro",

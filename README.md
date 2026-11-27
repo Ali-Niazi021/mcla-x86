@@ -106,7 +106,24 @@ Finished steps are skipped, so this is much faster than the first setup.
 - **Settings:** the launcher stores them in `%LOCALAPPDATA%\mcla_x86\launcher.json`.
 
 On a laptop: plug it in and select the vendor's performance mode. In a balanced or quiet mode the GPU is much slower
-and the game lowers detail to keep 60 fps.
+and the game lowers detail to keep 60 fps. The difference can be large: on an RTX 4060 Laptop (Lenovo IdeaPad Slim
+Pro 9) the vendor's default mode (Intelligent Cooling, "auto") holds the GPU to 55 W of its 100 W maximum, and its
+Extreme Performance mode (Fn+Q, or Lenovo Vantage) lets it draw up to 100 W: 85 fps instead of 106 fps at 3200x2000, a
+quarter more, at a louder fan. The game says so at the start: the `[mcla-sys]` lines of its log show the GPU's power
+limit against its maximum, the vendor mode and the Windows power mode, and a `WARNING` line appears when the GPU is held
+well below its maximum (or the Windows power mode is not Best performance) while a 60 fps or higher target is asked for. The
+game only reads these settings and never changes them. On Windows also set the power mode (Settings > System > Power &
+battery) to Best performance (it made no measurable difference to the GPU on that laptop, but it is the setting the
+warning checks).
+
+**120 fps** (launcher: Frame rate > 120 fps, or `--mcla_fps_target=120`): the same profile on a 1/120 s world step. The display has
+to follow: a 120 Hz mode (or a multiple), or variable refresh. A panel that only has 165 and 60 Hz modes, like the RTX 4060
+laptop's, shows 120 fps as a beat of 1 and 2 refreshes; with G-Sync on in the driver and the launcher's **Allow tearing**
+(Display page, advanced) it follows the game and shows it evenly. The GPU has to render a frame in under 8.3 ms: 1080p ultra
+holds 120 fps with room on an RTX 4060 Laptop in its performance mode (the GPU needs 6 ms), 3200x2000 reaches 118 fps only
+when adaptive detail drops to its lowest level (without it the GPU needs 9.4 ms and the game runs at about 90 fps and drops to 60
+for a while). When frames are missed the game drops to 60 fps by itself. The car's physics runs at a 1/120 s step: how the
+handling feels has not been judged yet.
 
 You can also start the game without the launcher:
 `mcla.exe --game_data_root=<game folder> --mcla_profile=1080p --mcla_fps_target=60`. Every setting is a

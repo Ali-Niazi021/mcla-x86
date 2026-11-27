@@ -2,19 +2,23 @@
 //
 // A run's frame rate depends on things outside the game: a laptop on battery or in Windows' "Best power efficiency"
 // mode will not hold 60 fps at 1080p, a 50 Hz panel cannot show 60 fps evenly, and a MyASUS "Whisper" fan profile caps
-// the CPU. This reads those settings (read-only, plain Win32, no admin rights, no vendor SDK) and logs them in at most
-// five `[mcla-sys] ...` lines, so a log or a recording says under which conditions it was made.
+// the CPU. This reads those settings (read-only, plain Win32, no admin rights, no vendor SDK) and logs them in a few
+// `[mcla-sys] ...` lines, so a log or a recording says under which conditions it was made. A laptop GPU's power limit is
+// the largest of them: the RTX 4060 Laptop of the test machine ran at 55 W of its 100 W maximum in the vendor's default
+// mode (Lenovo Intelligent Cooling "auto"), 85 fps at 2000p; in the vendor's Extreme Performance mode 100 W, 106 fps.
 //
 //   QuerySystemStatus(hwnd)   fills SystemStatus: power source and battery saver, Windows power mode (overlay) and
-//                             plan, processor boost mode and maximum state of the plan, the ASUS fan values, the
-//                             refresh rate and DPI of the window's monitor, the logical processors per efficiency class
+//                             plan, processor boost mode and maximum state of the plan, the ASUS fan values, the Lenovo
+//                             Intelligent Cooling mode, an NVIDIA GPU's power limit / clocks / temperature / throttle
+//                             reasons (NVML, loaded at run time), the refresh rate and DPI of the window's monitor, the
+//                             logical processors per efficiency class
 //   LogSystemStatus(...)      the `[mcla-sys]` lines; the last one is a WARNING when `target_fps` >= 60 at a guest
 //                             height >= 1000 is unlikely and says why
 //   SystemStatusWarning(...)  the same warning text on its own (empty = nothing to warn about)
 //   SystemStatusOneLine(...)  one compact line for a launcher status line
 //
-// Nothing here changes a setting. powrprof.dll and dwmapi are loaded at run time (no link dependency); the registry is
-// read with RegOpenKeyEx and KEY_READ only. The only SDK dependency is in LogSystemStatus (rex/logging.h, and the
+// Nothing here changes a setting. powrprof.dll, nvml.dll and dwmapi are loaded at run time (no link dependency); the
+// registry is read with RegOpenKeyEx and KEY_READ only; NVML is only asked questions (nvmlDeviceGet*). The only SDK dependency is in LogSystemStatus (rex/logging.h, and the
 // `fullscreen` cvar through rex::cvar::Query).
 #pragma once
 
@@ -48,6 +52,13 @@ struct SystemStatus {
   std::optional<uint32_t> boost_mode_dc;
   std::optional<uint32_t> max_state_ac;
   std::optional<uint32_t> max_state_dc;
+  // The power mode the Windows slider holds for the current power source (PowerGetActualOverlayScheme). It differs from the
+  // effective one above when the active plan is not Balanced: the High performance plan switches the slider off (the
+  // effective overlay then reads as "Balanced / none").
+  bool overlay_actual_known = false;
+  std::string overlay_actual_guid;
+  std::string overlay_actual_name;
+  bool plan_is_performance = false;  // the active plan is "High performance" or "Ultimate performance"
 
   // --- ASUS (MyASUS / ASUS System Control Interface), raw registry values; the mapping to the Standard / Whisper /
   // Performance / Full-speed profiles is NOT verified, so they are logged raw. QuietFan and QuietFanPowerMode live
@@ -57,6 +68,30 @@ struct SystemStatus {
   std::optional<uint32_t> asus_quiet_fan;
   std::optional<uint32_t> asus_quiet_fan_power_mode;
   std::optional<uint32_t> asus_fan_mode;
+
+  // --- Lenovo Intelligent Cooling (the ITS service, "Lenovo Notebook ITS Service"): the vendor's thermal / performance mode,
+  // HKLM\SYSTEM\CurrentControlSet\Services\LITSSVC\LNBITS\IC\MMC. CurrentSetting 0 = Intelligent Cooling (auto), 1 = Battery
+  // Saving (cool and quiet), 3 = Extreme Performance (see LenovoModeName; Capability is a bit mask of the modes the
+  // machine has: 2 cool, 8 performance). Verified on an IdeaPad Slim Pro 9 16IRP8 (docs/LEARNINGS NATIVE-O).
+  bool lenovo_present = false;
+  std::optional<uint32_t> lenovo_mode;
+  std::optional<uint32_t> lenovo_capability;
+
+  // --- An NVIDIA GPU through NVML (nvml.dll from the driver, loaded at run time; absent = unknown). The first device only.
+  // The enforced power limit is what the GPU is held to now: on a laptop the vendor's thermal mode sets it, and a limit well
+  // under the maximum is the commonest reason for a missed frame rate.
+  bool gpu_known = false;
+  std::string gpu_name;
+  uint32_t gpu_limit_mw = 0;    // enforced power limit; 0 = not readable
+  uint32_t gpu_default_mw = 0;  // the board's default limit
+  uint32_t gpu_min_mw = 0;
+  uint32_t gpu_max_mw = 0;
+  uint32_t gpu_draw_mw = 0;     // power draw now
+  uint32_t gpu_clock_mhz = 0;   // graphics clock now
+  uint32_t gpu_clock_max_mhz = 0;
+  int gpu_temp_c = -1;
+  bool gpu_reasons_known = false;
+  uint64_t gpu_reasons = 0;     // NVML clocks throttle reasons bit mask (0x1 idle, 0x4 software power cap, 0x20 software thermal ...)
 
   // --- The monitor the window is on (the primary one without a window)
   bool display_known = false;
@@ -82,14 +117,8 @@ SystemStatus QuerySystemStatus(void* native_window = nullptr);
 // target_fps >= 60 and guest_height >= 1000 and a reason applies.
 void LogSystemStatus(const SystemStatus& status, int target_fps, int guest_height);
 
-// `60 fps at 1080p is unlikely: <reasons>`: on battery; battery saver on; Windows power mode "Best power efficiency";
-// the display's refresh rate is not a multiple of target_fps. Empty when target_fps < 60, guest_height < 1000 or no
-// reason applies. (The plan's boost mode and maximum state are logged but are not reasons.)
-std::string SystemStatusWarning(const SystemStatus& status, int target_fps, int guest_height);
-
-// True when `refresh` is, within 1 Hz (59.94 reports as 59 or 60), a whole multiple of `target` (also when either is
-// unknown, <= 0). 60 on 120 or 60 is; 60 on 165, 144, 100 or 75 is not: frames then last 2 or 3 refreshes in a beat.
-bool RefreshIsMultipleOf(int refresh, int target);
+// The pure rules (the warning text, the GPU-capped test, the Lenovo mode names, the refresh multiple) live in
+// system_status_rules.h, which only needs this header and the standard library: mcla/tests checks them.
 
 // One compact line, e.g. `AC power | mode Best performance | 120 Hz 2880x1800 | cpu 20 logical`.
 std::string SystemStatusOneLine(const SystemStatus& status);
@@ -100,3 +129,5 @@ std::string SystemStatusOneLine(const SystemStatus& status);
 void LogSystemSample();
 
 }  // namespace mcla_host
+
+#include "system_status_rules.h"

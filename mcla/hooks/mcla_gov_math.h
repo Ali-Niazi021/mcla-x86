@@ -459,6 +459,37 @@ struct Params {
   double compile_excuse_s = 4.0;
 };
 
+// ---- the budget follows the frame-rate target (T6) ---------------------------------------------------------------------------
+//
+// shed_ms, restore_ms and enrich_margin_ms are written for the 60 fps frame (16.7 ms: shed above 15.6, restore below 15.0, a
+// 1.5 ms enrichment margin). On the 1/120 grid (a cap above 60, the 120 fps target) the frame budget is 8.33 ms, and a GPU
+// that needs 9.5 ms is over budget by 14 % although it is far under 15.6: left alone the governor would never act at 120 and
+// the missed frames alone would send the world to its 60 tier. The thresholds therefore scale with the cap: the frame budget
+// is scaled and the presenter's paint outside the measured GPU frame (about 0.7 ms) stays, so at 120: shed above 7.5 ms,
+// restore below 7.2 ms, margin 0.75 ms. At a cap of 60 or below (or unknown, 0) nothing changes, bit for bit.
+constexpr double kPresenterPaintMs = 0.7;
+constexpr int kBudgetBaseFps = 60;
+// 1 at a cap of 60 or below (and 0 = unknown); 60 / cap above it (0.5 at 120), never below 0.25.
+inline double BudgetScale(int cap) {
+  if (cap <= kBudgetBaseFps) return 1.0;
+  return std::max(0.25, double(kBudgetBaseFps) / double(cap));
+}
+// A threshold in GPU frame ms written for the 60 fps frame, for a cap: the frame budget scales, the presenter's paint stays.
+inline double ScaleThresholdMs(double ms, int cap) {
+  const double scale = BudgetScale(cap);
+  if (scale >= 1.0) return ms;
+  return std::max(1.0, (ms + kPresenterPaintMs) * scale - kPresenterPaintMs);
+}
+// A margin written for the 60 fps frame: scales with the budget.
+inline double ScaleMarginMs(double ms, int cap) { return ms * BudgetScale(cap); }
+
+// The three thresholds of Params for a cap (the cvars hold the 60 fps values). A no-op at 60 or below.
+inline void ScaleParamsForCap(Params& p, int cap) {
+  p.shed_ms = ScaleThresholdMs(p.shed_ms, cap);
+  p.restore_ms = ScaleThresholdMs(p.restore_ms, cap);
+  p.enrich_margin_ms = ScaleMarginMs(p.enrich_margin_ms, cap);
+}
+
 // The shape of the ladder for one set of Params.
 struct Ladder {
   int floor = 1, ceiling = 1, vrs = 0;

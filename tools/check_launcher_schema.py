@@ -258,8 +258,13 @@ def check_structure(schema: dict, rep: Report) -> Dict[str, dict]:
         for rid, rv in s.get("requires", {}).items():
             if rid not in by_id:
                 rep.err("%s: requires unknown %s" % (i, rid))
-            elif not is_valid(by_id[rid], rv):
-                rep.err("%s: requires %s=%r invalid" % (i, rid, rv))
+                continue
+            # a list is "any of these values" (launcher/src/core/settings_schema.h)
+            if isinstance(rv, list) and not rv:
+                rep.err("%s: requires %s: the list of values is empty" % (i, rid))
+            for one in (rv if isinstance(rv, list) else [rv]):
+                if not is_valid(by_id[rid], one):
+                    rep.err("%s: requires %s=%r invalid" % (i, rid, one))
 
     def cyclic(i: str, seen: frozenset) -> bool:
         if i in seen:

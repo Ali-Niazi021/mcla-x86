@@ -793,12 +793,13 @@
     {
       "id": "mcla_fps_target",
       "label": "Frame rate",
-      "help": "The game's frame-rate profile. 60 = the full 60 fps timing (quantised simulation, smoothed camera, UI held at 30 Hz, corrected race clock). 30 = locked 30 with the shipped timing. Shipped timing = the game's own present interval, no host cap.",
+      "help": "The game's frame-rate profile. 60 = the full 60 fps timing (quantised simulation, smoothed camera, UI held at 30 Hz, corrected race clock). 120 = the same on a 1/120 s world step: needs a 120 Hz display mode (or variable refresh) and a GPU that renders the chosen size in under 8.3 ms. 30 = locked 30 with the shipped timing. Shipped timing = the game's own present interval, no host cap.",
       "category": "performance",
       "type": "enum",
       "cvar": "mcla_fps_target",
       "default": 60,
       "options": [
+        {"value": 120, "label": "120 fps", "help": "The 60 fps profile on a 1/120 s world step. Set the display to a 120 Hz mode first (Windows: Settings > System > Display > Advanced display, or the graphics driver; a 165 Hz mode shows 120 fps unevenly) and, on a laptop, the vendor's performance mode. Needs a GPU that renders the chosen size in under 8.3 ms; otherwise the game drops to 60 for a while. The car's physics runs at 1/120 s steps: handling has not been judged by feel yet."},
         {"value": 60, "label": "60 fps", "help": "The 60 fps profile. Needs a GPU that renders the chosen size in under 16.7 ms; otherwise the game drops to a steady 30 for a while (see Max hold at 30 fps)."},
         {"value": 30, "label": "30 fps (locked)", "help": "The shipped 1/30 s timing, paced to an even 30 fps by the host."},
         {"value": 0, "label": "Shipped timing", "help": "Nothing is set: the guest's own present interval holds 30 fps, no host cap."}
@@ -835,7 +836,7 @@
     {
       "id": "mcla_sim_hold30_s",
       "label": "Max hold at 30 fps (seconds)",
-      "help": "At 60 fps, when more than about 10 % of frames in a short window miss 60, the game holds 30 fps for a while (a steady 30 beats a 40-50 fps judder), up to this many seconds. 0 = never hold at 30.",
+      "help": "At 60 fps, when more than about 10 % of frames in a short window miss 60, the game holds 30 fps for a while (a steady 30 beats a 40-50 fps judder), up to this many seconds. At 120 fps the same rule holds 60 instead. 0 = never hold.",
       "category": "performance",
       "type": "int",
       "cvar": "mcla_sim_hold30_s",
@@ -844,7 +845,7 @@
       "max": 120,
       "step": 5,
       "advanced": false,
-      "requires": {"mcla_fps_target": 60},
+      "requires": {"mcla_fps_target": [60, 120]},
       "emit": "nondefault"
     },
     {
@@ -856,7 +857,7 @@
       "cvar": "mcla_gov",
       "default": true,
       "advanced": false,
-      "requires": {"mcla_fps_target": 60},
+      "requires": {"mcla_fps_target": [60, 120]},
       "emit": "always"
     },
     {
@@ -1020,7 +1021,7 @@
       "cvar": "mcla_smoothing_fix",
       "default": true,
       "advanced": false,
-      "requires": {"mcla_fps_target": 60},
+      "requires": {"mcla_fps_target": [60, 120]},
       "emit": "nondefault"
     },
     {
@@ -1037,7 +1038,7 @@
         {"value": "off", "label": "Off (the game's own)", "help": "The game's int(dt x 1000): about 4 % slow at 60 fps."}
       ],
       "advanced": false,
-      "requires": {"mcla_fps_target": 60},
+      "requires": {"mcla_fps_target": [60, 120]},
       "emit": "nondefault"
     },
     {
@@ -1049,7 +1050,7 @@
       "cvar": "mcla_ui_30hz",
       "default": true,
       "advanced": true,
-      "requires": {"mcla_fps_target": 60},
+      "requires": {"mcla_fps_target": [60, 120]},
       "emit": "nondefault"
     },
     {

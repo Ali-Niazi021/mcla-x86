@@ -14,7 +14,7 @@
 // (the same drawn at 2x2 on the host: 3200x2000, a 16:10 laptop panel's native size) came with the owner's native request.
 //
 // Frame-rate target (W4.1): `--mcla_fps_target=60` (cvar below; 0 = the shipped timing, nothing is set) is the whole 60 fps
-// profile in one switch. It is a separate axis from the resolution presets: `--mcla_profile=1080p --mcla_fps_target=60`
+// profile in one switch; `--mcla_fps_target=120` (T6) is the same on the 1/120 world grid and a 120 Hz guest vblank. It is a separate axis from the resolution presets: `--mcla_profile=1080p --mcla_fps_target=60`
 // is M6. It is applied in phase 0 (OnConfigurePaths) so that the host's start-up `[mcla-cap]` line, which is logged
 // before OnPreSetup, already reads the cap; a value that only the TOML file gives (loaded after phase 0) is applied in
 // phase 2, with a note. Same mechanism as everything here: the command line, the environment and the TOML file win.
@@ -57,7 +57,11 @@ REXCVAR_DEFINE_INT32(mcla_fps_target, 0, "MCLA",
                      "the 60 fps profile: mcla_sim60=true, mcla_fps_cap=0 (no host limiter: the guest vblank's swap gate "
                      "paces the swaps at the 60 Hz video_mode_refresh_rate), the A5 present interval on the guest "
                      "vblank rate (1 at 60 Hz), k(dt) camera and chassis, Flash movies at 30 Hz, countdown and race "
-                     "clock. 120 is reserved (M7) and is not applied. Independent of mcla_profile (the resolution)")
+                     "clock. 120 = the 120 fps profile (T6): the same on the 1/120 world grid (mcla_sim_cap=120, "
+                     "video_mode_refresh_rate=120, the guest's present interval 1 on a 120 Hz vblank), the motion-blur streak "
+                     "kept at the 60 fps length (mcla_vis_motion_blur=2), the governor's budget halved with the cap. It needs a "
+                     "display mode of 120 Hz (or a multiple: 240) or variable refresh: on a 165 Hz panel the frames cannot be "
+                     "even. Independent of mcla_profile (the resolution)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace mcla {
@@ -620,6 +624,34 @@ constexpr CvarDefault kFps60Defaults[] = {
     {"render_target_trim_seconds", "0"},
 };
 
+// 120 fps (T6): the 60 fps rows on the 1/120 world grid (TIMING.md section 15). What differs from kFps60Defaults:
+//   * mcla_sim_cap=120: the world's cap. A cap above 60 puts the world on the 1/120 grid (n = 1..8 quanta, one physics substep a
+//     frame at n = 1, the pacer's period 8.33 ms, the present interval exact on a 120 Hz vblank); misses drop the world to a
+//     60 tier by the 60 -> 30 judge's rule (mcla_sim_pacer 2). The host limiter stays 0: the guest vblank's swap gate paces.
+//   * video_mode_refresh_rate=120: the guest's vblank on the 1/120 grid; the A5 hook then lowers nothing but computes the
+//     interval exactly (120 Hz / 120 fps = 1; at the 60 tier 2, at a 30 hold 4).
+//   * mcla_vis_motion_blur=2: the game's streak is 0.25 x the displacement of ONE frame, so at 120 fps it would be a quarter of
+//     the console's (half of the 60 fps profile's). x2 gives back the 60 fps length. A fixed multiplier, not the dt-based
+//     console look (-1): the 60 tier then looks 2x longer than at 60 for the few seconds it lasts.
+//   * everything else is the 60 fps row: Flash movies at 30 Hz (mcla_ui_30hz, a movie step every 4th frame), the countdown and
+//     the race clock on their own accumulators, the camera and chassis smoothing as k(dt), the render-target trim off.
+//   The pump's wake-on-demand (mcla_cpu_pump_wake) is NOT part of it: the A/B at 120 is in docs/METRICS.md (T6 rows).
+constexpr CvarDefault kFps120Defaults[] = {
+    {"mcla_sim60", "true"},
+    {"mcla_sim_cap", "120"},
+    {"mcla_fps_cap", "0"},
+    {"mcla_present_interval", "-1"},
+    {"video_mode_refresh_rate", "120"},
+    {"mcla_smoothing_fix", "true"},
+    {"mcla_ui_30hz", "true"},
+    {"mcla_race_clock", "retail"},
+    {"mcla_sim_pace", "true"},
+    {"mcla_input_title_latch", "-1"},
+    {"mcla_input_menu_repeat", "-1"},
+    {"mcla_vis_motion_blur", "2"},
+    {"render_target_trim_seconds", "0"},
+};
+
 struct FpsTarget {
   int fps;              // the value of mcla_fps_target
   const char* summary;  // for the log
@@ -634,6 +666,11 @@ constexpr FpsTarget kFpsTargets[] = {
      "60 fps (M5): world step n/60 s (mcla_sim60) with k(dt) camera and chassis, Flash movies at 30 Hz, countdown and "
      "race clock corrected, guest present interval 1 on the 60 Hz guest vblank, host limiter at 60",
      kFps60Defaults, sizeof(kFps60Defaults) / sizeof(kFps60Defaults[0])},
+    {120,
+     "120 fps (T6): the 60 fps profile on the 1/120 world grid (mcla_sim_cap=120, step n/120 s, one physics substep at n = 1), "
+     "guest vblank 120 Hz with present interval 1, Flash movies at 30 Hz, motion-blur streak at the 60 fps length, the "
+     "governor's budget 8.3 ms; needs a 120 Hz display mode or variable refresh",
+     kFps120Defaults, sizeof(kFps120Defaults) / sizeof(kFps120Defaults[0])},
 };
 
 enum class Outcome { kApplied, kMissing, kRejected };
@@ -798,10 +835,9 @@ void LogFpsTarget(Tally* tally) {
   }
   const FpsTarget* chosen = FindFpsTarget(target);
   if (chosen == nullptr) {
-    REXLOG_ERROR("[mcla-profile] error: mcla_fps_target={} ({}) is {} (known: 0, 30, 60); the shipped timing is used",
-                 target, source,
-                 target == 120 ? "reserved for M7 (it needs a 120 Hz guest vblank and the 1/120 world grid)"
-                               : "not a frame-rate target");
+    REXLOG_ERROR("[mcla-profile] error: mcla_fps_target={} ({}) is not a frame-rate target (known: 0, 30, 60, 120); the shipped "
+                 "timing is used",
+                 target, source);
     return;
   }
   std::string set, kept, problems;

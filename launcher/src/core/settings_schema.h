@@ -13,7 +13,8 @@
 //                       "options": [ { "value": <v>, "label": "...", "help": "..." } ],     (enum only, required there)
 //                       "min": <n>, "max": <n>, "step": <n>,                    (int / float: min and max required)
 //                       "advanced": false,
-//                       "requires": { "<setting id>": <value>, ... },                                        (optional)
+//                       "requires": { "<setting id>": <value> | [<value>, ...], ... },                      (optional)
+//                                     (a list = any of those values: the 60 fps timing options need "mcla_fps_target": [60, 120])
 //                       "emit": "nondefault" | "always" | "never" } ] }                         (default "nondefault")
 //
 // Validation is strict about things that would silently break the command line (missing or duplicate ids, unknown
