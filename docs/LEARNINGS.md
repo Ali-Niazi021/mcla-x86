@@ -337,6 +337,21 @@ hold reads 55–100 % missed, which starts a 12 s hold. **Fix** Open (PORT_STATE
 when set by hand). The picture is correct (HUD, Vert+); 23–26 fps on the 880M, GPU 100 % busy; dual-write resolves and
 the direct present fall back at a scale above 1. **Evidence** runs `orc-native-n2000`, `orc-native2-*`, `orc-flk-n2000`.
 
+### R2 / R3 2000p: off-screen targets double with the draw scale, VRS as the base (2026-11-27, static work, not run)
+**Symptom** At draw scale 2 every render target is 4x the pixels, also the ones the game sizes from a constant: the 640x640 4x-MSAA
+sun-shadow target is 1280x1280 on the host (shadow group 1.75 ms, environment map 0.99, post 2.23, composite 1.17 in the T1 M2 run
+`t1-m2-2000u`, RTX 4060, governor off). **Fix** Game side: `mcla_gfx_shadow_res=320` in the `2000p` profile (host 640, the 1080p look; the
+audit is in `mcla_gfx_shadow_res.cpp`), a gfx preset's shadow size halved at scale 2, `mcla_gfx_env_res` for the environment map
+(0x8233AB3C, off until it is checked), `vrs_level=2` as the profile's VRS base. **Findings** (1) The SDK's VRS selection reads the GUEST
+surface pitch (`RB_SURFACE_INFO`) and the guest phase markers, never the scaled width: `vrs_min_target_width` 640 selects the same targets at
+scale 2 as at 1x (1600 and 800 shaded, 400 not), no SDK change needed. (2) The governor wrote its VRS rungs as absolute levels 1 and 2, so with
+`vrs_level=2` a shed would have walked the shading rate back to level 1: the rungs now sit above the base (`mcla_gfx_res_math.h VrsRungs`,
+none left with two levels). (3) A gfx preset applied at first use replaces a profile's app default of the same knob (`SetDefaultValue` keeps the
+source at default), so `--mcla_gfx_preset=ultra` would have restored 640. (4) The shadow texel-size constants (pixel shader register 5) follow
+the guest edge: the penumbra at 320 is about twice as wide as at 640 / 1x. (5) Every other off-screen target (reflection 256, impostors,
+fast collector 256 / 512, 960x640 `self`) is sized by literals at several sites with no size field: addresses and blockers in
+`docs/native/R2_TARGETS.md`. **Evidence** static: `$WORK/scratch/r2r3/`; run pending (integrator).
+
 ### Sprint P1/R6 Where the 880M's time goes
 **Symptom** 1080p single tile ~17.8 ms GPU; game-side detail cuts barely moved it. **Cause** (1) the package is capped at
 ~35 W, so the GPU runs ~1.25–1.6 GHz of 2.9 and loses more when any other CPU work runs (agent builds, rga, VS Code,

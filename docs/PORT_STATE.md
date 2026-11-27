@@ -494,6 +494,11 @@ Reports in `$WORK/scratch/{S2,S3,S4,S5,R2,R3,R4,R5,R6}/REPORT.md`.
   reference 0.2–0.4 % of pixels with a temporal std > 6). An empty `--mcla_gfx_preset=` swallows the next argument.
 - **Native 3200x2000:** `mcla_profile=2000p` = the 1600x1000 guest at `draw_resolution_scale` 2x2: correct picture,
   23–26 fps, GPU 100 % busy; dual-write resolves and the direct present fall back at a scale above 1.
+  Since 2026-11-27 (R2 / R3 of `docs/native/ROADMAP.md`, not yet measured): the profile also sets `mcla_gfx_shadow_res=320` (the host
+  shadow map is the shipped 640, not 1280; a gfx preset's shadow size is halved at scale 2) and `vrs_level=2` (post, composite, translucent
+  and pre phases shaded 2x2 = native size, the scene and the UI 1x1) as the BASE, with the governor's VRS rungs above it (none left with the
+  SDK's two-level table). `mcla_gfx_env_res` (the cars' reflection map 512x256 -> 256x128) exists but is off. Targets and addresses:
+  `docs/native/R2_TARGETS.md`. A/B: `--mcla_gfx_shadow_res=640`, `--vrs_level=0`, `--mcla_gfx_env_res=256`.
 - **Fullscreen is Hardware: Independent Flip** now that the SuperDisplay virtual display is detached; a window is
   Composed: Flip (the desktop is 3200x2000).
 

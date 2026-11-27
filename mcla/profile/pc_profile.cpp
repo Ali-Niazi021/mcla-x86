@@ -27,6 +27,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
+#include "mcla_gfx_res_math.h"  // mcla/hooks: the 2000p entries (shadow edge, VRS level) are checked against the maths the hooks use
 #include "mcla_ws_sizing.h"  // mcla/hooks: the presets' numbers are checked against the same maths the hooks use
 
 REXCVAR_DEFINE_STRING(mcla_profile, "", "MCLA",
@@ -45,7 +46,7 @@ REXCVAR_DEFINE_STRING(mcla_profile, "", "MCLA",
                       "1280x800, '900p16' = 1440x900, '1200p' = 1920x1200, '1200p-fsr' = 1200p with the scene at "
                       "1280x800 upscaled by FSR (1.5x), '1200p-fsr4p' = 1200p from 960x600 by FSR 4 (2x), '1000p' = "
                       "1600x1000, '2000p' = 3200x2000 on the host (1000p with every render target drawn at 2x2: "
-                      "about 4x the GPU load). "
+                      "about 4x the GPU load, less with its sun-shadow map 320 and VRS level 2 base). "
                       "Read once, in OnPreSetup")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -367,11 +368,34 @@ constexpr CvarDefault k1000pDefaults[] = {
     {"mcla_ws_ui_squeeze", "268"},
     {"mcla_ws_ui_probe", "false"},
 };
+// The two levers that keep 2x2 drawing from costing 4x everywhere (docs/native/ROADMAP.md R2 and R3), both behind their own cvars, so
+// `--mcla_gfx_shadow_res=640` / `--vrs_level=0` on the command line (or in the config file) is the A/B and wins over these defaults:
+//   mcla_gfx_shadow_res=320   The SDK draws every render target at the draw scale and the guest does not know, so the 640x640 4x-MSAA
+//                             sun-shadow target would be 1280x1280 on the host: 4x the shadow pixels for no visible gain. A guest map of 320
+//                             is the host 640 of the 1080p look (mcla_gfx_shadow_res.cpp: the audit of the size, read at a world load). A
+//                             gfx preset (mcla_gfx_preset) does not undo it: its shadow size is halved at scale 2 (mcla_gfx_tune.cpp).
+//   vrs_level=2               The SDK's variable rate shading (patch 0500, vrs_levels table of 0510) as the BASE level: level 2 shades the
+//                             post, composite, translucent and pre phases (the post-processing chain, glass, particles, the screen-sized
+//                             shadow collector) at 2x2 and the main scene, the shadow cascades, the tone map and the UI at 1x1. At draw scale
+//                             2 a 2x2 coarse pixel is exactly one guest pixel: native-size shading for those passes. The SDK picks the phase
+//                             from the guest's render markers and the target by its GUEST surface pitch (`vrs_min_target_width` 640 against
+//                             the unscaled width: targets narrower than that, the environment, reflection and impostor maps, the small
+//                             levels of the blur chain and the HUD textures, stay 1x1), so the selection is the same at scale 2 as at 1x.
+//                             The governor (mcla_gov) puts its VRS rungs above this base (mcla_gov.cpp: with the table's two levels there
+//                             is none left, a shed goes straight to the tiers below the floor); with the governor off it is the only VRS.
+// Not set here (A/B first, by `--mcla_gfx_env_res=256`): the environment map's size (mcla_gfx_env_res.cpp, the same idea for the cars'
+// reflection map: guest 256x128 is the shipped 512x256 on the host).
+static_assert(mcla::gfxres::ShadowEdgeOf(320) == 320 && mcla::gfxres::ShadowEdgeIsTiled(320) && mcla::gfxres::ShadowFitsEdram(320) &&
+                  2 * mcla::gfxres::ShadowEdgeOf(320) == mcla::gfxres::kShadowShippedEdge,
+              "the 2000p shadow edge is an edge the hook accepts and its host target is the shipped 640");
+static_assert(mcla::gfxres::VrsRungs(2, 2, 2) == 0, "the governor has no VRS rung above the 2000p base level of the SDK's two-level table");
 constexpr CvarDefault k2000pDefaults[] = {
     {"draw_resolution_scale_x", "2"},
     {"draw_resolution_scale_y", "2"},
     {"window_width", "3200"},
     {"window_height", "2000"},
+    {"mcla_gfx_shadow_res", "320"},
+    {"vrs_level", "2"},
 };
 
 // 1200p-fsr / 1200p-fsr4p: the 1200p render with the scene drawn at 1280x800 (1.5x) or 960x600 (2x) and upscaled to
@@ -490,7 +514,8 @@ constexpr Preset kPresets[] = {
      k1000pDefaults, sizeof(k1000pDefaults) / sizeof(k1000pDefaults[0]), nullptr},
     {"2000p",
      "16:10 3200x2000 on the host: the 1000p render with every render target drawn at 2x2 (draw_resolution_scale_x/y=2); "
-     "the game still sees 1600x1000",
+     "the game still sees 1600x1000; sun-shadow map 320 (host 640, mcla_gfx_shadow_res) and variable rate shading level 2 "
+     "(post / composite / translucent / pre at 2x2, vrs_level) as the base",
      k2000pDefaults, sizeof(k2000pDefaults) / sizeof(k2000pDefaults[0]), "1000p"},
 };
 
