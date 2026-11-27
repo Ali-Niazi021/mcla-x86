@@ -25,7 +25,7 @@ mismatch (verify, verify-xex), 130 interrupted.
 Contract lines go to stdout; progress and diagnostics go to stderr, so `... | grep` and `$(...)` stay clean.
 
 Paths: <iso> for verify/list and <xex> for verify-xex may be omitted; the tool then looks in the game directory
-(--game DIR, else $MCLA_GAME, else C:/Users/Ali/Development/dumps/mcla-x360) for the single *.iso or default.xex.
+(--game DIR, else $MCLA_GAME, else <work>/game next to the repo) for the single *.iso or default.xex.
 
 Format notes (XDVDFS): the volume descriptor sits at sector 32 of the partition (magic MICROSOFT*XBOX*MEDIA at +0
 and +0x7EC, root sector and size as little-endian u32 at +0x14/+0x18). A directory is a binary tree of
@@ -55,7 +55,9 @@ PIN_DISC_COUNT = 1
 PIN_XEX_NAME = "default.xex"
 
 # --- Defaults (overridable by --game / MCLA_GAME) ----------------------------------------------------------------
-DEFAULT_GAME = "C:/Users/Ali/Development/dumps/mcla-x360"
+_LEGACY_GAME = "C:/Users/Ali/Development/dumps/mcla-x360"
+# the owner's folder when it exists; elsewhere <the folder mcla-x86-work next to the repo>/game (tools/setup.py's layout)
+DEFAULT_GAME = _LEGACY_GAME if os.path.isdir(_LEGACY_GAME) else os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "mcla-x86-work", "game").replace(os.sep, "/")
 
 # --- XDVDFS constants --------------------------------------------------------------------------------------------
 SECTOR = 2048

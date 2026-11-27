@@ -30,7 +30,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-DEFAULT_WORK = "C:/Users/Ali/Development/mcla-x86-work"
+_LEGACY_WORK = "C:/Users/Ali/Development/mcla-x86-work"
+DEFAULT_WORK = _LEGACY_WORK if os.path.isdir(_LEGACY_WORK) else (Path(__file__).resolve().parents[2] / "mcla-x86-work").as_posix()
 
 
 def junction(link: Path, target: Path) -> None:

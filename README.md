@@ -6,8 +6,8 @@ of game hooks (60 fps, widescreen, 1080p and more, a launcher, HDR output).
 
 Status: the game boots, drives, races and saves. On a Radeon 880M laptop it runs at 1080p and 60 fps with the
 Recommended preset. On an RTX 4060 Laptop (Intel 6P+8E, 3200x2000 panel at 165 Hz) the native panel preset (the
-3200x2000 profile) holds 60 fps in a scripted drive, at the Ultra and at the Performance scene detail, and 1080p Ultra
-needs about 5.3 ms of GPU time a frame. The scripted drive keeps the car parked, so these are lower bounds. Details
+3200x2000 profile) holds 60 fps in a scripted drive through Hollywood traffic (the bike really drives), at the Ultra and
+at the Performance scene detail, and 1080p Ultra needs about 5.3 ms of GPU time a frame. Details
 and measurements are in [docs/PORT_STATE.md](docs/PORT_STATE.md); the native plan and its status board are in
 [docs/NATIVE_PLAN.md](docs/NATIVE_PLAN.md).
 
@@ -46,8 +46,9 @@ cd mcla-x86
 python tools/setup.py --iso "C:\path\to\your game.iso"
 ```
 
-That one command does everything. Expect about 30 to 60 minutes the first time, mostly for the SDK build; you do not
-have to watch it:
+That one command does everything. Expect 6 minutes plus the 940 MB compiler download on a fast 20-thread laptop (43 s
+to unpack the compiler, 10 s for the NVIDIA download, 5 s to extract the game, 4 minutes for the SDK, 1 minute for the
+game and the launcher), and 30 to 60 minutes on a slower PC, mostly for the SDK build; you do not have to watch it:
 
 | Step | What it does |
 |---|---|
@@ -107,7 +108,7 @@ Finished steps are skipped, so this is much faster than the first setup.
 - **Adaptive detail** (on by default): keeps 60 fps by lowering detail where it is least visible, and raises it again
   when the GPU has room.
 - **NVIDIA DLSS (RTX cards):** the launcher has presets **Native panel 3200x2000, NVIDIA DLAA** (anti-aliasing at the full size) and **NVIDIA DLSS Performance** (scene drawn at half size, model K), and a preset for **DLSS Frame Generation** (below); the mod menu's Display tab has an Upscaling section (the quality and the DLSS model change live, the upscaler and on / off at the next start). DLSS here is a picture-quality choice, not a speed-up: on an RTX 4060 Laptop it costs about 4-5 ms a frame at 3200x2000 (8.4 ms plain, 12.5-13.5 ms with DLSS; every mode holds 60 fps, none reaches a clean 120) and 20-26 W more GPU power at 60 fps. It needs an RTX GPU and NVIDIA's DLLs next to the game (the setup downloads them); without them, on another GPU, or with `--nvidia_streamline=off`, FSR runs and the log says so once. The DLLs are NVIDIA's development ones: they print a small NVIDIA notice at the bottom of the screen, which is for personal use only and must not be passed on.
-- **DLSS Frame Generation** (RTX 40 or newer, Windows' hardware-accelerated GPU scheduling on, G-Sync with **Allow tearing**): the preset **Native panel 3200x2000, 120 fps shown with NVIDIA DLSS Frame Generation** renders 60 frames a second and shows 118 (measured over a 6 minute drive); the game still simulates at 60, the HUD stays sharp, the frame between two rendered ones delays the real one a little (input latency was not measured). FXAA must be off (the preset does it). Only at the display's own size (3200x2000 on the laptop panel); not on the 1080p TV.
+- **DLSS Frame Generation** (RTX 40 or newer, Windows' hardware-accelerated GPU scheduling on, G-Sync with **Allow tearing**): the preset **Native panel 3200x2000, 120 fps with NVIDIA DLSS Frame Generation** renders 60 frames a second and shows 118 (measured over a 6 minute drive); the game still simulates at 60, the HUD stays sharp, the frame between two rendered ones delays the real one a little (input latency was not measured). FXAA must be off (the preset does it). Only at the display's own size (3200x2000 on the laptop panel); not on the 1080p TV.
 - **Anti-aliasing:** automatic by default (FXAA).
 - **Vsync and tearing:** vsync is always on, and with tearing off each frame waits for the display's next refresh.
   Tearing is off by default, which is right for TVs and ordinary monitors. The launcher's **Allow tearing (G-Sync /
@@ -155,9 +156,11 @@ You can also start the game without the launcher:
   panel each frame stays on the screen for 3, 3, 3 and then 2 refreshes. This is by design, not a fault, and no
   setting in the game removes it. Variable refresh (G-Sync or FreeSync, with **Allow tearing** on) or a 60 or 120 Hz
   mode of the panel does.
-- The first frames of menus and loading screens still hitch at each start: the worst frame is 107 to 121 ms on the RTX
-  4060 Laptop, down from 167 to 197 ms. What is left is the memory allocation of the first 3D frame and about 7
-  compute pipelines a run, which are not stored.
+- The first frames of menus and loading screens still hitch at each start: the worst frame of the first 3D scene is
+  about 55 to 130 ms on a warm start on the RTX 4060 Laptop (down from 167 to 197 ms at the start of the work), made of
+  the first use of the scene's textures and upload buffers. The very first start on a PC, with no shader cache yet, is
+  worse (a frame of 150 to 450 ms while shaders are compiled, a few more such frames in the first minute); the cache
+  is saved and the next starts are smooth.
 - At 3200x2000 the game still makes some copies that it avoids at 1080p. Direct present stays off, because it leaves a
   one-pixel stripe along the top and left edge. The pause backdrop, the vinyl editor and HDR are not covered by the
   copy shortcuts yet.

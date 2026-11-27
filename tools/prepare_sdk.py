@@ -85,6 +85,7 @@ PRESET = "win-amd64"
 STATE_DIR = ".mcla-x86"
 APPLIED_NAME = "series.applied"
 INSTALL_STAMP = "mcla-x86-sdk-build.json"
+STREAMLINE_DIRNAME = "streamline-2.14.16"   # <work>/toolchain/nvidia/<this>: fetched by tools/setup.py (STREAMLINE_VERSION there)
 TOOLCHAIN_STAMP = "mcla-toolchain.txt"
 
 EXIT_FAIL = 1
@@ -535,6 +536,10 @@ def install_line(L: Layout, S: Series) -> str:
         return "install %s: built from an unknown series (no %s)" % (posix(L.prefix), INSTALL_STAMP)
     built = rec.get("series_fingerprint", "?")
     if built == S.fingerprint:
+        sl_here = (L.work / "toolchain" / "nvidia" / STREAMLINE_DIRNAME / "include" / "sl.h").is_file()
+        if sl_here and not (L.prefix / "bin" / "sl.interposer.dll").exists():
+            # setup ran first with --no-nvidia (or before the download existed): the SDK has no DLSS support until it is rebuilt
+            return "install %s: STALE, built without NVIDIA Streamline, which is available now: run build" % posix(L.prefix)
         return "install %s: built from this series (%s, %s, %s)" % (posix(L.prefix), built, rec.get("config", "?"), rec.get("clang", "?"))
     return "install %s: STALE, built from series %s (current %s): run build" % (posix(L.prefix), built, S.fingerprint)
 
@@ -882,7 +887,7 @@ def plan_build(L: Layout, args: argparse.Namespace) -> BuildPlan:
         configure.append("-DREXGLUE_FSR_SIGNED_DIR=" + ffx_signed.as_posix())
     # NVIDIA Streamline (SDK patches 0770/0780: DLSS SR, DLSS-G, Reflex), fetched by tools/setup.py; its DLLs are installed
     # next to the SDK's (development ones by default) and staged next to mcla.exe by mcla_stage_sdk_runtime.
-    streamline = L.work / "toolchain" / "nvidia" / "streamline-2.14.16"
+    streamline = L.work / "toolchain" / "nvidia" / STREAMLINE_DIRNAME
     if (streamline / "include" / "sl.h").is_file():
         configure.append("-DREXGLUE_STREAMLINE_DIR=" + streamline.as_posix())
     configure += args.cmake_arg or []

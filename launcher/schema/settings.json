@@ -31,6 +31,10 @@
         "temporal_aa_upscaler": "dlss",
         "temporal_aa_upscale": 1.0,
         "temporal_aa_sharpness": 0.3,
+        "dlss_preset": "default",
+        "frame_generation": "off",
+        "mcla_low_latency_frames": false,
+        "d3d12_allow_variable_refresh_rate_and_tearing": false,
         "fullscreen": true
       }
     },
@@ -55,12 +59,15 @@
         "temporal_aa_upscale": 2.0,
         "dlss_preset": "k",
         "temporal_aa_sharpness": 0.3,
+        "frame_generation": "off",
+        "mcla_low_latency_frames": false,
+        "d3d12_allow_variable_refresh_rate_and_tearing": false,
         "fullscreen": true
       }
     },
     {
       "id": "panel_2000_fg",
-      "label": "Native panel 3200x2000, 120 fps shown with NVIDIA DLSS Frame Generation (RTX 40 or newer, G-Sync)",
+      "label": "Native panel 3200x2000, 120 fps with NVIDIA DLSS Frame Generation (RTX 40+, G-Sync)",
       "help": "The native-panel 3200x2000 picture at the game's 60 fps, with NVIDIA DLSS Frame Generation putting a generated frame between every two rendered ones: 120 frames a second on the screen (measured 118.7 shown a second over a 6 minute drive, 1 % low 88 fps, no crash; G-Sync follows with Allow tearing on) for about 8 ms of GPU time a shown frame. The generated frame is made from the game's depth, motion vectors and the picture without the HUD, so the HUD stays sharp (checked on the generated frames alone). The game still runs its 60 fps simulation: handling feels like 60, the picture looks like 120; the frame generated in between delays the real one, so input latency is a little higher than plain 60 (not measured: PresentMon gave no input-to-photon figure for the plain game). Needs: an RTX 40 series or newer GPU, Windows' hardware-accelerated GPU scheduling, NVIDIA's DLLs next to the game (the setup downloads them), the 3200x2000 panel at its native size, and a G-Sync display with variable refresh on in the NVIDIA driver (on a panel without a 120 Hz mode the shown frames are even only with it). FXAA is off (frame generation needs it). Not for the 1080p TV: the setting is off there. Takes about 27 W more GPU power than the plain 60 fps picture (84 W against 57 W).",
       "set": {
         "mcla_profile": "2000p",
@@ -81,6 +88,7 @@
         "frame_generation": "dlss",
         "mcla_low_latency_frames": true,
         "d3d12_allow_variable_refresh_rate_and_tearing": true,
+        "dlss_preset": "default",
         "fullscreen": true
       }
     },
@@ -101,7 +109,13 @@
         "temporal_aa": "off",
         "temporal_aa_upscaler": "fsr3",
         "temporal_aa_upscale": 1.5,
-        "temporal_aa_sharpness": 0.3
+        "temporal_aa_sharpness": 0.3,
+        "aa_auto": true,
+        "swap_post_effect": "fxaa",
+        "dlss_preset": "default",
+        "frame_generation": "off",
+        "mcla_low_latency_frames": false,
+        "d3d12_allow_variable_refresh_rate_and_tearing": false
       }
     },
     {
@@ -122,6 +136,12 @@
         "temporal_aa_upscaler": "fsr3",
         "temporal_aa_upscale": 1.5,
         "temporal_aa_sharpness": 0.3,
+        "aa_auto": true,
+        "swap_post_effect": "fxaa",
+        "dlss_preset": "default",
+        "frame_generation": "off",
+        "mcla_low_latency_frames": false,
+        "d3d12_allow_variable_refresh_rate_and_tearing": false,
         "fullscreen": true
       }
     },
@@ -142,7 +162,13 @@
         "temporal_aa": "off",
         "temporal_aa_upscaler": "fsr3",
         "temporal_aa_upscale": 1.5,
-        "temporal_aa_sharpness": 0.3
+        "temporal_aa_sharpness": 0.3,
+        "aa_auto": true,
+        "swap_post_effect": "fxaa",
+        "dlss_preset": "default",
+        "frame_generation": "off",
+        "mcla_low_latency_frames": false,
+        "d3d12_allow_variable_refresh_rate_and_tearing": false
       }
     },
     {
@@ -162,7 +188,13 @@
         "temporal_aa": "off",
         "temporal_aa_upscaler": "fsr3",
         "temporal_aa_upscale": 1.5,
-        "temporal_aa_sharpness": 0.3
+        "temporal_aa_sharpness": 0.3,
+        "aa_auto": true,
+        "swap_post_effect": "fxaa",
+        "dlss_preset": "default",
+        "frame_generation": "off",
+        "mcla_low_latency_frames": false,
+        "d3d12_allow_variable_refresh_rate_and_tearing": false
       }
     },
     {
@@ -182,7 +214,13 @@
         "temporal_aa": "fsr",
         "temporal_aa_upscaler": "fsr4",
         "temporal_aa_upscale": 2.0,
-        "temporal_aa_sharpness": 0.2
+        "temporal_aa_sharpness": 0.2,
+        "aa_auto": true,
+        "swap_post_effect": "fxaa",
+        "dlss_preset": "default",
+        "frame_generation": "off",
+        "mcla_low_latency_frames": false,
+        "d3d12_allow_variable_refresh_rate_and_tearing": false
       }
     },
     {
@@ -203,13 +241,19 @@
         "temporal_aa_upscaler": "fsr3",
         "temporal_aa_upscale": 1.5,
         "temporal_aa_sharpness": 0.3,
+        "aa_auto": true,
+        "swap_post_effect": "fxaa",
+        "dlss_preset": "default",
+        "frame_generation": "off",
+        "mcla_low_latency_frames": false,
+        "d3d12_allow_variable_refresh_rate_and_tearing": false,
         "fullscreen": true
       }
     },
     {
       "id": "panel_2000",
       "label": "Native panel 3200x2000 (60 fps on an RTX 4060 Laptop class GPU)",
-      "help": "A true 3200x2000 picture for the 3200x2000 laptop panel: the game renders 1600x1000 and draws every render target at 2x2, 4x the pixels of 1600x1000. Measured on a GeForce RTX 4060 Laptop (55 W) with this setup while driving through traffic: it holds 60 fps (GPU busy 10.5 ms of the 16.7 ms frame, 95th percentile 12.4 ms, no missed frame in 118 s); unlocked it reaches about 93 fps with the Ultra graphics preset, so a card about a third slower than that one is roughly the limit. Weaker graphics (an integrated Radeon 880M managed 23-26 fps in a parked scene, before the 2x copy and shadow savings) will not hold 60: use 1080p there. The 60 fps profile runs unlocked below 60 with a variable simulation step, so the game's speed stays right (world/real 1.000). Sun-shadow map 320 (host 640 texels, the 1080p look) and the environment map 256x128 (host 512x256) are the 3200x2000 profile's own choices. Fullscreen uses the desktop size (borderless); do not switch the display mode, it would go to 1600x1000.",
+      "help": "A true 3200x2000 picture for the 3200x2000 laptop panel: the game renders 1600x1000 and draws every render target at 2x2, 4x the pixels of 1600x1000. Measured on a GeForce RTX 4060 Laptop held to 55 W (the laptop vendor's automatic mode) with this setup while driving through traffic: it holds 60 fps (GPU busy 11.5 ms p50 and 14.1 ms p95 of the 16.7 ms frame, 60.00 fps, no missed frame, no hitch in 118 s); unlocked it reaches about 93 fps with the Ultra graphics preset (106-108 fps in the vendor's Extreme Performance mode, which lets the GPU draw 100 W), so a card about a third slower than that one is roughly the limit. Weaker graphics (an integrated Radeon 880M managed 23-26 fps in a parked scene, before the 2x copy and shadow savings) will not hold 60: use 1080p there. The 60 fps profile runs unlocked below 60 with a variable simulation step, so the game's speed stays right (world/real 1.000). Sun-shadow map 320 (host 640 texels, the 1080p look) and the environment map 256x128 (host 512x256) are the 3200x2000 profile's own choices. Fullscreen uses the desktop size (borderless); do not switch the display mode, it would go to 1600x1000.",
       "set": {
         "mcla_profile": "2000p",
         "mcla_noaa": true,
@@ -224,6 +268,12 @@
         "temporal_aa_upscaler": "fsr3",
         "temporal_aa_upscale": 1.5,
         "temporal_aa_sharpness": 0.3,
+        "aa_auto": true,
+        "swap_post_effect": "fxaa",
+        "dlss_preset": "default",
+        "frame_generation": "off",
+        "mcla_low_latency_frames": false,
+        "d3d12_allow_variable_refresh_rate_and_tearing": false,
         "fullscreen": true
       }
     },
@@ -244,7 +294,13 @@
         "temporal_aa": "off",
         "temporal_aa_upscaler": "fsr3",
         "temporal_aa_upscale": 1.5,
-        "temporal_aa_sharpness": 0.3
+        "temporal_aa_sharpness": 0.3,
+        "aa_auto": true,
+        "swap_post_effect": "fxaa",
+        "dlss_preset": "default",
+        "frame_generation": "off",
+        "mcla_low_latency_frames": false,
+        "d3d12_allow_variable_refresh_rate_and_tearing": false
       }
     }
   ],
@@ -575,14 +631,14 @@
     },
     {
       "id": "temporal_aa_upscale",
-      "label": "FSR quality",
-      "help": "How much smaller the scene is drawn than the output (the ratio). Higher = faster and softer. At 1920x1080: Quality 1280x720, Balanced 1129x635, Performance 960x540.",
+      "label": "Upscaler quality (FSR / DLSS)",
+      "help": "How much smaller the scene is drawn than the output (the ratio). Higher = a smaller, softer scene: faster with FSR; DLSS costs about the same at every ratio on an RTX 4060 Laptop (the DLSS pass itself is 4-5 ms at 3200x2000). At 1920x1080: Quality 1280x720, Balanced 1129x635, Performance 960x540.",
       "category": "graphics",
       "type": "enum",
       "cvar": "temporal_aa_upscale",
       "default": 1.5,
       "options": [
-        {"value": 1.0, "label": "Native AA (1.0x)", "help": "No upscaling: FSR only anti-aliases at the output size."},
+        {"value": 1.0, "label": "Native AA (1.0x)", "help": "No upscaling: the upscaler only anti-aliases at the output size (DLSS: DLAA)."},
         {"value": 1.3333, "label": "Ultra Quality (1.33x)", "help": "Scene at three quarters of the output size."},
         {"value": 1.5, "label": "Quality (1.5x)", "help": "Scene at two thirds of the output size (1280x720 for 1080p)."},
         {"value": 1.7, "label": "Balanced (1.7x)", "help": "A little less than two thirds of the output size."},
@@ -919,7 +975,7 @@
       "cvar": "mcla_fps_target",
       "default": 60,
       "options": [
-        {"value": 120, "label": "120 fps", "help": "The 60 fps profile on a 1/120 s world step. Set the display to a 120 Hz mode first (Windows: Settings > System > Display > Advanced display, or the graphics driver; a 165 Hz mode shows 120 fps unevenly) and, on a laptop, the vendor's performance mode. Needs a GPU that renders the chosen size in under 8.3 ms; otherwise the game drops to 60 for a while. The car's physics runs at 1/120 s steps: handling has not been judged by feel yet."},
+        {"value": 120, "label": "120 fps", "help": "The 60 fps profile on a 1/120 s world step. Set the display to a 120 Hz mode first (Windows: Settings > System > Display > Advanced display, or the graphics driver; a 165 Hz mode shows 120 fps unevenly) or use a G-Sync / FreeSync display with Allow tearing on (the refresh then follows the game) and, on a laptop, the vendor's performance mode. Needs a GPU that renders the chosen size in under 8.3 ms; otherwise the game drops to 60 for a while. The car's physics runs at 1/120 s steps: handling has not been judged by feel yet."},
         {"value": 60, "label": "60 fps", "help": "The 60 fps profile. Needs a GPU that renders the chosen size in under 16.7 ms; otherwise the game drops to a steady 30 for a while (see Max hold at 30 fps)."},
         {"value": 30, "label": "30 fps (locked)", "help": "The shipped 1/30 s timing, paced to an even 30 fps by the host."},
         {"value": 0, "label": "Shipped timing", "help": "Nothing is set: the guest's own present interval holds 30 fps, no host cap."}
@@ -1000,7 +1056,7 @@
     {
       "id": "mcla_fps_cap",
       "label": "Frame cap override",
-      "help": "Overrides the host frame cap that the Frame rate setting chooses. 0 = use the Frame rate setting's own cap. Only 30 and 60 are meaningful.",
+      "help": "Overrides the host frame cap that the Frame rate setting chooses. 0 = use the Frame rate setting's own cap (30, 60 and 120 fps each set theirs: leave this at 0 unless you are testing). Only 30 and 60 are offered here.",
       "category": "performance",
       "type": "enum",
       "cvar": "mcla_fps_cap",
@@ -1588,7 +1644,7 @@
     {
       "id": "mcla_overlay_key_menu",
       "label": "Keyboard: mod menu",
-      "help": "Key that opens and closes the in-game mod menu. Names as above (F1-F24, A-Z, ...). While the menu is open the game gets no input.",
+      "help": "Key that opens and closes the in-game mod menu. Names: F1-F24, A-Z, 0-9, Space, Return, Tab, Escape, ... as for the keyboard bindings. While the menu is open the game gets no input.",
       "category": "controls",
       "type": "string",
       "cvar": "mcla_overlay_key_menu",

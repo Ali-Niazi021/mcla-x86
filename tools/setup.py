@@ -466,7 +466,10 @@ def main() -> int:
         tools = check_tools(work)
         if args.check:
             say("\nwork folder  %s\ngame folder  %s\niso          %s" % (posix(work), posix(game), posix(iso) if iso else "(none given)"))
-            say("compiler     %s" % ("ready" if (work / "toolchain" / ("llvm-%s" % LLVM_VERSION) / "bin" / "clang++.exe").exists()
+            llvm_dir = work / "toolchain" / ("llvm-%s" % LLVM_VERSION)
+            llvm_zip = work / "toolchain" / "dl" / LLVM_FILE
+            say("compiler     %s" % ("ready" if (llvm_dir / "bin" / "clang++.exe").exists()
+                                     else "downloaded, will be unpacked" if llvm_zip.exists() and llvm_zip.stat().st_size == LLVM_BYTES
                                      else "will be downloaded (940 MB)"))
             say("game files   %s" % ("ready" if game_root_of(game) else "will be extracted from the .iso"))
             say("nvidia       %s" % ("skipped (--no-nvidia): no DLSS" if args.no_nvidia else

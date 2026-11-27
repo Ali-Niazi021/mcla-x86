@@ -20,7 +20,7 @@ Reads launcher/schema/settings.json and checks that
 --sdk-src PATH   the SDK source root, the folder that holds src/ and include/. Default $WORK/sdk/src; use
                  $WORK/scratch/ORC-series/sdk/src for the tree the series was applied to in the scratch.
 --schema PATH    default launcher/schema/settings.json.
---work DIR       $WORK (default env MCLA_WORK, else C:/Users/Ali/Development/mcla-x86-work).
+--work DIR       $WORK (default env MCLA_WORK, else the folder mcla-x86-work next to the repo).
 -q               do not print the INFO lines (settings whose emit is not nondefault).
 
 Output: a summary, INFO / WARN / ERROR lines, and as the last line `RESULT OK (<e> errors, <w> warnings)` or
@@ -37,7 +37,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 REPO = Path(__file__).resolve().parents[1]
-DEFAULT_WORK = "C:/Users/Ali/Development/mcla-x86-work"
+_LEGACY_WORK = "C:/Users/Ali/Development/mcla-x86-work"
+DEFAULT_WORK = _LEGACY_WORK if os.path.isdir(_LEGACY_WORK) else (REPO.parent / "mcla-x86-work").as_posix()
 SOURCE_SUFFIXES = (".cpp", ".h", ".cc", ".hpp", ".inc")
 
 # ================================================================================================================

@@ -17,7 +17,8 @@ Usage
         remove a stale lock; with --force remove the lock even if its holder is alive (it then keeps running
         without the lock: use only when the holder is known to be wedged).
 
-Paths: $WORK is --work, else $MCLA_WORK, else C:/Users/Ali/Development/mcla-x86-work.
+Paths: $WORK is --work, else $MCLA_WORK, else the folder mcla-x86-work next to the repo (the owner's old
+C:/Users/Ali/Development/mcla-x86-work when that exists).
     $WORK/locks/heavy.lock     the lock: JSON {pid, pid_created, label, cmd, started, started_epoch, token}
     $WORK/locks/queue/         one ticket file per waiter, named <time_ns>-<pid>-<random>.ticket
 
@@ -52,7 +53,10 @@ import time
 import uuid
 from typing import Dict, List, Optional, Tuple
 
-DEFAULT_WORK = "C:/Users/Ali/Development/mcla-x86-work"
+# The owner's folder when it exists (the global lock lives there for every checkout); on any other machine the folder
+# mcla-x86-work next to the repo, the same place tools/setup.py puts the work folder.
+_LEGACY_WORK = "C:/Users/Ali/Development/mcla-x86-work"
+DEFAULT_WORK = _LEGACY_WORK if os.path.isdir(_LEGACY_WORK) else os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "mcla-x86-work").replace(os.sep, "/")
 LOCK_NAME = "heavy.lock"
 QUEUE_NAME = "queue"
 ENV_TOKEN = "MCLA_HEAVY_LOCK_TOKEN"

@@ -7,8 +7,8 @@
   (no flag)     full config: mcla/codegen/mcla_manifest.toml with all its includes (overrides, harvest, huecos,
                 the four hooks files).
   --baseline    the same manifest with includes = ["overrides.toml"] only: no harvest, no huecos, no hooks.
-  --work W      $WORK (default: env MCLA_WORK, else C:/Users/Ali/Development/mcla-x86-work)
-  --game G      $GAME, the game files (default: env MCLA_GAME, else C:/Users/Ali/Development/dumps/mcla-x360).
+  --work W      $WORK (default: env MCLA_WORK, else the folder mcla-x86-work next to the repo)
+  --game G      $GAME, the game files (default: env MCLA_GAME, else <work>/game).
                 default.xex is taken from $GAME/game/ if it is there, else from $GAME/.
   --rexglue P   the CLI (default: $WORK/sdk/install/bin/rexglue.exe)
   --xex PATH    use this default.xex (its folder becomes the codegen's game root)

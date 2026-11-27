@@ -22,8 +22,11 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 
-DEFAULT_WORK = "C:/Users/Ali/Development/mcla-x86-work"
-DEFAULT_GAME = "C:/Users/Ali/Development/dumps/mcla-x360"
+_LEGACY_WORK = "C:/Users/Ali/Development/mcla-x86-work"
+_LEGACY_GAME = "C:/Users/Ali/Development/dumps/mcla-x360"
+# the owner's folders when they exist; elsewhere the folder mcla-x86-work next to the repo (tools/setup.py's layout)
+DEFAULT_WORK = _LEGACY_WORK if os.path.isdir(_LEGACY_WORK) else (REPO.parent / "mcla-x86-work").as_posix()
+DEFAULT_GAME = _LEGACY_GAME if os.path.isdir(_LEGACY_GAME) else DEFAULT_WORK + "/game"
 
 # Pinned identity of the supported build (Complete Edition, title 545407F8, media 5940C9DB, v0.0.0.8).
 XEX_SHA256 = "c386f4001fa569e6ad4b982f441f67412f00b3f47c166134555cd4b59854a432"

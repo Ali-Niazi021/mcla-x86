@@ -44,7 +44,10 @@ says: "Read docs/AGENT_SETUP.md and docs/NATIVE_PLAN.md before any work; follow 
    it runs, any program of that user can run administrator commands: do not start it on a machine that matters.
    Agents never stop or kill the broker and never run the game itself elevated.
 6. Scripted run: `python tools/run_game.py --flow quick_drive2 --config Release --work <WORK> --game <WORK> --run-id <id>
-   --cvar k=v ...` (118 s; `--summarize <log>` re-reads a log). Use `quick_drive2` / `bench_drive2` for any drive number: the old `quick_drive` / `bench_drive`
+   --cvar k=v ...` (118 s; `--summarize <log>` re-reads a log). `--game` may be `<WORK>` or `<WORK>/game` (the folder that
+   holds default.xex). Without `--work` / `--game` the tools use `MCLA_WORK` / `MCLA_GAME`, else the folder `mcla-x86-work`
+   next to the repo (the one `tools/setup.py` makes) and its `game` folder; on the owner's machine the old
+   `C:/Users/Ali/Development/mcla-x86-work` still wins where it exists (the global lock lives there), so pass `--work`. Use `quick_drive2` / `bench_drive2` for any drive number: the old `quick_drive` / `bench_drive`
    leave the bike parked against a wall (header of `quick_drive2.txt`). Read the speedometer in `--screenshot-every 5` shots to see that it drives. The GPU clock
    moves 1800-2500 MHz between runs (LEARNINGS NATIVE-N): for A/B lock it with `nvidia-smi -lgc 1800,1800` through the broker and reset with `-rgc`. Bench: `tools/bench.py`. Run from PowerShell, not Git
    Bash, for anything that configures CMake (a configure from Git Bash produced an SDK that does not link).

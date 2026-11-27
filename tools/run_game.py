@@ -54,8 +54,8 @@
   --no-lock        do not take the heavy lock (use only when a parent already holds it or for a dry experiment).
   --check-flow     only validate the flow file (same grammar as the host) and print its steps; no lock, no run.
   --summarize X    only parse an existing log and print the display / hitch lines and the run line (re-analysis of a finished run).
-  --work W / --game G   $WORK (default env MCLA_WORK, else C:/Users/Ali/Development/mcla-x86-work) and $GAME
-                   (env MCLA_GAME, else C:/Users/Ali/Development/dumps/mcla-x360; the game files are in $GAME/game).
+  --work W / --game G   $WORK (default env MCLA_WORK, else the folder mcla-x86-work next to the repo) and $GAME
+                   (env MCLA_GAME, else <work>/game; the game files are in $GAME/game or $GAME itself).
 
 Schedule steps (the host's SchedStep, src/host/input_script.h; tools/segments.py cuts a run at them)
   <seconds>:set <cvar>=<value>   the host changes a run-time cvar then. cvar [A-Za-z0-9_]+ (not burn / burnmem / burngpu / mark); value
@@ -205,8 +205,9 @@ if str(HERE) not in sys.path:  # tools/ is on sys.path when run as a script; thi
 import display_log  # noqa: E402
 import heavy_lock  # noqa: E402
 
-DEFAULT_WORK = "C:/Users/Ali/Development/mcla-x86-work"
-DEFAULT_GAME = "C:/Users/Ali/Development/dumps/mcla-x360"
+DEFAULT_WORK = heavy_lock.DEFAULT_WORK
+LEG_GAME = "C:/Users/Ali/Development/dumps/mcla-x360"   # the owner's old game folder (the files are in <it>/game)
+DEFAULT_GAME = LEG_GAME if os.path.isdir(LEG_GAME) else DEFAULT_WORK + "/game"
 DEFAULT_CONFIG = "RelWithDebInfo"
 DEFAULT_SECONDS = 180.0
 TITLE_ID = "545407F8"
@@ -1764,6 +1765,8 @@ def run(opts: RunOptions, on_start: Optional[Callable[[int, Path], None]] = None
         raise Fail("no game executable at %s (build it: cmake --build %s --config %s; or pass --exe)"
                    % (posix(exe), posix(work / "build"), opts.config))
     game_root = game / "game"
+    if not (game_root / "default.xex").is_file() and (game / "default.xex").is_file():
+        game_root = game  # $GAME is the folder with default.xex itself (tools/setup.py: <work>/game, MCLA_GAME)
     if not (game_root / "default.xex").is_file():
         raise Fail("no default.xex in %s (python tools/xiso.py extract <iso> %s)" % (posix(game_root), posix(game_root)))
     # No --fixture: the flow's `# fixture:` header (as bench.py does), so `--flow quick_drive` alone reaches free roam.
