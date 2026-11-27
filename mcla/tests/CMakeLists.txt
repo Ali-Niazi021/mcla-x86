@@ -24,6 +24,10 @@
 #                                                              environment map sizes, the governor's VRS rungs above a base level).
 #                                                              constexpr tests: the compiler runs them (-fsyntax-only is a test run)
 #
+#   mcla_cheat_test            test_cheat.cpp                  hooks/mcla_cheat_math.h (the classic cheats: the screens they may act on, holding and
+#                                                              giving back one of the game's flag words, the time scale that multiplies the game's own
+#                                                              and never compounds, the money arithmetic with the game's limits, the pointer checks).
+#                                                              constexpr tests: the compiler runs them (-fsyntax-only is a test run)
 #   mcla_overlay_test          test_overlay.cpp                src/host/overlay/overlay_math.h (frame-time statistics, world speed,
 #                                                              rates, graph bars, font choice, hitch phrases), overlay_json.h (the
 #                                                              launcher.json merge) and overlay_feed.cpp (the lock-free frame ring)
@@ -41,7 +45,7 @@
 #
 # Input, set by the root CMakeLists.txt before add_subdirectory(mcla/tests) or with -D on the command line:
 #   MCLA_HOOKS_DIR   directory with mcla_t_sim_math.h, frame_clock_policy.h, mcla_game_state.h, mcla_game_state.cpp,
-#                    mcla_ws_sizing.h, mcla_t_swap_target.h, mcla_gov_math.h and mcla_gfx_res_math.h.
+#                    mcla_ws_sizing.h, mcla_t_swap_target.h, mcla_gov_math.h, mcla_gfx_res_math.h and mcla_cheat_math.h.
 #                    Default: ../hooks (mcla/hooks). A relative value is taken from the top-level source directory.
 #
 # From the root: add_subdirectory(mcla/tests) (the root calls enable_testing()). Alone, with no SDK or toolchain
@@ -60,7 +64,7 @@ get_filename_component(_mcla_tests_hooks_dir "${MCLA_HOOKS_DIR}" ABSOLUTE BASE_D
 
 # Say so at configure time when the GAME slice's files are not where the tests expect them.
 foreach(_mcla_tests_input IN ITEMS mcla_t_sim_math.h frame_clock_policy.h mcla_game_state.h mcla_game_state.cpp
-                                   mcla_ws_sizing.h mcla_t_swap_target.h mcla_gov_math.h mcla_gfx_res_math.h)
+                                   mcla_ws_sizing.h mcla_t_swap_target.h mcla_gov_math.h mcla_gfx_res_math.h mcla_cheat_math.h)
   if(NOT EXISTS "${_mcla_tests_hooks_dir}/${_mcla_tests_input}")
     message(FATAL_ERROR "mcla/tests: ${_mcla_tests_input} not found in MCLA_HOOKS_DIR (${_mcla_tests_hooks_dir})")
   endif()
@@ -100,6 +104,9 @@ target_include_directories(mcla_swap_target_test PRIVATE "${_mcla_tests_hooks_di
 
 mcla_add_unit_test(mcla_gov_test 23 test_gov.cpp)
 target_include_directories(mcla_gov_test PRIVATE "${_mcla_tests_hooks_dir}")
+
+mcla_add_unit_test(mcla_cheat_test 23 test_cheat.cpp)
+target_include_directories(mcla_cheat_test PRIVATE "${_mcla_tests_hooks_dir}")
 
 # The overlay's pure parts live with the host (src/host/overlay), not with the hooks: found by path, not by MCLA_HOOKS_DIR.
 mcla_add_unit_test(mcla_overlay_test 23 test_overlay.cpp "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/overlay/overlay_feed.cpp")
