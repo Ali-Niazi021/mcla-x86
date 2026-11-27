@@ -92,9 +92,11 @@ A follow-up check is a new task with a fresh brief, not a continuation.
 - Watch Claude usage: at 98 % of the 5-hour limit, pause until it resets, then continue. `tools/usage_watch.py` reads the
   subscription's usage with the Claude Code login (owner-approved; it never prints or refreshes the token) and writes
   `$WORK/usage/usage.json`. Procedure for the lead:
-  1. Keep `python tools/usage_watch.py --until 96 --interval 180` running as a background command (the harness wakes the
-     lead when it exits; relaunch it when it ends on the 2-hour background limit). Exit 20 = monitoring is off: say so.
-  2. On exit 10 (>= 96 %): start nothing new; commit and push what is verified; update the status board; tell every
+  1. A recurring scheduled prompt (the harness's cron tool, every 20 minutes at off-minutes; session-only, re-create it in
+     a new session) makes the lead run `python tools/usage_watch.py` and act on the number. The background mode
+     `--until 96` also works, but a harness background command lives 2 hours at most and is not relaunched after that.
+     A read that fails = monitoring is off: say so.
+  2. At >= 96 % (from 90 % on: start nothing new): start nothing new; commit and push what is verified; update the status board; tell every
      running agent to finish its current step, write its state and partial results to its scratch folder, restore the
      display mode if it holds the machine, and stop. Be idle before 98 %.
   3. Wait with `python tools/usage_watch.py --until-reset` (exit 11 = the window reset), then resume from the status board.
