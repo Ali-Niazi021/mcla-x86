@@ -8,6 +8,10 @@
 //                    events so the game never sees them. Key and button RELEASES always pass (nothing sticks); a key held
 //                    since before the menu opened is "not down" for the game until it is pressed again. The drivers are also
 //                    told to go quiet (the active callback of OnRuntimeReady), which silences the pads and the mouse capture.
+//   PadTap           the controller, game thread: once per engine frame it asks the input system for the pad's state (with the
+//                    input drivers told they are active, whatever the menu says: the game's own poll is the one that is muted),
+//                    detects the chord that opens the menu, and keeps the game's pad quiet while the menu is open and until the
+//                    buttons held at its close are up. The menu (UI thread) reads the newest sample and feeds ImGui's gamepad keys.
 //   Overlay          the state: what is shown (the cvars mcla_overlay_fps / _stats, and the menu), the one ImGui dialog that
 //                    exists only while something is shown, the sampler, the menu's tab.
 //   OverlayDialog    the ImGuiDialog whose OnDraw draws the FPS counter, the statistics window and the menu.
@@ -25,6 +29,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <bitset>
 #include <cfloat>
 #include <cmath>
@@ -34,6 +39,7 @@
 #include <filesystem>
 #include <initializer_list>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -41,7 +47,9 @@
 #include <fmt/format.h>
 #include <imgui.h>
 #include <rex/cvar.h>
+#include <rex/input/input.h>
 #include <rex/input/input_system.h>
+#include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/logging.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
@@ -54,6 +62,7 @@
 #include "overlay_feed.h"
 #include "overlay_items.h"
 #include "overlay_math.h"
+#include "overlay_pad.h"
 #include "overlay_sample.h"
 
 // ---- cvars ----------------------------------------------------------------------------------------------------------------
@@ -90,6 +99,17 @@ REXCVAR_DEFINE_INT32(mcla_overlay_tab, 0, "MCLA",
                      "scripted runs); clicking a tab does not change it. Never saved. Live")
     .range(0, 4)
     .transient();
+REXCVAR_DEFINE_BOOL(mcla_overlay_pad, true, "MCLA",
+                    "The overlay with a controller: the chord (mcla_overlay_pad_chord) opens and closes the mod menu and the menu is "
+                    "operated with the D-pad, the buttons and the bumpers. Off: the pad is not looked at and the menu is for the keyboard "
+                    "and the mouse only. Live");
+REXCVAR_DEFINE_INT32(mcla_overlay_pad_chord, 1, "MCLA",
+                     "The controller buttons that open and close the mod menu when held together for mcla_overlay_pad_hold_ms with no "
+                     "other button down: 1 both stick clicks (L3 + R3), 2 Back + Start, 3 LB + RB + Back, 0 none. Live")
+    .range(0, 3);
+REXCVAR_DEFINE_INT32(mcla_overlay_pad_hold_ms, 500, "MCLA",
+                     "How long the controller chord must be held (milliseconds) to open or close the mod menu. Live")
+    .range(200, 2000);
 REXCVAR_DEFINE_STRING(mcla_overlay_key_menu, "F1", "Input/Keybinds/System", "Open or close the mod menu");
 REXCVAR_DEFINE_STRING(mcla_overlay_key_fps, "F2", "Input/Keybinds/System", "Show or hide the FPS counter");
 REXCVAR_DEFINE_STRING(mcla_overlay_key_stats, "F5", "Input/Keybinds/System", "Show or hide the statistics screen");
@@ -106,10 +126,43 @@ constexpr float kFontPixels[] = {14.0f, 17.0f, 21.0f, 26.0f, 33.0f};
 constexpr int kFontCount = int(sizeof(kFontPixels) / sizeof(kFontPixels[0]));
 ImFont* g_fonts[kFontCount] = {};
 
+namespace pad = mcla_overlay::pad;
+using rex::X_RESULT;  // the SDK's X_ERROR_* macros expand to the unqualified type
+
 // The menu is open: read by the input drivers' active callback on the game thread, by the gate and by the dialog.
 std::atomic<bool> g_menu_open{false};
 // Auto-repeat key-down events the gate saw since the menu was last closed (a line in the log: whether a held key repeats at all).
 std::atomic<uint32_t> g_key_repeats{0};
+
+// ---- the controller: shared by the game thread (PadTap) and the UI thread ---------------------------------------------------------
+thread_local bool t_pad_probe = false;       // this thread is making the overlay's own look at the pad: the drivers answer as if active
+pad::HoldOff g_game_hold;                    // the game's pad stays quiet until these inputs (held at the chord / the close) are up
+std::atomic<int64_t> g_open_pending_ms{0};   // the chord was completed and the UI thread has not opened the menu yet (steady ms; 0 = no)
+std::atomic<int> g_tap_busy{0};              // threads inside PadTap (Shutdown waits for them)
+rex::input::InputSystem* g_input = nullptr;  // set before the tap is installed, cleared after it is removed
+
+int64_t NowMs() { return mcla_overlay::NowNs() / 1'000'000; }
+
+// The newest look at the pad (written by the game thread once per engine frame, read by the UI thread).
+struct PadSample {
+  uint32_t bits = 0;       // pad::Digitize()
+  pad::Raw raw;            // the analog values (the right stick scrolls the menu)
+  int64_t at_ms = 0;
+  bool connected = false;  // the input system had a pad (or the script pad) for user 0
+};
+std::mutex g_sample_mutex;
+PadSample g_sample;
+constexpr int64_t kSampleStaleMs = 1000;  // a game thread that has not looked for this long (a stall) leaves no input behind
+
+PadSample LatestPad(int64_t now_ms) {
+  PadSample s;
+  {
+    std::lock_guard<std::mutex> lock(g_sample_mutex);
+    s = g_sample;
+  }
+  if (!s.connected || now_ms - s.at_ms > kSampleStaleMs) return PadSample();
+  return s;
+}
 
 constexpr ImVec4 kGood{0.45f, 0.95f, 0.45f, 1.0f};
 constexpr ImVec4 kWarn{1.00f, 0.80f, 0.30f, 1.0f};
@@ -138,6 +191,10 @@ class Overlay {
   void OpenMenu();
   void CloseMenu();
   void ToggleMenu() { menu_open() ? CloseMenu() : OpenMenu(); }
+  // Game thread: the controller chord completed. Opens or closes the menu on the UI thread.
+  void RequestPadToggle(bool open);
+  void OpenMenuFromPad();
+  pad::DeviceTracker& devices() { return devices_; }
   // Toggles a bool cvar the way the player's key does: through the registry, remembered for Save when `track`.
   void ToggleCvar(const char* name, bool track);
 
@@ -160,6 +217,12 @@ class Overlay {
   void Section(const char* title, std::initializer_list<const Item*> items);
   void Row(const Item& item);
   void Footer();
+  // The controller (UI thread).
+  void PadFrame(ImGuiIO& io, int64_t now_ms);
+  void FeedPadKeys(ImGuiIO& io, uint32_t want, float scroll);
+  void SaveFromMenu();
+  void FocusRing() const;
+  void Legend();
 
   rex::ui::Window* window_;
   rex::ui::ImGuiDrawer* drawer_;
@@ -184,6 +247,25 @@ class Overlay {
   std::vector<std::string> restart_pending_;  // cvars changed that apply at the next start (this frame's list)
   bool cheats_allowed_ = false;
   bool gov_on_ = false;
+
+  // The controller: while the menu is open from a session that has the pad on (mcla_overlay_pad at the open).
+  bool pad_session_ = false;
+  pad::MenuPad menu_pad_;             // the mapping of the pad to the menu's keys and actions
+  pad::HoldOff menu_gate_;            // inputs held when the menu opened are not presses
+  pad::DeviceTracker devices_;        // the last input device: the legend and the mouse cursor follow it
+  pad::MenuOut pad_out_;              // this frame's pad actions
+  pad::Focus focus_now_ = pad::Focus::kOther;   // what the focused row is, found while drawing this frame
+  pad::Focus focus_last_ = pad::Focus::kOther;  // ... and last frame's (what the pad's left / right does now)
+  uint32_t pad_bits_prev_ = 0;        // last frame's inputs after the hold-off (for the device tracker)
+  uint32_t fed_ = 0;                  // ImGui gamepad keys held now (kFed* bits)
+  float fed_scroll_ = 0.0f;
+  bool focus_first_ = false;          // the first row of the tab takes the focus (after the open, after a tab change)
+  bool nav_init_ = false;             // show the navigation cursor in the next frame
+  bool nav_visible_ = false;          // ImGui draws the navigation cursor (a key or a pad was used last)
+  ImGuiBackendFlags saved_backend_flags_ = 0;
+  float saved_repeat_delay_ = 0.275f, saved_repeat_rate_ = 0.05f;
+  bool saved_mouse_look_ = true;
+  int64_t pad_log_ms_ = 0;            // rate limit of the "pad changed a value" log line
 };
 
 class OverlayDialog final : public rex::ui::ImGuiDialog {
@@ -252,6 +334,31 @@ void Overlay::OpenMenu() {
   ImGuiIO& io = drawer_->GetIO();
   saved_config_flags_ = io.ConfigFlags;
   io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+  pad_session_ = REXCVAR_GET(mcla_overlay_pad);
+  if (pad_session_) {
+    // The controller: ImGui's gamepad navigation on (the flag and the backend's "a gamepad is there"), slower key repeat for a TV, no
+    // mouse capture for the right stick (the poll makes the drivers active), and what the pad holds now is not a press.
+    const int64_t now = NowMs();
+    saved_backend_flags_ = io.BackendFlags;
+    saved_repeat_delay_ = io.KeyRepeatDelay;
+    saved_repeat_rate_ = io.KeyRepeatRate;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+    io.KeyRepeatDelay = 0.40f;
+    io.KeyRepeatRate = 0.09f;
+    saved_mouse_look_ = rex::input::mnk::IsMouseLookActive();
+    rex::input::mnk::SetMouseLookActive(false);
+    menu_gate_.Begin(LatestPad(now).bits, now);
+    menu_pad_.Reset();
+    pad_bits_prev_ = 0;
+    fed_ = 0;
+    fed_scroll_ = 0.0f;
+    focus_now_ = focus_last_ = pad::Focus::kOther;
+    pad_out_ = pad::MenuOut();
+    focus_first_ = nav_init_ = devices_.last() == pad::Device::kPad;
+    REXLOG_INFO("[mcla-overlay] pad: the menu answers the controller (last input: {}; {} input(s) held at the open are ignored until released)",
+                devices_.last() == pad::Device::kPad ? "pad" : "keyboard / mouse", std::popcount(menu_gate_.Mask()));
+  }
   if (!have_about_) {
     have_about_ = true;
     about_ = mcla_overlay::CollectAbout(window_->GetNativeWindowHandle());
@@ -261,8 +368,27 @@ void Overlay::OpenMenu() {
 
 void Overlay::CloseMenu() {
   if (!menu_open()) return;
+  if (pad_session_) {
+    // A button held at the close (the B that closed it, the chord) must not reach the game until it is up: the game's pad stays quiet
+    // until each input held now has been released (PadTap ends it). Begun BEFORE the menu stops muting, so there is no gap.
+    const int64_t now = NowMs();
+    const uint32_t held = LatestPad(now).bits;
+    if (held != 0) {
+      g_game_hold.Begin(held, now);
+      REXLOG_INFO("[mcla-overlay] pad: {} input(s) held at the close (0x{:X}): the game's pad stays quiet until they are released",
+                  std::popcount(held), held);
+    }
+  }
   g_menu_open.store(false, std::memory_order_relaxed);
   ImGuiIO& io = drawer_->GetIO();
+  if (pad_session_) {
+    FeedPadKeys(io, 0, 0.0f);  // nothing stays pressed inside ImGui
+    io.BackendFlags = saved_backend_flags_;
+    io.KeyRepeatDelay = saved_repeat_delay_;
+    io.KeyRepeatRate = saved_repeat_rate_;
+    rex::input::mnk::SetMouseLookActive(saved_mouse_look_);
+    pad_session_ = false;
+  }
   io.ConfigFlags = saved_config_flags_;
   window_->SetCursorVisibility(saved_cursor_);
   rex::cvar::SetFlagByName("mcla_overlay_menu", "false");
@@ -275,6 +401,116 @@ void Overlay::ToggleCvar(const char* name, bool track) {
   Refresh();
 }
 
+void Overlay::RequestPadToggle(bool open) {
+  window_->app_context().CallInUIThreadDeferred([open] {
+    if (!g_overlay) return;
+    if (open) {
+      g_overlay->OpenMenuFromPad();
+    } else {
+      g_overlay->CloseMenu();
+    }
+  });
+}
+
+void Overlay::OpenMenuFromPad() {
+  devices_.Force(pad::Device::kPad);
+  OpenMenu();
+  g_open_pending_ms.store(0, std::memory_order_relaxed);  // the menu mutes the game itself from here on
+}
+
+// ---- the controller's game-thread half ----------------------------------------------------------------------------------------
+
+// Once per engine frame on the game thread (overlay_feed.h SetFrameTap): the thread that polls the pads, so asking the input system
+// for the state here cannot race its device list. The drivers are made active for this one call (t_pad_probe), whatever the menu
+// says: the game's own poll, a moment later, is the one that gets zeros.
+void PadTap(int64_t now_ns) {
+  struct Busy {
+    Busy() { g_tap_busy.fetch_add(1, std::memory_order_acq_rel); }
+    ~Busy() { g_tap_busy.fetch_sub(1, std::memory_order_acq_rel); }
+  } busy;
+  static uint32_t prev_bits = 0;
+  static pad::ChordDetector chord;
+  static bool reported = false, was_connected = false;
+  Overlay* overlay = g_overlay;
+  rex::input::InputSystem* input = g_input;
+  if (!overlay || !input) return;
+  const int64_t now_ms = now_ns / 1'000'000;
+  if (!REXCVAR_GET(mcla_overlay_pad)) {
+    // Off, or switched off while the game's pad was quiet: it has its pad back at once.
+    g_game_hold.Clear();
+    g_open_pending_ms.store(0, std::memory_order_relaxed);
+    chord.Reset();
+    prev_bits = 0;
+    return;
+  }
+  const int chord_id = REXCVAR_GET(mcla_overlay_pad_chord);
+  if (!overlay->menu_open() && chord_id == 0 && !g_game_hold.Active() && g_open_pending_ms.load(std::memory_order_relaxed) == 0) {
+    chord.Reset();  // nothing wants the pad: no look at all
+    prev_bits = 0;
+    return;
+  }
+
+  rex::input::X_INPUT_STATE state = {};
+  t_pad_probe = true;
+  const X_RESULT result = input->GetState(0, &state);
+  t_pad_probe = false;
+  PadSample sample;
+  sample.at_ms = now_ms;
+  if (result == X_ERROR_SUCCESS) {
+    const rex::input::X_INPUT_GAMEPAD& g = state.gamepad;
+    sample.connected = true;
+    sample.raw.buttons = uint16_t(g.buttons);
+    sample.raw.lt = g.left_trigger;
+    sample.raw.rt = g.right_trigger;
+    sample.raw.lx = int16_t(g.thumb_lx);
+    sample.raw.ly = int16_t(g.thumb_ly);
+    sample.raw.rx = int16_t(g.thumb_rx);
+    sample.raw.ry = int16_t(g.thumb_ry);
+    sample.bits = pad::Digitize(sample.raw, prev_bits);
+  }
+  prev_bits = sample.bits;
+  {
+    std::lock_guard<std::mutex> lock(g_sample_mutex);
+    g_sample = sample;
+  }
+  if (!reported || sample.connected != was_connected) {
+    reported = true;
+    was_connected = sample.connected;
+    REXLOG_INFO("[mcla-overlay] pad: {}", sample.connected ? "a controller is connected (guest user 0)" : "no controller (guest user 0)");
+  }
+
+  // The game's pad: quiet until the inputs held at the chord / at the close are up.
+  const bool was_held = g_game_hold.Active();
+  const int64_t held_since = g_game_hold.StartMs();
+  g_game_hold.Update(sample.bits, now_ms);
+  if (was_held && !g_game_hold.Active()) {
+    REXLOG_INFO("[mcla-overlay] pad: released after {} ms: the game has its pad again", now_ms - held_since);
+  }
+  if (g_game_hold.TakeExpired()) {
+    REXLOG_WARN("[mcla-overlay] pad: an input is still held {} ms after the close (a stuck button or stick?): the game has its pad again",
+                pad::HoldOff::kTimeoutMs);
+  }
+  const int64_t pending = g_open_pending_ms.load(std::memory_order_relaxed);
+  if (pending != 0 && now_ms - pending > 1500) {
+    g_open_pending_ms.store(0, std::memory_order_relaxed);  // the UI thread never opened it (shut down?): do not keep the pad quiet
+    REXLOG_WARN("[mcla-overlay] pad: the menu did not open within 1.5 s of the chord");
+  }
+
+  // The chord: opens the menu, or closes it when it is open.
+  const int64_t hold_ms = REXCVAR_GET(mcla_overlay_pad_hold_ms);
+  if (chord.Update(sample.bits, pad::ChordMask(chord_id), now_ms, hold_ms)) {
+    const bool is_open = overlay->menu_open() || g_open_pending_ms.load(std::memory_order_relaxed) != 0;
+    REXLOG_INFO("[mcla-overlay] pad: chord {} held {} ms: {} the menu", pad::ChordText(chord_id), chord.HeldMs(now_ms),
+                is_open ? "closing" : "opening");
+    if (!is_open) {
+      // Quiet from this very frame: the game's poll that follows must not see the chord's buttons.
+      g_game_hold.Begin(sample.bits, now_ms);
+      g_open_pending_ms.store(std::max<int64_t>(now_ms, 1), std::memory_order_relaxed);
+    }
+    overlay->RequestPadToggle(!is_open);
+  }
+}
+
 // ---- the key listener -------------------------------------------------------------------------------------------------------
 
 class Gate final : public rex::ui::WindowInputListener {
@@ -282,6 +518,7 @@ class Gate final : public rex::ui::WindowInputListener {
   void OnKeyDown(rex::ui::KeyEvent& e) override {
     if (!g_overlay) return;
     const bool open = g_overlay->menu_open();
+    if (!e.prev_state()) g_overlay->devices().NoteKey();  // the keyboard was used last (the legend follows)
     const rex::ui::VirtualKey vk = e.virtual_key();
     const size_t index = size_t(vk);
     if (!open && index < pressed_in_menu_.size() && pressed_in_menu_[index]) {
@@ -332,9 +569,19 @@ class Gate final : public rex::ui::WindowInputListener {
   void OnKeyChar(rex::ui::KeyEvent& e) override {
     if (g_overlay && g_overlay->menu_open()) e.set_handled(true);
   }
-  void OnMouseDown(rex::ui::MouseEvent& e) override { Swallow(e); }
-  void OnMouseMove(rex::ui::MouseEvent& e) override { Swallow(e); }
-  void OnMouseWheel(rex::ui::MouseEvent& e) override { Swallow(e); }
+  void OnMouseDown(rex::ui::MouseEvent& e) override {
+    if (g_overlay && g_overlay->menu_open()) g_overlay->devices().NoteKey();
+    Swallow(e);
+  }
+  void OnMouseMove(rex::ui::MouseEvent& e) override {
+    if (g_overlay && g_overlay->menu_open()) g_overlay->devices().NoteMouseMove(float(e.x()), float(e.y()));
+    Swallow(e);
+  }
+  void OnMouseWheel(rex::ui::MouseEvent& e) override {
+    if (g_overlay && g_overlay->menu_open()) g_overlay->devices().NoteKey();
+    Swallow(e);
+  }
+
  private:
   std::bitset<256> pressed_in_menu_;  // keys whose down went to the menu (UI thread only)
   uint32_t repeats_swallowed_[256] = {};  // auto-repeats of such a key after the menu closed (for the log)
@@ -592,6 +839,43 @@ void Overlay::DrawStats(const ImGuiIO& io, float em, bool interactive) {
 
 // ---- the menu: rows -------------------------------------------------------------------------------------------------------
 
+namespace {
+
+// How many decimals a slider's format shows ("%.2f x" -> 2, "%d" -> 0): a stepped value is rounded to them, so 0.75 stays 0.75 and not
+// 0.7500000001 (which the "changed from the default" test would call a change).
+int DecimalsOf(const char* format) {
+  if (!format) return 2;
+  const char* dot = std::strchr(format, '.');
+  if (dot && dot[1] >= '0' && dot[1] <= '9') return dot[1] - '0';
+  return std::strstr(format, "%d") ? 0 : 2;
+}
+
+// What one press of left / right changes a float slider by: a fiftieth of its range, never less than the last decimal it shows.
+double FloatUnit(const mcla_overlay::Item& it) {
+  return std::max((it.max - it.min) / 50.0, std::pow(10.0, -DecimalsOf(it.format)));
+}
+
+double RoundTo(double v, int decimals) {
+  const double k = std::pow(10.0, decimals);
+  return std::round(v * k) / k;
+}
+
+// The focus the controller (or the keyboard) has: a band across the row and a thick ring round the item, in a colour that reads
+// from across a room. ImGui's own 2 px cursor stays (the same colour) for the items that do not draw the ring.
+constexpr ImU32 kFocusBand = IM_COL32(255, 214, 64, 52);
+constexpr ImU32 kFocusRing = IM_COL32(255, 214, 64, 255);
+
+}  // namespace
+
+void Overlay::FocusRing() const {
+  if (!nav_visible_ || !ImGui::IsItemFocused()) return;
+  const float em = ImGui::GetFontSize();
+  const float grow = 0.10f * em;
+  const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+  ImGui::GetWindowDrawList()->AddRect(ImVec2(a.x - grow, a.y - grow), ImVec2(b.x + grow, b.y + grow), kFocusRing, 0.30f * em, 0,
+                                      0.16f * em);
+}
+
 void Overlay::Row(const Item& it) {
   using namespace mcla_overlay;
   const bool is_cheat = (it.flags & kFlagCheat) != 0;
@@ -618,10 +902,36 @@ void Overlay::Row(const Item& it) {
   ImGui::TableNextColumn();
   ImGui::SetNextItemWidth(-FLT_MIN);
   ImGui::PushID(it.cvar);
+  // The controller: this frame's left / right steps act on the item that has the focus. `row_focused`: a widget of this row has it.
+  const int steps = pad_out_.adjust;
+  const int mult = pad_out_.adjust_mult;
+  bool row_focused = false;
+  if (focus_first_ && !disabled_why) {
+    ImGui::SetKeyboardFocusHere();  // the first row of a tab takes the focus (after the open and after LB / RB)
+    focus_first_ = false;
+  }
+  // A line in the log for a change the pad made (one per 400 ms: a held button repeats).
+  auto pad_log = [&](const std::string& value) {
+    const int64_t now = NowMs();
+    if (now - pad_log_ms_ < 400) return;
+    pad_log_ms_ = now;
+    REXLOG_INFO("[mcla-overlay] pad: {} ({}) -> {}", it.label, it.cvar, value);
+  };
   switch (it.kind) {
     case Kind::kToggle: {
       bool v = CvarBool(it.cvar);
-      if (ImGui::Checkbox("##v", &v)) {
+      bool changed = ImGui::Checkbox("##v", &v);
+      if (ImGui::IsItemFocused()) {
+        row_focused = true;
+        focus_now_ = pad::Focus::kToggle;
+        if (!changed && steps != 0 && v != (steps > 0)) {
+          v = steps > 0;
+          changed = true;
+          pad_log(v ? "on" : "off");
+        }
+        FocusRing();
+      }
+      if (changed) {
         SetCvarBool(it.cvar, v, !is_cheat);
         if (std::strcmp(it.cvar, "mcla_overlay_fps") == 0 || std::strcmp(it.cvar, "mcla_overlay_stats") == 0) Refresh();
         if (std::strcmp(it.cvar, "mcla_overlay_cheats") == 0 && !v && AnyCheatActive()) {
@@ -634,20 +944,52 @@ void Overlay::Row(const Item& it) {
     }
     case Kind::kInt: {
       int v = int(CvarNumber(it.cvar));
-      if (ImGui::SliderInt("##v", &v, int(it.min), int(it.max), it.format)) SetCvarNumber(it.cvar, double(v), !is_cheat);
+      bool changed = ImGui::SliderInt("##v", &v, int(it.min), int(it.max), it.format);
+      if (ImGui::IsItemFocused()) {
+        row_focused = true;
+        focus_now_ = pad::Focus::kSlider;
+        if (!changed && steps != 0) {
+          const int nv = int(std::lround(pad::StepValue(double(v), steps, mult, 1.0, it.min, it.max)));
+          if (nv != v) {
+            v = nv;
+            changed = true;
+            pad_log(std::to_string(v));
+          }
+        }
+        FocusRing();
+      }
+      if (changed) SetCvarNumber(it.cvar, double(v), !is_cheat);
       break;
     }
     case Kind::kFloat: {
       float v = float(CvarNumber(it.cvar));
-      if (ImGui::SliderFloat("##v", &v, float(it.min), float(it.max), it.format)) SetCvarNumber(it.cvar, double(v), !is_cheat);
+      bool changed = ImGui::SliderFloat("##v", &v, float(it.min), float(it.max), it.format);
+      if (ImGui::IsItemFocused()) {
+        row_focused = true;
+        focus_now_ = pad::Focus::kSlider;
+        if (!changed && steps != 0) {
+          const double nv = RoundTo(pad::StepValue(double(v), steps, mult, FloatUnit(it), it.min, it.max), DecimalsOf(it.format));
+          if (std::fabs(nv - double(v)) > 1e-9) {
+            v = float(nv);
+            changed = true;
+            pad_log(fmt::format("{:.4g}", nv));
+          }
+        }
+        FocusRing();
+      }
+      if (changed) SetCvarNumber(it.cvar, double(v), !is_cheat);
       break;
     }
     case Kind::kChoice: {
       const std::string current = CvarString(it.cvar);
       const char* preview = nullptr;
       std::string custom;
+      int current_index = -1;
       for (int i = 0; i < it.choice_count; ++i) {
-        if (current == it.choices[i].value) preview = it.choices[i].label;
+        if (current == it.choices[i].value) {
+          preview = it.choices[i].label;
+          current_index = i;
+        }
       }
       if (!preview) {
         custom = fmt::format("{} (custom)", current);
@@ -662,6 +1004,17 @@ void Overlay::Row(const Item& it) {
           if (selected) ImGui::SetItemDefaultFocus();
         }
         ImGui::EndCombo();
+      } else if (ImGui::IsItemFocused()) {
+        row_focused = true;
+        focus_now_ = pad::Focus::kChoice;
+        if (steps != 0) {
+          const int next = pad::StepChoice(current_index, steps, it.choice_count);
+          if (next >= 0 && next != current_index) {
+            SetCvar(it.cvar, it.choices[next].value, !is_cheat);
+            pad_log(it.choices[next].label);
+          }
+        }
+        FocusRing();
       }
       break;
     }
@@ -669,46 +1022,99 @@ void Overlay::Row(const Item& it) {
     case Kind::kHoldFloat: {
       const double value = CvarNumber(it.cvar);
       bool held = std::fabs(value - it.off_value) > 1e-6;
-      if (ImGui::Checkbox("##hold", &held)) {
+      bool hold_changed = ImGui::Checkbox("##hold", &held);
+      if (ImGui::IsItemFocused()) {
+        row_focused = true;
+        focus_now_ = pad::Focus::kToggle;
+        if (!hold_changed && steps != 0 && held != (steps > 0)) {
+          held = steps > 0;
+          hold_changed = true;
+          pad_log(held ? "held" : "released");
+        }
+        FocusRing();
+      }
+      if (hold_changed) {
         SetCvarNumber(it.cvar, held ? it.on_value : it.off_value, !is_cheat);
       }
       ImGui::SameLine();
       ImGui::SetNextItemWidth(-FLT_MIN);
       if (!held) ImGui::BeginDisabled();
-      float v = float(held ? value : it.on_value);
+      float v = float(held && !hold_changed ? value : it.on_value);
+      bool changed = false;
       if (it.kind == Kind::kHoldInt) {
         int iv = int(std::lround(v));
-        if (ImGui::SliderInt("##v", &iv, int(it.min), int(it.max), it.format)) SetCvarNumber(it.cvar, double(iv), !is_cheat);
+        changed = ImGui::SliderInt("##v", &iv, int(it.min), int(it.max), it.format);
+        if (ImGui::IsItemFocused()) {
+          row_focused = true;
+          focus_now_ = pad::Focus::kSlider;
+          if (!changed && steps != 0) {
+            const int nv = int(std::lround(pad::StepValue(double(iv), steps, mult, 1.0, it.min, it.max)));
+            if (nv != iv) {
+              iv = nv;
+              changed = true;
+              pad_log(std::to_string(iv));
+            }
+          }
+          FocusRing();
+        }
+        v = float(iv);
       } else {
-        if (ImGui::SliderFloat("##v", &v, float(it.min), float(it.max), it.format)) SetCvarNumber(it.cvar, double(v), !is_cheat);
+        changed = ImGui::SliderFloat("##v", &v, float(it.min), float(it.max), it.format);
+        if (ImGui::IsItemFocused()) {
+          row_focused = true;
+          focus_now_ = pad::Focus::kSlider;
+          if (!changed && steps != 0) {
+            const double nv = RoundTo(pad::StepValue(double(v), steps, mult, FloatUnit(it), it.min, it.max), DecimalsOf(it.format));
+            if (std::fabs(nv - double(v)) > 1e-9) {
+              v = float(nv);
+              changed = true;
+              pad_log(fmt::format("{:.4g}", nv));
+            }
+          }
+          FocusRing();
+        }
       }
+      if (changed) SetCvarNumber(it.cvar, double(v), !is_cheat);
       if (!held) ImGui::EndDisabled();
       break;
     }
     case Kind::kPreset: {
       const std::string current = CurrentPresetName();
-      const PresetOption* shown = &kPresets[0];
-      for (const PresetOption& option : kPresets) {
-        if (current == option.value) shown = &option;
+      const int count = int(std::size(kPresets));
+      int shown_index = 0;
+      for (int i = 0; i < count; ++i) {
+        if (current == kPresets[i].value) shown_index = i;
       }
-      if (ImGui::BeginCombo("##v", shown->label)) {
+      auto apply = [this](const PresetOption& option) {
+        const int n = ApplyDetailPreset(option.value, gov_on_);
+        if (n < 0) {
+          status_ = fmt::format("Preset {} is not known to this build.", option.label);
+        } else if (gov_on_) {
+          status_ = fmt::format("Preset {}: adaptive detail now starts from tier {} (its floor) and goes up to its ceiling.",
+                                option.label, PresetFloorTier(option.value));
+        } else {
+          status_ = fmt::format("Preset {}: {} knob(s) set (a knob you set yourself kept its value).", option.label, n);
+        }
+      };
+      if (ImGui::BeginCombo("##v", kPresets[shown_index].label)) {
         for (const PresetOption& option : kPresets) {
           const bool selected = current == option.value;
-          if (ImGui::Selectable(option.label, selected)) {
-            const int n = ApplyDetailPreset(option.value, gov_on_);
-            if (n < 0) {
-              status_ = fmt::format("Preset {} is not known to this build.", option.label);
-            } else if (gov_on_) {
-              status_ = fmt::format("Preset {}: adaptive detail now starts from tier {} (its floor) and goes up to its ceiling.",
-                                    option.label, PresetFloorTier(option.value));
-            } else {
-              status_ = fmt::format("Preset {}: {} knob(s) set (a knob you set yourself kept its value).", option.label, n);
-            }
-          }
+          if (ImGui::Selectable(option.label, selected)) apply(option);
           if (ImGui::IsItemHovered()) Tooltip(option.help);
           if (selected) ImGui::SetItemDefaultFocus();
         }
         ImGui::EndCombo();
+      } else if (ImGui::IsItemFocused()) {
+        row_focused = true;
+        focus_now_ = pad::Focus::kChoice;
+        if (steps != 0) {
+          const int next = pad::StepChoice(shown_index, steps, count);
+          if (next != shown_index) {
+            apply(kPresets[next]);
+            pad_log(kPresets[next].label);
+          }
+        }
+        FocusRing();
       }
       break;
     }
@@ -746,6 +1152,16 @@ void Overlay::Row(const Item& it) {
       ImGui::PopID();
       if (ImGui::IsItemHovered()) Tooltip("Back to the default of this setup (the PC profile's or the game's)");
     }
+  }
+
+  // The row that has the focus is lit; the pad's X puts it back to its default (the same as the small button).
+  if (row_focused) {
+    if (pad_out_.reset && !disabled_why && it.kind != Kind::kPreset && it.cvar && *it.cvar && IsNonDefault(it.cvar)) {
+      ResetCvar(it.cvar, !is_cheat);
+      status_ = fmt::format("{}: back to its default.", it.label);
+      REXLOG_INFO("[mcla-overlay] pad: X reset {} ({})", it.label, it.cvar);
+    }
+    if (nav_visible_) ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, kFocusBand);
   }
 }
 
@@ -807,10 +1223,12 @@ void Overlay::DrawTabGame() {
   Section("60 / 120 fps fixes", {&kSmoothing, &kUi30});
   Section("Screen", {&kHudAspect, &kSkipIntro});
   Section("Keyboard and mouse", {&kMouse, &kMouseSens});
-  Section("Overlay", {&kOverlayOn});
+  Section("Overlay", {&kOverlayOn, &kPadChord});
   ImGui::TextColored(kDim, "Keys: menu %s, FPS counter %s, statistics %s (rebind in the launcher, or in the F4 settings overlay).",
                      REXCVAR_GET(mcla_overlay_key_menu).c_str(), REXCVAR_GET(mcla_overlay_key_fps).c_str(),
                      REXCVAR_GET(mcla_overlay_key_stats).c_str());
+  ImGui::TextColored(kDim, "Controller: hold %s for %.1f s to open or close this menu (B closes it too).",
+                     pad::ChordText(REXCVAR_GET(mcla_overlay_pad_chord)), double(REXCVAR_GET(mcla_overlay_pad_hold_ms)) / 1000.0);
 }
 
 void Overlay::DrawTabCheats() {
@@ -857,12 +1275,102 @@ void Overlay::DrawTabAbout() {
   ImGui::BulletText("%s  FPS counter", REXCVAR_GET(mcla_overlay_key_fps).c_str());
   ImGui::BulletText("%s  statistics screen", REXCVAR_GET(mcla_overlay_key_stats).c_str());
   ImGui::BulletText("F4  all settings (SDK overlay), `  console, F3  debug stamp");
+  ImGui::SeparatorText("Controller");
+  ImGui::BulletText("%s held for %.1f s  opens and closes the mod menu (B closes it too)",
+                    pad::ChordText(REXCVAR_GET(mcla_overlay_pad_chord)), double(REXCVAR_GET(mcla_overlay_pad_hold_ms)) / 1000.0);
+  ImGui::BulletText("D-pad / left stick  move,  left / right  change a value (hold to speed up),  A  select,  B  back");
+  ImGui::BulletText("X  reset the row,  Y  save,  LB / RB  previous / next tab,  right stick  scroll");
+  ImGui::BulletText("While the menu is open the game gets nothing from the pad; a button held at the close is ignored until released");
   ImGui::SeparatorText("Files");
   ImGui::TextWrapped("Config: %s", config_path_.string().c_str());
   const std::filesystem::path launcher = mcla_overlay::LauncherSettingsPath();
   std::error_code ec;
   ImGui::TextWrapped("Launcher settings: %s%s", launcher.empty() ? "(none)" : launcher.string().c_str(),
                      (!launcher.empty() && std::filesystem::exists(launcher, ec)) ? "" : "  (not found)");
+}
+
+void Overlay::SaveFromMenu() {
+  if (mcla_overlay::SavableChangeCount() == 0) {
+    status_ = "No unsaved changes.";
+  } else {
+    status_ = mcla_overlay::SaveSettings(config_path_).message;
+  }
+}
+
+namespace {
+
+// One round (A B X Y) or rounded-square (LB, D-pad) button glyph and its label, drawn with the draw list, as one item of the legend.
+float GlyphWidth(const char* text, bool round) {
+  const float em = ImGui::GetFontSize();
+  return round ? 1.3f * em : ImGui::CalcTextSize(text).x + 0.9f * em;
+}
+void Glyph(const char* text, ImU32 fill, bool round) {
+  const float em = ImGui::GetFontSize();
+  const ImVec2 ts = ImGui::CalcTextSize(text);
+  const float h = 1.3f * em;
+  const float w = GlyphWidth(text, round);
+  const ImVec2 p = ImGui::GetCursorScreenPos();
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  if (round) {
+    dl->AddCircleFilled(ImVec2(p.x + w * 0.5f, p.y + h * 0.5f), h * 0.5f, fill, 24);
+  } else {
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), fill, 0.3f * em);
+  }
+  dl->AddText(ImVec2(p.x + (w - ts.x) * 0.5f, p.y + (h - ts.y) * 0.5f), IM_COL32(16, 16, 20, 255), text);
+  ImGui::Dummy(ImVec2(w, h));
+}
+void HintText(const char* text) {
+  const float em = ImGui::GetFontSize();
+  const ImVec2 ts = ImGui::CalcTextSize(text);
+  const float h = 1.3f * em;
+  const ImVec2 p = ImGui::GetCursorScreenPos();
+  ImGui::GetWindowDrawList()->AddText(ImVec2(p.x, p.y + (h - ts.y) * 0.5f), IM_COL32(225, 228, 232, 255), text);
+  ImGui::Dummy(ImVec2(ts.x, h));
+}
+
+}  // namespace
+
+// The last line of the menu: what the buttons do. The pad's when the pad was used last, the keyboard's and the mouse's otherwise.
+void Overlay::Legend() {
+  const float em = ImGui::GetFontSize();
+  if (pad_session_ && devices_.last() == pad::Device::kPad) {
+    constexpr ImU32 kGrey = IM_COL32(200, 202, 208, 255), kGreen = IM_COL32(110, 205, 110, 255), kRed = IM_COL32(235, 90, 85, 255),
+                    kBlue = IM_COL32(95, 150, 245, 255), kYellow = IM_COL32(245, 205, 70, 255);
+    struct Hint {
+      const char* glyph;
+      const char* glyph2;  // a second glyph before the text (LB RB)
+      ImU32 color;
+      bool round;
+      const char* text;
+    };
+    static constexpr Hint kHints[] = {{"D-pad", nullptr, kGrey, false, "Move"}, {"< >", nullptr, kGrey, false, "Change"},
+                                      {"A", nullptr, kGreen, true, "Select"},   {"B", nullptr, kRed, true, "Back"},
+                                      {"LB", "RB", kGrey, false, "Tabs"},       {"X", nullptr, kBlue, true, "Reset"},
+                                      {"Y", nullptr, kYellow, true, "Save"}};
+    const float gap = 0.35f * em, between = 1.0f * em;
+    float room = ImGui::GetContentRegionAvail().x;
+    bool first = true;
+    for (const Hint& h : kHints) {
+      float need = GlyphWidth(h.glyph, h.round) + gap + ImGui::CalcTextSize(h.text).x;
+      if (h.glyph2) need += gap + GlyphWidth(h.glyph2, h.round);
+      if (!first) need += between;
+      if (need > room) break;  // a narrow window drops the last hints, never wraps
+      room -= need;
+      if (!first) ImGui::SameLine(0.0f, between);
+      first = false;
+      Glyph(h.glyph, h.color, h.round);
+      if (h.glyph2) {
+        ImGui::SameLine(0.0f, gap);
+        Glyph(h.glyph2, h.color, h.round);
+      }
+      ImGui::SameLine(0.0f, gap);
+      HintText(h.text);
+    }
+  } else {
+    ImGui::TextColored(kDim, "Arrow keys or mouse: move   Enter / Space or click: select   Left / Right: change   Ctrl+Tab: tabs   Esc or %s: close%s%s",
+                       REXCVAR_GET(mcla_overlay_key_menu).c_str(), pad_session_ ? "   Controller: hold " : "",
+                       pad_session_ ? pad::ChordText(REXCVAR_GET(mcla_overlay_pad_chord)) : "");
+  }
 }
 
 void Overlay::Footer() {
@@ -878,9 +1386,9 @@ void Overlay::Footer() {
   }
   if (pending == 0) ImGui::BeginDisabled();
   if (ImGui::Button("Save settings")) {
-    const mcla_overlay::SaveReport report = mcla_overlay::SaveSettings(config_path_);
-    status_ = report.message;
+    SaveFromMenu();
   }
+  FocusRing();
   if (pending == 0) ImGui::EndDisabled();
   if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled | ImGuiHoveredFlags_DelayNormal)) {
     Tooltip("Writes the settings you changed to the launcher's settings and to the game's config file, so they are there at the "
@@ -899,6 +1407,8 @@ void Overlay::Footer() {
       if (g_overlay) g_overlay->CloseMenu();
     });
   }
+  FocusRing();
+  Legend();
 }
 
 void Overlay::DrawMenu(const ImGuiIO& io, float em) {
@@ -908,6 +1418,8 @@ void Overlay::DrawMenu(const ImGuiIO& io, float em) {
   ImGui::SetNextWindowBgAlpha(std::min(1.0f, float(REXCVAR_GET(mcla_overlay_opacity)) + 0.2f));
   // Esc closes the menu, except when it was only closing a combo (ImGui has already closed the popup by now).
   const bool escape = ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !popup_open_last_frame_ && !io.WantTextInput;
+  // B on the pad does the same (ImGui closes the open combo with it; the menu closes when there was none).
+  const bool pad_back = pad_out_.back && !popup_open_last_frame_ && !io.WantTextInput;
   if (focus_menu_) {
     ImGui::SetNextWindowFocus();  // a window created after the menu is drawn over it: the menu comes back to the front
     focus_menu_ = false;
@@ -925,11 +1437,14 @@ void Overlay::DrawMenu(const ImGuiIO& io, float em) {
     }
     // The footer: a rule, the status (up to two lines), the restart warning when there is one, and the button row.
     restart_pending_ = rex::cvar::GetPendingRestartFlags();
-    const float footer = ImGui::GetFrameHeightWithSpacing() * 1.35f +
+    const float footer = ImGui::GetFrameHeightWithSpacing() * 1.35f + ImGui::GetFontSize() * 1.9f +  // ... and the legend
                          ImGui::GetTextLineHeightWithSpacing() * float((status_.empty() ? 0 : 2) + (restart_pending_.empty() ? 0 : 1));
     if (ImGui::BeginTabBar("##tabs")) {
       for (int t = 0; t < kTabCount; ++t) {
-        if (ImGui::BeginTabItem(kTabNames[t], nullptr, select_tab_ == t ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None)) {
+        const bool tab_selected =
+            ImGui::BeginTabItem(kTabNames[t], nullptr, select_tab_ == t ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None);
+        FocusRing();
+        if (tab_selected) {
           tab_ = t;
           if (ImGui::BeginChild("##scroll", ImVec2(0.0f, -footer), ImGuiChildFlags_None)) {
             switch (t) {
@@ -947,15 +1462,93 @@ void Overlay::DrawMenu(const ImGuiIO& io, float em) {
       ImGui::EndTabBar();
       select_tab_ = -1;
     }
+    focus_first_ = false;  // it was for the first row of this frame's tab, if it had one
     Footer();
   }
   ImGui::End();
   popup_open_last_frame_ = ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
-  if (escape) {
+  if (escape || pad_back) {
+    if (pad_back) REXLOG_INFO("[mcla-overlay] pad: B closes the menu");
     // Not from inside the draw: the dialog may go away with the menu.
     window_->app_context().CallInUIThreadDeferred([] {
       if (g_overlay) g_overlay->CloseMenu();
     });
+  }
+}
+
+// ---- the controller's menu half -----------------------------------------------------------------------------------------------
+
+namespace {
+constexpr uint32_t kFedUp = 1u << 0, kFedDown = 1u << 1, kFedLeft = 1u << 2, kFedRight = 1u << 3, kFedActivate = 1u << 4,
+                   kFedCancel = 1u << 5;
+}  // namespace
+
+// What ImGui is told: its gamepad keys for the directions, A (activate) and B (cancel) go in as key events (ImGui's navigation does
+// the rest: it moves the focus, presses buttons and tick boxes, opens and closes combos, scrolls to the focused item); the right
+// stick goes in as the "left stick" scroll axis, which ImGui turns into scrolling of the focused window. Events are queued and
+// processed at the next frame; only changes are sent.
+void Overlay::FeedPadKeys(ImGuiIO& io, uint32_t want, float scroll) {
+  struct Map {
+    uint32_t bit;
+    ImGuiKey key;
+  };
+  static constexpr Map kMap[] = {{kFedUp, ImGuiKey_GamepadDpadUp},       {kFedDown, ImGuiKey_GamepadDpadDown},
+                                 {kFedLeft, ImGuiKey_GamepadDpadLeft},   {kFedRight, ImGuiKey_GamepadDpadRight},
+                                 {kFedActivate, ImGuiKey_GamepadFaceDown}, {kFedCancel, ImGuiKey_GamepadFaceRight}};
+  for (const Map& m : kMap) {
+    if ((want ^ fed_) & m.bit) io.AddKeyEvent(m.key, (want & m.bit) != 0);
+  }
+  fed_ = want;
+  if (scroll != fed_scroll_) {
+    io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickDown, scroll > 0.0f, scroll > 0.0f ? scroll : 0.0f);
+    io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickUp, scroll < 0.0f, scroll < 0.0f ? -scroll : 0.0f);
+    fed_scroll_ = scroll;
+  }
+}
+
+// One frame of the pad while the menu is open (UI thread, inside the ImGui frame): the newest look the game thread took, minus what
+// was held at the open, through the mapping, into ImGui's keys and the menu's own actions (tabs, save; the row actions are in Row).
+void Overlay::PadFrame(ImGuiIO& io, int64_t now_ms) {
+  focus_last_ = popup_open_last_frame_ ? pad::Focus::kOther : focus_now_;  // an open combo's list takes left / right for itself
+  focus_now_ = pad::Focus::kOther;
+  pad_out_ = pad::MenuOut();
+  nav_visible_ = io.NavVisible;
+  if (!pad_session_) return;
+
+  const PadSample sample = LatestPad(now_ms);
+  menu_gate_.Update(sample.bits, now_ms);
+  const uint32_t gate = menu_gate_.Mask();
+  const uint32_t bits = sample.bits & ~gate;
+  devices_.NotePad(bits, pad_bits_prev_);
+  pad_bits_prev_ = bits;
+  pad_out_ = menu_pad_.Update(bits, now_ms, focus_last_);
+
+  uint32_t want = 0;
+  if (pad_out_.dirs & pad::kNavUp) want |= kFedUp;
+  if (pad_out_.dirs & pad::kNavDown) want |= kFedDown;
+  if (pad_out_.dirs & pad::kNavLeft) want |= kFedLeft;
+  if (pad_out_.dirs & pad::kNavRight) want |= kFedRight;
+  if (pad_out_.activate) want |= kFedActivate;
+  if (pad_out_.cancel) want |= kFedCancel;
+  const float scroll = (gate & (pad::kRsUp | pad::kRsDown)) ? 0.0f : -pad::StickValue(sample.raw.ry);  // stick up = scroll up
+  FeedPadKeys(io, want, scroll);
+
+  // The focus rectangle shows from the first press (ImGui shows it for its own navigation keys; LB, RB, X and Y are ours), and from
+  // the open when the pad opened the menu.
+  if (nav_init_ || pad_out_.pressed != 0) {
+    ImGui::SetNavCursorVisible(true);
+    nav_init_ = false;
+  }
+
+  if (pad_out_.tab_step != 0) {
+    const int next = (tab_ + pad_out_.tab_step + kTabCount) % kTabCount;
+    select_tab_ = next;
+    focus_first_ = true;  // the new tab's first row takes the focus: the old row is gone
+    REXLOG_INFO("[mcla-overlay] pad: {} -> tab {}", pad_out_.tab_step > 0 ? "RB" : "LB", kTabNames[next]);
+  }
+  if (pad_out_.save) {
+    SaveFromMenu();
+    REXLOG_INFO("[mcla-overlay] pad: Y save: {}", status_);
   }
 }
 
@@ -966,9 +1559,13 @@ void Overlay::Draw(ImGuiIO& io) {
   const bool menu = menu_open();
   sampler_.Update(now, stats);
   ScopedLook look(io);
-  if (menu && window_->GetCursorVisibility() != rex::ui::Window::CursorVisibility::kVisible) {
-    // The mouse-look driver puts its own visibility back when it lets go of the mouse; the menu needs the cursor.
-    window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
+  if (menu) {
+    PadFrame(io, now / 1'000'000);
+    // The mouse-look driver puts its own visibility back when it lets go of the mouse; the menu needs the cursor (hidden while the
+    // pad is what is being used: a mouse that moves brings it back).
+    const auto want = pad_session_ && devices_.last() == pad::Device::kPad ? rex::ui::Window::CursorVisibility::kHidden
+                                                                            : rex::ui::Window::CursorVisibility::kVisible;
+    if (window_->GetCursorVisibility() != want) window_->SetCursorVisibility(want);
   }
   if (stats && !stats_drawn_last_ && menu) focus_menu_ = true;
   stats_drawn_last_ = stats;
@@ -1035,16 +1632,31 @@ void OnRuntimeReady(rex::input::InputSystem* input) {
   if (input) {
     // The SDK installed its own callback (silent while the mouse is over one of its overlays); this one is the same, plus
     // silent while the menu is open: no key, no mouse, no pad reaches the game. It reads the ImGui flag the way the SDK's does.
+    //
+    // The controller adds two things. The overlay's own look at the pad (PadTap, on the game thread) is answered as if active
+    // (t_pad_probe), or the menu could not read what the game must not see. And the game's pad stays quiet in two more cases: the
+    // chord was completed and the menu is about to open, and after the close until the inputs held then are released (g_game_hold).
     rex::ui::ImGuiDrawer* drawer = g_overlay->drawer();
     input->SetActiveCallback([drawer]() {
+      if (t_pad_probe) return true;
       if (g_menu_open.load(std::memory_order_relaxed)) return false;
+      if (g_open_pending_ms.load(std::memory_order_relaxed) != 0 || g_game_hold.Active()) return false;
       return !drawer->GetIO().WantCaptureMouse;
     });
+    g_input = input;
+    mcla_overlay::SetFrameTap(&PadTap);
+    REXLOG_INFO("[mcla-overlay] pad: {} (chord {}, hold {} ms)", REXCVAR_GET(mcla_overlay_pad) ? "on" : "off (--mcla_overlay_pad=false)",
+                pad::ChordText(REXCVAR_GET(mcla_overlay_pad_chord)), REXCVAR_GET(mcla_overlay_pad_hold_ms));
   }
   g_overlay->Refresh();  // mcla_overlay_fps on the command line or in the config shows at start
 }
 
 void Shutdown() {
+  mcla_overlay::SetFrameTap(nullptr);  // the game thread leaves PadTap, then nobody calls it again
+  for (int i = 0; i < 250 && g_tap_busy.load(std::memory_order_acquire) != 0; ++i) Sleep(1);
+  g_input = nullptr;
+  g_game_hold.Clear();
+  g_open_pending_ms.store(0, std::memory_order_relaxed);
   for (const char* name : {"mcla_overlay_fps", "mcla_overlay_stats", "mcla_overlay_menu", "mcla_overlay_tab"}) {
     rex::cvar::UnregisterChangeCallbacks(name);
   }

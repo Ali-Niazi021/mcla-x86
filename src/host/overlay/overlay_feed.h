@@ -35,6 +35,12 @@ int64_t NowNs();
 // first frame after the feed was off) is not a frame time: it restarts the measurement.
 void NoteEngineFrame(int64_t now_ns);
 
+// A function the game thread calls at the top of every NoteEngineFrame (the overlay's controller poll, overlay_ui.cpp PadTap: the
+// game thread is the one that polls the pads, so it is the one thread that may ask the input system for their state without racing
+// it). Set once the input system exists, cleared (null) at shutdown; a null tap costs one relaxed load per frame.
+using FrameTap = void (*)(int64_t now_ns);
+void SetFrameTap(FrameTap tap);
+
 // Right after NoteEngineFrame, with the game timer's total (guest seconds) read at the same instant: the pair is stored with the
 // frame, so the world speed (guest seconds over real seconds) is measured between two exact frame starts, not between two UI
 // paints (which would be a frame off in 2 s: +-0.8 %). Only call it while Demand().
