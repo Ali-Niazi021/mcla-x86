@@ -56,9 +56,11 @@ work lands; T5 and T8 last. Nothing is called faster or fixed without a measured
 | Hitch attribution `[mcla-hitch]`, `[mcla-sys] sample`, display path, command line | done | run `final-check` |
 | Thread placement on parked cores | fixed (0 warnings in 5 runs) | run `final-check` |
 | G1 TV test, "no tearing" default | running | - |
-| Run summaries for the new lines | running | `tools/display_log.py` |
+| Run summaries for the new lines | done: display verdict per run, 50 parser tests | `tools/display_log.py` |
+| Cvar inventory for the mod menu | done: 509 cvars, 119 marked live | scratch `native/cvars.json` |
+| Claude usage watch (pause at 98 % of the 5-hour limit) | running | `tools/usage_watch.py` |
 | Pipeline cache misses at boot (176 ms menu hitches) | diagnosis running | scratch `pipeline-cache/` |
-| Native roadmap study (T3, T4) | running | `docs/native/` |
+| Native roadmap study (T2, T3, T4, G3 bounds, T1 runs M1-M8) | done: `docs/native/ROADMAP.md`. Top five: the 2x path as cheap as 1x (dual write, direct present, transfer skips at draw scale 2), scale-aware off-screen targets at 2000p (shadow map first), VRS 2x2 on post at 2x, zero run-time compiles, resolve renaming. All gains are estimates from the 880M until M1-M3 run | lead spot-checked `overrides.toml` (native memcpy / memset ready but blocked by the SDK return path) |
 | Overlay and mod menu (T7) | design and first code running | - |
 | 120 fps (T6) | queued behind the TV test (both change the display mode) | - |
-| T1 baseline matrix | queued (needs the machine) | - |
+| T1 measurement M1 (1080p uncapped), M2 (2000p uncapped), M3 (2000p bench) | next holder of the machine after the TV test | ROADMAP section 4 |
