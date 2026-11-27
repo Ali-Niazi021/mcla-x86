@@ -89,7 +89,14 @@ A follow-up check is a new task with a fresh brief, not a continuation.
 - Commit and push as the work proceeds. Work branch: `native-pc` (pushed to `origin`); `main` is merged by the owner or
   on request. Commit only verified states; never commit game data, logs or anything from the work folder.
 - If something in the game has to be reimplemented for the PC, do it; measure before and after.
-- Watch Claude usage: at 98 % of the 5-hour limit, pause until it resets, then continue. The harness does not expose the
-  usage meter to the agent, so the lead keeps the number of concurrent agents small, commits and updates the status board
-  after every step (a stop loses nothing), and resumes from `docs/NATIVE_PLAN.md` after a reset.
+- Watch Claude usage: at 98 % of the 5-hour limit, pause until it resets, then continue. `tools/usage_watch.py` reads the
+  subscription's usage with the Claude Code login (owner-approved; it never prints or refreshes the token) and writes
+  `$WORK/usage/usage.json`. Procedure for the lead:
+  1. Keep `python tools/usage_watch.py --until 96 --interval 180` running as a background command (the harness wakes the
+     lead when it exits; relaunch it when it ends on the 2-hour background limit). Exit 20 = monitoring is off: say so.
+  2. On exit 10 (>= 96 %): start nothing new; commit and push what is verified; update the status board; tell every
+     running agent to finish its current step, write its state and partial results to its scratch folder, restore the
+     display mode if it holds the machine, and stop. Be idle before 98 %.
+  3. Wait with `python tools/usage_watch.py --until-reset` (exit 11 = the window reset), then resume from the status board.
+  Also read the weekly figure on each check; near its limit the same pause applies until the owner decides.
 - The test laptop may be changed freely (display mode, power settings, elevated commands). No damage concerns.
