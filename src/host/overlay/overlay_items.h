@@ -76,6 +76,8 @@ struct Item {
   double off_value = -1.0;  // kHold*: the value that means "off" (the game's own behaviour)
   double on_value = 0.0;    // kHold*: where the slider starts when the tick box is ticked
   const char* companion = nullptr;  // a launcher-only setting Save sets to false with this one (aa_auto)
+  const char* note = nullptr;       // a dim line under the label: what it does and how sure we are (the classic cheats)
+  int state = -1;                   // the classic cheats: the mcla::cheat::Which whose live state is shown under the control, -1 = none
 };
 
 template <size_t N>
@@ -135,6 +137,11 @@ inline constexpr Choice kChoicesDlssPreset[] = {{"default", "Automatic (K, M for
                                                 {"k", "K"},
                                                 {"l", "L"},
                                                 {"m", "M"}};
+
+// The amounts of the money buttons.
+inline constexpr Choice kChoicesMoney[] = {{"1000", "$1,000"},     {"10000", "$10,000"},       {"100000", "$100,000"},
+                                           {"500000", "$500,000"}, {"1000000", "$1,000,000"},  {"10000000", "$10,000,000"},
+                                           {"100000000", "$100,000,000"}};
 
 // A choice's value against the cvar's text: equal, or the same number ("1.500000" and "1.5").
 inline bool ChoiceIs(const std::string& current, const char* value) {
@@ -342,6 +349,62 @@ inline constexpr Item kRoadDensity{Kind::kHoldInt, "Hold the traffic density", "
                                    "A global traffic density index (0 to 15; 6 is the usual) instead of each road's own. Not yet "
                                    "tried in the game.",
                                    0, 15, "%d", nullptr, 0, kFlagCheat | kFlagNoSave | kFlagUntested, -1.0, 6.0};
+
+
+// The classic cheats (mcla/hooks/mcla_cheat.cpp, docs/CHEATS.md). `state` is the mcla::cheat::Which index (nitro 0, special 1, damage 2,
+// cops 3, time scale 4, no save 5, unlock 6; overlay_ui.cpp static_asserts it). The confidence letter is the one of docs/CHEATS.md:
+// A = the code path is unambiguous and a second source agrees, B = one consistent reading, nothing contradicts it.
+inline constexpr Item kCheatNitro{Kind::kToggle, "Infinite nitro", "mcla_cheat_nitro",
+                                  "Your nitro bars are never spent. Holds the game's own unlimited-nitrous cheat while you drive (the "
+                                  "switch its pause menu's Cheats page uses): the bar is not taken when you fire the nitro and you can "
+                                  "fire it with no bar left. Only in free roam and races; put back in every menu and load. While it is on "
+                                  "the game counts the drive as cheating and pays no reputation or money for it.",
+                                  0, 0, "", nullptr, 0, kFlagCheat | kFlagNoSave | kFlagUntested, -1.0, 0.0, nullptr,
+                                  "A: nitro is never spent (Zone, Agro, Roar, EMP are the next row)", 0};
+inline constexpr Item kCheatSpecial{Kind::kToggle, "Infinite special abilities", "mcla_cheat_special",
+                                    "Zone, Agro, Roar and EMP can be used again and again: holds the game's own unlimited-special cheat "
+                                    "while you drive (its activation always finds a charge). Only in free roam and races. The game counts "
+                                    "the drive as cheating: no reputation or money from it.",
+                                    0, 0, "", nullptr, 0, kFlagCheat | kFlagNoSave | kFlagUntested, -1.0, 0.0, nullptr,
+                                    "B: Zone, Agro, Roar, EMP never run out of charges", 1};
+inline constexpr Item kCheatDamage{Kind::kToggle, "No damage", "mcla_cheat_nodamage",
+                                   "The vehicle takes no damage: holds the game's own unlimited-damage cheat while you drive (the "
+                                   "collision damage is never applied, so the damage meter does not fill and the car cannot be wrecked). "
+                                   "Only in free roam and races. The game counts the drive as cheating: no reputation or money from it.",
+                                   0, 0, "", nullptr, 0, kFlagCheat | kFlagNoSave | kFlagUntested, -1.0, 0.0, nullptr,
+                                   "A: crashes do not damage the vehicle", 2};
+inline constexpr Item kCheatCops{Kind::kToggle, "No police", "mcla_cheat_nocops",
+                                 "No cop is spawned and the pursuit code does not run: holds the game's own no-cops cheat while you "
+                                 "drive. Only in free roam and races. Cops already out may stop where they are (the game's own switch does the "
+                                 "same). The game counts the drive as cheating: no reputation or money from it.",
+                                 0, 0, "", nullptr, 0, kFlagCheat | kFlagNoSave | kFlagUntested, -1.0, 0.0, nullptr,
+                                 "A: the cops do not start or continue a pursuit", 3};
+inline constexpr Item kCheatSlow{Kind::kHoldFloat, "Slow motion", "mcla_cheat_timescale",
+                                 "The whole world (you, traffic, opponents) runs at this fraction of its speed while you drive: the "
+                                 "engine timer's own time scale is multiplied by it every frame. 1 = normal. The game's own pause "
+                                 "(a scale of 0) still pauses. Only in free roam and races. The race clock and the sound may not follow "
+                                 "the world.",
+                                 0.05, 1.0, "x%.2f", nullptr, 0, kFlagCheat | kFlagNoSave | kFlagUntested, 1.0, 0.5, nullptr,
+                                 "B: the game's time scale, as its own slow motion uses it", 4};
+
+inline constexpr Item kCheatMoneyAmount{Kind::kChoice, "Amount for the money buttons", "mcla_cheat_money_amount",
+                                        "The amount Give, Take and Set below use.", 0, 0, "", kChoicesMoney, CountOf(kChoicesMoney),
+                                        kFlagCheat | kFlagNoSave | kFlagUntested, -1.0, 0.0, nullptr,
+                                        "B: the career's money, one field the whole game reads"};
+inline constexpr Item kCheatUnlock{Kind::kToggle, "Unlock races, parts, upgrades and abilities", "mcla_cheat_unlock",
+                                   "The game's own unlocked-or-not checks answer yes for races, parts, performance upgrades and special "
+                                   "abilities (its unlockraces, unlockparts, unlockperformance and unlockspecialabilities switches); its "
+                                   "save data is not rewritten. Cars are not covered. Held in a drive, the pause menu, the garage and the "
+                                   "map. What you buy, fit or race with an unlocked item CAN END UP IN YOUR SAVE.",
+                                   0, 0, "", nullptr, 0, kFlagCheat | kFlagNoSave | kFlagUntested, -1.0, 0.0, nullptr,
+                                   "B: can end up in your save (what you do with the unlocked items)", 6};
+inline constexpr Item kCheatNoSave{Kind::kToggle, "Don't write saves this session", "mcla_cheat_nosave",
+                                   "Turns on the game's own `nosave` switch: its save manager skips every save and carries on, so nothing "
+                                   "you do reaches the disk until you restart (or switch this off). The game may still SAY it saved. Held "
+                                   "on every screen, because the saves happen in menus and between loads. Switch it on BEFORE using money "
+                                   "or unlocks if you do not want them kept.",
+                                   0, 0, "", nullptr, 0, kFlagCheat | kFlagNoSave | kFlagUntested, -1.0, 0.0, nullptr,
+                                   "B: nothing is written to your save while this is on", 5};
 
 }  // namespace items
 
