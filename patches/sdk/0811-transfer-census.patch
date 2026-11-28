@@ -1,0 +1,408 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Fri, 27 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0811: transfer_census_log: the EDRAM ownership transfers by source, destination and reason (with the stencil-bit passes); transfers and resolve clears in copy_byte_census (native stream, zero-copy P2 + P3)
+
+Source: Ours, written for this SDK (native stream; design note scratch/zerocopy/DESIGN.md section P2). Written without a build or a
+  run: checked with clang++ 20.1.8 -fsyntax-only (the SDK's Release flags) of pipeline/render_target/cache.cpp,
+  d3d12/render_target_cache.cpp and vulkan/render_target_cache.cpp (the changed header); 0 errors, no new warning.
+  Needs 0810 (copy_census.h). Applies after 0780, and also on top of 0800.
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: At draw scale 2 the EDRAM ownership transfers cost 0.85 ms a frame (24.8 brackets, 153 draws) and nothing logs which they
+  are. New cvar transfer_census_log (bool, default false, hot reload; "GPU"): every 10 s `[transfer-census] a frame over N
+  frames ...` (transfers made, cut, left out whole by a cut; host Mpx made of the full ones; MB read and written), one line each
+  for colour and depth / stencil destinations (with the stencil-bit passes: Direct3D 12 without a pixel-shader stencil reference
+  output, the NVIDIA case, makes every depth / stencil transfer as one depth draw, a stencil clear and 8 draws, one a stencil
+  bit), and the first 24 rows by bytes: `<source RT> -> <destination RT> (<reason>): made (cut), left out whole, host Mpx, MB read,
+  MB written, stencil-bit passes`. Reasons: whole: not a rectangle-list draw / skip_overwritten_transfers is off / the
+  depth-stencil target of the tone map draw / a rectangle draw not analysed; cut by skip_overwritten_transfers; colour cut by
+  tonemap_transfer_skip; around a clear rectangle draw; around a resolve clear; or the analysis's own reason why a rectangle
+  draw keeps its transfers (GetOverwrittenRectangle's reject text). The transfers a cut leaves out whole are counted in
+  ChangeOwnership (base class), the ones made in D3D12RenderTargetCache::PerformTransfersAndResolveClears. copy_byte_census (0810)
+  gets the transfer read / write and resolve clear classes from the same place. Off = no change (one cvar read a call).
+Bucket: REDO
+
+0811-transfer-census.patch (mcla-x86 native stream, zero-copy P2).
+
+---
+diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
+index b679e15..baa1824 100644
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -648,6 +648,18 @@ class RenderTargetCache {
+   // The rectangle of all the render targets of the last update that its draw
+   // rewrites completely (not to be transferred into), as the clear rectangle
+   // of the transfers (a cutout), or null if there isn't one.
++  // LOCAL PATCH - MCLA (0811): transfer_census_log. transfer_census_reason_ (private) says why the transfers that
++  // ChangeOwnership finds next are what they are (cut by which skip, or kept and why), set before it by the draw, the
++  // clear rectangle draw and the resolve clear; the transfers a cut leaves out whole are counted there, the backend counts
++  // the ones it makes (NoteTransferCensus) and calls LogTransferCensusIfDue. Host pixels are guest pixels times the draw
++  // resolution scale's area; bytes are the backend's (samples times the bytes of a sample). stencil_bit_passes: the draws
++  // over the transfer's rectangles that write the stencil one bit at a time (Direct3D 12 without a pixel-shader stencil
++  // reference output: 8 for a depth / stencil destination; transfers from one source share those draws).
++  static bool IsTransferCensusOn();
++  void NoteTransferCensus(RenderTargetKey source, RenderTargetKey dest, bool skipped_whole, uint64_t host_pixels_full,
++                          uint64_t host_pixels_made, uint64_t bytes_read, uint64_t bytes_written,
++                          uint32_t stencil_bit_passes = 0);
++  void LogTransferCensusIfDue(uint64_t current_frame);
+   const Transfer::Rectangle* last_update_overwritten_rectangle() const {
+     assert_true(GetPath() == Path::kHostRenderTargets);
+     return last_update_overwritten_rectangle_valid_ ? &last_update_overwritten_rectangle_ : nullptr;
+@@ -826,6 +838,9 @@ class RenderTargetCache {
+   bool update_after_tonemap_marker_ = false;
+   Transfer::Rectangle last_update_overwritten_rectangle_ = {};
+   bool last_update_overwritten_rectangle_valid_ = false;
++  // LOCAL PATCH - MCLA (0811): transfer_census_log: why the transfers that ChangeOwnership finds next are what they are
++  // (a string literal; see NoteTransferCensus).
++  const char* transfer_census_reason_ = "";
+ 
+   // Temporary storage for GetDirectResolveSource.
+   mutable std::vector<ResolveCopyDumpRectangle> direct_resolve_rectangles_;
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index 00de96f..d014b4a 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -29,6 +29,7 @@
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
+ #include <rex/graphics/d3d12/command_processor.h>
++#include <rex/graphics/d3d12/copy_census.h>  // LOCAL PATCH - MCLA (0811): copy_byte_census
+ #include <rex/graphics/d3d12/deferred_command_list.h>
+ #include <rex/graphics/d3d12/render_target_cache.h>
+ #include <rex/filesystem.h>  // LOCAL PATCH - MCLA (0790)
+@@ -5245,6 +5246,73 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+   D3D12CommandProcessor::GpuTimingOpScope gt_op(command_processor_, D3D12CommandProcessor::kGtOpXfer, false);
+ 
+   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
++  // LOCAL PATCH - MCLA (0811): transfer_census_log, copy_byte_census: each transfer made here (the part of it outside the
++  // cut, which resolve_clear_rectangle is for a draw), and the resolve clear.
++  const bool transfer_census = IsTransferCensusOn();
++  const bool byte_census = IsCopyByteCensusOn();
++  if (transfer_census || byte_census) {
++    const uint64_t scale_area = uint64_t(draw_resolution_scale_x()) * draw_resolution_scale_y();
++    auto bytes_per_sample = [](const RenderTarget* render_target) -> uint64_t {
++      return render_target ? GetRenderTargetBytesPerSample(
++                                 static_cast<const D3D12RenderTarget*>(render_target)->resource()->GetDesc().Format)
++                           : 0;
++    };
++    for (uint32_t i = 0; i < render_target_count; ++i) {
++      RenderTarget* census_dest = render_targets[i];
++      if (!census_dest) {
++        continue;
++      }
++      const RenderTargetKey census_dest_key = census_dest->key();
++      const uint64_t census_samples = uint64_t(1) << uint32_t(census_dest_key.msaa_samples);
++      const uint64_t census_dest_bytes = bytes_per_sample(census_dest);
++      for (const Transfer& transfer : render_target_transfers[i]) {
++        Transfer::Rectangle census_rectangles[Transfer::kMaxRectanglesWithCutout];
++        uint64_t pixels_made = 0, pixels_full = 0;
++        const uint32_t made_count = transfer.GetRectangles(
++            census_dest_key.base_tiles, census_dest_key.pitch_tiles_at_32bpp, census_dest_key.msaa_samples,
++            census_dest_key.Is64bpp(), edram_tile_count(), census_rectangles, resolve_clear_rectangle);
++        for (uint32_t j = 0; j < made_count; ++j) {
++          pixels_made += uint64_t(census_rectangles[j].width_pixels) * census_rectangles[j].height_pixels;
++        }
++        const uint32_t full_count = transfer.GetRectangles(
++            census_dest_key.base_tiles, census_dest_key.pitch_tiles_at_32bpp, census_dest_key.msaa_samples,
++            census_dest_key.Is64bpp(), edram_tile_count(), census_rectangles);
++        for (uint32_t j = 0; j < full_count; ++j) {
++          pixels_full += uint64_t(census_rectangles[j].width_pixels) * census_rectangles[j].height_pixels;
++        }
++        const uint64_t host_samples = pixels_made * scale_area * census_samples;
++        const uint64_t source_bytes =
++            bytes_per_sample(transfer.source) +
++            (transfer.host_depth_source && transfer.host_depth_source != census_dest
++                 ? bytes_per_sample(transfer.host_depth_source)
++                 : 0);
++        const uint64_t bytes_read = host_samples * source_bytes;
++        const uint64_t bytes_written = host_samples * census_dest_bytes;
++        if (transfer_census) {
++          // A depth / stencil destination without the stencil reference output: one depth draw, a clear of the stencil,
++          // and a draw for each of the 8 stencil bits.
++          NoteTransferCensus(transfer.source ? transfer.source->key() : RenderTargetKey(), census_dest_key, false,
++                             pixels_full * scale_area, pixels_made * scale_area, bytes_read, bytes_written,
++                             (census_dest_key.is_depth && !use_stencil_reference_output_) ? 8 : 0);
++        }
++        if (byte_census) {
++          CountCopyBytes(CopyByteClass::kTransferRead, bytes_read);
++          CountCopyBytes(CopyByteClass::kTransferWrite, bytes_written);
++        }
++      }
++      if (byte_census && resolve_clear_needed) {
++        CountCopyBytes(CopyByteClass::kClearWrite, uint64_t(resolve_clear_rectangle->width_pixels) *
++                                                       resolve_clear_rectangle->height_pixels * scale_area *
++                                                       census_samples * census_dest_bytes);
++      }
++    }
++    if (transfer_census) {
++      LogTransferCensusIfDue(command_processor_.GetCurrentFrame());
++    }
++    if (byte_census) {
++      LogCopyByteCensusIfDue(command_processor_.GetCurrentFrame());
++    }
++  }
+   D3D12_RECT clear_rect;
+   if (resolve_clear_needed) {
+     // Assuming the rectangle is already clamped by the setup function from the
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index 01c75b3..10a0d10 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -111,6 +111,14 @@ REXCVAR_DEFINE_BOOL(tonemap_transfer_skip_poison, false, "GPU",
+                     "picture")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// LOCAL PATCH - MCLA (0811): the EDRAM ownership transfers of a window, by source, destination and reason.
++REXCVAR_DEFINE_BOOL(transfer_census_log, false, "GPU",
++                    "With host render targets: every 10 s, log '[transfer-census] ...': the EDRAM ownership transfers a "
++                    "frame, by source render target, destination render target and why they were made whole, cut "
++                    "(skip_overwritten_transfers, tonemap_transfer_skip, a clear) or left out whole by a cut, with the "
++                    "host pixels and (Direct3D 12) the bytes read and written")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_UINT32(edram_tiles, 2048, "GPU",
+                       "Size of the EDRAM emulated, in tiles: 2048 as on the console, or 4096 for "
+                       "titles patched to draw more at once than the console could hold (a "
+@@ -333,6 +341,125 @@ class TonemapSkipStats {
+   bool logged_first_skip_ = false;
+ };
+ 
++// LOCAL PATCH - MCLA (0811): transfer_census_log. The CP thread only.
++class TransferCensus {
++ public:
++  void Note(uint32_t source, uint32_t dest, bool dest_is_depth, const char* reason, bool skipped_whole,
++            uint64_t host_pixels_full, uint64_t host_pixels_made, uint64_t bytes_read, uint64_t bytes_written,
++            uint32_t stencil_bit_passes) {
++    Row& row = rows_[std::make_tuple(source, dest, reason)];
++    if (skipped_whole) {
++      ++row.skipped;
++    } else {
++      ++row.made;
++      if (host_pixels_made < host_pixels_full) {
++        ++row.cut;
++      }
++    }
++    row.pixels_full += host_pixels_full;
++    row.pixels_made += host_pixels_made;
++    row.bytes_read += bytes_read;
++    row.bytes_written += bytes_written;
++    row.stencil_bit_passes += stencil_bit_passes;
++    row.stencil_bit_pixels += uint64_t(stencil_bit_passes) * host_pixels_made;
++    // Depth against colour destinations.
++    Row& kind = dest_is_depth ? depth_ : colour_;
++    kind.made += skipped_whole ? 0 : 1;
++    kind.skipped += skipped_whole ? 1 : 0;
++    kind.pixels_made += host_pixels_made;
++    kind.bytes_read += bytes_read;
++    kind.bytes_written += bytes_written;
++    kind.stencil_bit_passes += stencil_bit_passes;
++    kind.stencil_bit_pixels += uint64_t(stencil_bit_passes) * host_pixels_made;
++  }
++
++  template <typename DescribeKey>
++  void LogIfDue(uint64_t current_frame, DescribeKey describe_key) {
++    const auto now = std::chrono::steady_clock::now();
++    const double seconds = std::chrono::duration<double>(now - window_start_).count();
++    // A window much older than the period is from before the census was switched off.
++    if (!started_ || seconds > 30.0) {
++      rows_.clear();
++      colour_ = Row();
++      depth_ = Row();
++      started_ = true;
++      window_start_ = now;
++      window_frame_ = current_frame;
++      return;
++    }
++    if (seconds < 10.0) {
++      return;
++    }
++    const uint64_t frames = current_frame > window_frame_ ? current_frame - window_frame_ : 0;
++    const double per_frame = frames ? 1.0 / double(frames) : 0.0;
++    std::vector<std::pair<const std::tuple<uint32_t, uint32_t, const char*>*, const Row*>> order;
++    Row total;
++    for (const auto& entry : rows_) {
++      order.emplace_back(&entry.first, &entry.second);
++      total.made += entry.second.made;
++      total.cut += entry.second.cut;
++      total.skipped += entry.second.skipped;
++      total.pixels_full += entry.second.pixels_full;
++      total.pixels_made += entry.second.pixels_made;
++      total.bytes_read += entry.second.bytes_read;
++      total.bytes_written += entry.second.bytes_written;
++    }
++    std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) {
++      const uint64_t bytes_a = a.second->bytes_read + a.second->bytes_written;
++      const uint64_t bytes_b = b.second->bytes_read + b.second->bytes_written;
++      return bytes_a != bytes_b ? bytes_a > bytes_b : a.second->pixels_full > b.second->pixels_full;
++    });
++    REXGPU_INFO(
++        "[transfer-census] a frame over {} frames ({:.1f} s): {:.2f} transfers made ({:.2f} of them cut), {:.2f} left out "
++        "whole by a cut; host {:.3f} Mpx made of {:.3f}; {:.2f} MB read, {:.2f} MB written; {} rows (source -> "
++        "destination, reason), the first {}:",
++        frames, seconds, double(total.made) * per_frame, double(total.cut) * per_frame,
++        double(total.skipped) * per_frame, double(total.pixels_made) * per_frame / 1e6,
++        double(total.pixels_full) * per_frame / 1e6, double(total.bytes_read) * per_frame / 1048576.0,
++        double(total.bytes_written) * per_frame / 1048576.0, order.size(), std::min(order.size(), size_t(24)));
++    for (const Row* kind : {&colour_, &depth_}) {
++      REXGPU_INFO(
++          "[transfer-census]   into {} targets: {:.2f} made, {:.2f} left out whole; host {:.3f} Mpx; {:.2f} MB read, "
++          "{:.2f} MB written; {:.2f} stencil-bit passes over {:.3f} host Mpx",
++          kind == &depth_ ? "depth / stencil" : "colour", double(kind->made) * per_frame,
++          double(kind->skipped) * per_frame, double(kind->pixels_made) * per_frame / 1e6,
++          double(kind->bytes_read) * per_frame / 1048576.0, double(kind->bytes_written) * per_frame / 1048576.0,
++          double(kind->stencil_bit_passes) * per_frame, double(kind->stencil_bit_pixels) * per_frame / 1e6);
++    }
++    for (size_t i = 0; i < std::min(order.size(), size_t(24)); ++i) {
++      const Row& row = *order[i].second;
++      REXGPU_INFO(
++          "[transfer-census]   {} -> {} ({}): {:.2f} made ({:.2f} cut), {:.2f} left out whole; host {:.3f} of {:.3f} Mpx; "
++          "{:.2f} MB read, {:.2f} MB written; {:.2f} stencil-bit passes",
++          describe_key(std::get<0>(*order[i].first)), describe_key(std::get<1>(*order[i].first)),
++          std::get<2>(*order[i].first), double(row.made) * per_frame, double(row.cut) * per_frame,
++          double(row.skipped) * per_frame, double(row.pixels_made) * per_frame / 1e6,
++          double(row.pixels_full) * per_frame / 1e6, double(row.bytes_read) * per_frame / 1048576.0,
++          double(row.bytes_written) * per_frame / 1048576.0, double(row.stencil_bit_passes) * per_frame);
++    }
++    rows_.clear();
++    colour_ = Row();
++    depth_ = Row();
++    window_start_ = now;
++    window_frame_ = current_frame;
++  }
++
++ private:
++  struct Row {
++    uint64_t made = 0, cut = 0, skipped = 0;
++    uint64_t pixels_full = 0, pixels_made = 0;
++    uint64_t bytes_read = 0, bytes_written = 0;
++    uint64_t stencil_bit_passes = 0, stencil_bit_pixels = 0;
++  };
++  std::map<std::tuple<uint32_t, uint32_t, const char*>, Row> rows_;
++  Row colour_, depth_;
++  std::chrono::steady_clock::time_point window_start_ = std::chrono::steady_clock::now();
++  uint64_t window_frame_ = 0;
++  bool started_ = false;
++};
++
++TransferCensus g_transfer_census;
++
+ TonemapSkipStats g_tonemap_skip_stats;
+ 
+ }  // namespace
+@@ -1176,6 +1303,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+   // If the draw rewrites a rectangle of the color render targets completely,
+   // there is no need to transfer what's there into them. Looked for only if a
+   // transfer would happen (the analysis runs the vertex shader on the CPU).
++  g_overwrite_reject_reason = "";  // LOCAL PATCH - MCLA (0811): transfer_census_log: this draw's own reason only
+   if (!interlock_barrier_only && pixel_shader && is_rasterization_done &&
+       regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type == xenos::PrimitiveType::kRectangleList &&
+       (skip_overwritten_generic || (tonemap_skip_on && after_tonemap_marker))) {
+@@ -1238,6 +1366,26 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+     }
+   }
+ 
++  // LOCAL PATCH - MCLA (0811): transfer_census_log: why this draw's transfers are what they are.
++  if (IsTransferCensusOn()) {
++    const bool rectangle_draw =
++        !interlock_barrier_only && pixel_shader && is_rasterization_done &&
++        regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type == xenos::PrimitiveType::kRectangleList;
++    if (!rectangle_draw) {
++      transfer_census_reason_ = "whole: not a rectangle-list draw (no overwrite analysis)";
++    } else if (!(skip_overwritten_generic || (tonemap_skip_on && after_tonemap_marker))) {
++      transfer_census_reason_ = "whole: skip_overwritten_transfers is off";
++    } else if (tonemap_skip_cut) {
++      transfer_census_reason_ = "colour cut by tonemap_transfer_skip";
++    } else if (last_update_overwritten_rectangle_valid_) {
++      transfer_census_reason_ = "cut by skip_overwritten_transfers";
++    } else if (g_overwrite_reject_reason[0]) {
++      transfer_census_reason_ = g_overwrite_reject_reason;
++    } else {
++      transfer_census_reason_ = "whole: a rectangle draw not analysed (after the tone map marker, not the tone map)";
++    }
++  }
++
+   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
+     uint32_t rt_bit_index = rt_base_index.second;
+@@ -1260,7 +1408,10 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+   // contents: the stencil test is a pass, the depth is kept) are made here, whole, and not left for them.
+   if (tonemap_skip_cut && (depth_and_color_rts_used_bits & 1) && rts[0] && !last_update_transfers_[0].empty()) {
+     static const Transfer::Rectangle no_cutout = {};
++    const char* const census_reason = transfer_census_reason_;  // LOCAL PATCH - MCLA (0811)
++    transfer_census_reason_ = "whole: the depth / stencil target of the tone map draw";
+     TransferAndClearRenderTargets(1, &rts[0], &last_update_transfers_[0], nullptr, nullptr, no_cutout);
++    transfer_census_reason_ = census_reason;
+     last_update_transfers_[0].clear();
+   }
+ 
+@@ -1818,6 +1969,7 @@ bool RenderTargetCache::ClearRectangleDraw(bool is_rasterization_done, const Sha
+     if (!render_targets[i]) {
+       continue;
+     }
++    transfer_census_reason_ = "around a clear rectangle draw";  // LOCAL PATCH - MCLA (0811): transfer_census_log
+     ChangeOwnership(keys[i], starts_tiles[i], lengths_tiles[i], &clear_rectangle_transfers_[i],
+                     &rectangles[i]);
+     ClearRectangleWaitingForDraw& waiting = clear_rectangles_waiting_for_draw_[i];
+@@ -2108,6 +2260,24 @@ bool RenderTargetCache::GetOverwrittenRectangle(const Shader& vertex_shader,
+   return true;
+ }
+ 
++// LOCAL PATCH - MCLA (0811): transfer_census_log
++bool RenderTargetCache::IsTransferCensusOn() { return REXCVAR_GET(transfer_census_log); }
++
++void RenderTargetCache::NoteTransferCensus(RenderTargetKey source, RenderTargetKey dest, bool skipped_whole,
++                                           uint64_t host_pixels_full, uint64_t host_pixels_made, uint64_t bytes_read,
++                                           uint64_t bytes_written, uint32_t stencil_bit_passes) {
++  g_transfer_census.Note(source.key, dest.key, dest.is_depth != 0, transfer_census_reason_, skipped_whole,
++                         host_pixels_full, host_pixels_made, bytes_read, bytes_written, stencil_bit_passes);
++}
++
++void RenderTargetCache::LogTransferCensusIfDue(uint64_t current_frame) {
++  g_transfer_census.LogIfDue(current_frame, [](uint32_t key_value) {
++    RenderTargetKey key;
++    key.key = key_value;
++    return key.IsEmpty() ? std::string("(none)") : key.GetDebugName();
++  });
++}
++
+ uint32_t RenderTargetCache::GetLastUpdateBoundRenderTargets(
+     uint32_t* depth_and_color_formats_out) const {
+   if (GetPath() != Path::kHostRenderTargets) {
+@@ -2439,6 +2609,8 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
+     return false;
+   }
+ 
++  // LOCAL PATCH - MCLA (0811): transfer_census_log
++  transfer_census_reason_ = "around a resolve clear";
+   // Change ownership of the tiles containing the area to be cleared, so the
+   // up-to-date host render target for the cleared range will be the cleared
+   // one.
+@@ -2762,10 +2934,26 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
+         // be different than the destination.
+         if (!transfer_source.IsEmpty() && transfer_source != dest) {
+           uint32_t transfer_end_tiles = std::min(it->second.end_tiles, extent_end);
+-          if (!resolve_clear_cutout ||
++          const bool transfer_outside_cutout =
++              !resolve_clear_cutout ||
+               Transfer::GetRangeRectangles(it->first, transfer_end_tiles, dest.base_tiles,
+                                            dest_pitch_tiles, dest.msaa_samples, dest_is_64bpp,
+-                                           edram_tile_count_, nullptr, resolve_clear_cutout)) {
++                                           edram_tile_count_, nullptr, resolve_clear_cutout);
++          // LOCAL PATCH - MCLA (0811): transfer_census_log: a transfer the cut leaves out whole.
++          if (!transfer_outside_cutout && IsTransferCensusOn()) {
++            Transfer::Rectangle census_rectangles[Transfer::kMaxRectanglesWithoutCutout];
++            const uint32_t census_rectangle_count = Transfer::GetRangeRectangles(
++                it->first, transfer_end_tiles, dest.base_tiles, dest_pitch_tiles, dest.msaa_samples,
++                dest_is_64bpp, edram_tile_count_, census_rectangles);
++            uint64_t census_pixels = 0;
++            for (uint32_t j = 0; j < census_rectangle_count; ++j) {
++              census_pixels +=
++                  uint64_t(census_rectangles[j].width_pixels) * census_rectangles[j].height_pixels;
++            }
++            NoteTransferCensus(transfer_source, dest, true,
++                               census_pixels * draw_resolution_scale_x() * draw_resolution_scale_y(), 0, 0, 0);
++          }
++          if (transfer_outside_cutout) {
+             RenderTargetKey transfer_host_depth_source =
+                 host_depth_encoding_different
+                     ? it->second.GetHostDepthRenderTarget(dest.GetDepthFormat())
