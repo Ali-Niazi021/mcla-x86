@@ -620,7 +620,7 @@ index 873b4e0..bf25225 100644
 +          break;
 +        }
 +        if (verify) {
-+          verify_add(first, 0, guest);
++          verify_add(first, 0, shadow_bytes_.data() + size_t(ShadowFind(first)) * page_size);  // the slot: what the buffer must hold
 +        }
 +        ++first;
 +        --count;
@@ -635,7 +635,7 @@ index 873b4e0..bf25225 100644
 +          break;
 +        }
 +        if (verify) {
-+          verify_add(last, 0, guest);
++          verify_add(last, 0, shadow_bytes_.data() + size_t(ShadowFind(last)) * page_size);  // the slot: what the buffer must hold
 +        }
 +        --count;
 +        if (census_.active) {
