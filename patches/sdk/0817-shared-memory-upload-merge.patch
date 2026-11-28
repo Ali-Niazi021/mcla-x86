@@ -3,7 +3,7 @@ From: mcla-x86 SDK patch layer
 Date: Sat, 28 Nov 2026 00:00:00 +0000
 Subject: [PATCH] 0817: shared memory uploads: d3d12_upload_census, d3d12_upload_merge (+ bridge pages), d3d12_upload_skip_same, d3d12_upload_verify, shared_memory_merge_upload_calls (Direct3D 12; native stream, uploads session)
 
-Source: Ours, written for this SDK (native stream; scratch/uploads/DESIGN.md, TESTPLAN.md). Written without a build or a run: checked
+Source: Ours, written for this SDK (native stream; scratch/uploads/DESIGN.md, TESTPLAN.md). Written without a build or a run (items 1 - 4 built and run in session 5; item 5 is new): checked
   with clang++ 20.1.8 -fsyntax-only (the SDK's Release flags) of graphics/shared_memory.cpp, d3d12/shared_memory.cpp and
   d3d12/command_processor.cpp (the units that include the changed headers); 0 errors, no warning on an added line. The pristine files
   are the series up to 0814 (0815 / 0816 touch none of these files but deferred_command_list.h, far from the added hunk); the patch
@@ -32,13 +32,21 @@ Purpose: The shared memory uploads (guest pages the CPU wrote, copied from an up
      copy does before its memcpy, and the pages left out stay so (a block that a guest write invalidated is needed again unchanged
      by the draws that read its other pages; the copy, the in-place transitions and the end of the hoisted run were for nothing).
   4. d3d12_upload_verify (bool, proof mode): the pages left out by 3 and the gap pages of 2 are read back from the buffer in place
-     before the call's copies, and compared with the bytes expected when the submission is done; `[upload-verify] MISMATCH`.
+     before the call's copies, and compared with the bytes expected (a skipped page: its slot's) when the submission is done; `[upload-verify] MISMATCH`.
+  5. d3d12_upload_span_guard (bool, default true; only on the d3d12_upload_merge / d3d12_upload_skip_same path): the stale byte of
+     session 5 (3 episodes in ~6.7 M skipped pages, one byte of a hot page, the buffer older than the slot, persisting): two copies of
+     one page recorded between the same two barriers of the buffer have no defined order on the GPU (a hot page the guest rewrites
+     between two requests of a draw; a page bridged as a gap of a hoisted block and uploaded again in it), the older one can land last,
+     and a skipped copy then trusts the slot for good. Now no page is copied twice in one span: a page copied in the span the buffer is
+     in (in place) goes after a transition to the reading state and back; a bridged gap page is marked as written in its hoisted run
+     (so a later upload of it goes in place) and is not bridged if copied in the span. The slot is read once (guest -> slot -> upload
+     buffer), as before. Census: `copy-span breaks`, `bridged pages marked`.
 Bucket: REDO
 
 0817-shared-memory-upload-merge.patch (mcla-x86 native stream, uploads session).
 ---
 diff --git a/include/rex/graphics/d3d12/deferred_command_list.h b/include/rex/graphics/d3d12/deferred_command_list.h
-index 5851ff6..1b55b39 100644
+index b862195..3b2e27c 100644
 --- a/include/rex/graphics/d3d12/deferred_command_list.h
 +++ b/include/rex/graphics/d3d12/deferred_command_list.h
 @@ -163,6 +163,40 @@ class DeferredCommandList {
@@ -83,7 +91,7 @@ index 5851ff6..1b55b39 100644
      auto& args = *reinterpret_cast<D3DCopyResourceArguments*>(
          WriteCommand(Command::kD3DCopyResource, sizeof(D3DCopyResourceArguments)));
 diff --git a/include/rex/graphics/d3d12/shared_memory.h b/include/rex/graphics/d3d12/shared_memory.h
-index a376c39..b667e7f 100644
+index a376c39..f71dd30 100644
 --- a/include/rex/graphics/d3d12/shared_memory.h
 +++ b/include/rex/graphics/d3d12/shared_memory.h
 @@ -12,6 +12,7 @@
@@ -106,7 +114,7 @@ index a376c39..b667e7f 100644
    // Counts, for the log (d3d12_hoist_shared_memory_uploads_stats).
    struct HoistStats {
      // Runs of draws started, uploads hoisted to the start of a run, and uploads
-@@ -187,6 +191,104 @@ class D3D12SharedMemory : public SharedMemory {
+@@ -187,6 +191,117 @@ class D3D12SharedMemory : public SharedMemory {
    void MarkPages(uint32_t start, uint32_t length);
    void WriteHoistedBarrier(D3D12_RESOURCE_STATES state_before, D3D12_RESOURCE_STATES state_after);
  
@@ -131,6 +139,18 @@ index a376c39..b667e7f 100644
 +  bool UploadRangesJoined(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges);
 +  std::vector<std::pair<uint32_t, uint32_t>> upload_plan_;
 +  std::vector<uint32_t> upload_lead_gap_;
++  std::vector<std::pair<uint32_t, uint32_t>> upload_bridged_gaps_;
++
++  // The pages that copies have been recorded for since the buffer last changed state (a "span": the copies of a hoisted
++  // run between its two barriers, or the in-place ones while the buffer stays the copy destination), a bit per page, in
++  // 64-page words that only count if their serial is the span's. D3D12 does not order two copies that write the same
++  // bytes with no barrier between them (the later one may land first): two copies of one page in one span are never
++  // recorded (d3d12_upload_span_guard); a hoisted run's own marks (hoist_pages_) do the same for its block.
++  uint64_t copy_span_serial_ = 1;
++  std::vector<uint64_t> copy_span_pages_;
++  std::vector<uint64_t> copy_span_pages_serial_;
++  bool CopySpanHas(uint32_t page_first, uint32_t page_count) const;
++  void CopySpanMark(uint32_t page_first, uint32_t page_count);
 +
 +  // upload_skip_same: the bytes last copied to hot pages, kept on this side (the copy goes from them, so they are what
 +  // the buffer holds), to leave a copy out when a hot page asked for again still has the same bytes. A slot is good
@@ -165,6 +185,7 @@ index a376c39..b667e7f 100644
 +    uint64_t bytes_by_kind[kRequestKindCount] = {};
 +    uint64_t hot_pages = 0, skipped_pages = 0, skipped_calls = 0;
 +    uint64_t barriers_to_copy = 0, barriers_from_copy = 0, hoisted_pairs = 0, hoisted_rewrites = 0;
++    uint64_t span_breaks = 0, bridged_marked_pages = 0;
 +    uint64_t pages_distinct = 0, pages_repeated = 0, pages_repeated_hot = 0, page_extra_copies = 0;
 +    // Of the uploads of a page that had been uploaded before (the bytes hashed from guest memory when the copy is
 +    // made): in the same frame with the same bytes / other bytes, in an earlier frame with the same / other bytes.
@@ -242,7 +263,7 @@ index a4d8c76..1a468fc 100644
    uint32_t host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;
    std::vector<uint64_t> host_gpu_memory_sparse_allocated_;
 diff --git a/src/graphics/d3d12/shared_memory.cpp b/src/graphics/d3d12/shared_memory.cpp
-index 873b4e0..bf25225 100644
+index 873b4e0..6368fea 100644
 --- a/src/graphics/d3d12/shared_memory.cpp
 +++ b/src/graphics/d3d12/shared_memory.cpp
 @@ -9,6 +9,7 @@
@@ -253,7 +274,7 @@ index 873b4e0..bf25225 100644
  #include <chrono>  // LOCAL PATCH - MCLA (0794)
  #include <cstring>
  #include <utility>
-@@ -26,6 +27,42 @@ REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true, "GPU/D3D12",
+@@ -26,6 +27,49 @@ REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true, "GPU/D3D12",
                      "Use tiled shared memory on D3D12")
      .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
  
@@ -286,6 +307,13 @@ index 873b4e0..bf25225 100644
 +REXCVAR_DEFINE_UINT32(d3d12_upload_skip_same_pages, 4096, "GPU/D3D12",
 +                      "With d3d12_upload_skip_same: how many pages of last-copied bytes to keep (16 to 65536)")
 +    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_BOOL(d3d12_upload_span_guard, true, "GPU/D3D12",
++                    "With d3d12_upload_merge / d3d12_upload_skip_same: never record two copies of one page between two "
++                    "barriers of the shared memory buffer (an upload of a page already copied in the span goes after a "
++                    "transition; a bridged gap counts as copied): Direct3D 12 does not order copies that write the same "
++                    "bytes without a barrier, and a skipped copy trusts the last one to have landed. Off only to test "
++                    "that")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 +REXCVAR_DEFINE_BOOL(d3d12_upload_verify, false, "GPU/D3D12",
 +                    "Proof mode for d3d12_upload_skip_same and the bridging of d3d12_upload_merge: the pages left out "
 +                    "and the pages bridged are read back from the shared memory (in place, ahead of the uploads of "
@@ -296,7 +324,7 @@ index 873b4e0..bf25225 100644
  namespace rex::graphics::d3d12 {
  
  D3D12SharedMemory::D3D12SharedMemory(D3D12CommandProcessor& command_processor,
-@@ -170,12 +207,17 @@ void D3D12SharedMemory::Shutdown(bool from_destructor) {
+@@ -170,17 +214,23 @@ void D3D12SharedMemory::Shutdown(bool from_destructor) {
  
  void D3D12SharedMemory::ClearCache() {
    SharedMemory::ClearCache();
@@ -314,10 +342,17 @@ index 873b4e0..bf25225 100644
  }
  
  void D3D12SharedMemory::BeginSubmission() {
-@@ -194,6 +236,15 @@ void D3D12SharedMemory::CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATES
+   // ExecuteCommandLists is a full UAV barrier.
+   buffer_uav_writes_commit_needed_ = false;
++  ++copy_span_serial_;  // LOCAL PATCH - MCLA (0817)
+ }
+ 
+ void D3D12SharedMemory::CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATES new_state) {
+@@ -194,6 +244,16 @@ void D3D12SharedMemory::CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATES
    // A run of draws (BeginDrawReads) needs the buffer to stay in the reading
    // state.
    EndHoistRun();
++  ++copy_span_serial_;  // LOCAL PATCH - MCLA (0817): a barrier ends the span of copies
 +  // LOCAL PATCH - MCLA (0817): the census counts the transitions to and from the copy destination state (the uploads'
 +  // own); a use of the buffer by the GPU as a UAV may change any page, so what was kept of the last copies is let go.
 +  if (census_.active) {
@@ -330,7 +365,7 @@ index 873b4e0..bf25225 100644
    command_processor_.PushTransitionBarrier(buffer_, buffer_state_, new_state);
    buffer_state_ = new_state;
    // "UAV -> anything" transition commits the writes implicitly.
-@@ -339,12 +390,36 @@ bool D3D12SharedMemory::WarmUpHostGpuMemory(uint32_t start, uint32_t length) {
+@@ -339,12 +399,36 @@ bool D3D12SharedMemory::WarmUpHostGpuMemory(uint32_t start, uint32_t length) {
    return made;
  }
  
@@ -367,7 +402,7 @@ index 873b4e0..bf25225 100644
    // LOCAL PATCH - MCLA (0520): gpu_timing_ops: in the stream the copies are written to (the hoisted one when hoisting),
    // from before the transition of an in-place upload to after its last copy (ended before EndHoistedUpload).
    D3D12CommandProcessor::GpuTimingOpScope gt_op(command_processor_, D3D12CommandProcessor::kGtOpUpload);
-@@ -376,6 +451,10 @@ bool D3D12SharedMemory::UploadRanges(
+@@ -376,6 +460,10 @@ bool D3D12SharedMemory::UploadRanges(
        command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
                                         upload_buffer, UINT64(upload_buffer_offset),
                                         UINT64(upload_buffer_size));
@@ -378,7 +413,7 @@ index 873b4e0..bf25225 100644
        uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
        upload_range_start += upload_buffer_pages;
        upload_range_length -= upload_buffer_pages;
-@@ -468,6 +547,8 @@ bool D3D12SharedMemory::BeginHoistedUpload(
+@@ -468,6 +556,8 @@ bool D3D12SharedMemory::BeginHoistedUpload(
    command_list.SetWritingHoisted(true);
    if (!hoist_run_has_uploads_) {
      hoist_run_has_uploads_ = true;
@@ -387,7 +422,7 @@ index 873b4e0..bf25225 100644
      WriteHoistedBarrier(kReadState, D3D12_RESOURCE_STATE_COPY_DEST);
    } else {
      command_list.TruncateHoistedStream(hoist_closing_barrier_offset_);
-@@ -499,6 +580,7 @@ void D3D12SharedMemory::BeginDrawReads() {
+@@ -499,6 +589,7 @@ void D3D12SharedMemory::BeginDrawReads() {
      return;
    }
    hoist_point_ = command_processor_.GetDeferredCommandList().CmdHoistPoint();
@@ -395,7 +430,7 @@ index 873b4e0..bf25225 100644
    ++hoist_serial_;
    hoist_run_has_uploads_ = false;
    hoist_run_active_ = true;
-@@ -547,4 +629,654 @@ void D3D12SharedMemory::WriteHoistedBarrier(D3D12_RESOURCE_STATES state_before,
+@@ -547,4 +638,719 @@ void D3D12SharedMemory::WriteHoistedBarrier(D3D12_RESOURCE_STATES state_before,
    command_processor_.GetDeferredCommandList().D3DResourceBarrier(1, &barrier);
  }
  
@@ -418,6 +453,38 @@ index 873b4e0..bf25225 100644
 +    }
 +  }
 +  return false;
++}
++
++bool D3D12SharedMemory::CopySpanHas(uint32_t page_first, uint32_t page_count) const {
++  for (uint32_t page = page_first; page < page_first + page_count; ++page) {
++    const uint32_t word = page >> 6;
++    if (word >= copy_span_pages_.size()) {
++      return false;
++    }
++    if (copy_span_pages_serial_[word] == copy_span_serial_ && (copy_span_pages_[word] & (uint64_t(1) << (page & 63)))) {
++      return true;
++    }
++  }
++  return false;
++}
++
++void D3D12SharedMemory::CopySpanMark(uint32_t page_first, uint32_t page_count) {
++  if (copy_span_pages_.empty()) {
++    const size_t words = ((size_t(kBufferSize) >> page_size_log2()) + 63) / 64;
++    copy_span_pages_.assign(words, 0);
++    copy_span_pages_serial_.assign(words, 0);
++  }
++  for (uint32_t page = page_first; page < page_first + page_count; ++page) {
++    const uint32_t word = page >> 6;
++    if (word >= copy_span_pages_.size()) {
++      return;
++    }
++    if (copy_span_pages_serial_[word] != copy_span_serial_) {
++      copy_span_pages_serial_[word] = copy_span_serial_;
++      copy_span_pages_[word] = 0;
++    }
++    copy_span_pages_[word] |= uint64_t(1) << (page & 63);
++  }
 +}
 +
 +uint32_t D3D12SharedMemory::ShadowFind(uint32_t page) const {
@@ -565,6 +632,7 @@ index 873b4e0..bf25225 100644
 +  // does (MakeRangeValid before the memcpy), for the whole plan at once; what is not copied stays valid.
 +  const bool armed_upfront = skip_mode == 2;
 +  const bool verify = REXCVAR_GET(d3d12_upload_verify);
++  const bool span_guard = REXCVAR_GET(d3d12_upload_span_guard);
 +  const uint32_t bridge_max = merge ? std::min(uint32_t(REXCVAR_GET(d3d12_upload_bridge_pages)), uint32_t(64)) : 0;
 +
 +  // The plan: sorted by address, the runs that overlap or touch made one (a page of two runs is copied once).
@@ -662,7 +730,8 @@ index 873b4e0..bf25225 100644
 +    for (size_t i = 1; i < upload_plan_.size(); ++i) {
 +      const uint32_t previous_end = upload_plan_[i - 1].first + upload_plan_[i - 1].second;
 +      const uint32_t gap = upload_plan_[i].first - previous_end;
-+      if (gap && gap <= bridge_max && ArePagesPlainValid(previous_end, gap) && !PagesMarkedInRun(previous_end, gap)) {
++      if (gap && gap <= bridge_max && ArePagesPlainValid(previous_end, gap) && !PagesMarkedInRun(previous_end, gap) &&
++          !(span_guard && CopySpanHas(previous_end, gap))) {
 +        lead_gap[i] = gap;
 +        if (verify) {
 +          for (uint32_t page = previous_end; page < previous_end + gap; ++page) {
@@ -692,7 +761,8 @@ index 873b4e0..bf25225 100644
 +    if (first_byte > hoist_tail_.dst_end) {
 +      const uint32_t gap = uint32_t((first_byte - hoist_tail_.dst_end) >> page_log2);
 +      const uint32_t gap_first = hoist_tail_.dst_end >> page_log2;
-+      if (gap <= bridge_max && ArePagesPlainValid(gap_first, gap) && !PagesMarkedInRun(gap_first, gap)) {
++      if (gap <= bridge_max && ArePagesPlainValid(gap_first, gap) && !PagesMarkedInRun(gap_first, gap) &&
++          !(span_guard && CopySpanHas(gap_first, gap))) {
 +        lead_gap[0] = gap;
 +      }
 +    }
@@ -701,7 +771,23 @@ index 873b4e0..bf25225 100644
 +  if (!hoist) {
 +    CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
 +    command_processor_.SubmitBarriers();
++    if (span_guard) {
++      // The buffer was the copy destination already (an upload of an earlier call of this draw's requests): if one of
++      // these pages was copied in that span, the two copies would be unordered. A transition to the reading state and
++      // back ends the span: the earlier copy is done before the later one starts.
++      for (const std::pair<uint32_t, uint32_t>& range : upload_plan_) {
++        if (CopySpanHas(range.first, range.second)) {
++          CommitUAVWritesAndTransitionBuffer(kReadState);
++          command_processor_.SubmitBarriers();
++          CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
++          command_processor_.SubmitBarriers();
++          census_.span_breaks += census_.active;
++          break;
++        }
++      }
++    }
 +  }
++  upload_bridged_gaps_.clear();
 +  auto& command_list = command_processor_.GetDeferredCommandList();
 +  CopyTail local_tail;
 +  CopyTail& tail = hoist ? hoist_tail_ : local_tail;
@@ -809,6 +895,13 @@ index 873b4e0..bf25225 100644
 +        tail.src = upload_buffer;
 +        tail.src_end = upload_buffer_offset + upload_buffer_size;
 +      }
++      if (!hoist) {
++        CopySpanMark(first_page, block_pages);
++      }
++      if (gap_pages) {
++        upload_bridged_gaps_.emplace_back(first_page, gap_pages);
++        census_.bridged_marked_pages += census_.active ? gap_pages : 0;
++      }
 +      if (census_.active) {
 +        CensusPiece(start << page_log2, real_pages << page_log2);
 +        census_.commands += !extended;
@@ -833,6 +926,11 @@ index 873b4e0..bf25225 100644
 +    hoist_byte_ranges_temp_.clear();
 +    for (const std::pair<uint32_t, uint32_t>& range : upload_plan_) {
 +      hoist_byte_ranges_temp_.emplace_back(range.first << page_size_log2(), range.second << page_size_log2());
++    }
++    // A bridged gap page was copied in this block too: marked as written in the run, so a later copy of it (an upload
++    // of it after a guest write) goes in place, after a barrier, and not into the same barrier-free block.
++    for (const std::pair<uint32_t, uint32_t>& gap : upload_bridged_gaps_) {
++      hoist_byte_ranges_temp_.emplace_back(gap.first << page_size_log2(), gap.second << page_size_log2());
 +    }
 +    EndHoistedUpload(hoist_byte_ranges_temp_);
 +  }
@@ -990,11 +1088,12 @@ index 873b4e0..bf25225 100644
 +      "[upload-census] {:.1f} s, {} frames with uploads, per frame: {:.1f} copies made ({:.1f} pieces, {:.1f} of them "
 +      "went on an earlier copy), {:.0f} KB (+{:.0f} KB bridged), {:.1f} calls ({:.1f} hoisted, {:.1f} in place with no "
 +      "run going, {:.1f} in place for a page a draw of the run had read); transitions to copy dest {:.1f}, from it "
-+      "{:.1f}, hoisted run pairs {:.1f}",
++      "{:.1f}, hoisted run pairs {:.1f}, copy-span breaks {:.3f}, bridged pages marked {:.1f}",
 +      seconds, c.window_frames, double(c.commands) / frames, double(c.pieces) / frames, double(c.extended) / frames,
 +      double(c.bytes) / 1024.0 / frames, double(c.bridged_bytes) / 1024.0 / frames, double(c.calls) / frames,
 +      double(c.hoisted_calls) / frames, double(c.in_place_no_run) / frames, double(c.in_place_page_read) / frames,
-+      double(c.barriers_to_copy) / frames, double(c.barriers_from_copy) / frames, double(c.hoisted_pairs) / frames);
++      double(c.barriers_to_copy) / frames, double(c.barriers_from_copy) / frames, double(c.hoisted_pairs) / frames,
++      double(c.span_breaks) / frames, double(c.bridged_marked_pages) / frames);
 +  REXGPU_INFO(
 +      "[upload-census] pages per frame: {:.1f} distinct, {:.1f} uploaded more than once ({:.1f} of them hot; {:.1f} "
 +      "extra copies of pages), {:.1f} uploads of hot pages, {:.1f} left out for the same bytes ({} calls); uploaded in "
@@ -1039,6 +1138,7 @@ index 873b4e0..bf25225 100644
 +  std::fill(std::begin(census_.bytes_by_kind), std::end(census_.bytes_by_kind), uint64_t(0));
 +  census_.hot_pages = census_.skipped_pages = census_.skipped_calls = 0;
 +  census_.barriers_to_copy = census_.barriers_from_copy = census_.hoisted_pairs = census_.hoisted_rewrites = 0;
++  census_.span_breaks = census_.bridged_marked_pages = 0;
 +  census_.pages_distinct = census_.pages_repeated = census_.pages_repeated_hot = census_.page_extra_copies = 0;
 +  census_.same_in_frame = census_.changed_in_frame = census_.same_earlier_frame = census_.changed_earlier_frame = 0;
 +  census_.pages_in_2 = census_.pages_in_8 = census_.pages_in_32 = 0;
