@@ -59,7 +59,7 @@ index b679e15..baa1824 100644
    // Temporary storage for GetDirectResolveSource.
    mutable std::vector<ResolveCopyDumpRectangle> direct_resolve_rectangles_;
 diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
-index 9fe96fa..cc941d8 100644
+index 00de96f..d014b4a 100644
 --- a/src/graphics/d3d12/render_target_cache.cpp
 +++ b/src/graphics/d3d12/render_target_cache.cpp
 @@ -29,6 +29,7 @@
@@ -70,7 +70,7 @@ index 9fe96fa..cc941d8 100644
  #include <rex/graphics/d3d12/deferred_command_list.h>
  #include <rex/graphics/d3d12/render_target_cache.h>
  #include <rex/filesystem.h>  // LOCAL PATCH - MCLA (0790)
-@@ -5219,6 +5220,73 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+@@ -5245,6 +5246,73 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
    D3D12CommandProcessor::GpuTimingOpScope gt_op(command_processor_, D3D12CommandProcessor::kGtOpXfer, false);
  
    bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;

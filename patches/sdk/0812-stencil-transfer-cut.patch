@@ -1,0 +1,397 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Sat, 28 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0812: stencil_transfer_cut: the stencil-bit draws of a depth / stencil ownership transfer leave out what the draw rewrites (Direct3D 12 without a stencil reference output; native stream, zero-copy P2)
+
+Source: Ours, written for this SDK (native stream; design note scratch/zerocopy/DESIGN.md section P2 "S1"). Written without a build
+  or a run: checked with clang++ 20.1.8 -fsyntax-only (the SDK's Release flags) of pipeline/render_target/cache.cpp,
+  d3d12/render_target_cache.cpp and vulkan/render_target_cache.cpp (the changed header); 0 errors, no warning on an added line.
+  Needs 0811 (and 0810). Applies after 0780, and also on top of 0800.
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: Without a pixel-shader stencil reference output (D3D12_FEATURE_DATA_D3D12_OPTIONS::PSSpecifiedStencilRefSupported false:
+  this NVIDIA GPU) the Direct3D 12 backend makes every depth / stencil ownership transfer as one depth draw, a stencil clear and 8
+  draws that each set one stencil bit (render_target_cache.cpp: need_stencil_bit_draws, the `j <= is_stencil_bit * 7` loop). When
+  the draw that needs the transfer rewrites the stencil of every sample of a rectangle, those 8 draws (and the clear) need not cover
+  it. Proof, from the state the host uses for a rectangle list (pipeline_cache.cpp: not polygonal, so the front face's ops and
+  write mask serve both faces): RB_DEPTHCONTROL stencil_enable, stencilfunc ALWAYS, a depth test that cannot fail (z off or
+  ALWAYS: no depth-fail op can run), stencilzpass REPLACE, RB_STENCILREFMASK stencilwritemask 0xFF; and the coverage of
+  GetOverwrittenRectangle with depth_stencil_passes_all (the proof skip_overwritten_transfers and tonemap_transfer_skip use: a
+  rectangle list, no user clip planes, no kill / alpha test / alpha to mask, the covered rectangle in guest pixels, the
+  half-pixel shift at a draw scale above 1 taken into account). The title's tone map draw meets it (logged RB_DEPTHCONTROL
+  0x00708761: stencil on, z off, ALWAYS, REPLACE; RB_STENCILREFMASK 0x00FFFF00: mask 0xFF), so its depth / stencil target's
+  transfers (3 a frame at 2000p, 24 stencil-bit draws) bring only the depth plus the strips the quad does not cover. The depth
+  draw is unchanged. New cvars ("GPU", hot reload, default false): stencil_transfer_cut, stencil_transfer_cut_poison (the left-out
+  stencil filled with 0xA5 after the transfers; the draw must rewrite it). Log every 10 s while on: `[stencil-transfer-cut] ...
+  draws ... had their stencil cut, N not (<reason x count>...); stencil-bit transfers left out ... made over a smaller area ...,
+  made whole ...; X host Mpx of stencil-bit passes saved`. The cut is for the draw's own target and transfers only
+  (last_update_transfers()[0], reset at every Update); resolve clears and clear rectangle draws keep their own cut. Off = no change.
+Bucket: REDO
+
+0812-stencil-transfer-cut.patch (mcla-x86 native stream, zero-copy P2).
+
+---
+diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
+index baa1824..d20f78c 100644
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -648,6 +648,21 @@ class RenderTargetCache {
+   // The rectangle of all the render targets of the last update that its draw
+   // rewrites completely (not to be transferred into), as the clear rectangle
+   // of the transfers (a cutout), or null if there isn't one.
++  // LOCAL PATCH - MCLA (0812): stencil_transfer_cut. For the draw being set up (Update), a rectangle of the depth / stencil
++  // target whose stencil the draw rewrites in every sample (a rectangle list covering it, the stencil test ALWAYS, the
++  // depth test unable to fail, the pass operation REPLACE, the write mask 0xFF): the transfers of that target need not
++  // bring its stencil there. Valid only for the transfers of last_update_transfers()[0] made right after the Update (the
++  // backend checks the vector), reset at the start of every Update; the backend that writes the stencil apart from the
++  // depth (Direct3D 12 without a pixel-shader stencil reference output: a draw for each stencil bit) cuts those draws to
++  // it and reports what it did with NoteStencilTransferCut.
++  Transfer::Rectangle transfer_stencil_cutout_ = {};
++  bool transfer_stencil_cutout_valid_ = false;
++  static bool IsStencilTransferCutPoison();
++  // transfers_dropped: stencil-bit invocations left out (all of their rectangles inside the cut), transfers_cut: made over
++  // fewer rectangles, transfers_kept: made whole; pixel_passes_saved: host pixels times the 8 passes.
++  void NoteStencilTransferCut(uint32_t transfers_dropped, uint32_t transfers_cut, uint32_t transfers_kept,
++                              uint64_t pixel_passes_saved);
++
+   // LOCAL PATCH - MCLA (0811): transfer_census_log. transfer_census_reason_ (private) says why the transfers that
+   // ChangeOwnership finds next are what they are (cut by which skip, or kept and why), set before it by the draw, the
+   // clear rectangle draw and the resolve clear; the transfers a cut leaves out whole are counted there, the backend counts
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index d014b4a..ee274ba 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -1689,6 +1689,7 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
+       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+                                        depth_and_color_render_targets, last_update_transfers(),
+                                        nullptr, last_update_overwritten_rectangle());
++      transfer_stencil_cutout_valid_ = false;  // LOCAL PATCH - MCLA (0812): stencil_transfer_cut: this draw's only
+       SetCommandListRenderTargets(depth_and_color_render_targets);
+     } break;
+     case Path::kPixelShaderInterlock: {
+@@ -5683,6 +5684,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+     command_processor_.PushTransitionBarrier(
+         dest_d3d12_rt.resource(), dest_d3d12_rt.SetResourceState(dest_state), dest_state);
+ 
++    // LOCAL PATCH - MCLA (0812): stencil_transfer_cut: the stencil of this depth / stencil target was cut (for the poison).
++    bool stencil_cut_used = false;
+     if (!current_transfers.empty()) {
+       are_current_command_list_render_targets_valid_ = false;
+       if (dest_rt_key.is_depth) {
+@@ -5705,6 +5708,20 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+       // Gather shader keys and sort to reduce pipeline state and binding
+       // switches. Also gather stencil rectangles to clear if needed.
+       bool need_stencil_bit_draws = dest_rt_key.is_depth && !use_stencil_reference_output_;
++      // LOCAL PATCH - MCLA (0812): stencil_transfer_cut: the stencil-bit draws of the draw's own depth / stencil target
++      // (last_update_transfers()[0]) leave out the rectangle the draw rewrites the stencil of. Only where the transfers
++      // have no cut of their own (the tone map's depth / stencil target is given an empty one; a cut drawn for the colour
++      // would mean no depth / stencil target), so the rectangle is the whole cut of the stencil.
++      const Transfer::Rectangle* stencil_cutout = resolve_clear_rectangle;
++      if (need_stencil_bit_draws && transfer_stencil_cutout_valid_ &&
++          &current_transfers == &last_update_transfers()[0] &&
++          (!resolve_clear_rectangle || !resolve_clear_rectangle->width_pixels ||
++           !resolve_clear_rectangle->height_pixels)) {
++        stencil_cutout = &transfer_stencil_cutout_;
++        stencil_cut_used = true;
++      }
++      uint32_t stencil_cut_dropped = 0, stencil_cut_cut = 0, stencil_cut_kept = 0;
++      uint64_t stencil_cut_pixels_saved = 0;
+       current_transfer_invocations_.clear();
+       current_transfer_invocations_.reserve(current_transfers.size()
+                                             << uint32_t(need_stencil_bit_draws));
+@@ -5755,9 +5772,40 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+             new_transfer_shader_key.mode = source_rt_key.is_depth
+                                                ? TransferMode::kDepthToStencilBit
+                                                : TransferMode::kColorToStencilBit;
+-            stencil_clear_rectangle_count += transfer.GetRectangles(
++            // LOCAL PATCH - MCLA (0812): stencil_transfer_cut: the stencil's own cut; a transfer with no stencil left to
++            // bring gets no stencil-bit invocation.
++            const uint32_t transfer_stencil_rectangle_count = transfer.GetRectangles(
+                 dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
+-                edram_tile_count(), nullptr, resolve_clear_rectangle);
++                edram_tile_count(), nullptr, stencil_cutout);
++            if (stencil_cutout != resolve_clear_rectangle) {
++              Transfer::Rectangle cut_rectangles[Transfer::kMaxRectanglesWithCutout];
++              uint64_t pixels_before = 0, pixels_after = 0;
++              const uint32_t before_count = transfer.GetRectangles(
++                  dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
++                  edram_tile_count(), cut_rectangles, resolve_clear_rectangle);
++              for (uint32_t k = 0; k < before_count; ++k) {
++                pixels_before += uint64_t(cut_rectangles[k].width_pixels) * cut_rectangles[k].height_pixels;
++              }
++              const uint32_t after_count = transfer.GetRectangles(
++                  dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
++                  edram_tile_count(), cut_rectangles, stencil_cutout);
++              for (uint32_t k = 0; k < after_count; ++k) {
++                pixels_after += uint64_t(cut_rectangles[k].width_pixels) * cut_rectangles[k].height_pixels;
++              }
++              if (!after_count) {
++                ++stencil_cut_dropped;
++              } else if (pixels_after < pixels_before) {
++                ++stencil_cut_cut;
++              } else {
++                ++stencil_cut_kept;
++              }
++              stencil_cut_pixels_saved += (pixels_before - std::min(pixels_after, pixels_before)) *
++                                          draw_resolution_scale_x() * draw_resolution_scale_y() * 8;
++            }
++            if (!transfer_stencil_rectangle_count) {
++              continue;
++            }
++            stencil_clear_rectangle_count += transfer_stencil_rectangle_count;
+           } else {
+             if (dest_rt_key.is_depth) {
+               if (host_depth_source_d3d12_rt) {
+@@ -5780,6 +5828,17 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+         }
+       }
+       std::sort(current_transfer_invocations_.begin(), current_transfer_invocations_.end());
++      if (stencil_cut_used) {  // LOCAL PATCH - MCLA (0812): stencil_transfer_cut
++        NoteStencilTransferCut(stencil_cut_dropped, stencil_cut_cut, stencil_cut_kept, stencil_cut_pixels_saved);
++      }
++      // LOCAL PATCH - MCLA (0812): stencil_transfer_cut: the cut of an invocation's rectangles (the stencil-bit ones have
++      // their own).
++      auto invocation_cutout = [&](const TransferInvocation& invocation) -> const Transfer::Rectangle* {
++        return (invocation.shader_key.mode == TransferMode::kDepthToStencilBit ||
++                invocation.shader_key.mode == TransferMode::kColorToStencilBit)
++                   ? stencil_cutout
++                   : resolve_clear_rectangle;
++      };
+ 
+       // Clear the stencil to 0 where it will be loaded - will be setting the
+       // bits that need to be 1 by discarding samples. Clearing everything here
+@@ -5795,7 +5854,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+           Transfer::Rectangle transfer_stencil_clear_rectangles[Transfer::kMaxRectanglesWithCutout];
+           uint32_t transfer_stencil_clear_rectangle_count = transfer.GetRectangles(
+               dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
+-              edram_tile_count(), transfer_stencil_clear_rectangles, resolve_clear_rectangle);
++              edram_tile_count(), transfer_stencil_clear_rectangles,
++              stencil_cutout);  // LOCAL PATCH - MCLA (0812): stencil_transfer_cut
+           for (uint32_t j = 0; j < transfer_stencil_clear_rectangle_count; ++j) {
+             const Transfer::Rectangle& stencil_clear_rectangle =
+                 transfer_stencil_clear_rectangles[j];
+@@ -5844,9 +5904,10 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+         const TransferInvocation& transfer_invocation_first = *it;
+         // Will be merging transfers from the same source into one mesh.
+         auto it_merged_first = it, it_merged_last = it;
++        // LOCAL PATCH - MCLA (0812): stencil_transfer_cut: invocation_cutout (merged invocations have one mode).
+         uint32_t transfer_rectangle_count = transfer_invocation_first.transfer.GetRectangles(
+             dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
+-            edram_tile_count(), nullptr, resolve_clear_rectangle);
++            edram_tile_count(), nullptr, invocation_cutout(transfer_invocation_first));
+         for (auto it_merge = std::next(it_merged_first);
+              it_merge != current_transfer_invocations_.cend(); ++it_merge) {
+           if (!transfer_invocation_first.CanBeMergedIntoOneDraw(*it_merge)) {
+@@ -5854,7 +5915,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+           }
+           transfer_rectangle_count += it_merge->transfer.GetRectangles(
+               dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
+-              edram_tile_count(), nullptr, resolve_clear_rectangle);
++              edram_tile_count(), nullptr, invocation_cutout(*it_merge));
+           it_merged_last = it_merge;
+         }
+         assert_not_zero(transfer_rectangle_count);
+@@ -5912,7 +5973,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+           Transfer::Rectangle transfer_invocation_rectangles[Transfer::kMaxRectanglesWithCutout];
+           uint32_t transfer_invocation_rectangle_count = it_merged->transfer.GetRectangles(
+               dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
+-              edram_tile_count(), transfer_invocation_rectangles, resolve_clear_rectangle);
++              edram_tile_count(), transfer_invocation_rectangles,
++              invocation_cutout(*it_merged));  // LOCAL PATCH - MCLA (0812): stencil_transfer_cut
+           assert_not_zero(transfer_invocation_rectangle_count);
+           for (uint32_t j = 0; j < transfer_invocation_rectangle_count; ++j) {
+             const Transfer::Rectangle& transfer_rectangle = transfer_invocation_rectangles[j];
+@@ -6129,6 +6191,21 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+       }
+     }
+ 
++    // LOCAL PATCH - MCLA (0812): stencil_transfer_cut_poison: the stencil the cut left out is junk, which the draw must
++    // rewrite (the render target is in the depth write state from its transfers).
++    if (stencil_cut_used && IsStencilTransferCutPoison()) {
++      D3D12_RECT poison_rect;
++      poison_rect.left = LONG(transfer_stencil_cutout_.x_pixels * draw_resolution_scale_x());
++      poison_rect.top = LONG(transfer_stencil_cutout_.y_pixels * draw_resolution_scale_y());
++      poison_rect.right =
++          LONG((transfer_stencil_cutout_.x_pixels + transfer_stencil_cutout_.width_pixels) * draw_resolution_scale_x());
++      poison_rect.bottom = LONG((transfer_stencil_cutout_.y_pixels + transfer_stencil_cutout_.height_pixels) *
++                                draw_resolution_scale_y());
++      command_processor_.SubmitBarriers();
++      command_list.D3DClearDepthStencilView(dest_d3d12_rt.descriptor_draw().GetHandle(), D3D12_CLEAR_FLAG_STENCIL, 0.0f,
++                                            0xA5, 1, &poison_rect);
++    }
++
+     // Perform the clear.
+     if (resolve_clear_needed) {
+       gt_op.Switch(D3D12CommandProcessor::kGtOpClear);  // LOCAL PATCH - MCLA (0520): gpu_timing_ops
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index 10a0d10..df2ed41 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -119,6 +119,23 @@ REXCVAR_DEFINE_BOOL(transfer_census_log, false, "GPU",
+                     "host pixels and (Direct3D 12) the bytes read and written")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// LOCAL PATCH - MCLA (0812): the stencil of a depth / stencil transfer that the draw rewrites.
++REXCVAR_DEFINE_BOOL(stencil_transfer_cut, false, "GPU",
++                    "With host render targets on Direct3D 12 without a pixel-shader stencil reference output (where the "
++                    "stencil of a depth / stencil ownership transfer is written by a draw for each of its 8 bits): the "
++                    "stencil-bit draws leave out the rectangle that the draw needing the transfer rewrites the stencil of "
++                    "in every sample (a rectangle list that provably covers it, as for skip_overwritten_transfers; the "
++                    "stencil test ALWAYS, a depth test that cannot fail, the stencil pass operation REPLACE, the stencil "
++                    "write mask 0xFF), such as the title's tone map. The depth is transferred as before. Logs "
++                    "'[stencil-transfer-cut] ...' every 10 s")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(stencil_transfer_cut_poison, false, "GPU",
++                    "Development check of stencil_transfer_cut: fill the stencil of the left-out rectangle with 0xA5 "
++                    "after the transfers, so that a draw that does not rewrite all of it changes what later stencil "
++                    "tests pass (the picture must be the same as with stencil_transfer_cut off)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_UINT32(edram_tiles, 2048, "GPU",
+                       "Size of the EDRAM emulated, in tiles: 2048 as on the console, or 4096 for "
+                       "titles patched to draw more at once than the console could hold (a "
+@@ -341,6 +358,80 @@ class TonemapSkipStats {
+   bool logged_first_skip_ = false;
+ };
+ 
++// LOCAL PATCH - MCLA (0812): stencil_transfer_cut. The CP thread only.
++class StencilTransferCutStats {
++ public:
++  // A draw whose depth / stencil target needs transfers: reason null when the cut was set, else why not.
++  void NoteDraw(const char* reason) {
++    if (!reason) {
++      ++draws_cut_;
++    } else {
++      ++kept_reasons_[reason];
++    }
++  }
++  void NoteTransfers(uint32_t dropped, uint32_t cut, uint32_t kept, uint64_t pixel_passes_saved) {
++    dropped_ += dropped;
++    cut_ += cut;
++    kept_ += kept;
++    pixel_passes_saved_ += pixel_passes_saved;
++  }
++  void LogIfDue(bool poison) {
++    const auto now = std::chrono::steady_clock::now();
++    const double seconds = std::chrono::duration<double>(now - window_start_).count();
++    if (seconds < 10.0) {
++      return;
++    }
++    std::string reasons;
++    uint64_t draws_kept = 0;
++    for (const auto& kept : kept_reasons_) {
++      draws_kept += kept.second;
++      reasons += (reasons.empty() ? "" : "; ") + std::string(kept.first) + " x" + std::to_string(kept.second);
++    }
++    if (draws_cut_ || draws_kept || dropped_ || cut_ || kept_) {
++      REXGPU_INFO(
++          "[stencil-transfer-cut] {:.1f} s: {} draws needing depth / stencil transfers had their stencil cut, {} not "
++          "({}); stencil-bit transfers left out {} ({} draws of a stencil bit), made over a smaller area {}, made whole "
++          "{}; {:.1f} host Mpx of stencil-bit passes saved{}",
++          seconds, draws_cut_, draws_kept, reasons.empty() ? "none" : reasons, dropped_, uint64_t(dropped_) * 8, cut_,
++          kept_, double(pixel_passes_saved_) / 1e6,
++          poison ? " (the left-out stencil is filled with 0xA5: stencil_transfer_cut_poison)" : "");
++    }
++    draws_cut_ = dropped_ = cut_ = kept_ = pixel_passes_saved_ = 0;
++    kept_reasons_.clear();
++    window_start_ = now;
++  }
++
++ private:
++  uint64_t draws_cut_ = 0, dropped_ = 0, cut_ = 0, kept_ = 0, pixel_passes_saved_ = 0;
++  std::map<const char*, uint64_t> kept_reasons_;
++  std::chrono::steady_clock::time_point window_start_ = std::chrono::steady_clock::now();
++};
++
++StencilTransferCutStats g_stencil_transfer_cut_stats;
++
++// Why a draw does not rewrite the stencil of every sample it covers (nullptr when it does), from the state the host sets
++// for a rectangle list (pipeline_cache.cpp: not polygonal, so the front face's state and write mask are used for both):
++// the stencil test always passes, the depth test cannot fail (no depth-fail operation can happen), the pass operation is
++// REPLACE (the reference is written, whatever it is), and all 8 bits are written.
++const char* StencilRewriteRejectReason(reg::RB_DEPTHCONTROL normalized_depth_control, const RegisterFile& regs) {
++  if (!normalized_depth_control.stencil_enable) {
++    return "the stencil is not written (no stencil test)";
++  }
++  if (normalized_depth_control.stencilfunc != xenos::CompareFunction::kAlways) {
++    return "the stencil function is not ALWAYS";
++  }
++  if (normalized_depth_control.z_enable && normalized_depth_control.zfunc != xenos::CompareFunction::kAlways) {
++    return "the depth test can fail";
++  }
++  if (normalized_depth_control.stencilzpass != xenos::StencilOp::kReplace) {
++    return "the stencil pass operation is not REPLACE";
++  }
++  if (regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask != 0xFF) {
++    return "the stencil write mask is not 0xFF";
++  }
++  return nullptr;
++}
++
+ // LOCAL PATCH - MCLA (0811): transfer_census_log. The CP thread only.
+ class TransferCensus {
+  public:
+@@ -969,6 +1060,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+   const Shader* pixel_shader = update_pixel_shader_;
+   update_pixel_shader_ = nullptr;
+   last_update_overwritten_rectangle_valid_ = false;
++  transfer_stencil_cutout_valid_ = false;  // LOCAL PATCH - MCLA (0812): stencil_transfer_cut
+ 
+   // LOCAL PATCH - MCLA (04e0): whether the title's tone map marker has been seen in this frame (the command processor
+   // says so for every draw), for tonemap_transfer_skip. skip_overwritten_transfers, which covers the tone map as well,
+@@ -1386,6 +1478,40 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+     }
+   }
+ 
++  // LOCAL PATCH - MCLA (0812): stencil_transfer_cut: the rectangle of the depth / stencil target whose stencil this draw
++  // rewrites, if its transfers need it. The coverage is GetOverwrittenRectangle's (with the depth and stencil tests that
++  // always pass allowed: those never change which samples are written), run again here (after the census took its reason)
++  // only for a rectangle draw that writes the stencil this way.
++  if (REXCVAR_GET(stencil_transfer_cut) && !interlock_barrier_only && (depth_and_color_rts_used_bits & 1)) {
++    uint32_t depth_length_tiles = 0;
++    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
++      if (edram_bases_sorted[i].second == 0) {
++        depth_length_tiles = rt_lengths_tiles[i];
++      }
++    }
++    if (depth_length_tiles && WouldOwnershipChangeRequireTransfers(rt_keys[0], 0, depth_length_tiles)) {
++      const char* reason = nullptr;
++      if (!pixel_shader || !is_rasterization_done ||
++          regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type != xenos::PrimitiveType::kRectangleList) {
++        reason = "not a rectangle-list draw";
++      } else {
++        reason = StencilRewriteRejectReason(normalized_depth_control, regs);
++      }
++      if (!reason) {
++        Transfer::Rectangle stencil_rectangle;
++        if (GetOverwrittenRectangle(vertex_shader, *pixel_shader, normalized_depth_control, normalized_color_mask,
++                                    stencil_rectangle, nullptr, true)) {
++          transfer_stencil_cutout_ = stencil_rectangle;
++          transfer_stencil_cutout_valid_ = true;
++        } else {
++          reason = g_overwrite_reject_reason[0] ? g_overwrite_reject_reason : "coverage not proven";
++        }
++      }
++      g_stencil_transfer_cut_stats.NoteDraw(reason);
++    }
++    g_stencil_transfer_cut_stats.LogIfDue(REXCVAR_GET(stencil_transfer_cut_poison));
++  }
++
+   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
+     uint32_t rt_bit_index = rt_base_index.second;
+@@ -2260,6 +2386,14 @@ bool RenderTargetCache::GetOverwrittenRectangle(const Shader& vertex_shader,
+   return true;
+ }
+ 
++// LOCAL PATCH - MCLA (0812): stencil_transfer_cut
++bool RenderTargetCache::IsStencilTransferCutPoison() { return REXCVAR_GET(stencil_transfer_cut_poison); }
++
++void RenderTargetCache::NoteStencilTransferCut(uint32_t transfers_dropped, uint32_t transfers_cut,
++                                               uint32_t transfers_kept, uint64_t pixel_passes_saved) {
++  g_stencil_transfer_cut_stats.NoteTransfers(transfers_dropped, transfers_cut, transfers_kept, pixel_passes_saved);
++}
++
+ // LOCAL PATCH - MCLA (0811): transfer_census_log
+ bool RenderTargetCache::IsTransferCensusOn() { return REXCVAR_GET(transfer_census_log); }
+ 

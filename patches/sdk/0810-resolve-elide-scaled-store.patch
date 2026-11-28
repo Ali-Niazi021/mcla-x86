@@ -32,7 +32,10 @@ Purpose: At draw scale 2 (profile 2000p) a dual-written resolve (0760 scaled_cop
   Log: `[resolve-elide] <mode> over N frames ...` every 10 s while active, `[resolve-elide] read: addr=...,len=...,pitch=...,
   height=...,fmt=...,src=... - by the load of ...` once per destination, `[resolve-elide] at exit: ... as keep rules: ...` and
   up to 64 `[resolve-elide] at exit: addr=...: N stores (X a frame ...) of M MB each, ...` lines (the inventory of the
-  dual-written resolves of the run, largest first).
+  dual-written resolves of the run, largest first), and for the first tracked resolve of each destination one
+  `[resolve-elide] rename: <rule> - source <RT> (host DXGI f WxH), copy shader n (bitwise|converting), swap, endian, exp bias,
+  sample select, half-pixel fill, clears colour / depth; texture <fmt> (host DXGI f WxH, endian, mips), whole|partial -> a
+  rename candidate | not a rename candidate (<blockers>)` line: the inventory render-target renaming (R5) is decided on.
   A record is retired when a later resolve with the same destination base, pitch and bytes a texel writes an area that
   contains it (the scaled tiled address is a one-to-one function of the texel and those three).
   New file src/graphics/d3d12/resolve_elide.cpp (listed in src/graphics/CMakeLists.txt) and include/rex/graphics/d3d12/
@@ -123,10 +126,10 @@ index 0000000..40d29d0
 +
 +}  // namespace rex::graphics::d3d12
 diff --git a/include/rex/graphics/d3d12/texture_cache.h b/include/rex/graphics/d3d12/texture_cache.h
-index 18ac0da..408fdf6 100644
+index 18ac0da..8b2ecb4 100644
 --- a/include/rex/graphics/d3d12/texture_cache.h
 +++ b/include/rex/graphics/d3d12/texture_cache.h
-@@ -297,6 +297,72 @@ class D3D12TextureCache final : public TextureCache {
+@@ -297,6 +297,102 @@ class D3D12TextureCache final : public TextureCache {
    // Every 10 s logs the counts since the last line, if there were any.
    void LogResolveDualWriteIfDue();
  
@@ -181,7 +184,37 @@ index 18ac0da..408fdf6 100644
 +    uint32_t key_index = UINT32_MAX;
 +    // The texture the resolve writes along with the store (for the log).
 +    TextureKey written_texture_key;
++    // The first resolve of this destination tracked in the run (its rename line is logged).
++    bool first_sighting = false;
 +  };
++  // What decides whether the texture a resolve dual-writes could be the source render target itself (R5, render-target
++  // renaming; scratch/zerocopy/R5_DESIGN.md): the source render target and the resolve, given by the render target cache
++  // for the first tracked resolve of each destination; LogResolveRenameCandidate adds the texture's side and the verdict.
++  struct ResolveRenameFacts {
++    // RenderTargetKey::GetDebugName of the source.
++    std::string source_name;
++    DXGI_FORMAT source_format = DXGI_FORMAT_UNKNOWN;
++    uint64_t source_width = 0;
++    uint32_t source_height = 0;
++    bool source_multisampled = false;
++    // The copy shader: bitwise (the fast kinds) or converting, its index (draw_util::ResolveCopyShaderIndex).
++    bool copy_bitwise = false;
++    uint32_t copy_shader = 0;
++    // RB_COPY_DEST_INFO: red / blue swap, endian (xenos::Endian128), exponent bias; the sample select.
++    bool dest_swap = false;
++    uint32_t dest_endian = 0;
++    int32_t dest_exp_bias = 0;
++    uint32_t sample_select = 0;
++    // The half-pixel gap filled by the resolve (its first host row and column copied from the next ones).
++    bool half_pixel_fill = false;
++    // The resolve also clears the render target's colour / depth after copying it.
++    bool clears_color = false;
++    bool clears_depth = false;
++    // The area is the texture's area minus nothing (the dual write is not partial).
++    bool whole = false;
++  };
++  void LogResolveRenameCandidate(const ResolveElideDecision& decision, const ResolveDualWriteTarget& dual_target,
++                                 const ResolveRenameFacts& facts);
 +  // Whether DecideResolveElide and NoteResolveElideWritten have work: resolve_elide on, or records left from it.
 +  bool IsResolveElideActive() const;
 +  // Before the dispatch of a resolve at a draw resolution scale above 1. dual_target: the texture it writes as well
@@ -199,7 +232,7 @@ index 18ac0da..408fdf6 100644
    // ---- LOCAL PATCH - MCLA (0560): resolve_defer_memory_write ----
    //
    // A resolve that D3D12RenderTargetCache::Resolve has dual-written (resolve_dual_write) whole - the
-@@ -987,6 +1053,99 @@ class D3D12TextureCache final : public TextureCache {
+@@ -987,6 +1083,100 @@ class D3D12TextureCache final : public TextureCache {
                                      bool compare_all);  // LOCAL PATCH - MCLA (0530): resolve_dual_write_msaa
    void ProcessResolveDualWriteVerifies(uint64_t completed_submission_index);
  
@@ -286,6 +319,7 @@ index 18ac0da..408fdf6 100644
 +  uint64_t resolve_elide_last_log_ms_ = 0;
 +  uint64_t resolve_elide_last_log_frame_ = 0;
 +  uint32_t resolve_elide_consumed_lines_ = 0;
++  uint32_t resolve_elide_rename_lines_ = 0;
 +  // The frame the first destination was seen in (the rates of the lines at exit).
 +  uint64_t resolve_elide_first_frame_ = 0;
 +  // resolve_dual_write_verify's own load is not a reader the tracking learns from.
@@ -388,7 +422,7 @@ index 9b4907f..fae85cb 100644
                                                int rule, const char* result, bool done) {
    if (done) {
 diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
-index 4815b9f..9fe96fa 100644
+index 4815b9f..00de96f 100644
 --- a/src/graphics/d3d12/render_target_cache.cpp
 +++ b/src/graphics/d3d12/render_target_cache.cpp
 @@ -2068,6 +2068,54 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetDirectResolveStretchPipeline(
@@ -446,7 +480,7 @@ index 4815b9f..9fe96fa 100644
  bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMemory& shared_memory,
                                       D3D12TextureCache& texture_cache,
                                       uint32_t& written_address_out, uint32_t& written_length_out) {
-@@ -2241,6 +2289,16 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+@@ -2241,6 +2289,42 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
            }
          }
        }
@@ -459,11 +493,37 @@ index 4815b9f..9fe96fa 100644
 +      const bool elide_active = draw_resolution_scaled && texture_cache.IsResolveElideActive();
 +      if (elide_active) {
 +        elide_decision = texture_cache.DecideResolveElide(elide_geometry, dual_write ? &dual_write_target : nullptr);
++        // LOCAL PATCH - MCLA (0810): resolve_elide: the inventory line of render-target renaming (R5), once a destination.
++        if (elide_decision.first_sighting && dual_write && direct_source) {
++          D3D12TextureCache::ResolveRenameFacts rename_facts;
++          const D3D12_RESOURCE_DESC source_desc = direct_source->resource()->GetDesc();
++          rename_facts.source_name = direct_source->key().GetDebugName();
++          rename_facts.source_format = source_desc.Format;
++          rename_facts.source_width = source_desc.Width;
++          rename_facts.source_height = source_desc.Height;
++          rename_facts.source_multisampled = direct_source->key().msaa_samples != xenos::MsaaSamples::k1X;
++          rename_facts.copy_shader = uint32_t(copy_shader);
++          rename_facts.copy_bitwise = copy_shader == draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA ||
++                                      copy_shader == draw_util::ResolveCopyShaderIndex::kFast32bpp4xMSAA ||
++                                      copy_shader == draw_util::ResolveCopyShaderIndex::kFast64bpp1x2xMSAA ||
++                                      copy_shader == draw_util::ResolveCopyShaderIndex::kFast64bpp4xMSAA;
++          rename_facts.dest_swap = resolve_info.copy_dest_info.copy_dest_swap != 0;
++          rename_facts.dest_endian = uint32_t(resolve_info.copy_dest_info.copy_dest_endian);
++          rename_facts.dest_exp_bias = resolve_info.copy_dest_info.copy_dest_exp_bias;
++          rename_facts.sample_select = uint32_t(resolve_info.copy_dest_coordinate_info.copy_sample_select);
++          const draw_util::ResolveEdramInfo& rename_edram_info =
++              resolve_info.IsCopyingDepth() ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
++          rename_facts.half_pixel_fill = rename_edram_info.fill_half_pixel_offset != 0;
++          rename_facts.clears_color = resolve_info.IsClearingColor();
++          rename_facts.clears_depth = resolve_info.IsClearingDepth();
++          rename_facts.whole = !dual_write_target.partial;
++          texture_cache.LogResolveRenameCandidate(elide_decision, dual_write_target, rename_facts);
++        }
 +      }
  
        // Make sure there is memory to write to.
        bool copy_dest_committed;
-@@ -2348,10 +2406,17 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+@@ -2348,10 +2432,17 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                  nullptr, nullptr, &null_desc, descriptor_dest.first);
            }
            if (draw_resolution_scaled) {
@@ -485,7 +545,7 @@ index 4815b9f..9fe96fa 100644
            } else {
              shared_memory.UseForWriting();
            }
-@@ -2440,7 +2505,9 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+@@ -2440,7 +2531,9 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
  
            // Order the resolve with other work using the destination as a UAV.
            if (draw_resolution_scaled) {
@@ -496,7 +556,7 @@ index 4815b9f..9fe96fa 100644
            } else {
              shared_memory.MarkUAVWritesCommitNeeded();
            }
-@@ -2470,6 +2537,12 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+@@ -2470,6 +2563,12 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
              texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                                resolve_info.copy_dest_extent_length);
            }
@@ -511,10 +571,10 @@ index 4815b9f..9fe96fa 100644
            }
 diff --git a/src/graphics/d3d12/resolve_elide.cpp b/src/graphics/d3d12/resolve_elide.cpp
 new file mode 100644
-index 0000000..fa2ae52
+index 0000000..a661a0e
 --- /dev/null
 +++ b/src/graphics/d3d12/resolve_elide.cpp
-@@ -0,0 +1,643 @@
+@@ -0,0 +1,704 @@
 +/**
 + * LOCAL PATCH - MCLA (0810): resolve_elide and copy_byte_census (Direct3D 12).
 + *
@@ -735,6 +795,7 @@ index 0000000..fa2ae52
 +  const ResolveElideKeyInfo& info = resolve_elide_keys_[key_index];
 +  decision.track = true;
 +  decision.key_index = key_index;
++  decision.first_sighting = info.seen == 0;
 +  // The reasons to store, in order: a reader that is not a texture load (the copies right after the resolve), the keys
 +  // kept by hand or by a read, a texture the resolve leaves outdated (it is loaded from the buffer), the dual-write
 +  // verify (it loads from the buffer), the warm-up, the limit of the watch.
@@ -1048,6 +1109,66 @@ index 0000000..fa2ae52
 +                                                                              values, 0, nullptr);
 +  MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
 +  ++stats.poisoned;
++}
++
++void D3D12TextureCache::LogResolveRenameCandidate(const ResolveElideDecision& decision,
++                                                  const ResolveDualWriteTarget& dual_target,
++                                                  const ResolveRenameFacts& facts) {
++  constexpr uint32_t kMaxRenameLines = 128;
++  if (decision.key_index >= resolve_elide_keys_.size() || !dual_target.texture ||
++      resolve_elide_rename_lines_ >= kMaxRenameLines) {
++    return;
++  }
++  ++resolve_elide_rename_lines_;
++  const D3D12Texture& texture = *static_cast<const D3D12Texture*>(dual_target.texture);
++  const D3D12_RESOURCE_DESC texture_desc = texture.resource()->GetDesc();
++  const TextureKey& key = texture.key();
++  const FormatInfo* format_info = FormatInfo::Get(key.format);
++  // What keeps the texture from being the render target's resource as it is (the half-pixel fill is not on the list: it
++  // is two strips the rename can copy itself; it is reported).
++  std::string blockers;
++  auto block = [&](const char* reason) {
++    blockers += blockers.empty() ? "" : ", ";
++    blockers += reason;
++  };
++  if (facts.source_multisampled) {
++    block("multisampled source");
++  }
++  if (!facts.copy_bitwise) {
++    block("converting copy");
++  }
++  if (facts.dest_swap) {
++    block("red / blue swap");
++  }
++  if (facts.dest_exp_bias) {
++    block("exponent bias");
++  }
++  if (facts.dest_endian != uint32_t(key.endianness)) {
++    block("the resolve's endian is not the texture's");
++  }
++  if (facts.source_format != texture_desc.Format) {
++    block("host DXGI formats differ (a typeless family shared by both may still allow a view)");
++  }
++  if (facts.source_width != texture_desc.Width || facts.source_height != texture_desc.Height) {
++    block("host sizes differ");
++  }
++  if (!facts.whole) {
++    block("the resolve writes a part of the texture");
++  }
++  if (key.mip_max_level || key.GetDepthOrArraySize() != 1) {
++    block("mips or layers");
++  }
++  REXGPU_INFO(
++      "[resolve-elide] rename: {} - source {} (host DXGI {} {}x{}), copy shader {} ({}), swap {}, endian {}, exp bias {}, "
++      "sample select {}, half-pixel fill {}, clears colour {} depth {}; texture {} (host DXGI {} {}x{}, endian {}, mips "
++      "{}){} -> {}",
++      DescribeResolveElideKey(resolve_elide_keys_[decision.key_index]), facts.source_name, uint32_t(facts.source_format),
++      facts.source_width, facts.source_height, facts.copy_shader, facts.copy_bitwise ? "bitwise" : "converting",
++      int(facts.dest_swap), facts.dest_endian, facts.dest_exp_bias, facts.sample_select, int(facts.half_pixel_fill),
++      int(facts.clears_color), int(facts.clears_depth), format_info ? format_info->name : "?",
++      uint32_t(texture_desc.Format), texture_desc.Width, texture_desc.Height, uint32_t(key.endianness),
++      key.mip_max_level, facts.whole ? ", whole" : ", partial",
++      blockers.empty() ? std::string("a rename candidate") : "not a rename candidate (" + blockers + ")");
 +}
 +
 +std::string D3D12TextureCache::DescribeResolveElideKey(const ResolveElideKeyInfo& info) const {
