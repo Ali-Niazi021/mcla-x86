@@ -458,17 +458,16 @@ static_assert(mcla::gfxres::EnvSizeOf(256).width == 256 && mcla::gfxres::EnvSize
               "the 2000p environment map size is one the hook accepts and its host target is the shipped 512x256");
 // resolve_elide_keep_rules of 2000p and its children (SDK 0814 / 0816). Where each rule comes from: the first five from the
 // learn run and the MISS lines of session 2, the sixth and seventh from the soak and the pause / map flow of session 3, the
-// last four from the first DLAA runs of session 4 (s4-dlaa, s4-dlaa3: 128x128 / 256x256 8888 textures whose address depends on the route). A child that needs more writes this list plus its own.
+// last two from the DLAA runs of session 4 (256x256). The sixth to ninth became one class rule (any 128x128 8888 resolve, 64 KB each):
+// the 128x128 textures that read the resolve's own bytes sit at a new address on every route (0x0328F000, 0x031C3000, 0x0357F000,
+// 0x031DF000, 0x031AE000 in six runs), so an address list never ends. A child that needs more writes this list plus its own.
 #define MCLA_2000P_KEEP_RULES \
     "addr=0x03601000,len=262144,pitch=256,height=128,fmt=32,src=0;" \
     "addr=0x052C1000,len=1048576,pitch=512,height=512,fmt=6,src=0;" \
     "addr=0x0732E000,len=778240,pitch=640,height=640,fmt=22,src=4;" \
     "addr=0x035BD000,len=262144,pitch=256,height=256,fmt=6,src=0;" \
     "addr=0x05D64000,len=262144,pitch=256,height=256,fmt=23,src=4;" \
-    "addr=0x0328F000,len=65536,pitch=128,height=128,fmt=6,src=0;" \
-    "addr=0x031C3000,len=65536,pitch=128,height=128,fmt=6,src=0;" \
-    "addr=0x0357F000,len=65536,pitch=128,height=128,fmt=6,src=0;" \
-    "addr=0x031DF000,len=65536,pitch=128,height=128,fmt=6,src=0;" \
+    "len=65536,pitch=128,height=128,fmt=6,src=0;" \
     "addr=0x05A32000,len=262144,pitch=256,height=256,fmt=6,src=0;" \
     "addr=0x05A72000,len=262144,pitch=256,height=256,fmt=6,src=0"
 
