@@ -40,14 +40,22 @@ in the sections below are unchanged.
 - 2000p profile: `scaled_copy_levers` = 27 (dual write, tone-map skip and the swap made from the render target at draw scale 2,
   0760 + 0800), `stencil_transfer_cut` = true (0812) and the unscaled-copy rule for the rain (6d2effe).
 - 2000p profile, copy elision (SDK 0813 / 0814): `transfer_skip_scrambled` = 7, `resolve_reinterpret_reload` = 1,
-  `resolve_elide` = 2 with `resolve_elide_keep_rules`: five exact destinations, one class rule for any 128x128 8888 resolve
-  (that texture reads the resolve's own bytes at a new address on every route) and two 256x256 ones; `2000p-dlaa` adds the
+  `resolve_elide` = 2 with `resolve_elide_keep_rules`: four exact destinations, one class rule for any 128x128 8888 resolve
+  and one for any 256x256 8888 resolve (those textures read the resolve's own bytes at a new address on every route; the
+  256x256 class rule replaced three addresses after a `MISS` at 0x059B2000, costs 3 MB of 190 MB elided a frame, session 6);
+  `2000p-dlaa` adds the
   16F scene pair 0x08850000 / 0x08E90000. All on against all off: -0.73 +- 0.09 ms GPU busy (8.40 -> 7.68 ms at 2685 MHz), all
   written bytes -32 %. A `MISS` line in a log (`[resolve-elide]`) names a reader the rules do not know: its printed rule is
   also stored in `<cache>/shaders/shareable/<title>.resolve-keep.txt` (SDK 0816, `resolve_elide_keep_file`) and kept from the
   next start on; add it to the profile list as well. `front_buffer_resolve_skip` = true (SDK 0815): the front-buffer resolve
   right before a swap shown from the render target is cancelled, -0.26 +- 0.08 ms busy. The DLAA, DLSS Performance and
   frame-generation 2000p profiles ran with all of these (unlock-2x session 4): 0 MISS but the DLAA ones above.
+- 2000p profile, `d3d12_upload_skip_same` = 2 (SDK 0817, unlock-2x session 6): a shared memory page the buffer already holds the
+  bytes of is not uploaded again (merge and bridging stay off: they gave nothing). Paired A/B at 2685-2700 MHz: GPU busy -0.85 +- 0.08 ms
+  (timestamps between copies) / -0.68 +- 0.09 ms (as shipped), copies a frame 417 -> 109, GPU Commands thread +0.1 to +0.3 ms a frame.
+  Verified with `d3d12_upload_verify` (each skipped page read back and compared with its slot): 9.5 M pages, 0 differing bytes. The
+  one stale byte the earlier runs found was the compiler forwarding `memcpy(slot, guest); memcpy(upload, slot)` into a second read of
+  the guest page (patch revised: a compiler barrier). `d3d12_upload_span_guard` (default true) stays on: free in the A/B, and the episodes with it on were the double read.
 - Profiles `992p` / `1984p` (guest 1600x992, experimental, merged from t3/display-profile-1984p): `1984p` inherits everything
   2000p sets. Unlike 1000p / 2000p they have no 16-row strip of garbage in the bottom rows of the pause screen, the GPS map and
   the ARRESTED screen (session 4); cause of that strip not found (it follows the guest height 1000, not the draw scale).

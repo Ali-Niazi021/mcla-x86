@@ -460,16 +460,16 @@ static_assert(mcla::gfxres::EnvSizeOf(256).width == 256 && mcla::gfxres::EnvSize
 // learn run and the MISS lines of session 2, the sixth and seventh from the soak and the pause / map flow of session 3, the
 // last two from the DLAA runs of session 4 (256x256). The sixth to ninth became one class rule (any 128x128 8888 resolve, 64 KB each):
 // the 128x128 textures that read the resolve's own bytes sit at a new address on every route (0x0328F000, 0x031C3000, 0x0357F000,
-// 0x031DF000, 0x031AE000 in six runs), so an address list never ends. A child that needs more writes this list plus its own.
+// 0x031DF000, 0x031AE000 in six runs), so an address list never ends. The 256x256 8888 ones (0x035BD000, 0x05A32000, 0x05A72000,
+// and 0x059B2000 = the one MISS of session 5's 6 minute governor-off drive, a new address again) became a second class rule
+// (256 KB each, unlock-2x session 6). A child that needs more writes this list plus its own.
 #define MCLA_2000P_KEEP_RULES \
     "addr=0x03601000,len=262144,pitch=256,height=128,fmt=32,src=0;" \
     "addr=0x052C1000,len=1048576,pitch=512,height=512,fmt=6,src=0;" \
     "addr=0x0732E000,len=778240,pitch=640,height=640,fmt=22,src=4;" \
-    "addr=0x035BD000,len=262144,pitch=256,height=256,fmt=6,src=0;" \
     "addr=0x05D64000,len=262144,pitch=256,height=256,fmt=23,src=4;" \
     "len=65536,pitch=128,height=128,fmt=6,src=0;" \
-    "addr=0x05A32000,len=262144,pitch=256,height=256,fmt=6,src=0;" \
-    "addr=0x05A72000,len=262144,pitch=256,height=256,fmt=6,src=0"
+    "len=262144,pitch=256,height=256,fmt=6,src=0"
 
 constexpr CvarDefault k2000pDefaults[] = {
     {"draw_resolution_scale_x", "2"},
@@ -515,6 +515,17 @@ constexpr CvarDefault k2000pDefaults[] = {
     // host). Without the rule the rain is not drawn at 2000p (r1-rain0: stormy weather, no streak; r1-rain1: the same with the
     // rule, streaks); the 1x path needs none.
     {"resolve_unscaled_copy_rules", "len=131072,pitch=128,height=128,fmt=37"},
+    // SDK 0817 (unlock-2x sessions 5 and 6): a page of the shared memory that the buffer already holds the bytes of is not
+    // uploaded again (mode 2: any page whose bytes equal those of the slot of its last copy; merge and bridging stay off, they
+    // gave nothing). Paired A/B in one saturated run pair, 2685-2700 MHz, 3 s stretches, n = 27 each: GPU busy -0.85 +- 0.08 ms
+    // with timestamps between the copies (ops on; upload class 0.34 -> 0.08 ms, 417 -> 109 copies a frame, barriers 199 -> 64) and
+    // -0.68 +- 0.09 ms with them off (as shipped); shadow group -0.4, post -0.2. GPU Commands thread +0.1 to +0.3 ms a frame (within
+    // the spread of 4 runs). Exact: d3d12_upload_verify read back every skipped page and compared it with its slot: 9.5 M pages
+    // (6.2 M of them with this setting alone), 0 differing bytes, no D3D12 debug-layer break. The earlier "one stale byte in a few
+    // million pages" was the compiler turning `memcpy(slot, guest); memcpy(upload, slot)` into a second read of the guest page
+    // (the patch now has a compiler barrier between the two). d3d12_upload_span_guard (default true) is free: with it against
+    // without it, within +-0.2 ms in both runs, opposite signs.
+    {"d3d12_upload_skip_same", "2"},
     {"mcla_gfx_shadow_res", "320"},
     {"mcla_gfx_env_res", "256"},
 };

@@ -430,7 +430,7 @@ index 873b4e0..6368fea 100644
    ++hoist_serial_;
    hoist_run_has_uploads_ = false;
    hoist_run_active_ = true;
-@@ -547,4 +638,719 @@ void D3D12SharedMemory::WriteHoistedBarrier(D3D12_RESOURCE_STATES state_before,
+@@ -547,4 +638,722 @@ void D3D12SharedMemory::WriteHoistedBarrier(D3D12_RESOURCE_STATES state_before,
    command_processor_.GetDeferredCommandList().D3DResourceBarrier(1, &barrier);
  }
  
@@ -537,6 +537,9 @@ index 873b4e0..6368fea 100644
 +  uint8_t* slot_bytes = shadow_bytes_.data() + (size_t(slot) * page_size);
 +  // The copy to the buffer is made from the slot: the slot is, to the byte, what the buffer will hold.
 +  std::memcpy(slot_bytes, guest, page_size);
++  // A barrier for the compiler: without it clang forwards the second copy to the guest memory (memcpy(upload, guest)),
++  // which reads the guest page twice, and a hot page the guest writes in between differs between slot and buffer.
++  __asm__ __volatile__("" : : "r"(slot_bytes) : "memory");
 +  std::memcpy(upload_dst, slot_bytes, page_size);
 +}
 +
