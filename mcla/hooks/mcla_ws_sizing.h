@@ -475,4 +475,11 @@ constexpr uint32_t PhysicalPoolReductionKiB(uint64_t growth_bytes) {
 // bottom of every full-screen target is cut: the PC profile's 1024 is right for 720 lines, not for 1080.
 constexpr uint32_t RenderTargetMaxHeight(uint32_t height) { return AlignUp(height, 16); }
 
+// The rows a host render target of RenderTargetMaxHeight() rows has below a `height`-row picture: the padding to whole
+// 16-row EDRAM tiles (times the draw resolution scale on the host). 0 exactly when the height is a multiple of 16, and then
+// the host render target the game resolves from is as tall as the texture it resolves into (the 3200x1984 of 1600x992 at
+// scale 2): the size condition of render-target renaming (scratch/zerocopy/R5_DESIGN.md 2.1). 1000 rows pad 8 (16 host rows
+// at scale 2: a 3200x2016 render target for a 3200x2000 texture).
+constexpr uint32_t RenderTargetPaddingRows(uint32_t height) { return RenderTargetMaxHeight(height) - height; }
+
 }  // namespace mcla::ws::sizing
