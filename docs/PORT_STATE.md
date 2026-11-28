@@ -40,7 +40,8 @@ in the sections below are unchanged.
 - 2000p profile: `scaled_copy_levers` = 27 (dual write, tone-map skip and the swap made from the render target at draw scale 2,
   0760 + 0800), `stencil_transfer_cut` = true (0812) and the unscaled-copy rule for the rain (6d2effe).
 - 2000p profile, copy elision (SDK 0813 / 0814): `transfer_skip_scrambled` = 7, `resolve_reinterpret_reload` = 1,
-  `resolve_elide` = 2 with `resolve_elide_keep_rules` = the five destinations of unlock-2x session 2 (R5). All on against
+  `resolve_elide` = 2 with `resolve_elide_keep_rules` = seven destinations (the five of unlock-2x session 2 + two that a 6 min
+  drive and the GPS map printed in session 3). All on against
   all off: -0.73 +- 0.09 ms GPU busy (8.40 -> 7.68 ms at 2685 MHz), all written bytes -32 %. A `MISS` line in a log
   (`[resolve-elide]`) names a reader the rules do not know: add its printed rule to the list. The DLSS / FSR 2000p variants
   inherit these; they were not run with them.
