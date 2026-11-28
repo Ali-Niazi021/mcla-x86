@@ -443,6 +443,28 @@ constexpr CvarDefault k2000pDefaults[] = {
     // SDK 0812: the stencil-bit draws of a depth / stencil ownership transfer leave out what the draw rewrites (poison-checked);
     // tone-map group -0.18 to -0.21 ms.
     {"stencil_transfer_cut", "true"},
+    // Copy elision (SDK 0813 / 0814, unlock-2x session 2): work the 2x path does for nothing, left out and poison-checked.
+    //   transfer_skip_scrambled=7  0813: render-target-to-render-target transfers whose result nothing can read as that layout
+    //                              (sample count, bits per pixel and pitch differing; reasons 1 + 2 + 4) are not made, and
+    //                              their stencil-bit passes are not drawn: ~38 of ~41 transfers a frame (178 MB, 133 passes).
+    //   resolve_reinterpret_reload=1  0814: a texture that is a resolve's other-layout copy is not reloaded from memory.
+    //   resolve_elide=2            0814: the memory store of a scaled resolve is left out when the scaled copy is the only
+    //                              reader (~170-190 MB a frame); a reader the rules do not know of shows as a `MISS` line.
+    //   resolve_elide_keep_rules   the five destinations that are read again as the memory layout (learn run + the three
+    //                              `MISS` lines of s2-ep: front-end, dusk and night switches); with them 0 MISS in the
+    //                              tour, the drive and the soak runs (R5.txt of session 2).
+    // Measured at 2685 MHz on the RTX 4060 Laptop, paired in one run: all on against all off -0.73 +- 0.09 ms GPU busy
+    // (8.40 -> 7.68, p95 -0.80, 116.1 -> 120.0 fps; transfers 24.5 -> 3.1 a frame), per lever on top of this profile: 0813
+    // -0.39, 0814 + elide -0.46, both -0.66. All written bytes -32 %, all read -29 %.
+    {"transfer_skip_scrambled", "7"},
+    {"resolve_reinterpret_reload", "1"},
+    {"resolve_elide", "2"},
+    {"resolve_elide_keep_rules",
+     "addr=0x03601000,len=262144,pitch=256,height=128,fmt=32,src=0;"
+     "addr=0x052C1000,len=1048576,pitch=512,height=512,fmt=6,src=0;"
+     "addr=0x0732E000,len=778240,pitch=640,height=640,fmt=22,src=4;"
+     "addr=0x035BD000,len=262144,pitch=256,height=256,fmt=6,src=0;"
+     "addr=0x05D64000,len=262144,pitch=256,height=256,fmt=23,src=4"},
     // The rain: its four 128x128 render targets are resolved and then read as vertex data, which at a draw scale above 1 only
     // works when the resolve is also written unscaled into the shared memory (Renan's mcla_rain_unscaled_copy, not in this
     // host). Without the rule the rain is not drawn at 2000p (r1-rain0: stormy weather, no streak; r1-rain1: the same with the

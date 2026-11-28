@@ -39,6 +39,11 @@ in the sections below are unchanged.
 - Thread placement falls back to an unparked sibling when an ideal processor is parked (3fe81e5).
 - 2000p profile: `scaled_copy_levers` = 27 (dual write, tone-map skip and the swap made from the render target at draw scale 2,
   0760 + 0800), `stencil_transfer_cut` = true (0812) and the unscaled-copy rule for the rain (6d2effe).
+- 2000p profile, copy elision (SDK 0813 / 0814): `transfer_skip_scrambled` = 7, `resolve_reinterpret_reload` = 1,
+  `resolve_elide` = 2 with `resolve_elide_keep_rules` = the five destinations of unlock-2x session 2 (R5). All on against
+  all off: -0.73 +- 0.09 ms GPU busy (8.40 -> 7.68 ms at 2685 MHz), all written bytes -32 %. A `MISS` line in a log
+  (`[resolve-elide]`) names a reader the rules do not know: add its printed rule to the list. The DLSS / FSR 2000p variants
+  inherit these; they were not run with them.
 - Render-target transfer pipelines are stored in `<title>.rtv.d3d12.xrtp` and made at start (0790; no cvar).
 - Guest memory is pre-faulted on a background thread at boot in the PC profile (`mcla_prefault_guest`,
   `src/host/pf_probe.h`).
