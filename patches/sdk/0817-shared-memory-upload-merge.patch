@@ -1,0 +1,1149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Sat, 28 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0817: shared memory uploads: d3d12_upload_census, d3d12_upload_merge (+ bridge pages), d3d12_upload_skip_same, d3d12_upload_verify, shared_memory_merge_upload_calls (Direct3D 12; native stream, uploads session)
+
+Source: Ours, written for this SDK (native stream; scratch/uploads/DESIGN.md, TESTPLAN.md). Written without a build or a run: checked
+  with clang++ 20.1.8 -fsyntax-only (the SDK's Release flags) of graphics/shared_memory.cpp, d3d12/shared_memory.cpp and
+  d3d12/command_processor.cpp (the units that include the changed headers); 0 errors, no warning on an added line. The pristine files
+  are the series up to 0814 (0815 / 0816 touch none of these files but deferred_command_list.h, far from the added hunk); the patch
+  applies to the tree with 0815 and 0816 applied (git apply --check).
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: The shared memory uploads (guest pages the CPU wrote, copied from an upload buffer into the shared memory buffer before the
+  draws that read them) cost 0.36 - 0.45 ms of GPU time a frame at 3200x2000, 470 - 600 copies at ~0.76 us each: the cost follows the
+  count of copies. All new cvars default to today's behaviour; with all off the upload code is the old code (UploadRangesPlain).
+  1. d3d12_upload_census (bool): every 10 s `[upload-census]` lines, per frame: copies made, pieces (copies before joining), bytes,
+     calls (hoisted / in place with no run / in place for a page a draw of the run had read), transitions to and from the copy
+     destination state and hoisted run pairs, distinct pages, pages uploaded more than once, pages uploaded in each of the last 2 / 8 /
+     32 frames, hot pages, a histogram of the gaps between a frame's copies in address order and how many copies would be left if gaps
+     of up to 0 / 4 / 16 / 64 KB were bridged, and how many pieces continue the one made before them; by request kind.
+  2. d3d12_upload_merge (bool) + d3d12_upload_bridge_pages (0..64): the plan of a call is sorted with overlapping and touching runs
+     made one; a copy that continues the one before it (the same upload buffer, the next bytes of it, the next bytes of the shared
+     memory; the copy before it was recorded in the same call or, in a hoisted run, by an earlier call and is the last command of
+     the hoisted stream) is made that copy, longer (DeferredCommandList::ExtendCopyBufferRegion). A gap of at most bridge_pages pages
+     between two runs is copied with them when every page of it is valid, not GPU-written, not hot, and (in a hoisted run) no draw
+     of the run has read it, so the copy writes the bytes the buffer already has. shared_memory_merge_upload_calls (bool, common
+     code): a request with hot pages, on a backend with no byte path (this one), makes one UploadRanges call for its pages and its
+     hot pages together, instead of two with the second one unsorted and a page that two asked ranges share copied twice.
+  3. d3d12_upload_skip_same (0 off, 1 hot pages, 2 any page; d3d12_upload_skip_same_pages): a page at the start or end of a run of
+     pages to upload whose bytes are the ones last copied to it (kept on this side: the copy is made from them, so they are what the
+     buffer holds; let go at every transition of the buffer to the unordered access state and at ClearCache) is not copied again.
+     A hot page is never valid nor watched, so nothing else changes; with 2 the plan's pages are made valid and watched first, as a
+     copy does before its memcpy, and the pages left out stay so (a block that a guest write invalidated is needed again unchanged
+     by the draws that read its other pages; the copy, the in-place transitions and the end of the hoisted run were for nothing).
+  4. d3d12_upload_verify (bool, proof mode): the pages left out by 3 and the gap pages of 2 are read back from the buffer in place
+     before the call's copies, and compared with the bytes expected when the submission is done; `[upload-verify] MISMATCH`.
+Bucket: REDO
+
+0817-shared-memory-upload-merge.patch (mcla-x86 native stream, uploads session).
+---
+diff --git a/include/rex/graphics/d3d12/deferred_command_list.h b/include/rex/graphics/d3d12/deferred_command_list.h
+index 5851ff6..1b55b39 100644
+--- a/include/rex/graphics/d3d12/deferred_command_list.h
++++ b/include/rex/graphics/d3d12/deferred_command_list.h
+@@ -163,6 +163,40 @@ class DeferredCommandList {
+     args.num_bytes = num_bytes;
+   }
+ 
++  // LOCAL PATCH - MCLA (0817): upload_merge. D3DCopyBufferRegion, giving back where the arguments of the command are in
++  // the stream written to now (the main one, or the hoisted one after SetWritingHoisted(true)), for
++  // ExtendCopyBufferRegion.
++  size_t D3DCopyBufferRegionTracked(ID3D12Resource* dst_buffer, UINT64 dst_offset,
++                                    ID3D12Resource* src_buffer, UINT64 src_offset,
++                                    UINT64 num_bytes) {
++    auto& args = *reinterpret_cast<D3DCopyBufferRegionArguments*>(
++        WriteCommand(Command::kD3DCopyBufferRegion, sizeof(D3DCopyBufferRegionArguments)));
++    args.dst_buffer = dst_buffer;
++    args.dst_offset = dst_offset;
++    args.src_buffer = src_buffer;
++    args.src_offset = src_offset;
++    args.num_bytes = num_bytes;
++    return size_t(reinterpret_cast<const uintmax_t*>(&args) - write_stream_->data());
++  }
++  // Makes the copy at `args_index` of the hoisted or the main stream copy `extra_bytes` more (the bytes that follow its
++  // own in both buffers), if it is a copy and the last command of that stream: false (and nothing changed) if
++  // anything was written after it.
++  bool ExtendCopyBufferRegion(bool hoisted, size_t args_index, UINT64 extra_bytes) {
++    std::vector<uintmax_t>& stream = hoisted ? hoisted_stream_ : command_stream_;
++    constexpr size_t kArgumentElements =
++        (sizeof(D3DCopyBufferRegionArguments) + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
++    if (args_index < kCommandHeaderSizeElements || args_index + kArgumentElements != stream.size()) {
++      return false;
++    }
++    const CommandHeader& header =
++        *reinterpret_cast<const CommandHeader*>(stream.data() + (args_index - kCommandHeaderSizeElements));
++    if (header.command != Command::kD3DCopyBufferRegion) {
++      return false;
++    }
++    reinterpret_cast<D3DCopyBufferRegionArguments*>(stream.data() + args_index)->num_bytes += extra_bytes;
++    return true;
++  }
++
+   void D3DCopyResource(ID3D12Resource* dst_resource, ID3D12Resource* src_resource) {
+     auto& args = *reinterpret_cast<D3DCopyResourceArguments*>(
+         WriteCommand(Command::kD3DCopyResource, sizeof(D3DCopyResourceArguments)));
+diff --git a/include/rex/graphics/d3d12/shared_memory.h b/include/rex/graphics/d3d12/shared_memory.h
+index a376c39..b667e7f 100644
+--- a/include/rex/graphics/d3d12/shared_memory.h
++++ b/include/rex/graphics/d3d12/shared_memory.h
+@@ -12,6 +12,7 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <chrono>  // LOCAL PATCH - MCLA (0817)
+ #include <memory>
+ #include <utility>
+ #include <vector>
+@@ -96,7 +97,10 @@ class D3D12SharedMemory : public SharedMemory {
+   void MarkReadByDraw(uint32_t start, uint32_t length);
+   // Anything else that uses the buffer, and the end of the command list, end the
+   // run: uploads after it are done in place.
+-  void EndHoistRun() { hoist_run_active_ = false; }
++  void EndHoistRun() {
++    hoist_run_active_ = false;
++    hoist_tail_.valid = false;  // LOCAL PATCH - MCLA (0817)
++  }
+   // Counts, for the log (d3d12_hoist_shared_memory_uploads_stats).
+   struct HoistStats {
+     // Runs of draws started, uploads hoisted to the start of a run, and uploads
+@@ -187,6 +191,104 @@ class D3D12SharedMemory : public SharedMemory {
+   void MarkPages(uint32_t start, uint32_t length);
+   void WriteHoistedBarrier(D3D12_RESOURCE_STATES state_before, D3D12_RESOURCE_STATES state_after);
+ 
++  // LOCAL PATCH - MCLA (0817): upload_merge / upload_skip_same / upload_census (src/graphics/d3d12/shared_memory.cpp).
++  // The last copy recorded, which the next one may be made a part of (the same CopyBufferRegion, longer): it must be
++  // the last command of its stream, which the command list checks. The tail of a hoisted run is dropped with the run
++  // (EndHoistRun); the one of an upload done in place lives in that call.
++  struct CopyTail {
++    bool valid = false;
++    bool hoisted = false;
++    size_t args_index = 0;
++    uint32_t dst_end = 0;      // The byte after its last one in the shared memory.
++    ID3D12Resource* src = nullptr;
++    size_t src_end = 0;        // The byte after its last one in `src`.
++  };
++  CopyTail hoist_tail_;
++  // The pages a draw of the run has read, or an upload of the run has written (hoist_pages_): any of [first, first +
++  // count)?
++  bool PagesMarkedInRun(uint32_t page_first, uint32_t page_count) const;
++  // The plain path (every cvar of this patch off) and the one that joins, bridges and skips.
++  bool UploadRangesPlain(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges);
++  bool UploadRangesJoined(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges);
++  std::vector<std::pair<uint32_t, uint32_t>> upload_plan_;
++  std::vector<uint32_t> upload_lead_gap_;
++
++  // upload_skip_same: the bytes last copied to hot pages, kept on this side (the copy goes from them, so they are what
++  // the buffer holds), to leave a copy out when a hot page asked for again still has the same bytes. A slot is good
++  // while its generation is the current one, which every transition of the buffer to the unordered access state
++  // (the GPU may write anything) and ClearCache start anew.
++  uint32_t shadow_generation_ = 1;
++  uint32_t shadow_used_ = 0;
++  uint32_t shadow_slots_ = 0;
++  std::vector<uint8_t> shadow_bytes_;
++  std::vector<uint32_t> shadow_slot_page_;
++  std::vector<uint32_t> shadow_slot_generation_;
++  std::vector<uint32_t> shadow_page_slot_;  // Per page: slot + 1, 0 none.
++  // The slot of a page whose bytes in the buffer are known, or UINT32_MAX.
++  uint32_t ShadowFind(uint32_t page) const;
++  // Copies the page from guest memory into a slot of its own and from there to `upload_dst` (what the copy command
++  // then puts in the buffer is what the slot holds); without a free slot, from guest memory directly.
++  void ShadowStore(uint32_t page, const uint8_t* guest, uint8_t* upload_dst);
++  bool ShadowSame(uint32_t page, const uint8_t* guest) const;
++  void ShadowReset();
++
++  // upload_census: what the uploads of a frame are, every 10 s (CensusCopy and the others are no-ops when off).
++  struct Census {
++    bool active = false;
++    uint64_t frame = UINT64_MAX;          // The frame being counted.
++    uint64_t window_first_frame = 0;
++    uint64_t window_frames = 0;           // Frames that had uploads.
++    std::chrono::steady_clock::time_point window_start;
++    // Window totals.
++    uint64_t calls = 0, pieces = 0, commands = 0, extended = 0, bytes = 0, bridged_bytes = 0;
++    uint64_t hoisted_calls = 0, in_place_no_run = 0, in_place_page_read = 0;
++    uint64_t pieces_by_kind[kRequestKindCount] = {};
++    uint64_t bytes_by_kind[kRequestKindCount] = {};
++    uint64_t hot_pages = 0, skipped_pages = 0, skipped_calls = 0;
++    uint64_t barriers_to_copy = 0, barriers_from_copy = 0, hoisted_pairs = 0, hoisted_rewrites = 0;
++    uint64_t pages_distinct = 0, pages_repeated = 0, pages_repeated_hot = 0, page_extra_copies = 0;
++    // Of the uploads of a page that had been uploaded before (the bytes hashed from guest memory when the copy is
++    // made): in the same frame with the same bytes / other bytes, in an earlier frame with the same / other bytes.
++    uint64_t same_in_frame = 0, changed_in_frame = 0, same_earlier_frame = 0, changed_earlier_frame = 0;
++    uint64_t pages_in_2 = 0, pages_in_8 = 0, pages_in_32 = 0;
++    uint64_t merge_potential[4] = {};     // Copies left of a frame's pieces if gaps of 0 / 4 / 16 / 64 KB were bridged.
++    uint64_t merge_bytes[4] = {};         // The bytes of those gaps.
++    uint64_t gap_hist[7] = {};            // overlap, 0, <= 4K, <= 16K, <= 64K, <= 1M, more.
++    uint64_t adjacent_in_order[3] = {};   // Pieces that continue the one before in the order made: exactly / within 4 KB / within 64 KB.
++    // The frame being counted.
++    std::vector<std::pair<uint32_t, uint32_t>> frame_pieces;  // byte start, length, in the order made.
++    std::vector<uint8_t> page_count;      // Per page, uploads this frame (saturating at 127), bit 7: hot at one of them.
++    std::vector<uint64_t> page_hash;      // Per page, a hash of the bytes of its last upload, and the frame of it.
++    std::vector<uint32_t> page_hash_frame;
++    std::vector<uint32_t> page_history;   // Per page, a bit per frame back from page_last_frame.
++    std::vector<uint32_t> page_last_frame;
++    std::vector<uint32_t> touched;
++  };
++  Census census_;
++  void CensusFrame();                     // Closes the frame being counted if the frame number has moved on, logs if due.
++  void CensusCloseFrame();
++  void CensusPiece(uint32_t byte_start, uint32_t length);
++  void CensusCall(bool hoisted, uint64_t no_run_before, uint64_t page_read_before);
++  void CensusLog();
++
++  // upload_verify (a proof mode): the pages a lever left out or covered with a copy of what they were thought to have
++  // (a hot page skipped for having the bytes already; a page bridged between two copies) are read back from the buffer
++  // right then, and compared with the bytes expected there when the submission is done.
++  struct VerifyEntry {
++    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
++    uint64_t submission = 0;
++    std::vector<uint32_t> pages;
++    std::vector<uint8_t> kinds;     // 0 skipped, 1 bridged.
++    std::vector<uint8_t> expected;  // pages.size() pages of bytes.
++  };
++  std::vector<VerifyEntry> verifies_;
++  uint64_t verify_checked_[2] = {};
++  uint64_t verify_mismatched_[2] = {};
++  uint32_t verify_mismatches_logged_ = 0;
++  void VerifyRecord(const std::vector<uint32_t>& pages, const std::vector<uint8_t>& kinds,
++                    const std::vector<uint8_t>& expected);
++  void VerifyCompare();
++
+   // Non-shader-visible buffer descriptor heap for faster binding (via copying
+   // rather than creation).
+   enum class BufferDescriptorIndex : uint32_t {
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index a4d8c76..1a468fc 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -217,6 +217,16 @@ class SharedMemory {
+     return false;
+   }
+ 
++  // LOCAL PATCH - MCLA (0817): upload_merge. Whether every page of [page_first, page_first + page_count) is valid
++  // (the buffer holds what guest memory holds), holds no data the GPU wrote and is not hot: copying such a page
++  // again from guest memory writes the bytes it has. For the backends that join near uploads into one copy.
++  bool ArePagesPlainValid(uint32_t page_first, uint32_t page_count);
++  // Whether a page is hot now. Reads the hot-until time without the lock: for the command processor thread, which is
++  // the only one that cools pages, so a page that is hot here stays unwatched until it is asked for again.
++  bool IsPageHotNow(uint32_t page) const;
++  // What the request being served is for (RequestKind), for the backend's statistics.
++  uint32_t current_request_kind() const { return request_kind_; }
++
+  private:
+   memory::Memory& memory_;
+ 
+@@ -233,6 +243,8 @@ class SharedMemory {
+   bool request_ranges_hook_active_ = false;
+   bool request_ranges_hook_running_ = false;
+   uint32_t request_kind_ = kRequestKindOther;
++  // LOCAL PATCH - MCLA (0817): set when UploadByteRanges has said that the backend has no byte path.
++  bool upload_byte_ranges_unsupported_ = false;
+   std::vector<std::pair<uint32_t, uint32_t>> request_ranges_hook_ranges_;
+   uint32_t host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;
+   std::vector<uint64_t> host_gpu_memory_sparse_allocated_;
+diff --git a/src/graphics/d3d12/shared_memory.cpp b/src/graphics/d3d12/shared_memory.cpp
+index 873b4e0..bf25225 100644
+--- a/src/graphics/d3d12/shared_memory.cpp
++++ b/src/graphics/d3d12/shared_memory.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>  // LOCAL PATCH - MCLA (0817)
+ #include <chrono>  // LOCAL PATCH - MCLA (0794)
+ #include <cstring>
+ #include <utility>
+@@ -26,6 +27,42 @@ REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true, "GPU/D3D12",
+                     "Use tiled shared memory on D3D12")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++// LOCAL PATCH - MCLA (0817): the shared memory uploads: a census, joining of copies, skipping of copies, a proof mode.
++REXCVAR_DEFINE_BOOL(d3d12_upload_census, false, "GPU/D3D12",
++                    "Every 10 s, log what the shared memory uploads of a frame are: copies, bytes, pages, pages "
++                    "uploaded more than once or in every one of the last frames, the gaps between copies in address "
++                    "order, the barriers made for them, and what each lever of d3d12_upload_merge / "
++                    "d3d12_upload_skip_same could save")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_BOOL(d3d12_upload_merge, false, "GPU/D3D12",
++                    "Make fewer copy commands for the same uploads: the pages of the uploads of a call sorted and "
++                    "joined where they overlap or touch, and a copy that continues the one before it (the same "
++                    "buffer, the next bytes of both, recorded in the same hoisted run or the same call) made the "
++                    "same command, longer. With shared_memory_merge_upload_calls, one call for a request that has "
++                    "hot pages. Not a byte of any page changes")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_UINT32(d3d12_upload_bridge_pages, 0, "GPU/D3D12",
++                      "With d3d12_upload_merge: the most pages of a gap (0 to 64) that a copy may cover to be joined "
++                      "with the one before it. A gap is bridged only if every page in it is valid, holds no "
++                      "GPU-written data and is not hot (the copy writes the bytes that the buffer has), and no draw "
++                      "of the hoisted run has read it; 0 bridges nothing")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_UINT32(d3d12_upload_skip_same, 0, "GPU/D3D12",
++                      "0: off. 1: a hot page asked for again, at the start or end of a run of pages to upload, whose bytes "
++                      "are those last copied to it (kept on this side, until the GPU may have written the buffer) is not "
++                      "copied again. 2: the same for any page (the pages of a block that a guest write invalidated, "
++                      "which a draw needs again unchanged; every copy then goes through a slot, which costs CPU)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_UINT32(d3d12_upload_skip_same_pages, 4096, "GPU/D3D12",
++                      "With d3d12_upload_skip_same: how many pages of last-copied bytes to keep (16 to 65536)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_BOOL(d3d12_upload_verify, false, "GPU/D3D12",
++                    "Proof mode for d3d12_upload_skip_same and the bridging of d3d12_upload_merge: the pages left out "
++                    "and the pages bridged are read back from the shared memory (in place, ahead of the uploads of "
++                    "that call, which are then not hoisted) and compared with what they were expected to hold when "
++                    "the submission is done; a mismatch is logged. Slow")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics::d3d12 {
+ 
+ D3D12SharedMemory::D3D12SharedMemory(D3D12CommandProcessor& command_processor,
+@@ -170,12 +207,17 @@ void D3D12SharedMemory::Shutdown(bool from_destructor) {
+ 
+ void D3D12SharedMemory::ClearCache() {
+   SharedMemory::ClearCache();
++  ShadowReset();  // LOCAL PATCH - MCLA (0817)
++  hoist_tail_.valid = false;
+ 
+   upload_buffer_pool_->ClearCache();
+ }
+ 
+ void D3D12SharedMemory::CompletedSubmissionUpdated() {
+   upload_buffer_pool_->Reclaim(command_processor_.GetCompletedSubmission());
++  if (!verifies_.empty()) {
++    VerifyCompare();  // LOCAL PATCH - MCLA (0817)
++  }
+ }
+ 
+ void D3D12SharedMemory::BeginSubmission() {
+@@ -194,6 +236,15 @@ void D3D12SharedMemory::CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATES
+   // A run of draws (BeginDrawReads) needs the buffer to stay in the reading
+   // state.
+   EndHoistRun();
++  // LOCAL PATCH - MCLA (0817): the census counts the transitions to and from the copy destination state (the uploads'
++  // own); a use of the buffer by the GPU as a UAV may change any page, so what was kept of the last copies is let go.
++  if (census_.active) {
++    census_.barriers_to_copy += new_state == D3D12_RESOURCE_STATE_COPY_DEST;
++    census_.barriers_from_copy += buffer_state_ == D3D12_RESOURCE_STATE_COPY_DEST;
++  }
++  if (new_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
++    ShadowReset();
++  }
+   command_processor_.PushTransitionBarrier(buffer_, buffer_state_, new_state);
+   buffer_state_ = new_state;
+   // "UAV -> anything" transition commits the writes implicitly.
+@@ -339,12 +390,36 @@ bool D3D12SharedMemory::WarmUpHostGpuMemory(uint32_t start, uint32_t length) {
+   return made;
+ }
+ 
++// LOCAL PATCH - MCLA (0817): the cvars of this patch choose the way. All off: UploadRangesPlain, the code as it was
++// (with the census, if it is on).
+ bool D3D12SharedMemory::UploadRanges(
+     const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
+   if (upload_page_ranges.empty()) {
+     return true;
+   }
++  census_.active = REXCVAR_GET(d3d12_upload_census);
++  if (census_.active) {
++    CensusFrame();
++  }
++  const uint32_t skip_same = std::min(uint32_t(REXCVAR_GET(d3d12_upload_skip_same)), uint32_t(2));
++  if (!skip_same && shadow_used_) {
++    // A page copied from now on may not hold the bytes of its slot.
++    ShadowReset();
++  }
++  if (REXCVAR_GET(d3d12_upload_merge) || skip_same) {
++    return UploadRangesJoined(upload_page_ranges);
++  }
++  return UploadRangesPlain(upload_page_ranges);
++}
++
++bool D3D12SharedMemory::UploadRangesPlain(
++    const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
++  const uint64_t census_no_run_before = hoist_stats_.uploads_in_place_no_run;
++  const uint64_t census_page_read_before = hoist_stats_.uploads_in_place_page_read;
+   bool hoist = BeginHoistedUpload(upload_page_ranges);
++  if (census_.active) {
++    CensusCall(hoist, census_no_run_before, census_page_read_before);
++  }
+   // LOCAL PATCH - MCLA (0520): gpu_timing_ops: in the stream the copies are written to (the hoisted one when hoisting),
+   // from before the transition of an in-place upload to after its last copy (ended before EndHoistedUpload).
+   D3D12CommandProcessor::GpuTimingOpScope gt_op(command_processor_, D3D12CommandProcessor::kGtOpUpload);
+@@ -376,6 +451,10 @@ bool D3D12SharedMemory::UploadRanges(
+       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
+                                        upload_buffer, UINT64(upload_buffer_offset),
+                                        UINT64(upload_buffer_size));
++      if (census_.active) {
++        CensusPiece(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size));
++        ++census_.commands;
++      }
+       uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
+       upload_range_start += upload_buffer_pages;
+       upload_range_length -= upload_buffer_pages;
+@@ -468,6 +547,8 @@ bool D3D12SharedMemory::BeginHoistedUpload(
+   command_list.SetWritingHoisted(true);
+   if (!hoist_run_has_uploads_) {
+     hoist_run_has_uploads_ = true;
++    hoist_tail_.valid = false;  // LOCAL PATCH - MCLA (0817)
++    census_.hoisted_pairs += census_.active;
+     WriteHoistedBarrier(kReadState, D3D12_RESOURCE_STATE_COPY_DEST);
+   } else {
+     command_list.TruncateHoistedStream(hoist_closing_barrier_offset_);
+@@ -499,6 +580,7 @@ void D3D12SharedMemory::BeginDrawReads() {
+     return;
+   }
+   hoist_point_ = command_processor_.GetDeferredCommandList().CmdHoistPoint();
++  hoist_tail_.valid = false;  // LOCAL PATCH - MCLA (0817)
+   ++hoist_serial_;
+   hoist_run_has_uploads_ = false;
+   hoist_run_active_ = true;
+@@ -547,4 +629,654 @@ void D3D12SharedMemory::WriteHoistedBarrier(D3D12_RESOURCE_STATES state_before,
+   command_processor_.GetDeferredCommandList().D3DResourceBarrier(1, &barrier);
+ }
+ 
++// ---------------------------------------------------------------------------------------------------------------------
++// LOCAL PATCH - MCLA (0817): the shared memory uploads: joining, bridging, skipping, the census and the proof mode.
++// docs: scratch/uploads/DESIGN.md.
++// ---------------------------------------------------------------------------------------------------------------------
++
++bool D3D12SharedMemory::PagesMarkedInRun(uint32_t page_first, uint32_t page_count) const {
++  if (!hoist_run_active_) {
++    return false;
++  }
++  for (uint32_t page = page_first; page < page_first + page_count; ++page) {
++    const uint32_t word = page >> 6;
++    if (word >= hoist_pages_.size()) {
++      return true;
++    }
++    if (hoist_pages_serial_[word] == hoist_serial_ && (hoist_pages_[word] & (uint64_t(1) << (page & 63)))) {
++      return true;
++    }
++  }
++  return false;
++}
++
++uint32_t D3D12SharedMemory::ShadowFind(uint32_t page) const {
++  if (page >= shadow_page_slot_.size()) {
++    return UINT32_MAX;
++  }
++  const uint32_t slot_plus_one = shadow_page_slot_[page];
++  if (!slot_plus_one) {
++    return UINT32_MAX;
++  }
++  const uint32_t slot = slot_plus_one - 1;
++  if (slot >= shadow_used_ || shadow_slot_page_[slot] != page ||
++      shadow_slot_generation_[slot] != shadow_generation_) {
++    return UINT32_MAX;
++  }
++  return slot;
++}
++
++bool D3D12SharedMemory::ShadowSame(uint32_t page, const uint8_t* guest) const {
++  const uint32_t slot = ShadowFind(page);
++  if (slot == UINT32_MAX) {
++    return false;
++  }
++  return std::memcmp(shadow_bytes_.data() + (size_t(slot) << page_size_log2()), guest,
++                     size_t(1) << page_size_log2()) == 0;
++}
++
++void D3D12SharedMemory::ShadowStore(uint32_t page, const uint8_t* guest, uint8_t* upload_dst) {
++  const size_t page_size = size_t(1) << page_size_log2();
++  if (shadow_bytes_.empty()) {
++    shadow_slots_ = std::min(std::max(uint32_t(REXCVAR_GET(d3d12_upload_skip_same_pages)), uint32_t(16)), uint32_t(65536));
++    shadow_bytes_.resize(size_t(shadow_slots_) * page_size);
++    shadow_slot_page_.assign(shadow_slots_, 0);
++    shadow_slot_generation_.assign(shadow_slots_, 0);
++    shadow_page_slot_.assign(size_t(kBufferSize) >> page_size_log2(), 0);
++  }
++  uint32_t slot = ShadowFind(page);
++  if (slot == UINT32_MAX) {
++    if (shadow_used_ >= shadow_slots_) {
++      // No slot: copied from guest memory as it is, and the page has no bytes of record.
++      shadow_page_slot_[page] = 0;
++      std::memcpy(upload_dst, guest, page_size);
++      return;
++    }
++    slot = shadow_used_++;
++    shadow_page_slot_[page] = slot + 1;
++    shadow_slot_page_[slot] = page;
++  }
++  shadow_slot_generation_[slot] = shadow_generation_;
++  uint8_t* slot_bytes = shadow_bytes_.data() + (size_t(slot) * page_size);
++  // The copy to the buffer is made from the slot: the slot is, to the byte, what the buffer will hold.
++  std::memcpy(slot_bytes, guest, page_size);
++  std::memcpy(upload_dst, slot_bytes, page_size);
++}
++
++void D3D12SharedMemory::ShadowReset() {
++  ++shadow_generation_;
++  shadow_used_ = 0;
++}
++
++void D3D12SharedMemory::VerifyRecord(const std::vector<uint32_t>& pages, const std::vector<uint8_t>& kinds,
++                                     const std::vector<uint8_t>& expected) {
++  if (pages.empty() || verifies_.size() >= 256) {
++    return;
++  }
++  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
++  const size_t page_size = size_t(1) << page_size_log2();
++  D3D12_RESOURCE_DESC readback_desc;
++  ui::d3d12::util::FillBufferResourceDesc(readback_desc, UINT64(pages.size()) * page_size,
++                                          D3D12_RESOURCE_FLAG_NONE);
++  VerifyEntry entry;
++  if (FAILED(provider.GetDevice()->CreateCommittedResource(
++          &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(), &readback_desc,
++          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&entry.readback)))) {
++    REXGPU_WARN("[upload-verify] failed to create the readback buffer");
++    return;
++  }
++  // The buffer is read in place: after every copy recorded so far (hoisted ones too, they run at the start of
++  // their run) and before the ones of this call.
++  CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_SOURCE);
++  command_processor_.SubmitBarriers();
++  DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
++  for (size_t i = 0; i < pages.size(); ++i) {
++    command_list.D3DCopyBufferRegion(entry.readback.Get(), UINT64(i) * page_size, buffer_,
++                                     UINT64(pages[i]) << page_size_log2(), UINT64(page_size));
++  }
++  entry.submission = command_processor_.GetCurrentSubmission();
++  entry.pages = pages;
++  entry.kinds = kinds;
++  entry.expected = expected;
++  verifies_.push_back(std::move(entry));
++}
++
++void D3D12SharedMemory::VerifyCompare() {
++  const uint64_t completed = command_processor_.GetCompletedSubmission();
++  const size_t page_size = size_t(1) << page_size_log2();
++  size_t kept = 0;
++  for (size_t v = 0; v < verifies_.size(); ++v) {
++    VerifyEntry& entry = verifies_[v];
++    if (entry.submission > completed) {
++      if (kept != v) {
++        verifies_[kept] = std::move(entry);
++      }
++      ++kept;
++      continue;
++    }
++    D3D12_RANGE read_range = {0, SIZE_T(entry.pages.size() * page_size)};
++    void* mapping = nullptr;
++    if (SUCCEEDED(entry.readback->Map(0, &read_range, &mapping)) && mapping) {
++      for (size_t i = 0; i < entry.pages.size(); ++i) {
++        const uint8_t kind = entry.kinds[i];
++        ++verify_checked_[kind];
++        const uint8_t* got = static_cast<const uint8_t*>(mapping) + i * page_size;
++        const uint8_t* want = entry.expected.data() + i * page_size;
++        if (std::memcmp(got, want, page_size) != 0) {
++          ++verify_mismatched_[kind];
++          if (verify_mismatches_logged_ < 16) {
++            ++verify_mismatches_logged_;
++            size_t first = 0;
++            while (first < page_size && got[first] == want[first]) {
++              ++first;
++            }
++            REXGPU_ERROR(
++                "[upload-verify] MISMATCH ({}) page 0x{:08X}: the buffer differs from the bytes expected, first at "
++                "+0x{:X} (has {:02X}, expected {:02X})",
++                kind ? "bridged" : "skipped", entry.pages[i] << page_size_log2(), first, got[first], want[first]);
++          }
++        }
++      }
++      D3D12_RANGE written_range = {0, 0};
++      entry.readback->Unmap(0, &written_range);
++    }
++  }
++  verifies_.resize(kept);
++}
++
++bool D3D12SharedMemory::UploadRangesJoined(
++    const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
++  const uint32_t page_log2 = page_size_log2();
++  const size_t page_size = size_t(1) << page_log2;
++  const bool merge = REXCVAR_GET(d3d12_upload_merge);
++  const uint32_t skip_mode = std::min(uint32_t(REXCVAR_GET(d3d12_upload_skip_same)), uint32_t(2));
++  const bool skip_same = skip_mode != 0;
++  // Mode 2 compares pages that are not hot: they are valid and watched before their bytes are looked at, as a copy
++  // does (MakeRangeValid before the memcpy), for the whole plan at once; what is not copied stays valid.
++  const bool armed_upfront = skip_mode == 2;
++  const bool verify = REXCVAR_GET(d3d12_upload_verify);
++  const uint32_t bridge_max = merge ? std::min(uint32_t(REXCVAR_GET(d3d12_upload_bridge_pages)), uint32_t(64)) : 0;
++
++  // The plan: sorted by address, the runs that overlap or touch made one (a page of two runs is copied once).
++  upload_plan_.assign(upload_page_ranges.begin(), upload_page_ranges.end());
++  std::sort(upload_plan_.begin(), upload_plan_.end());
++  {
++    size_t joined = 0;
++    for (size_t i = 1; i < upload_plan_.size(); ++i) {
++      std::pair<uint32_t, uint32_t>& previous = upload_plan_[joined];
++      const std::pair<uint32_t, uint32_t>& current = upload_plan_[i];
++      const uint64_t previous_end = uint64_t(previous.first) + previous.second;
++      if (uint64_t(current.first) <= previous_end) {
++        const uint64_t current_end = uint64_t(current.first) + current.second;
++        if (current_end > previous_end) {
++          previous.second = uint32_t(current_end - previous.first);
++        }
++      } else {
++        upload_plan_[++joined] = current;
++      }
++    }
++    upload_plan_.resize(joined + 1);
++  }
++
++  std::vector<uint32_t> verify_pages;
++  std::vector<uint8_t> verify_kinds;
++  std::vector<uint8_t> verify_expected;
++  auto verify_add = [&](uint32_t page, uint8_t kind, const uint8_t* bytes) {
++    if (verify_pages.size() >= 32) {
++      return;
++    }
++    verify_pages.push_back(page);
++    verify_kinds.push_back(kind);
++    verify_expected.insert(verify_expected.end(), bytes, bytes + page_size);
++  };
++
++  if (armed_upfront) {
++    for (const std::pair<uint32_t, uint32_t>& range : upload_plan_) {
++      MakeRangeValid(range.first << page_log2, range.second << page_log2, false);
++    }
++  }
++
++  // Pages at the ends of a run (hot ones; with mode 2 any) that the buffer already holds the bytes of (the bytes of
++  // the slot, which are what the last copy of the page put there) are left out. Never the middle of a run: it would
++  // make two copies of one.
++  if (skip_same) {
++    size_t kept = 0;
++    for (size_t i = 0; i < upload_plan_.size(); ++i) {
++      uint32_t first = upload_plan_[i].first;
++      uint32_t count = upload_plan_[i].second;
++      while (count) {
++        const uint8_t* guest = memory().TranslatePhysical(first << page_log2);
++        if ((skip_mode == 1 && !IsPageHotNow(first)) || !ShadowSame(first, guest)) {
++          break;
++        }
++        if (verify) {
++          verify_add(first, 0, guest);
++        }
++        ++first;
++        --count;
++        if (census_.active) {
++          ++census_.skipped_pages;
++        }
++      }
++      while (count) {
++        const uint32_t last = first + count - 1;
++        const uint8_t* guest = memory().TranslatePhysical(last << page_log2);
++        if ((skip_mode == 1 && !IsPageHotNow(last)) || !ShadowSame(last, guest)) {
++          break;
++        }
++        if (verify) {
++          verify_add(last, 0, guest);
++        }
++        --count;
++        if (census_.active) {
++          ++census_.skipped_pages;
++        }
++      }
++      if (count) {
++        upload_plan_[kept++] = std::make_pair(first, count);
++      }
++    }
++    if (census_.active) {
++      census_.skipped_calls += kept < upload_plan_.size();
++    }
++    upload_plan_.resize(kept);
++    if (upload_plan_.empty() && verify_pages.empty()) {
++      return true;
++    }
++  }
++
++  // The gap before each run of the plan (after the first) that its copy may cover to continue the copy before it.
++  std::vector<uint32_t>& lead_gap = upload_lead_gap_;
++  lead_gap.assign(upload_plan_.size(), 0);
++  if (bridge_max) {
++    for (size_t i = 1; i < upload_plan_.size(); ++i) {
++      const uint32_t previous_end = upload_plan_[i - 1].first + upload_plan_[i - 1].second;
++      const uint32_t gap = upload_plan_[i].first - previous_end;
++      if (gap && gap <= bridge_max && ArePagesPlainValid(previous_end, gap) && !PagesMarkedInRun(previous_end, gap)) {
++        lead_gap[i] = gap;
++        if (verify) {
++          for (uint32_t page = previous_end; page < previous_end + gap; ++page) {
++            verify_add(page, 1, memory().TranslatePhysical(page << page_log2));
++          }
++        }
++      }
++    }
++  }
++  if (!verify_pages.empty()) {
++    // In place, after the readbacks (they are recorded first, which ends the run of draws).
++    VerifyRecord(verify_pages, verify_kinds, verify_expected);
++  }
++  if (upload_plan_.empty()) {
++    return true;
++  }
++
++  const uint64_t census_no_run_before = hoist_stats_.uploads_in_place_no_run;
++  const uint64_t census_page_read_before = hoist_stats_.uploads_in_place_page_read;
++  bool hoist = BeginHoistedUpload(upload_plan_);
++  if (census_.active) {
++    CensusCall(hoist, census_no_run_before, census_page_read_before);
++  }
++  // The gap before the first run: to the copy that ended the last upload of the hoisted run.
++  if (hoist && bridge_max && hoist_tail_.valid && !lead_gap.empty()) {
++    const uint64_t first_byte = uint64_t(upload_plan_[0].first) << page_log2;
++    if (first_byte > hoist_tail_.dst_end) {
++      const uint32_t gap = uint32_t((first_byte - hoist_tail_.dst_end) >> page_log2);
++      const uint32_t gap_first = hoist_tail_.dst_end >> page_log2;
++      if (gap <= bridge_max && ArePagesPlainValid(gap_first, gap) && !PagesMarkedInRun(gap_first, gap)) {
++        lead_gap[0] = gap;
++      }
++    }
++  }
++  D3D12CommandProcessor::GpuTimingOpScope gt_op(command_processor_, D3D12CommandProcessor::kGtOpUpload);
++  if (!hoist) {
++    CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
++    command_processor_.SubmitBarriers();
++  }
++  auto& command_list = command_processor_.GetDeferredCommandList();
++  CopyTail local_tail;
++  CopyTail& tail = hoist ? hoist_tail_ : local_tail;
++  if (!merge) {
++    tail.valid = false;
++  }
++  bool successful = true;
++  size_t failed_range_index = SIZE_MAX;
++  uint32_t failed_start = 0, failed_remaining = 0;
++  for (size_t range_index = 0; range_index < upload_plan_.size() && successful; ++range_index) {
++    uint32_t start = upload_plan_[range_index].first;
++    uint32_t remaining = upload_plan_[range_index].second;
++    uint32_t gap_pages = lead_gap[range_index];
++    while (remaining != 0) {
++      // A gap is only taken if the copy before this one ended exactly where the gap starts.
++      if (gap_pages && !(tail.valid && tail.dst_end == (uint64_t(start - gap_pages) << page_log2))) {
++        gap_pages = 0;
++      }
++      ID3D12Resource* upload_buffer;
++      size_t upload_buffer_offset, upload_buffer_size;
++      uint8_t* upload_buffer_mapping = upload_buffer_pool_->RequestPartial(
++          command_processor_.GetCurrentSubmission(), size_t(gap_pages + remaining) << page_log2,
++          page_size, &upload_buffer, &upload_buffer_offset, &upload_buffer_size, nullptr);
++      if (upload_buffer_mapping == nullptr) {
++        REXGPU_ERROR("Shared memory: Failed to get an upload buffer");
++        successful = false;
++        failed_range_index = range_index;
++        failed_start = start;
++        failed_remaining = remaining;
++        break;
++      }
++      uint32_t block_pages = uint32_t(upload_buffer_size >> page_log2);
++      bool continues = merge && tail.valid && upload_buffer == tail.src && upload_buffer_offset == tail.src_end &&
++                       tail.dst_end == (uint64_t(start - gap_pages) << page_log2);
++      if (gap_pages && (!continues || block_pages <= gap_pages)) {
++        // The block does not go on from the copy before: the gap is not worth a copy of its own.
++        if (block_pages > gap_pages) {
++          upload_buffer_mapping += size_t(gap_pages) << page_log2;
++          upload_buffer_offset += size_t(gap_pages) << page_log2;
++          upload_buffer_size -= size_t(gap_pages) << page_log2;
++          block_pages -= gap_pages;
++          gap_pages = 0;
++          continues = false;
++        } else {
++          // No room in the block (the end of an upload page of the pool) for the gap and a page: ask again, with no gap.
++          gap_pages = 0;
++          continue;
++        }
++      }
++      const uint32_t real_pages = block_pages - gap_pages;
++      const uint32_t first_page = start - gap_pages;
++      if (!armed_upfront) {
++        MakeRangeValid(start << page_log2, real_pages << page_log2, false);
++      }
++      const uint8_t* guest_start = memory().TranslatePhysical(first_page << page_log2);
++      if (skip_same) {
++        // The pages that are hot go through a slot of their own; the others as they were, but a page that had a slot
++        // does not keep it (its bytes are not the ones of the slot any more).
++        uint32_t page = first_page;
++        const uint32_t block_end = first_page + block_pages;
++        while (page < block_end) {
++          // With mode 2 every page of the real part goes through a slot; with 1 the hot ones.
++          const bool through_slot = page >= start && (skip_mode == 2 || IsPageHotNow(page));
++          uint32_t run_end = page + 1;
++          while (run_end < block_end &&
++                 (run_end >= start && (skip_mode == 2 || IsPageHotNow(run_end))) == through_slot) {
++            ++run_end;
++          }
++          if (through_slot) {
++            for (uint32_t p = page; p < run_end; ++p) {
++              ShadowStore(p, guest_start + (size_t(p - first_page) << page_log2),
++                          upload_buffer_mapping + (size_t(p - first_page) << page_log2));
++            }
++          } else {
++            std::memcpy(upload_buffer_mapping + (size_t(page - first_page) << page_log2),
++                        guest_start + (size_t(page - first_page) << page_log2),
++                        size_t(run_end - page) << page_log2);
++            if (!shadow_page_slot_.empty()) {
++              for (uint32_t p = page; p < run_end; ++p) {
++                shadow_page_slot_[p] = 0;
++              }
++            }
++          }
++          page = run_end;
++        }
++      } else {
++        std::memcpy(upload_buffer_mapping, guest_start, upload_buffer_size);
++      }
++      bool extended = false;
++      if (continues) {
++        extended = command_list.ExtendCopyBufferRegion(tail.hoisted, tail.args_index, UINT64(upload_buffer_size));
++        if (extended) {
++          tail.dst_end += uint32_t(upload_buffer_size);
++          tail.src_end += upload_buffer_size;
++        }
++      }
++      if (!extended) {
++        const size_t args_index = command_list.D3DCopyBufferRegionTracked(
++            buffer_, UINT64(first_page) << page_log2, upload_buffer, UINT64(upload_buffer_offset),
++            UINT64(upload_buffer_size));
++        tail.valid = merge;
++        tail.hoisted = hoist;
++        tail.args_index = args_index;
++        tail.dst_end = uint32_t((uint64_t(first_page) << page_log2) + upload_buffer_size);
++        tail.src = upload_buffer;
++        tail.src_end = upload_buffer_offset + upload_buffer_size;
++      }
++      if (census_.active) {
++        CensusPiece(start << page_log2, real_pages << page_log2);
++        census_.commands += !extended;
++        census_.extended += extended;
++        census_.bridged_bytes += uint64_t(gap_pages) << page_log2;
++      }
++      start += real_pages;
++      remaining -= real_pages;
++      gap_pages = 0;
++    }
++  }
++  gt_op.End();
++  if (!successful && armed_upfront && failed_range_index != SIZE_MAX) {
++    // The pages that were made valid ahead of their copy and did not get one are not valid.
++    MemoryInvalidationCallback(failed_start << page_log2, failed_remaining << page_log2, true);
++    for (size_t i = failed_range_index + 1; i < upload_plan_.size(); ++i) {
++      MemoryInvalidationCallback(upload_plan_[i].first << page_log2, upload_plan_[i].second << page_log2, true);
++    }
++  }
++  if (hoist) {
++    // Also after a failure, to leave the hoisted stream well-formed.
++    hoist_byte_ranges_temp_.clear();
++    for (const std::pair<uint32_t, uint32_t>& range : upload_plan_) {
++      hoist_byte_ranges_temp_.emplace_back(range.first << page_size_log2(), range.second << page_size_log2());
++    }
++    EndHoistedUpload(hoist_byte_ranges_temp_);
++  }
++  return successful;
++}
++
++// ----- The census -----
++
++void D3D12SharedMemory::CensusFrame() {
++  const uint64_t frame = command_processor_.GetCurrentFrame();
++  if (census_.frame == frame) {
++    return;
++  }
++  const size_t pages = size_t(kBufferSize) >> page_size_log2();
++  if (census_.page_count.empty()) {
++    census_.page_count.assign(pages, 0);
++    census_.page_hash.assign(pages, 0);
++    census_.page_hash_frame.assign(pages, 0);
++    census_.page_history.assign(pages, 0);
++    census_.page_last_frame.assign(pages, 0);
++    census_.window_start = std::chrono::steady_clock::now();
++  }
++  if (census_.frame != UINT64_MAX) {
++    CensusCloseFrame();
++  }
++  census_.frame = frame;
++  if (std::chrono::steady_clock::now() - census_.window_start >= std::chrono::seconds(10)) {
++    CensusLog();
++  }
++}
++
++void D3D12SharedMemory::CensusPiece(uint32_t byte_start, uint32_t length) {
++  ++census_.pieces;
++  census_.bytes += length;
++  const uint32_t kind = std::min(current_request_kind(), uint32_t(kRequestKindCount - 1));
++  ++census_.pieces_by_kind[kind];
++  census_.bytes_by_kind[kind] += length;
++  census_.frame_pieces.emplace_back(byte_start, length);
++  const uint32_t page_first = byte_start >> page_size_log2();
++  const uint32_t page_last = (byte_start + length - 1) >> page_size_log2();
++  const uint32_t frame32 = uint32_t(census_.frame);
++  for (uint32_t page = page_first; page <= page_last && page < census_.page_count.size(); ++page) {
++    uint8_t& count = census_.page_count[page];
++    if ((count & 0x7F) == 0) {
++      census_.touched.push_back(page);
++    }
++    if ((count & 0x7F) < 127) {
++      ++count;
++    }
++    if (IsPageHotNow(page)) {
++      ++census_.hot_pages;
++      count |= 0x80;
++    }
++    // Is it the bytes the page was last uploaded with? (hashed from guest memory now: for the counts, not a proof)
++    const uint64_t* words = reinterpret_cast<const uint64_t*>(memory().TranslatePhysical(page << page_size_log2()));
++    uint64_t hash = 0xCBF29CE484222325ull;
++    for (size_t i = 0; i < (size_t(1) << page_size_log2()) / sizeof(uint64_t); ++i) {
++      hash = (hash ^ words[i]) * 0x100000001B3ull;
++      hash ^= hash >> 29;
++    }
++    if (census_.page_hash_frame[page] != 0) {
++      const bool same = census_.page_hash[page] == hash;
++      if (census_.page_hash_frame[page] == frame32) {
++        ++(same ? census_.same_in_frame : census_.changed_in_frame);
++      } else {
++        ++(same ? census_.same_earlier_frame : census_.changed_earlier_frame);
++      }
++    }
++    census_.page_hash[page] = hash;
++    census_.page_hash_frame[page] = frame32 ? frame32 : 1;
++  }
++}
++
++void D3D12SharedMemory::CensusCall(bool hoisted, uint64_t no_run_before, uint64_t page_read_before) {
++  ++census_.calls;
++  if (hoisted) {
++    ++census_.hoisted_calls;
++  } else if (hoist_stats_.uploads_in_place_no_run != no_run_before) {
++    ++census_.in_place_no_run;
++  } else if (hoist_stats_.uploads_in_place_page_read != page_read_before) {
++    ++census_.in_place_page_read;
++  }
++}
++
++void D3D12SharedMemory::CensusCloseFrame() {
++  if (census_.frame_pieces.empty()) {
++    return;
++  }
++  ++census_.window_frames;
++  const uint32_t frame32 = uint32_t(census_.frame);
++  for (uint32_t page : census_.touched) {
++    const uint32_t count = census_.page_count[page] & 0x7F;
++    ++census_.pages_distinct;
++    if (count > 1) {
++      ++census_.pages_repeated;
++      census_.pages_repeated_hot += (census_.page_count[page] & 0x80) != 0;
++      census_.page_extra_copies += count - 1;
++    }
++    const uint32_t age = frame32 - census_.page_last_frame[page];
++    uint32_t history = age >= 32 ? 0 : census_.page_history[page] << age;
++    history |= 1;
++    census_.page_history[page] = history;
++    census_.page_last_frame[page] = frame32;
++    census_.pages_in_2 += (history & 0x3u) == 0x3u;
++    census_.pages_in_8 += (history & 0xFFu) == 0xFFu;
++    census_.pages_in_32 += history == 0xFFFFFFFFu;
++    census_.page_count[page] = 0;
++  }
++  census_.touched.clear();
++
++  // The gaps between the copies of the frame in address order, and what bridging them would leave.
++  std::vector<std::pair<uint32_t, uint32_t>>& pieces = census_.frame_pieces;
++  {
++    // In the order they were made: how many go on from the one before.
++    uint64_t previous_end = UINT64_MAX;
++    for (const std::pair<uint32_t, uint32_t>& piece : pieces) {
++      if (previous_end != UINT64_MAX && piece.first >= previous_end) {
++        const uint64_t gap = piece.first - previous_end;
++        census_.adjacent_in_order[0] += gap == 0;
++        census_.adjacent_in_order[1] += gap <= 4096;
++        census_.adjacent_in_order[2] += gap <= 65536;
++      }
++      previous_end = uint64_t(piece.first) + piece.second;
++    }
++  }
++  std::sort(pieces.begin(), pieces.end());
++  static constexpr uint64_t kThresholds[4] = {0, 4096, 16384, 65536};
++  uint64_t left[4] = {1, 1, 1, 1};
++  uint64_t end_so_far = uint64_t(pieces[0].first) + pieces[0].second;
++  for (size_t i = 1; i < pieces.size(); ++i) {
++    const int64_t gap = int64_t(pieces[i].first) - int64_t(end_so_far);
++    const size_t bucket = gap < 0 ? 0 : gap == 0 ? 1 : gap <= 4096 ? 2 : gap <= 16384 ? 3 : gap <= 65536 ? 4 : gap <= (1 << 20) ? 5 : 6;
++    ++census_.gap_hist[bucket];
++    for (size_t t = 0; t < 4; ++t) {
++      if (gap > int64_t(kThresholds[t])) {
++        ++left[t];
++      } else if (gap > 0) {
++        census_.merge_bytes[t] += uint64_t(gap);
++      }
++    }
++    end_so_far = std::max(end_so_far, uint64_t(pieces[i].first) + pieces[i].second);
++  }
++  for (size_t t = 0; t < 4; ++t) {
++    census_.merge_potential[t] += left[t];
++  }
++  pieces.clear();
++}
++
++void D3D12SharedMemory::CensusLog() {
++  const double seconds =
++      std::chrono::duration<double>(std::chrono::steady_clock::now() - census_.window_start).count();
++  const double frames = double(std::max<uint64_t>(census_.window_frames, 1));
++  const Census& c = census_;
++  REXGPU_INFO(
++      "[upload-census] {:.1f} s, {} frames with uploads, per frame: {:.1f} copies made ({:.1f} pieces, {:.1f} of them "
++      "went on an earlier copy), {:.0f} KB (+{:.0f} KB bridged), {:.1f} calls ({:.1f} hoisted, {:.1f} in place with no "
++      "run going, {:.1f} in place for a page a draw of the run had read); transitions to copy dest {:.1f}, from it "
++      "{:.1f}, hoisted run pairs {:.1f}",
++      seconds, c.window_frames, double(c.commands) / frames, double(c.pieces) / frames, double(c.extended) / frames,
++      double(c.bytes) / 1024.0 / frames, double(c.bridged_bytes) / 1024.0 / frames, double(c.calls) / frames,
++      double(c.hoisted_calls) / frames, double(c.in_place_no_run) / frames, double(c.in_place_page_read) / frames,
++      double(c.barriers_to_copy) / frames, double(c.barriers_from_copy) / frames, double(c.hoisted_pairs) / frames);
++  REXGPU_INFO(
++      "[upload-census] pages per frame: {:.1f} distinct, {:.1f} uploaded more than once ({:.1f} of them hot; {:.1f} "
++      "extra copies of pages), {:.1f} uploads of hot pages, {:.1f} left out for the same bytes ({} calls); uploaded in "
++      "each of the last 2 / 8 / 32 frames: {:.1f} / {:.1f} / {:.1f}; of the uploads of a page uploaded before: same "
++      "frame same bytes {:.1f} / other bytes {:.1f}, an earlier frame same bytes {:.1f} / other bytes {:.1f}",
++      double(c.pages_distinct) / frames, double(c.pages_repeated) / frames, double(c.pages_repeated_hot) / frames,
++      double(c.page_extra_copies) / frames, double(c.hot_pages) / frames, double(c.skipped_pages) / frames,
++      c.skipped_calls, double(c.pages_in_2) / frames, double(c.pages_in_8) / frames, double(c.pages_in_32) / frames,
++      double(c.same_in_frame) / frames, double(c.changed_in_frame) / frames, double(c.same_earlier_frame) / frames,
++      double(c.changed_earlier_frame) / frames);
++  REXGPU_INFO(
++      "[upload-census] by kind (pieces, KB a frame): other {:.1f}, {:.0f}; texture {:.1f}, {:.0f}; vertex {:.1f}, {:.0f}; "
++      "index {:.1f}, {:.0f}; memexport {:.1f}, {:.0f}; resolve {:.1f}, {:.0f}",
++      double(c.pieces_by_kind[0]) / frames, double(c.bytes_by_kind[0]) / 1024.0 / frames,
++      double(c.pieces_by_kind[1]) / frames, double(c.bytes_by_kind[1]) / 1024.0 / frames,
++      double(c.pieces_by_kind[2]) / frames, double(c.bytes_by_kind[2]) / 1024.0 / frames,
++      double(c.pieces_by_kind[3]) / frames, double(c.bytes_by_kind[3]) / 1024.0 / frames,
++      double(c.pieces_by_kind[4]) / frames, double(c.bytes_by_kind[4]) / 1024.0 / frames,
++      double(c.pieces_by_kind[5]) / frames, double(c.bytes_by_kind[5]) / 1024.0 / frames);
++  REXGPU_INFO(
++      "[upload-census] copies a frame left if the pieces, in address order, were joined across gaps of up to 0 / 4 / 16 / "
++      "64 KB: {:.1f} / {:.1f} / {:.1f} / {:.1f} (gap bytes copied for them a frame: {:.0f} / {:.0f} / {:.0f} / {:.0f} KB); "
++      "gaps (a frame): overlap {:.1f}, 0 {:.1f}, <= 4K {:.1f}, <= 16K {:.1f}, <= 64K {:.1f}, <= 1M {:.1f}, more {:.1f}; "
++      "pieces that go on from the one made before it: exactly {:.1f}, <= 4K gap {:.1f}, <= 64K gap {:.1f}",
++      double(c.merge_potential[0]) / frames, double(c.merge_potential[1]) / frames,
++      double(c.merge_potential[2]) / frames, double(c.merge_potential[3]) / frames,
++      double(c.merge_bytes[0]) / 1024.0 / frames, double(c.merge_bytes[1]) / 1024.0 / frames,
++      double(c.merge_bytes[2]) / 1024.0 / frames, double(c.merge_bytes[3]) / 1024.0 / frames,
++      double(c.gap_hist[0]) / frames, double(c.gap_hist[1]) / frames, double(c.gap_hist[2]) / frames,
++      double(c.gap_hist[3]) / frames, double(c.gap_hist[4]) / frames, double(c.gap_hist[5]) / frames,
++      double(c.gap_hist[6]) / frames, double(c.adjacent_in_order[0]) / frames,
++      double(c.adjacent_in_order[1]) / frames, double(c.adjacent_in_order[2]) / frames);
++  if (verify_checked_[0] || verify_checked_[1]) {
++    REXGPU_INFO("[upload-verify] checked so far: {} skipped pages ({} mismatched), {} bridged pages ({} mismatched)",
++                verify_checked_[0], verify_mismatched_[0], verify_checked_[1], verify_mismatched_[1]);
++  }
++  // The next window; what is kept of the frame being counted goes on with it.
++  census_.window_start = std::chrono::steady_clock::now();
++  census_.calls = census_.pieces = census_.commands = census_.extended = census_.bytes = census_.bridged_bytes = 0;
++  census_.hoisted_calls = census_.in_place_no_run = census_.in_place_page_read = 0;
++  std::fill(std::begin(census_.pieces_by_kind), std::end(census_.pieces_by_kind), uint64_t(0));
++  std::fill(std::begin(census_.bytes_by_kind), std::end(census_.bytes_by_kind), uint64_t(0));
++  census_.hot_pages = census_.skipped_pages = census_.skipped_calls = 0;
++  census_.barriers_to_copy = census_.barriers_from_copy = census_.hoisted_pairs = census_.hoisted_rewrites = 0;
++  census_.pages_distinct = census_.pages_repeated = census_.pages_repeated_hot = census_.page_extra_copies = 0;
++  census_.same_in_frame = census_.changed_in_frame = census_.same_earlier_frame = census_.changed_earlier_frame = 0;
++  census_.pages_in_2 = census_.pages_in_8 = census_.pages_in_32 = 0;
++  std::fill(std::begin(census_.merge_potential), std::end(census_.merge_potential), uint64_t(0));
++  std::fill(std::begin(census_.merge_bytes), std::end(census_.merge_bytes), uint64_t(0));
++  std::fill(std::begin(census_.gap_hist), std::end(census_.gap_hist), uint64_t(0));
++  std::fill(std::begin(census_.adjacent_in_order), std::end(census_.adjacent_in_order), uint64_t(0));
++  census_.window_frames = 0;
++}
++
+ }  // namespace rex::graphics::d3d12
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index 7f02674..1b430e7 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -47,6 +47,14 @@ REXCVAR_DEFINE_BOOL(shared_memory_request_fast_path, true, "GPU",
+                     "when every page it covers is already valid (most draws re-request unchanged "
+                     "buffers). Off restores the full path for every request.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++// LOCAL PATCH - MCLA (0817): upload_merge
++REXCVAR_DEFINE_BOOL(shared_memory_merge_upload_calls, false, "GPU",
++                    "With a backend that has no byte path for hot pages (Direct3D 12): one upload call for "
++                    "a request, the pages it needs and the hot pages it uses together, sorted and with the "
++                    "runs that overlap or touch joined, instead of one call for the pages and one for the hot "
++                    "ones (the hot ones, unsorted, with a page that two asked ranges share copied twice). "
++                    "The same bytes reach the same pages")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_BOOL(shared_memory_request_fast_path_with_hot_pages, true, "GPU",
+                     "Also take the fast path with hot pages or widened requests on: a request "
+                     "whose pages are all valid needs nothing from either. Off sends every request "
+@@ -405,6 +413,31 @@ bool SharedMemory::AreAllPagesValid(uint32_t start, uint32_t length) {
+   return true;
+ }
+ 
++// LOCAL PATCH - MCLA (0817): upload_merge
++bool SharedMemory::ArePagesPlainValid(uint32_t page_first, uint32_t page_count) {
++  if (!page_count || (uint64_t(page_first) + page_count) > (uint64_t(kBufferSize) >> page_size_log2_)) {
++    return false;
++  }
++  const uint32_t now_ms = uint32_t(rex::chrono::Clock::QueryHostUptimeMillis());
++  auto global_lock = global_critical_region_.Acquire();
++  const bool any_hot = AnyPageHot(now_ms);
++  for (uint32_t page = page_first; page < page_first + page_count; ++page) {
++    const uint64_t bit = uint64_t(1) << (page & 63);
++    if (!(system_page_flags_valid_[page >> 6] & bit) ||
++        (system_page_flags_valid_and_gpu_written_[page >> 6] & bit) ||
++        (any_hot && IsPageHot(page, now_ms))) {
++      return false;
++    }
++  }
++  return true;
++}
++
++// LOCAL PATCH - MCLA (0817): upload_merge
++bool SharedMemory::IsPageHotNow(uint32_t page) const {
++  const uint32_t now_ms = uint32_t(rex::chrono::Clock::QueryHostUptimeMillis());
++  return page < page_hot_until_ms_.size() && AnyPageHot(now_ms) && IsPageHot(page, now_ms);
++}
++
+ bool SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
+                                                     uint32_t length_allocations) {
+   assert_always(
+@@ -811,6 +844,37 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+   g_shared_memory_uploaded_bytes.fetch_add(upload_pages << page_size_log2_,
+                                            std::memory_order_relaxed);
+ 
++  // LOCAL PATCH - MCLA (0817): upload_merge. Once UploadByteRanges has said that the backend has none, the hot
++  // pages a request uses are uploaded as whole pages in a second call, which is the pages of the first call's
++  // neighbours, unsorted, and twice for a page that two of the asked ranges share. Joined with the first call's
++  // pages into one sorted list with its overlapping and touching runs made one, it is one call that copies every
++  // page once: hot pages are never valid, so MakeRangeValid leaves them alone in the one call as in two.
++  if (!hot_byte_ranges_.empty() && upload_byte_ranges_unsupported_ &&
++      REXCVAR_GET(shared_memory_merge_upload_calls)) {
++    for (const std::pair<uint32_t, uint32_t>& byte_range : hot_byte_ranges_) {
++      const uint32_t page_first = byte_range.first >> page_size_log2_;
++      const uint32_t page_last = (byte_range.first + byte_range.second - 1) >> page_size_log2_;
++      upload_ranges_.emplace_back(page_first, page_last - page_first + 1);
++    }
++    std::sort(upload_ranges_.begin(), upload_ranges_.end());
++    size_t joined = 0;
++    for (size_t i = 1; i < upload_ranges_.size(); ++i) {
++      std::pair<uint32_t, uint32_t>& previous = upload_ranges_[joined];
++      const std::pair<uint32_t, uint32_t>& current = upload_ranges_[i];
++      const uint64_t previous_end = uint64_t(previous.first) + previous.second;
++      if (uint64_t(current.first) <= previous_end) {
++        const uint64_t current_end = uint64_t(current.first) + current.second;
++        if (current_end > previous_end) {
++          previous.second = uint32_t(current_end - previous.first);
++        }
++      } else {
++        upload_ranges_[++joined] = current;
++      }
++    }
++    upload_ranges_.resize(joined + 1);
++    return UploadRanges(upload_ranges_);
++  }
++
+   if (!UploadRanges(upload_ranges_)) {
+     return false;
+   }
+@@ -824,6 +888,7 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+       g_shared_memory_hot_uploaded_bytes.fetch_add(hot_bytes, std::memory_order_relaxed);
+     } else {
+       // No byte path in this backend: the whole pages, as before.
++      upload_byte_ranges_unsupported_ = true;  // LOCAL PATCH - MCLA (0817)
+       upload_ranges_.clear();
+       for (const std::pair<uint32_t, uint32_t>& byte_range : hot_byte_ranges_) {
+         const uint32_t page_first = byte_range.first >> page_size_log2_;
