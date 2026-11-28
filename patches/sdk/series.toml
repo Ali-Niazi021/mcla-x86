@@ -1097,6 +1097,15 @@ purpose = "D3D12 (T9): NVIDIA DLSS Frame Generation (frame_generation=dlss; cvar
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0800-swap-direct-present-scaled-fill"
+source = "local"
+path = "patches/sdk/0800-swap-direct-present-scaled-fill.patch"
+sha256 = "2f4f09633bacfeb0a5070824f79f3288017748277686f0cc1ce93ac6ee727870"
+purpose = "D3D12 (direct present at 2000p): scaled_copy_levers bit 16 (range now 0..31; default 0 = unchanged; needs bit 2): swap_direct_present at a draw resolution scale above 1 is exact when the front buffer's resolve filled the half-pixel gap (resolve_resolution_scale_fill_half_pixel_offset): the host render target's first host row and column are never written by the frame (the half-pixel offset moves the guest's quads by one host pixel at 2x), the resolve fills them from the next ones, so the direct reads (the apply-gamma compute pass, with and without FXAA, the presenter's fused gamma paint, swap_direct_present_check) read it at max(pixel, scale >> 1). 3 new DXBC built with fxc (apply_gamma_table_fill_cs, apply_gamma_table_fxaa_luma_fill_cs, guest_output_gamma_table_fill_ps; the toolchain reproduces their originals bit for bit); HDR output keeps the loaded texture for such a picture. Bit 4 (0760) stays the old stripe: use 16. Written without a build or a run. Applies after 0780."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]
