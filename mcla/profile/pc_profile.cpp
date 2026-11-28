@@ -432,14 +432,17 @@ constexpr CvarDefault k2000pDefaults[] = {
     {"draw_resolution_scale_y", "2"},
     {"window_width", "3200"},
     {"window_height", "2000"},
-    // The copy levers of the 1x path at draw scale 2 (SDK patch 0760, D3D12; bits: 1 dual write, 2 / 4 direct present, 8
-    // tone-map transfer skip). 9 = dual write + tone-map skip: exact and they pay. Dual write: resolve_dual_write_verify
-    // compared ~8,450 scaled textures with 0 differing bytes (run r1-ver); -1.15 +- 0.09 ms GPU busy of 11.8 (paired A/B,
-    // runs r1-ab1 / r1-ab2); every resolve fell back `scaled` before (51.8 a frame, T1). Tone-map skip: 298 of 299 skipped, the
-    // poison fill never visible (r1-px9); -0.2 ms in the tone map group. Bits 2 and 4 stay OFF: this game's front-buffer resolve
-    // fills the half-pixel gap, so bit 2 never engages, and bit 4 leaves a one-pixel garbage stripe on the top row and left column
-    // of the 3200x2000 picture (5,199 pixels, swap_direct_present_check in r1-sw2; seen in r1-px) for -0.17 ms.
-    {"scaled_copy_levers", "9"},
+    // The copy levers of the 1x path at draw scale 2 (SDK patches 0760 and 0800, D3D12; bits: 1 dual write, 2 / 4 direct present,
+    // 8 tone-map transfer skip, 16 swap direct present with the half-pixel gap filled). 27 = 1 + 2 + 8 + 16: exact and they pay.
+    // Dual write: resolve_dual_write_verify compared ~8,450 scaled textures with 0 differing bytes (run r1-ver); -1.15 +- 0.09 ms
+    // GPU busy of 11.8 (paired A/B, runs r1-ab1 / r1-ab2). Tone-map skip: 298 of 299 skipped, the poison fill never visible
+    // (r1-px9); -0.2 ms in the tone map group. Bit 16 (0800): the swap is made from the render target and the gap is filled by
+    // the patch, so the one-pixel garbage stripe that left bit 4 off (r1-sw2) is gone: 411 checks, 0 differing pixels; -0.12 ms
+    // in the swap group (unlock-2x session 1).
+    {"scaled_copy_levers", "27"},
+    // SDK 0812: the stencil-bit draws of a depth / stencil ownership transfer leave out what the draw rewrites (poison-checked);
+    // tone-map group -0.18 to -0.21 ms.
+    {"stencil_transfer_cut", "true"},
     // The rain: its four 128x128 render targets are resolved and then read as vertex data, which at a draw scale above 1 only
     // works when the resolve is also written unscaled into the shared memory (Renan's mcla_rain_unscaled_copy, not in this
     // host). Without the rule the rain is not drawn at 2000p (r1-rain0: stormy weather, no streak; r1-rain1: the same with the

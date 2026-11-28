@@ -37,8 +37,8 @@ in the sections below are unchanged.
 - Vsync on, tearing off, in the launcher and the PC profile (775ec0c). The launcher has no vsync option (3fe81e5). The
   `[mcla-display]` lines log the present settings and warn on `vsync=false`.
 - Thread placement falls back to an unparked sibling when an ideal processor is parked (3fe81e5).
-- 2000p profile: `scaled_copy_levers` = 9 (dual write and tone-map skip at draw scale 2, 0760) and the unscaled-copy
-  rule for the rain (6d2effe).
+- 2000p profile: `scaled_copy_levers` = 27 (dual write, tone-map skip and the swap made from the render target at draw scale 2,
+  0760 + 0800), `stencil_transfer_cut` = true (0812) and the unscaled-copy rule for the rain (6d2effe).
 - Render-target transfer pipelines are stored in `<title>.rtv.d3d12.xrtp` and made at start (0790; no cvar).
 - Guest memory is pre-faulted on a background thread at boot in the PC profile (`mcla_prefault_guest`,
   `src/host/pf_probe.h`).
