@@ -1,0 +1,274 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Sat, 28 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0813: transfer_skip_scrambled: no EDRAM ownership transfer between render targets that lay their pixels out differently (Direct3D 12; native stream, zero-copy session 2 A)
+
+Source: Ours, written for this SDK (native stream; scratch/zerocopy2/DESIGN2.md section A, TESTPLAN2.md). Written without a build or
+  a run: checked with clang++ 20.1.8 -fsyntax-only (the SDK's Release flags) of d3d12/render_target_cache.cpp and the units that
+  include d3d12/render_target_cache.h; 0 errors, no warning on an added line. Applies after 0812 (W/sdk/src of unlock-2x 17b7bf2).
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: Session 1's transfer census: nearly every transfer at 2000p goes between render targets of another sample count, bits a
+  pixel or pitch (1x D24FS8 <20t> -> 4x D24FS8 <13t>, 16F -> D24FS8, D24FS8 -> 4x 8888, 8888 <20t> -> 4x 8888 <13t>, ...), 38 a frame,
+  104 MB read and 88 MB written, 130-160 stencil-bit passes over 35-39 host Mpx. For such a pair every destination pixel gets the
+  bits of another pixel or sample of the source (the EDRAM address of a sample depends on the pitch at 32 bpp, the bits a pixel and
+  the sample count): the console shows that garbage too. New cvar transfer_skip_scrambled (int bits, default 0 = every transfer as
+  before, hot reload): 1 the sample count differs, 2 the bits a pixel differ, 4 the pitch differs -> the transfer is not made, the
+  destination keeps what its own resource holds (its ownership changes as before). Kept always: transfers between targets of the
+  same layout (also depth to colour and between formats: the same pixel's bits read another way, which this title does use: the
+  census shows 4x D24S8 -> 4x 8888 at the same base and pitch, blended into), and those that differ in the base only (a shift by
+  whole tiles). transfer_skip_scrambled_poison: the area left out is cleared instead (colour magenta; depth 0.5 and stencil 0xA5).
+  `[transfer-skip-scrambled] ...` every 10 s: left out by difference, kept, host Mpx and MB not moved, stencil-bit passes not drawn.
+  Also: 0811's census counts the rectangles of 64 bpp destinations with their own pitch in tiles (GetPitchTiles, as the transfers do;
+  it used the 32 bpp pitch), and 0812's own-transfers check looks at the input array (the filtered one is a copy).
+Bucket: REDO
+
+0813-transfer-skip-scrambled.patch (mcla-x86 native stream, zero-copy session 2).
+
+---
+diff --git a/include/rex/graphics/d3d12/render_target_cache.h b/include/rex/graphics/d3d12/render_target_cache.h
+index 5d3e95b..ef9aa84 100644
+--- a/include/rex/graphics/d3d12/render_target_cache.h
++++ b/include/rex/graphics/d3d12/render_target_cache.h
+@@ -783,6 +783,14 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+       const uint64_t* render_target_resolve_clear_values = nullptr,
+       const Transfer::Rectangle* resolve_clear_rectangle = nullptr,
+       const float* color_resolve_clear_host_value = nullptr);
++  // LOCAL PATCH - MCLA (0813): transfer_skip_scrambled: the transfers of each render target without the ones whose source
++  // lays its pixels out differently (mask: the bits of the cvar), the area of those cleared with the poison if asked;
++  // `transfers` itself when none is left out. cutout: the area the transfers are cut to anyway.
++  const std::vector<Transfer>* FilterScrambledTransfers(uint32_t render_target_count,
++                                                        RenderTarget* const* render_targets,
++                                                        const std::vector<Transfer>* transfers,
++                                                        const Transfer::Rectangle* cutout, uint32_t mask);
++  std::vector<Transfer> scrambled_filtered_transfers_[1 + xenos::kMaxColorRenderTargets];
+ 
+   // Accepts an array of (1 + xenos::kMaxColorRenderTargets) render targets,
+   // first depth, then color.
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index 18a7ec3..e9453e2 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -106,6 +106,27 @@ REXCVAR_DECLARE(bool, resolve_dual_write_msaa);  // LOCAL PATCH - MCLA (0530): r
+ // LOCAL PATCH - MCLA (0560): resolve_defer_memory_write (defined in resolve_defer.cpp)
+ REXCVAR_DECLARE(bool, resolve_defer_memory_write);
+ 
++// LOCAL PATCH - MCLA (0813): transfer_skip_scrambled
++REXCVAR_DEFINE_INT32(transfer_skip_scrambled, 0, "GPU/D3D12",
++                     "Host render targets: an EDRAM ownership transfer whose source and destination lay their pixels "
++                     "out differently in the EDRAM is not made (the destination keeps what its own resource holds), "
++                     "a bit for each difference: 1 the sample count (1x / 2x / 4x MSAA), 2 the bits a pixel (32 against "
++                     "64), 4 the pitch. Each pixel of such a destination would get the bits of another pixel (or "
++                     "sample) of the source: the console shows that garbage, nothing can use it. Transfers between "
++                     "targets of the same layout are always made, also from depth to colour and between formats (the "
++                     "same pixel's bits read another way, which titles do use), and so are those whose bases differ "
++                     "only (a whole-tile shift). 0, the default: every transfer is made. Logs "
++                     "'[transfer-skip-scrambled] ...' every 10 s")
++    .range(0, 7)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(transfer_skip_scrambled_poison, false, "GPU/D3D12",
++                    "Development check of transfer_skip_scrambled: the area of a transfer it leaves out is cleared "
++                    "instead (colour: magenta; depth / stencil: depth 0.5, stencil 0xA5, which a depth or stencil test "
++                    "that relied on it passes or fails in large patches), so anything that uses those pixels before "
++                    "they are drawn or cleared shows in the picture")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ // LOCAL PATCH - MCLA (04a0): the master switch of the direct swap (see NoteSwapDirectResolve, command_processor.cpp
+ // IssueSwap and d3d12_presenter.cpp). Read by every resolve and every swap.
+ REXCVAR_DEFINE_BOOL(swap_direct_present, false, "GPU/D3D12",
+@@ -5229,16 +5250,169 @@ uint32_t ClearFullOutsideRects(LONG width, LONG height, const D3D12_RECT& rect,
+   return count;
+ }
+ 
++// The counts behind the 10 s line. The CP thread only.
++struct ScrambledTransferStats {
++  uint64_t skipped_by_bit[3] = {};
++  uint64_t skipped = 0, kept = 0;
++  uint64_t host_pixels = 0, bytes = 0, stencil_bit_passes = 0, poisoned = 0;
++  std::chrono::steady_clock::time_point window_start = std::chrono::steady_clock::now();
++
++  void LogIfDue() {
++    const auto now = std::chrono::steady_clock::now();
++    const double seconds = std::chrono::duration<double>(now - window_start).count();
++    if (seconds < 10.0) {
++      return;
++    }
++    if (skipped || kept) {
++      REXGPU_INFO(
++          "[transfer-skip-scrambled] {:.1f} s: {} transfers left out (sample count differs {}, bits a pixel {}, pitch "
++          "{}; a transfer can have several), {} of the same layout made; {:.1f} host Mpx and {:.1f} MB (read and "
++          "written) not moved, {} stencil-bit passes not drawn{}",
++          seconds, skipped, skipped_by_bit[0], skipped_by_bit[1], skipped_by_bit[2], kept, double(host_pixels) / 1e6,
++          double(bytes) / 1048576.0, stencil_bit_passes,
++          poisoned ? fmt::format(" ({} areas filled: transfer_skip_scrambled_poison)", poisoned) : std::string());
++    }
++    *this = ScrambledTransferStats();
++    window_start = now;
++  }
++};
++ScrambledTransferStats g_scrambled_transfer_stats;
++
+ }  // namespace
+ 
++// LOCAL PATCH - MCLA (0813): transfer_skip_scrambled
++const std::vector<RenderTargetCache::Transfer>* D3D12RenderTargetCache::FilterScrambledTransfers(
++    uint32_t render_target_count, RenderTarget* const* render_targets, const std::vector<Transfer>* transfers,
++    const Transfer::Rectangle* cutout, uint32_t mask) {
++  assert_true(render_target_count <= 1 + xenos::kMaxColorRenderTargets);
++  // Which of the differences that move a pixel's EDRAM bits to another pixel or sample the two render targets have: 1 the
++  // sample count, 2 the bits a pixel, 4 the pitch (the address of the samples of a pixel is a function of the base, the
++  // pitch in tiles at 32 bits a pixel, the bits a pixel and the sample count alone; the base is left out: a different base
++  // with the rest the same is a shift by whole tiles).
++  auto GetScrambledTransferBits = [](RenderTargetKey source, RenderTargetKey dest) -> uint32_t {
++    uint32_t bits = 0;
++    if (source.msaa_samples != dest.msaa_samples) {
++      bits |= 1;
++    }
++    if (source.Is64bpp() != dest.Is64bpp()) {
++      bits |= 2;
++    }
++    if (source.pitch_tiles_at_32bpp != dest.pitch_tiles_at_32bpp) {
++      bits |= 4;
++    }
++    return bits;
++  };
++  bool any = false;
++  for (uint32_t i = 0; i < render_target_count && !any; ++i) {
++    if (!render_targets[i]) {
++      continue;
++    }
++    for (const Transfer& transfer : transfers[i]) {
++      if (transfer.source && (GetScrambledTransferBits(transfer.source->key(), render_targets[i]->key()) & mask)) {
++        any = true;
++        break;
++      }
++    }
++  }
++  ScrambledTransferStats& stats = g_scrambled_transfer_stats;
++  if (!any) {
++    for (uint32_t i = 0; i < render_target_count; ++i) {
++      stats.kept += render_targets[i] ? transfers[i].size() : 0;
++    }
++    stats.LogIfDue();
++    return transfers;
++  }
++  const bool poison = REXCVAR_GET(transfer_skip_scrambled_poison);
++  const uint64_t scale_area = uint64_t(draw_resolution_scale_x()) * draw_resolution_scale_y();
++  DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
++  for (uint32_t i = 0; i < render_target_count; ++i) {
++    std::vector<Transfer>& filtered = scrambled_filtered_transfers_[i];
++    filtered.clear();
++    RenderTarget* dest_rt = render_targets[i];
++    if (!dest_rt) {
++      continue;
++    }
++    const RenderTargetKey dest_key = dest_rt->key();
++    auto& dest_d3d12_rt = *static_cast<D3D12RenderTarget*>(dest_rt);
++    const uint64_t samples = uint64_t(1) << uint32_t(dest_key.msaa_samples);
++    const uint64_t dest_bytes = GetRenderTargetBytesPerSample(dest_d3d12_rt.resource()->GetDesc().Format);
++    for (const Transfer& transfer : transfers[i]) {
++      const uint32_t bits =
++          transfer.source ? (GetScrambledTransferBits(transfer.source->key(), dest_key) & mask) : 0;
++      if (!bits) {
++        filtered.push_back(transfer);
++        ++stats.kept;
++        continue;
++      }
++      Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
++      const uint32_t rectangle_count =
++          transfer.GetRectangles(dest_key.base_tiles, dest_key.GetPitchTiles(), dest_key.msaa_samples,
++                                 dest_key.Is64bpp(), edram_tile_count(), rectangles, cutout);
++      uint64_t pixels = 0;
++      for (uint32_t j = 0; j < rectangle_count; ++j) {
++        pixels += uint64_t(rectangles[j].width_pixels) * rectangles[j].height_pixels;
++      }
++      const uint64_t source_bytes = GetRenderTargetBytesPerSample(
++          static_cast<const D3D12RenderTarget*>(transfer.source)->resource()->GetDesc().Format);
++      ++stats.skipped;
++      for (uint32_t b = 0; b < 3; ++b) {
++        stats.skipped_by_bit[b] += (bits >> b) & 1;
++      }
++      stats.host_pixels += pixels * scale_area;
++      stats.bytes += pixels * scale_area * samples * (source_bytes + dest_bytes);
++      if (dest_key.is_depth && !use_stencil_reference_output_) {
++        stats.stencil_bit_passes += 8;
++      }
++      if (poison && rectangle_count) {
++        D3D12_RECT host_rects[Transfer::kMaxRectanglesWithCutout];
++        for (uint32_t j = 0; j < rectangle_count; ++j) {
++          host_rects[j].left = LONG(rectangles[j].x_pixels * draw_resolution_scale_x());
++          host_rects[j].top = LONG(rectangles[j].y_pixels * draw_resolution_scale_y());
++          host_rects[j].right =
++              LONG((rectangles[j].x_pixels + rectangles[j].width_pixels) * draw_resolution_scale_x());
++          host_rects[j].bottom =
++              LONG((rectangles[j].y_pixels + rectangles[j].height_pixels) * draw_resolution_scale_y());
++        }
++        const D3D12_RESOURCE_STATES state =
++            dest_key.is_depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET;
++        command_processor_.PushTransitionBarrier(dest_d3d12_rt.resource(), dest_d3d12_rt.SetResourceState(state),
++                                                 state);
++        command_processor_.SubmitBarriers();
++        if (dest_key.is_depth) {
++          command_list.D3DClearDepthStencilView(dest_d3d12_rt.descriptor_draw().GetHandle(),
++                                                D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.5f, 0xA5,
++                                                rectangle_count, host_rects);
++        } else {
++          static const float kMagenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
++          command_list.D3DClearRenderTargetView(dest_d3d12_rt.descriptor_load_separate().IsValid()
++                                                    ? dest_d3d12_rt.descriptor_load_separate().GetHandle()
++                                                    : dest_d3d12_rt.descriptor_draw().GetHandle(),
++                                                kMagenta, rectangle_count, host_rects);
++        }
++        ++stats.poisoned;
++      }
++    }
++  }
++  stats.LogIfDue();
++  return scrambled_filtered_transfers_;
++}
++
+ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+     uint32_t render_target_count, RenderTarget* const* render_targets,
+-    const std::vector<Transfer>* render_target_transfers,
++    const std::vector<Transfer>* render_target_transfers_in,
+     const uint64_t* render_target_resolve_clear_values,
+     const Transfer::Rectangle* resolve_clear_rectangle,
+     const float* color_resolve_clear_host_value) {
+   assert_true(GetPath() == Path::kHostRenderTargets);
+ 
++  // LOCAL PATCH - MCLA (0813): transfer_skip_scrambled: the transfers made from here on (the input when it is off or none
++  // is left out).
++  const std::vector<Transfer>* render_target_transfers = render_target_transfers_in;
++  if (const int32_t skip_scrambled = REXCVAR_GET(transfer_skip_scrambled)) {
++    render_target_transfers = FilterScrambledTransfers(render_target_count, render_targets, render_target_transfers_in,
++                                                       resolve_clear_rectangle, uint32_t(skip_scrambled));
++  }
++
+   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+   ID3D12Device* device = provider.GetDevice();
+   uint64_t current_submission = command_processor_.GetCurrentSubmission();
+@@ -5270,13 +5444,13 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+         Transfer::Rectangle census_rectangles[Transfer::kMaxRectanglesWithCutout];
+         uint64_t pixels_made = 0, pixels_full = 0;
+         const uint32_t made_count = transfer.GetRectangles(
+-            census_dest_key.base_tiles, census_dest_key.pitch_tiles_at_32bpp, census_dest_key.msaa_samples,
++            census_dest_key.base_tiles, census_dest_key.GetPitchTiles(), census_dest_key.msaa_samples,
+             census_dest_key.Is64bpp(), edram_tile_count(), census_rectangles, resolve_clear_rectangle);
+         for (uint32_t j = 0; j < made_count; ++j) {
+           pixels_made += uint64_t(census_rectangles[j].width_pixels) * census_rectangles[j].height_pixels;
+         }
+         const uint32_t full_count = transfer.GetRectangles(
+-            census_dest_key.base_tiles, census_dest_key.pitch_tiles_at_32bpp, census_dest_key.msaa_samples,
++            census_dest_key.base_tiles, census_dest_key.GetPitchTiles(), census_dest_key.msaa_samples,
+             census_dest_key.Is64bpp(), edram_tile_count(), census_rectangles);
+         for (uint32_t j = 0; j < full_count; ++j) {
+           pixels_full += uint64_t(census_rectangles[j].width_pixels) * census_rectangles[j].height_pixels;
+@@ -5714,7 +5888,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+       // would mean no depth / stencil target), so the rectangle is the whole cut of the stencil.
+       const Transfer::Rectangle* stencil_cutout = resolve_clear_rectangle;
+       if (need_stencil_bit_draws && transfer_stencil_cutout_valid_ &&
+-          &current_transfers == &last_update_transfers()[0] &&
++          render_target_transfers_in == last_update_transfers() && i == 0 &&  // LOCAL PATCH - MCLA (0813): the input
+           (!resolve_clear_rectangle || !resolve_clear_rectangle->width_pixels ||
+            !resolve_clear_rectangle->height_pixels)) {
+         stencil_cutout = &transfer_stencil_cutout_;
