@@ -1097,6 +1097,24 @@ purpose = "D3D12 (T9): NVIDIA DLSS Frame Generation (frame_generation=dlss; cvar
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0810-resolve-elide-scaled-store"
+source = "local"
+path = "patches/sdk/0810-resolve-elide-scaled-store.patch"
+sha256 = "0bcfaa2866cba20e074b2dde65843653a7a32e21309c5a1aba8893cc92db82b6"
+purpose = "D3D12 (zero-copy P1 + P3): cvar resolve_elide (int 0..3, default 0 = unchanged, hot reload, no effect at draw scale 1): at a draw scale above 1 the store into the scaled resolve buffer of a dual-written resolve (0760 scaled_copy_levers 1) is dead unless a texture load reads that range before a later resolve rewrites it; 1 learn (every store made, every scaled load checked against records of the stores not yet overwritten whole, the destinations read logged as rules '[resolve-elide] read: addr=...,len=...,pitch=...,height=...,fmt=...,src=...', would-miss), 2 elide (the store goes to a null view once resolve_elide_after (60) of its resolves went by unread and it is at least resolve_elide_min_kb (16384: the full-screen ones) big, unless an unscaled-copy / readback / resolve_elide_keep_rules rule matches, the texture is partial and outdated, or resolve_dual_write_verify is on; a load over an elided store is one wrong texture, logged as an ERROR '[resolve-elide] MISS', the destination stored from then on), 3 elide + poison (resolve_elide_poison_value fills each elided range). copy_byte_census (bool): '[copy-bytes]' host bytes a frame by class every 10 s. New file d3d12/resolve_elide.cpp (CMakeLists), copy_census.h; CommandProcessor::MatchResolveScaledBytesReader. No shader. Not built before the next SDK build. Applies after 0780 and on top of 0800."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0811-transfer-census"
+source = "local"
+path = "patches/sdk/0811-transfer-census.patch"
+sha256 = "37c44a4029a47da62d513ab308f0e8ecde64370ec0ef8faf32e1a383a5b64677"
+purpose = "GPU / D3D12 (zero-copy P2): cvar transfer_census_log (bool, default false, hot reload): every 10 s '[transfer-census] ...' the EDRAM ownership transfers a frame (made, cut, left out whole by a cut; host Mpx; MB read and written), split into colour and depth / stencil destinations with the stencil-bit passes (no pixel-shader stencil reference output on this NVIDIA GPU: one depth draw, a stencil clear and 8 stencil-bit draws a depth transfer), and the first 24 rows by bytes as source RT -> destination RT (reason: which skip cut it, or why it was made whole). Transfers and resolve clears join copy_byte_census. Off = no change. Needs 0810. Not built before the next SDK build."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]

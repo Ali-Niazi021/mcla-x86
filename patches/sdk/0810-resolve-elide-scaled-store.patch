@@ -1,0 +1,1194 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Fri, 27 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0810: resolve_elide: at a draw resolution scale above 1, no scaled-buffer store for dual-written resolves nothing reads back; copy_byte_census (Direct3D 12; native stream, zero-copy P1 + P3)
+
+Source: Ours, written for this SDK (native stream; design note scratch/zerocopy/DESIGN.md, test plan scratch/zerocopy/TESTPLAN.md).
+  Written without a build or a run: checked with clang++ 20.1.8 -fsyntax-only (the SDK's Release flags, from impl-Release.ninja) of
+  the 4 changed or new translation units (d3d12/resolve_elide.cpp with resolve_defer.cpp's flags, d3d12/texture_cache.cpp,
+  d3d12/render_target_cache.cpp, command_processor.cpp) and of 2 more that include the changed headers; 0 errors, no new warning.
+  No shader, no DXBC. Applies after 0780 (and after 0760, whose dual write at scale it builds on).
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: At draw scale 2 (profile 2000p) a dual-written resolve (0760 scaled_copy_levers 1) writes its bytes twice: into the
+  texture that samples them and into the scaled resolve buffer. The buffer is invisible to the guest CPU; its only readers are the
+  loads of scaled_resolve textures (LoadTextureDataFromResidentMemoryImpl), the 1x copy of resolve_unscaled_copy_rules and the
+  copy to the guest memory of readback_resolve_rules (both chosen by the resolve's rules, right after it), and
+  resolve_dual_write_verify. The buffer copy is dead unless a load over the range comes before a later resolve writes those
+  bytes again.
+  New cvars (Direct3D 12, hot reload, all default to today's behaviour):
+    resolve_elide (int 0..3, default 0): 1 learn (every store made; every scaled load is checked against records of the
+      dual-written stores not yet overwritten whole; destinations read are logged in the rule grammar, with what 2 would have
+      done: would-miss), 2 elide (the store of a dual-written resolve goes to a null view once resolve_elide_after of its
+      resolves went by unread, unless an unscaled-copy / readback / keep rule matches, the texture was written in part and is
+      outdated, or resolve_dual_write_verify is on; a load over an elided store is one wrong texture, logged as an ERROR
+      `[resolve-elide] MISS`, and its destination is stored from then on), 3 elide + poison (each elided range filled with
+      resolve_elide_poison_value by ClearUnorderedAccessViewUint).
+    resolve_elide_min_kb (int, default 16384): 2 / 3 elide only stores at least this big (at 2000p the five full-screen
+      resolves, which are 69 % of the dual-written class; 0 = every size); 1 reports every size,
+    resolve_elide_after (int, default 60), resolve_elide_poison_value (uint, 0xFFFF00FF),
+    resolve_elide_keep_rules (string, the grammar of readback_resolve_rules; defined in command_processor.cpp),
+    copy_byte_census (bool, default false): `[copy-bytes] ...` every 10 s, host bytes a frame by class (resolve read / store /
+      store elided / dual-written texture, texture load read / write; transfers and clears with 0811).
+  Log: `[resolve-elide] <mode> over N frames ...` every 10 s while active, `[resolve-elide] read: addr=...,len=...,pitch=...,
+  height=...,fmt=...,src=... - by the load of ...` once per destination, `[resolve-elide] at exit: ... as keep rules: ...` and
+  up to 64 `[resolve-elide] at exit: addr=...: N stores (X a frame ...) of M MB each, ...` lines (the inventory of the
+  dual-written resolves of the run, largest first).
+  A record is retired when a later resolve with the same destination base, pitch and bytes a texel writes an area that
+  contains it (the scaled tiled address is a one-to-one function of the texel and those three).
+  New file src/graphics/d3d12/resolve_elide.cpp (listed in src/graphics/CMakeLists.txt) and include/rex/graphics/d3d12/
+  copy_census.h; CommandProcessor::MatchResolveScaledBytesReader (no logging, own rule caches). No change to
+  d3d12/command_processor.cpp.
+Bucket: REDO
+
+0810-resolve-elide-scaled-store.patch (mcla-x86 native stream, zero-copy P1).
+
+---
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index 85c666d..7cea58c 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -162,6 +162,13 @@ class CommandProcessor {
+   bool Save(::rex::stream::ByteStream* stream);
+   bool Restore(::rex::stream::ByteStream* stream);
+ 
++  // LOCAL PATCH - MCLA (0810): resolve_elide. What reads the scaled bytes of the resolve being made (it writes
++  // [written_address, written_address + written_length) of the guest memory; the copy registers are its own) after it,
++  // other than a texture load: 1 a rule of resolve_unscaled_copy_rules (its 1x copy), 2 a rule of readback_resolve_rules
++  // (its copy to the guest memory), 3 a rule of resolve_elide_keep_rules (kept by hand); 0 none. Logs nothing but the
++  // keep rules' count when their text changes. Command processor thread only.
++  int MatchResolveScaledBytesReader(uint32_t written_address, uint32_t written_length);
++
+  protected:
+   struct IndexBufferInfo {
+     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
+@@ -923,6 +930,11 @@ class CommandProcessor {
+   std::vector<ReadbackRule> readback_rules_;
+   std::string unscaled_copy_rules_text_;
+   std::vector<ReadbackRule> unscaled_copy_rules_;
++  // LOCAL PATCH - MCLA (0810): resolve_elide: the rule lists MatchResolveScaledBytesReader parses for itself.
++  std::string elide_readback_rules_text_;
++  std::vector<ReadbackRule> elide_readback_rules_;
++  std::string elide_keep_rules_text_;
++  std::vector<ReadbackRule> elide_keep_rules_;
+   uint32_t unscaled_copy_log_count_ = 0;
+   uint32_t unscaled_copy_done_count_ = 0;
+   // The resolve log's window: resolve_log_frames counts the title's frames (the
+diff --git a/include/rex/graphics/d3d12/copy_census.h b/include/rex/graphics/d3d12/copy_census.h
+new file mode 100644
+index 0000000..40d29d0
+--- /dev/null
++++ b/include/rex/graphics/d3d12/copy_census.h
+@@ -0,0 +1,43 @@
++/**
++ * LOCAL PATCH - MCLA (0810): copy_byte_census (Direct3D 12). The host bytes the copy work of a frame reads and writes, by
++ * class, counted where the work is recorded (resolves and texture loads: 0810; ownership transfers and resolve clears:
++ * 0811) and logged as `[copy-bytes] ...` every 10 s, per frame. The counts are what each operation addresses (the area
++ * times the scale times the bytes of a pixel), not what the GPU's caches and compression make of it. The command
++ * processor's thread only.
++ */
++
++#pragma once
++
++#include <cstdint>
++
++namespace rex::graphics::d3d12 {
++
++enum class CopyByteClass : uint32_t {
++  // A resolve: the source render target's pixels it reads (every sample), the bytes it stores (the shared memory at 1x,
++  // the scaled resolve buffer at a draw resolution scale above 1), the stores resolve_elide sent to a null view, and
++  // the texture a dual write (resolve_dual_write) wrote along with them.
++  kResolveRead,
++  kResolveStore,
++  kResolveStoreElided,
++  kDualWriteTexture,
++  // A texture load: the guest (or scaled resolve buffer) bytes read and the texture written (taken as the same).
++  kTextureLoadRead,
++  kTextureLoadWrite,
++  // An EDRAM ownership transfer: the source render target read, the destination written (after the cut of
++  // skip_overwritten_transfers / tonemap_transfer_skip).
++  kTransferRead,
++  kTransferWrite,
++  // A resolve clear of a host render target.
++  kClearWrite,
++
++  kCount,
++};
++
++// copy_byte_census is on.
++bool IsCopyByteCensusOn();
++void CountCopyBytes(CopyByteClass byte_class, uint64_t bytes, uint32_t operations = 1);
++// While the census is on: logs the line when 10 s have gone by since the last one; current_frame:
++// D3D12CommandProcessor::GetCurrentFrame.
++void LogCopyByteCensusIfDue(uint64_t current_frame);
++
++}  // namespace rex::graphics::d3d12
+diff --git a/include/rex/graphics/d3d12/texture_cache.h b/include/rex/graphics/d3d12/texture_cache.h
+index 18ac0da..408fdf6 100644
+--- a/include/rex/graphics/d3d12/texture_cache.h
++++ b/include/rex/graphics/d3d12/texture_cache.h
+@@ -297,6 +297,72 @@ class D3D12TextureCache final : public TextureCache {
+   // Every 10 s logs the counts since the last line, if there were any.
+   void LogResolveDualWriteIfDue();
+ 
++  // ---- LOCAL PATCH - MCLA (0810): resolve_elide (resolve_elide.cpp) ----
++  //
++  // At a draw resolution scale above 1 a resolve stores its bytes only in the scaled resolve buffer, which the guest CPU
++  // never sees. Its readers are all on the GPU: the load of a scaled_resolve texture over the range
++  // (LoadTextureDataFromResidentMemoryImpl: the cache's textures, the swap texture, resolve_dual_write_verify's scratch
++  // texture), and the 1x copy of resolve_unscaled_copy_rules and the copy to the guest memory of readback_resolve_rules,
++  // which read the resolve just made and are chosen by its rules. A dual-written resolve (resolve_dual_write at scale:
++  // scaled_copy_levers 1) has already put the same dwords into the texture that samples them, now up to date; the stored
++  // copy is read only if a load over the range comes before another resolve writes all of those bytes again: a texture
++  // of another shape over the range, or the written one after something else made it outdated.
++  //
++  // resolve_elide (1 learn, 2 elide, 3 elide + poison) keeps a record of the area each dual-written store wrote (its
++  // destination base, row pitch, bytes a texel and area, which fix the bytes: the scaled tiled address of a texel
++  // depends on nothing else) until a later resolve with the same base, pitch and texel size writes an area containing
++  // it, and checks every load from the scaled resolve buffer against the live records. A load over a record's range
++  // consumes it, and its destination (the key: extent, pitch, height, format and source of the copy registers, the
++  // fields of the rules) is kept (its bytes stored) for the rest of the run. With 2 the store of a key goes to a null
++  // view (no bytes) once resolve_elide_after of its resolves went by unconsumed, unless a rule reads it (unscaled copy,
++  // readback, resolve_elide_keep_rules), the texture was written only in part and is outdated (it will be loaded), or
++  // resolve_dual_write_verify is on. A load over an elided record reads what the buffer held before: one wrong load,
++  // logged ([resolve-elide] MISS), the key kept from then on. 1 makes every store and reports what 2 would have done
++  // (would-miss). 3 also fills the range of each elided store with resolve_elide_poison_value, so that a reader the
++  // tracking does not know of shows in the picture.
++  struct ResolveElideGeometry {
++    // The guest range the resolve may write (copy_dest_extent_start, copy_dest_extent_length).
++    uint32_t extent_start = 0;
++    uint32_t extent_length = 0;
++    // The address function of the area: the base its tiled offsets are relative to (copy_dest_base), the row pitch in 32
++    // texels, the bytes a texel (0 for a kind the records do not cover); the area in guest texels from that base,
++    // [x0, x1) x [y0, y1); into an array (not covered).
++    uint32_t dest_base = 0;
++    uint32_t pitch_div_32 = 0;
++    uint32_t bytes_per_texel = 0;
++    uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
++    bool array = false;
++    // The rule fields of the copy registers: RB_COPY_DEST_PITCH pitch and height, RB_COPY_DEST_INFO format,
++    // RB_COPY_CONTROL source.
++    uint32_t rule_pitch = 0, rule_height = 0, rule_format = 0, rule_source = 0;
++    // copy_byte_census: the bytes of a host pixel of the source (the bytes of a sample times the samples).
++    uint32_t source_bytes_per_pixel = 0;
++  };
++  struct ResolveElideDecision {
++    // The store goes to a null view.
++    bool elide = false;
++    // resolve_elide 1: what 2 would have done.
++    bool would_elide = false;
++    // A record of the store is kept.
++    bool track = false;
++    uint32_t key_index = UINT32_MAX;
++    // The texture the resolve writes along with the store (for the log).
++    TextureKey written_texture_key;
++  };
++  // Whether DecideResolveElide and NoteResolveElideWritten have work: resolve_elide on, or records left from it.
++  bool IsResolveElideActive() const;
++  // Before the dispatch of a resolve at a draw resolution scale above 1. dual_target: the texture it writes as well
++  // (resolve_dual_write), null if none.
++  ResolveElideDecision DecideResolveElide(const ResolveElideGeometry& geometry,
++                                          const ResolveDualWriteTarget* dual_target);
++  // For an elided store, in place of CreateCurrentScaledResolveRangeUintPow2UAV: a null view of the same format.
++  void WriteNullScaledResolveRangeUAV(D3D12_CPU_DESCRIPTOR_HANDLE handle, uint32_t element_size_bytes_pow2);
++  // After the dispatch of a resolve at a draw resolution scale above 1 (while IsResolveElideActive), the range it made
++  // current still current: the records it overwrites whole go, its own is added, the poison is filled.
++  void NoteResolveElideWritten(const ResolveElideGeometry& geometry, const ResolveElideDecision& decision);
++  // copy_byte_census: after every resolve that copied (any scale).
++  void NoteResolveCopyBytes(const ResolveElideGeometry& geometry, bool dual_written, bool elided);
++
+   // ---- LOCAL PATCH - MCLA (0560): resolve_defer_memory_write ----
+   //
+   // A resolve that D3D12RenderTargetCache::Resolve has dual-written (resolve_dual_write) whole - the
+@@ -987,6 +1053,99 @@ class D3D12TextureCache final : public TextureCache {
+                                     bool compare_all);  // LOCAL PATCH - MCLA (0530): resolve_dual_write_msaa
+   void ProcessResolveDualWriteVerifies(uint64_t completed_submission_index);
+ 
++  // ---- LOCAL PATCH - MCLA (0810): resolve_elide (resolve_elide.cpp) ----
++  // Why a dual-written resolve was not elided (resolve_elide 2), in the order the reasons are tried; kElided when it was.
++  enum class ResolveElideKeep : uint32_t {
++    kElided,
++    // resolve_elide 1: the store is made anyway (it would have been elided).
++    kLearn,
++    kReadbackGlobal,
++    kUnscaledCopyRule,
++    kReadbackRule,
++    kKeepRule,
++    kConsumed,
++    kPartialOutdated,
++    kVerify,
++    kSmall,
++    kWarmUp,
++    kRecordsFull,
++    kCount,
++  };
++  // One destination: the extent and the rule fields (address, length, pitch, height, format, source).
++  using ResolveElideKeyFields = std::array<uint32_t, 6>;
++  struct ResolveElideKeyInfo {
++    ResolveElideKeyFields fields = {};
++    // Dual-written stores of it seen, elided, the bytes of those, the bytes of one.
++    uint64_t seen = 0;
++    uint64_t elided = 0;
++    uint64_t elided_bytes = 0;
++    uint64_t store_bytes = 0;
++    // Records of it a load read, and of those the elided ones (misses) and the ones 2 would have elided (resolve_elide 1).
++    uint64_t consumed = 0;
++    uint64_t misses = 0;
++    uint64_t would_misses = 0;
++    // Read once: stored from then on.
++    bool kept_consumed = false;
++    bool miss_logged = false;
++  };
++  // The area one tracked store wrote.
++  struct ResolveElideRecord {
++    uint32_t key_index = 0;
++    uint32_t extent_start = 0, extent_end = 0;
++    uint32_t dest_base = 0, pitch_div_32 = 0, bytes_per_texel = 0;
++    uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
++    uint64_t host_bytes = 0;
++    // The texture the resolve wrote along with it (for the log).
++    TextureKey written_texture_key;
++    bool elided = false;
++    bool would_elide = false;
++    bool consumed = false;
++  };
++  struct ResolveElideStats {
++    // Since the last line: resolves at scale while active, dual-written ones tracked, why each tracked store was made
++    // (kElided: it was not), the bytes elided (and that 2 would have elided, with 1).
++    uint64_t resolves = 0;
++    uint64_t tracked = 0;
++    uint64_t keep[size_t(ResolveElideKeep::kCount)] = {};
++    uint64_t elided_bytes = 0;
++    uint64_t would_elide_bytes = 0;
++    // Records overwritten whole by a later resolve: stored and never read, elided (and the bytes).
++    uint64_t superseded_unread = 0, superseded_unread_bytes = 0;
++    uint64_t superseded_elided = 0, superseded_elided_bytes = 0;
++    // Loads over live records: records consumed (and the bytes), misses, would-misses, keys learned.
++    uint64_t consumed = 0, consumed_bytes = 0;
++    uint64_t misses = 0, would_misses = 0;
++    uint64_t keys_learned = 0;
++    // Not tracked: not dual-written, the key table full, a kind the records do not cover.
++    uint64_t not_dual_written = 0, keys_full = 0, not_covered = 0;
++    uint64_t poisoned = 0, poison_skipped = 0;
++  };
++  void NoteTextureLoadForResolveElide(const D3D12Texture& texture, bool load_base, bool load_mips);
++  void NoteResolveElideScaledRead(const TextureKey& reader, uint32_t start, uint32_t length);
++  void RemoveResolveElideRecordAt(size_t index);
++  void PoisonResolveElideRecord(const ResolveElideRecord& record);
++  std::string DescribeResolveElideKey(const ResolveElideKeyInfo& info) const;
++  void LogResolveElideIfDue(bool at_exit);
++  void ShutdownResolveElide();
++  std::vector<ResolveElideRecord> resolve_elide_records_;
++  size_t resolve_elide_elided_records_ = 0;
++  std::map<ResolveElideKeyFields, uint32_t> resolve_elide_key_indices_;
++  std::vector<ResolveElideKeyInfo> resolve_elide_keys_;
++  ResolveElideStats resolve_elide_stats_;
++  int32_t resolve_elide_mode_ = 0;
++  uint64_t resolve_elide_last_log_ms_ = 0;
++  uint64_t resolve_elide_last_log_frame_ = 0;
++  uint32_t resolve_elide_consumed_lines_ = 0;
++  // The frame the first destination was seen in (the rates of the lines at exit).
++  uint64_t resolve_elide_first_frame_ = 0;
++  // resolve_dual_write_verify's own load is not a reader the tracking learns from.
++  bool resolve_elide_ignore_reads_ = false;
++  // resolve_elide 3: the CPU descriptors ClearUnorderedAccessViewUint takes, a ring, and the submission each was last
++  // used in (reused only once that submission has completed: its deferred command list has been replayed by then).
++  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> resolve_elide_poison_heap_;
++  std::vector<uint64_t> resolve_elide_poison_slot_submission_;
++  uint32_t resolve_elide_poison_next_ = 0;
++
+   // ---- LOCAL PATCH - MCLA (0560): resolve_defer_memory_write (resolve_defer.cpp) ----
+   // One resolve write waiting for the bytes of its memory to be made.
+   struct DeferredResolveWrite {
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index 8e85bb6..c74e64f 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -84,6 +84,7 @@ if(REXGLUE_USE_D3D12)
+         d3d12/shared_memory.cpp
+         d3d12/texture_cache.cpp
+         d3d12/resolve_defer.cpp  # LOCAL PATCH - MCLA (0560): resolve_defer_memory_write
++        d3d12/resolve_elide.cpp  # LOCAL PATCH - MCLA (0810): resolve_elide, copy_byte_census
+         d3d12/deferred_command_list.cpp
+         d3d12/temporal_aa.cpp
+         d3d12/temporal_aa_dlss.cpp  # LOCAL PATCH - MCLA (0770)
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 9b4907f..fae85cb 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -257,6 +257,16 @@ REXCVAR_DEFINE_STRING(resolve_unscaled_copy_rules, "", "GPU",
+                       "rules (the default).")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// LOCAL PATCH - MCLA (0810): resolve_elide (Direct3D 12, d3d12/resolve_elide.cpp): the resolves whose scaled bytes are always
++// stored.
++REXCVAR_DEFINE_STRING(resolve_elide_keep_rules, "", "GPU",
++                      "With resolve_elide: the resolves that match a rule always store their scaled bytes in the "
++                      "scaled resolve buffer (as without resolve_elide). Rules are those of readback_resolve_rules "
++                      "(addr, len, pitch, height, fmt, src, phase; mode is not used); the [resolve-elide] lines "
++                      "print the destinations whose bytes were read in this grammar. Empty, or \"off\": no rules "
++                      "(the default).")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(resolve_unscaled_copy_batch, true, "GPU",
+                     "With resolve_unscaled_copy_rules: the copies of the scaled resolves wait for "
+                     "the next draw, swap or end of the submission and are made together, with one "
+@@ -886,6 +896,54 @@ int CommandProcessor::MatchUnscaledResolveCopyRule(uint32_t written_address,
+       uint32_t(copy_control.copy_src_select), guest_marker_phase_);
+ }
+ 
++// LOCAL PATCH - MCLA (0810): resolve_elide
++int CommandProcessor::MatchResolveScaledBytesReader(uint32_t written_address, uint32_t written_length) {
++  if (!written_length) {
++    return 0;
++  }
++  if (MatchUnscaledResolveCopyRule(written_address, written_length) >= 0) {
++    return 1;
++  }
++  // The rules are parsed here as well (GetReadbackResolveModeFor parses them only for the resolves it is asked about, and
++  // logs): the same text gives the same rules.
++  const std::string& readback_text = REXCVAR_GET(readback_resolve_rules);
++  if (readback_text != elide_readback_rules_text_) {
++    elide_readback_rules_text_ = readback_text;
++    ParseReadbackRules(elide_readback_rules_text_, elide_readback_rules_, "readback_resolve_rules");
++  }
++  std::string keep_text = REXCVAR_GET(resolve_elide_keep_rules);
++  if (keep_text == "off") {
++    keep_text.clear();
++  }
++  if (keep_text != elide_keep_rules_text_) {
++    elide_keep_rules_text_ = keep_text;
++    ParseReadbackRules(elide_keep_rules_text_, elide_keep_rules_, "resolve_elide_keep_rules");
++    REXGPU_INFO("resolve_elide_keep_rules: {} rule(s) from \"{}\"", elide_keep_rules_.size(),
++                elide_keep_rules_text_);
++  }
++  if (elide_readback_rules_.empty() && elide_keep_rules_.empty()) {
++    return 0;
++  }
++  const reg::RB_COPY_CONTROL copy_control = register_file_->Get<reg::RB_COPY_CONTROL>();
++  const reg::RB_COPY_DEST_INFO copy_dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
++  const reg::RB_COPY_DEST_PITCH copy_dest_pitch = register_file_->Get<reg::RB_COPY_DEST_PITCH>();
++  const uint64_t first = written_address;
++  const uint64_t last = first + (written_length - 1);
++  const uint32_t pitch = uint32_t(copy_dest_pitch.copy_dest_pitch);
++  const uint32_t height = uint32_t(copy_dest_pitch.copy_dest_height);
++  const uint32_t format = uint32_t(copy_dest_info.copy_dest_format);
++  const uint32_t source = uint32_t(copy_control.copy_src_select);
++  if (FindMatchingReadbackRule(elide_readback_rules_, first, last, written_length, pitch, height, format, source,
++                               guest_marker_phase_) >= 0) {
++    return 2;
++  }
++  if (FindMatchingReadbackRule(elide_keep_rules_, first, last, written_length, pitch, height, format, source,
++                               guest_marker_phase_) >= 0) {
++    return 3;
++  }
++  return 0;
++}
++
+ void CommandProcessor::LogUnscaledResolveCopy(uint32_t written_address, uint32_t written_length,
+                                               int rule, const char* result, bool done) {
+   if (done) {
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index 4815b9f..9fe96fa 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -2068,6 +2068,54 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetDirectResolveStretchPipeline(
+   return direct_resolve_stretch_pipelines_[index];
+ }
+ 
++// LOCAL PATCH - MCLA (0810): resolve_elide, copy_byte_census: where and how a resolve stores its texels (the destination
++// base its tiled offsets are relative to, the row pitch, the bytes a texel, the area from that base), the fields of the
++// rules, and the bytes of a host pixel of its source.
++static void GetResolveElideGeometry(const RegisterFile& regs, const draw_util::ResolveInfo& resolve_info,
++                                    draw_util::ResolveCopyShaderIndex copy_shader,
++                                    D3D12TextureCache::ResolveElideGeometry& geometry_out) {
++  geometry_out.extent_start = resolve_info.copy_dest_extent_start;
++  geometry_out.extent_length = resolve_info.copy_dest_extent_length;
++  geometry_out.dest_base = resolve_info.copy_dest_base & 0x1FFFFFFF;
++  geometry_out.pitch_div_32 = resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32;
++  switch (copy_shader) {
++    case draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA:
++    case draw_util::ResolveCopyShaderIndex::kFast32bpp4xMSAA:
++    case draw_util::ResolveCopyShaderIndex::kFull32bpp:
++      geometry_out.bytes_per_texel = 4;
++      break;
++    case draw_util::ResolveCopyShaderIndex::kFast64bpp1x2xMSAA:
++    case draw_util::ResolveCopyShaderIndex::kFast64bpp4xMSAA:
++    case draw_util::ResolveCopyShaderIndex::kFull64bpp:
++      geometry_out.bytes_per_texel = 8;
++      break;
++    case draw_util::ResolveCopyShaderIndex::kFull8bpp:
++      geometry_out.bytes_per_texel = 1;
++      break;
++    case draw_util::ResolveCopyShaderIndex::kFull16bpp:
++      geometry_out.bytes_per_texel = 2;
++      break;
++    default:
++      geometry_out.bytes_per_texel = 16;
++      break;
++  }
++  geometry_out.x0 = resolve_info.copy_dest_coordinate_info.offset_x_div_8 << xenos::kResolveAlignmentPixelsLog2;
++  geometry_out.y0 = resolve_info.copy_dest_coordinate_info.offset_y_div_8 << xenos::kResolveAlignmentPixelsLog2;
++  geometry_out.x1 =
++      geometry_out.x0 + (resolve_info.coordinate_info.width_div_8 << xenos::kResolveAlignmentPixelsLog2);
++  geometry_out.y1 = geometry_out.y0 + (resolve_info.height_div_8 << xenos::kResolveAlignmentPixelsLog2);
++  geometry_out.array = resolve_info.copy_dest_info.copy_dest_array != 0;
++  const reg::RB_COPY_DEST_PITCH copy_dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>();
++  geometry_out.rule_pitch = uint32_t(copy_dest_pitch.copy_dest_pitch);
++  geometry_out.rule_height = uint32_t(copy_dest_pitch.copy_dest_height);
++  geometry_out.rule_format = uint32_t(resolve_info.copy_dest_info.copy_dest_format);
++  geometry_out.rule_source = uint32_t(regs.Get<reg::RB_COPY_CONTROL>().copy_src_select);
++  const draw_util::ResolveEdramInfo& edram_info =
++      resolve_info.IsCopyingDepth() ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
++  geometry_out.source_bytes_per_pixel = (edram_info.format_is_64bpp ? 8u : 4u)
++                                        << uint32_t(edram_info.msaa_samples);
++}
++
+ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMemory& shared_memory,
+                                      D3D12TextureCache& texture_cache,
+                                      uint32_t& written_address_out, uint32_t& written_length_out) {
+@@ -2241,6 +2289,16 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+           }
+         }
+       }
++      // LOCAL PATCH - MCLA (0810): resolve_elide: at a draw resolution scale above 1, whether the store of a dual-written
++      // resolve into the scaled resolve buffer is made (D3D12TextureCache::DecideResolveElide); what the resolve writes,
++      // for the records of the stores and copy_byte_census.
++      D3D12TextureCache::ResolveElideGeometry elide_geometry;
++      D3D12TextureCache::ResolveElideDecision elide_decision;
++      GetResolveElideGeometry(register_file(), resolve_info, copy_shader, elide_geometry);
++      const bool elide_active = draw_resolution_scaled && texture_cache.IsResolveElideActive();
++      if (elide_active) {
++        elide_decision = texture_cache.DecideResolveElide(elide_geometry, dual_write ? &dual_write_target : nullptr);
++      }
+ 
+       // Make sure there is memory to write to.
+       bool copy_dest_committed;
+@@ -2348,10 +2406,17 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+                 nullptr, nullptr, &null_desc, descriptor_dest.first);
+           }
+           if (draw_resolution_scaled) {
+-            texture_cache.CreateCurrentScaledResolveRangeUintPow2UAV(
+-                descriptor_dest.first, copy_shader_info.dest_bpe_log2);
+-            texture_cache.TransitionCurrentScaledResolveRange(
+-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++            // LOCAL PATCH - MCLA (0810): resolve_elide: an elided store goes to a null view (the buffer isn't written,
++            // so it isn't moved to the UAV state either).
++            if (elide_decision.elide) {
++              texture_cache.WriteNullScaledResolveRangeUAV(descriptor_dest.first,
++                                                           copy_shader_info.dest_bpe_log2);
++            } else {
++              texture_cache.CreateCurrentScaledResolveRangeUintPow2UAV(
++                  descriptor_dest.first, copy_shader_info.dest_bpe_log2);
++              texture_cache.TransitionCurrentScaledResolveRange(
++                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++            }
+           } else {
+             shared_memory.UseForWriting();
+           }
+@@ -2440,7 +2505,9 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+ 
+           // Order the resolve with other work using the destination as a UAV.
+           if (draw_resolution_scaled) {
+-            texture_cache.MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
++            if (!elide_decision.elide) {  // LOCAL PATCH - MCLA (0810): resolve_elide: nothing written
++              texture_cache.MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
++            }
+           } else {
+             shared_memory.MarkUAVWritesCommitNeeded();
+           }
+@@ -2470,6 +2537,12 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+             texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+                                               resolve_info.copy_dest_extent_length);
+           }
++          // LOCAL PATCH - MCLA (0810): resolve_elide: the records this resolve overwrites go, its own is added (the range
++          // it made current is current again after resolve_dual_write_verify's load); copy_byte_census.
++          if (elide_active) {
++            texture_cache.NoteResolveElideWritten(elide_geometry, elide_decision);
++          }
++          texture_cache.NoteResolveCopyBytes(elide_geometry, dual_write, elide_decision.elide);
+           if (REXCVAR_GET(resolve_dual_write)) {
+             texture_cache.LogResolveDualWriteIfDue();
+           }
+diff --git a/src/graphics/d3d12/resolve_elide.cpp b/src/graphics/d3d12/resolve_elide.cpp
+new file mode 100644
+index 0000000..fa2ae52
+--- /dev/null
++++ b/src/graphics/d3d12/resolve_elide.cpp
+@@ -0,0 +1,643 @@
++/**
++ * LOCAL PATCH - MCLA (0810): resolve_elide and copy_byte_census (Direct3D 12).
++ *
++ * resolve_elide: at a draw resolution scale above 1, the store into the scaled resolve buffer of a resolve that was
++ * dual-written (resolve_dual_write, scaled_copy_levers 1) goes to a null view for the destinations whose stored bytes no
++ * load reads before another resolve writes them again; learned in the run (a load over the range of a tracked store keeps
++ * the destination), with rules (resolve_elide_keep_rules), a dry run (1), and a poison (3). The design is in the comment of
++ * D3D12TextureCache::ResolveElideGeometry (texture_cache.h) and in the patch's header.
++ *
++ * copy_byte_census: the host bytes of the copy work of a frame by class (copy_census.h).
++ */
++
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include <fmt/format.h>
++
++#include <rex/assert.h>
++#include <rex/chrono/clock.h>
++#include <rex/cvar.h>
++#include <rex/graphics/d3d12/command_processor.h>
++#include <rex/graphics/d3d12/copy_census.h>
++#include <rex/graphics/d3d12/texture_cache.h>
++#include <rex/graphics/pipeline/texture/info.h>
++#include <rex/logging.h>
++#include <rex/math.h>
++#include <rex/thread/mutex.h>
++#include <rex/ui/d3d12/d3d12_util.h>
++
++REXCVAR_DECLARE(int32_t, resolve_dual_write_verify);
++
++REXCVAR_DEFINE_INT32(resolve_elide, 0, "GPU/D3D12",
++                     "At a draw resolution scale above 1, with resolve_dual_write (scaled_copy_levers 1): 0 (the "
++                     "default) every resolve stores its bytes in the scaled resolve buffer as before; 1 learn: the same, "
++                     "and every load from the buffer is checked against the stores of the dual-written resolves that no "
++                     "later resolve has overwritten whole: the destinations read are logged in the grammar of the rules "
++                     "('[resolve-elide] read: addr=...'), with what 2 would have done (would-miss); 2 elide: the store of "
++                     "a dual-written resolve goes to a null view (the texture that samples it is written and up to date) "
++                     "once resolve_elide_after of the resolves of its destination went by with no load reading them, "
++                     "unless a rule of resolve_unscaled_copy_rules, readback_resolve_rules or resolve_elide_keep_rules "
++                     "matches it; a load that does read an elided store gets what the buffer held before ('[resolve-elide] "
++                     "MISS', an error: one wrong texture), and the destination is stored from then on; 3: as 2, and the "
++                     "range of every elided store is filled with resolve_elide_poison_value, so that a reader the "
++                     "tracking does not see shows in the picture (a proof mode, not for play). '[resolve-elide] ...' "
++                     "every 10 s and at exit. No effect at a scale of 1")
++    .range(0, 3)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_INT32(resolve_elide_after, 60, "GPU/D3D12",
++                     "With resolve_elide 2 or 3: the resolves of a destination that are stored (and watched) before its "
++                     "stores are elided; one that is read in that time is never elided. 0: from the first")
++    .range(0, 1000000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_INT32(resolve_elide_min_kb, 16384, "GPU/D3D12",
++                     "With resolve_elide 2 or 3: only stores of at least this many KiB of the scaled resolve buffer are "
++                     "elided (16384, the default: at 2000p the full-screen resolves, 25 MB in 8-bit colour and 50 MB in "
++                     "16-bit float, and none of the half-size or smaller ones); 0: every size. The tracking and the log "
++                     "(and resolve_elide 1's would-have-elided) take every size")
++    .range(0, 1 << 22)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_UINT32(resolve_elide_poison_value, 0xFFFF00FF, "GPU/D3D12",
++                      "With resolve_elide 3: the dword the range of an elided store is filled with (0xFFFF00FF: a "
++                      "saturated magenta, yellow or cyan in an 8-bit colour texture, depending on its component order; "
++                      "not a number in a 16-bit float one)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(copy_byte_census, false, "GPU/D3D12",
++                    "Log '[copy-bytes] ...' every 10 s: the host bytes read and written a frame by the copy work, by "
++                    "class: resolves (read, stored, stores elided by resolve_elide, dual-written textures), texture "
++                    "loads, EDRAM ownership transfers and resolve clears (each the area it addresses times the scale "
++                    "times the bytes of a pixel)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++namespace rex::graphics::d3d12 {
++
++namespace {
++
++// Live records (the oldest store that was made goes first when full; an elided one is never dropped, so there are at most
++// this many elided ones, and an elision is refused at that count), destinations, consumed lines in the log.
++constexpr size_t kMaxResolveElideRecords = 1024;
++constexpr size_t kMaxResolveElideElidedRecords = 512;
++constexpr size_t kMaxResolveElideKeys = 1024;
++constexpr uint32_t kMaxResolveElideReadLines = 64;
++constexpr uint32_t kMaxResolveElideExitKeyLines = 64;
++// resolve_elide 3: the CPU descriptors of the clears.
++constexpr uint32_t kResolveElidePoisonSlots = 4096;
++
++const char* const kResolveElideKeepNames[] = {
++    "elided",           "learn (stored)",    "readback (all)", "unscaled copy rule", "readback rule", "keep rule",
++    "read before",      "partial, outdated", "dual-write verify", "smaller than resolve_elide_min_kb", "warm-up",
++    "records full",
++};
++
++const char* const kResolveElideModeNames[] = {"off", "learn", "elide", "elide + poison"};
++
++std::string Megabytes(double bytes) { return fmt::format("{:.2f} MB", bytes / 1048576.0); }
++
++// copy_byte_census.
++struct CopyByteCensusState {
++  uint64_t bytes[size_t(CopyByteClass::kCount)] = {};
++  uint64_t operations[size_t(CopyByteClass::kCount)] = {};
++  uint64_t window_start_ms = 0;
++  uint64_t window_start_frame = 0;
++};
++CopyByteCensusState g_copy_byte_census;
++
++}  // namespace
++
++bool IsCopyByteCensusOn() { return REXCVAR_GET(copy_byte_census); }
++
++void CountCopyBytes(CopyByteClass byte_class, uint64_t bytes, uint32_t operations) {
++  g_copy_byte_census.bytes[size_t(byte_class)] += bytes;
++  g_copy_byte_census.operations[size_t(byte_class)] += operations;
++}
++
++void LogCopyByteCensusIfDue(uint64_t current_frame) {
++  CopyByteCensusState& state = g_copy_byte_census;
++  const uint64_t now = rex::chrono::Clock::QueryHostUptimeMillis();
++  // Called only while the census is on; a window much older than the period is from before it was switched off.
++  if (!state.window_start_ms || now - state.window_start_ms > 30000) {
++    state = CopyByteCensusState();
++    state.window_start_ms = now;
++    state.window_start_frame = current_frame;
++    return;
++  }
++  if (now - state.window_start_ms < 10000) {
++    return;
++  }
++  const double seconds = double(now - state.window_start_ms) / 1000.0;
++  const uint64_t frames = current_frame > state.window_start_frame ? current_frame - state.window_start_frame : 0;
++  const double per_frame = frames ? 1.0 / double(frames) : 0.0;
++  auto mb = [&](CopyByteClass c) { return Megabytes(double(state.bytes[size_t(c)]) * per_frame); };
++  auto n = [&](CopyByteClass c) { return double(state.operations[size_t(c)]) * per_frame; };
++  uint64_t read = 0, written = 0;
++  for (CopyByteClass c : {CopyByteClass::kResolveRead, CopyByteClass::kTextureLoadRead, CopyByteClass::kTransferRead}) {
++    read += state.bytes[size_t(c)];
++  }
++  for (CopyByteClass c : {CopyByteClass::kResolveStore, CopyByteClass::kDualWriteTexture, CopyByteClass::kTextureLoadWrite,
++                          CopyByteClass::kTransferWrite, CopyByteClass::kClearWrite}) {
++    written += state.bytes[size_t(c)];
++  }
++  REXGPU_INFO(
++      "[copy-bytes] a frame over {} frames ({:.1f} s): resolve read {} ({:.1f}), stored {} ({:.1f}), stores elided {} "
++      "({:.1f}), dual-written textures {} ({:.1f}); texture loads read {} written {} ({:.1f}); transfers read {} written "
++      "{} ({:.1f}); resolve clears {} ({:.1f}); all read {}, all written {} (count a frame in brackets)",
++      frames, seconds, mb(CopyByteClass::kResolveRead), n(CopyByteClass::kResolveRead), mb(CopyByteClass::kResolveStore),
++      n(CopyByteClass::kResolveStore), mb(CopyByteClass::kResolveStoreElided), n(CopyByteClass::kResolveStoreElided),
++      mb(CopyByteClass::kDualWriteTexture), n(CopyByteClass::kDualWriteTexture), mb(CopyByteClass::kTextureLoadRead),
++      mb(CopyByteClass::kTextureLoadWrite), n(CopyByteClass::kTextureLoadRead), mb(CopyByteClass::kTransferRead),
++      mb(CopyByteClass::kTransferWrite), n(CopyByteClass::kTransferWrite), mb(CopyByteClass::kClearWrite),
++      n(CopyByteClass::kClearWrite), Megabytes(double(read) * per_frame), Megabytes(double(written) * per_frame));
++  state = CopyByteCensusState();
++  state.window_start_ms = now;
++  state.window_start_frame = current_frame;
++}
++
++bool D3D12TextureCache::IsResolveElideActive() const {
++  return REXCVAR_GET(resolve_elide) != 0 || !resolve_elide_records_.empty();
++}
++
++D3D12TextureCache::ResolveElideDecision D3D12TextureCache::DecideResolveElide(
++    const ResolveElideGeometry& geometry, const ResolveDualWriteTarget* dual_target) {
++  static_assert(rex::countof(kResolveElideKeepNames) == size_t(ResolveElideKeep::kCount), "A name for every reason");
++  ResolveElideDecision decision;
++  const int32_t mode = std::clamp(REXCVAR_GET(resolve_elide), int32_t(0), int32_t(3));
++  if (mode != resolve_elide_mode_) {
++    REXGPU_INFO("[resolve-elide] mode {} ({}), was {}; {} records live, {} of them elided", mode,
++                kResolveElideModeNames[mode], resolve_elide_mode_, resolve_elide_records_.size(),
++                resolve_elide_elided_records_);
++    resolve_elide_mode_ = mode;
++    if (!mode) {
++      // Only the elided stores still need watching: their bytes are not in the buffer.
++      for (size_t i = resolve_elide_records_.size(); i-- > 0;) {
++        if (!resolve_elide_records_[i].elided) {
++          RemoveResolveElideRecordAt(i);
++        }
++      }
++    }
++  }
++  if (!mode) {
++    return decision;
++  }
++  if (!dual_target || !dual_target->texture) {
++    // Nothing else holds the bytes: the store is what the texture will be loaded from.
++    ++resolve_elide_stats_.not_dual_written;
++    return decision;
++  }
++  if (geometry.array || !geometry.bytes_per_texel || !geometry.extent_length || geometry.x1 <= geometry.x0 ||
++      geometry.y1 <= geometry.y0) {
++    ++resolve_elide_stats_.not_covered;
++    return decision;
++  }
++  const ResolveElideKeyFields fields = {geometry.extent_start, geometry.extent_length, geometry.rule_pitch,
++                                        geometry.rule_height,  geometry.rule_format,   geometry.rule_source};
++  uint32_t key_index;
++  auto key_it = resolve_elide_key_indices_.find(fields);
++  if (key_it != resolve_elide_key_indices_.end()) {
++    key_index = key_it->second;
++  } else {
++    if (resolve_elide_keys_.size() >= kMaxResolveElideKeys) {
++      ++resolve_elide_stats_.keys_full;
++      return decision;
++    }
++    key_index = uint32_t(resolve_elide_keys_.size());
++    if (resolve_elide_keys_.empty()) {
++      resolve_elide_first_frame_ = command_processor_.GetCurrentFrame();
++    }
++    resolve_elide_keys_.emplace_back();
++    resolve_elide_keys_.back().fields = fields;
++    resolve_elide_key_indices_.emplace(fields, key_index);
++  }
++  const ResolveElideKeyInfo& info = resolve_elide_keys_[key_index];
++  decision.track = true;
++  decision.key_index = key_index;
++  // The reasons to store, in order: a reader that is not a texture load (the copies right after the resolve), the keys
++  // kept by hand or by a read, a texture the resolve leaves outdated (it is loaded from the buffer), the dual-write
++  // verify (it loads from the buffer), the warm-up, the limit of the watch.
++  ResolveElideKeep keep = ResolveElideKeep::kElided;
++  if (command_processor_.IsReadbackResolveGloballyEnabled()) {
++    keep = ResolveElideKeep::kReadbackGlobal;
++  } else {
++    switch (command_processor_.MatchResolveScaledBytesReader(geometry.extent_start, geometry.extent_length)) {
++      case 1:
++        keep = ResolveElideKeep::kUnscaledCopyRule;
++        break;
++      case 2:
++        keep = ResolveElideKeep::kReadbackRule;
++        break;
++      case 3:
++        keep = ResolveElideKeep::kKeepRule;
++        break;
++      default:
++        break;
++    }
++  }
++  if (keep == ResolveElideKeep::kElided && info.kept_consumed) {
++    keep = ResolveElideKeep::kConsumed;
++  }
++  if (keep == ResolveElideKeep::kElided && dual_target->partial) {
++    // FinishResolveDualWrite keeps a texture written in part up to date only if it was before.
++    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
++    if (dual_target->texture->base_outdated(global_lock)) {
++      keep = ResolveElideKeep::kPartialOutdated;
++    }
++  }
++  if (keep == ResolveElideKeep::kElided && REXCVAR_GET(resolve_dual_write_verify) > 0) {
++    keep = ResolveElideKeep::kVerify;
++  }
++  // The size floor applies to what 2 does (1 reports every size as what 2 would do with resolve_elide_min_kb 0).
++  if (keep == ResolveElideKeep::kElided && mode >= 2 &&
++      uint64_t(geometry.x1 - geometry.x0) * (geometry.y1 - geometry.y0) * geometry.bytes_per_texel *
++              draw_resolution_scale_x() * draw_resolution_scale_y() <
++          (uint64_t(std::max(REXCVAR_GET(resolve_elide_min_kb), int32_t(0))) << 10)) {
++    keep = ResolveElideKeep::kSmall;
++  }
++  if (keep == ResolveElideKeep::kElided && info.seen < uint64_t(std::max(REXCVAR_GET(resolve_elide_after), int32_t(0)))) {
++    keep = ResolveElideKeep::kWarmUp;
++  }
++  if (keep == ResolveElideKeep::kElided && resolve_elide_elided_records_ >= kMaxResolveElideElidedRecords) {
++    keep = ResolveElideKeep::kRecordsFull;
++  }
++  if (keep == ResolveElideKeep::kElided) {
++    if (mode >= 2) {
++      decision.elide = true;
++    } else {
++      decision.would_elide = true;
++      keep = ResolveElideKeep::kLearn;
++    }
++  }
++  ++resolve_elide_stats_.keep[size_t(keep)];
++  decision.written_texture_key = dual_target->texture->key();
++  return decision;
++}
++
++void D3D12TextureCache::WriteNullScaledResolveRangeUAV(D3D12_CPU_DESCRIPTOR_HANDLE handle,
++                                                       uint32_t element_size_bytes_pow2) {
++  // The format and the size of the view the resolve's stores would go through (they are discarded).
++  D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
++  desc.Format = ui::d3d12::util::GetUintPow2DXGIFormat(element_size_bytes_pow2);
++  desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
++  desc.Buffer.FirstElement = 0;
++  desc.Buffer.NumElements =
++      std::max(UINT(scaled_resolve_current_range_length_scaled_ >> element_size_bytes_pow2), UINT(1));
++  command_processor_.GetD3D12Provider().GetDevice()->CreateUnorderedAccessView(nullptr, nullptr, &desc, handle);
++}
++
++void D3D12TextureCache::RemoveResolveElideRecordAt(size_t index) {
++  if (resolve_elide_records_[index].elided) {
++    assert_not_zero(resolve_elide_elided_records_);
++    --resolve_elide_elided_records_;
++  }
++  // In age order: the oldest record of a store that was made is the first to go when the watch is full.
++  resolve_elide_records_.erase(resolve_elide_records_.begin() + ptrdiff_t(index));
++}
++
++void D3D12TextureCache::NoteResolveElideWritten(const ResolveElideGeometry& geometry,
++                                                const ResolveElideDecision& decision) {
++  ResolveElideStats& stats = resolve_elide_stats_;
++  ++stats.resolves;
++  // The records whose bytes this resolve has all written again: the same base, row pitch and bytes a texel (the scaled
++  // tiled address of a texel is a function of those and the texel alone, one to one) and an area containing theirs.
++  if (!geometry.array && geometry.bytes_per_texel && !resolve_elide_records_.empty()) {
++    for (size_t i = resolve_elide_records_.size(); i-- > 0;) {
++      const ResolveElideRecord& record = resolve_elide_records_[i];
++      if (record.dest_base != geometry.dest_base || record.pitch_div_32 != geometry.pitch_div_32 ||
++          record.bytes_per_texel != geometry.bytes_per_texel || geometry.x0 > record.x0 || geometry.y0 > record.y0 ||
++          geometry.x1 < record.x1 || geometry.y1 < record.y1) {
++        continue;
++      }
++      if (record.elided) {
++        ++stats.superseded_elided;
++        stats.superseded_elided_bytes += record.host_bytes;
++      } else if (!record.consumed) {
++        ++stats.superseded_unread;
++        stats.superseded_unread_bytes += record.host_bytes;
++      }
++      RemoveResolveElideRecordAt(i);
++    }
++  }
++  if (decision.track && decision.key_index < resolve_elide_keys_.size()) {
++    ResolveElideKeyInfo& info = resolve_elide_keys_[decision.key_index];
++    ResolveElideRecord record;
++    record.key_index = decision.key_index;
++    record.extent_start = geometry.extent_start;
++    record.extent_end = geometry.extent_start + geometry.extent_length;
++    record.dest_base = geometry.dest_base;
++    record.pitch_div_32 = geometry.pitch_div_32;
++    record.bytes_per_texel = geometry.bytes_per_texel;
++    record.x0 = geometry.x0;
++    record.y0 = geometry.y0;
++    record.x1 = geometry.x1;
++    record.y1 = geometry.y1;
++    record.host_bytes = uint64_t(geometry.x1 - geometry.x0) * (geometry.y1 - geometry.y0) * geometry.bytes_per_texel *
++                        draw_resolution_scale_x() * draw_resolution_scale_y();
++    record.written_texture_key = decision.written_texture_key;
++    record.elided = decision.elide;
++    record.would_elide = decision.would_elide;
++    if (resolve_elide_records_.size() >= kMaxResolveElideRecords) {
++      // At most kMaxResolveElideElidedRecords are elided (DecideResolveElide), so a store that was made is there to go.
++      for (size_t i = 0; i < resolve_elide_records_.size(); ++i) {
++        if (!resolve_elide_records_[i].elided) {
++          RemoveResolveElideRecordAt(i);
++          break;
++        }
++      }
++    }
++    if (resolve_elide_records_.size() < kMaxResolveElideRecords || record.elided) {
++      resolve_elide_records_.push_back(record);
++      if (record.elided) {
++        ++resolve_elide_elided_records_;
++      }
++    }
++    ++info.seen;
++    info.store_bytes = record.host_bytes;
++    ++stats.tracked;
++    if (decision.elide) {
++      ++info.elided;
++      info.elided_bytes += record.host_bytes;
++      stats.elided_bytes += record.host_bytes;
++      if (resolve_elide_mode_ >= 3) {
++        PoisonResolveElideRecord(record);
++      }
++    } else if (decision.would_elide) {
++      stats.would_elide_bytes += record.host_bytes;
++    }
++  }
++  LogResolveElideIfDue(false);
++}
++
++void D3D12TextureCache::NoteResolveCopyBytes(const ResolveElideGeometry& geometry, bool dual_written, bool elided) {
++  if (!IsCopyByteCensusOn()) {
++    return;
++  }
++  const uint64_t host_pixels = uint64_t(geometry.x1 > geometry.x0 ? geometry.x1 - geometry.x0 : 0) *
++                               (geometry.y1 > geometry.y0 ? geometry.y1 - geometry.y0 : 0) * draw_resolution_scale_x() *
++                               draw_resolution_scale_y();
++  const uint64_t stored = host_pixels * geometry.bytes_per_texel;
++  CountCopyBytes(CopyByteClass::kResolveRead, host_pixels * geometry.source_bytes_per_pixel);
++  CountCopyBytes(elided ? CopyByteClass::kResolveStoreElided : CopyByteClass::kResolveStore, stored);
++  if (dual_written) {
++    CountCopyBytes(CopyByteClass::kDualWriteTexture, stored);
++  }
++  LogCopyByteCensusIfDue(command_processor_.GetCurrentFrame());
++}
++
++void D3D12TextureCache::NoteTextureLoadForResolveElide(const D3D12Texture& texture, bool load_base, bool load_mips) {
++  const TextureKey key = texture.key();
++  if (IsCopyByteCensusOn()) {
++    const uint64_t scale_area = key.scaled_resolve ? uint64_t(draw_resolution_scale_x()) * draw_resolution_scale_y() : 1;
++    const uint64_t bytes =
++        (uint64_t(load_base ? texture.GetGuestBaseSize() : 0) + (load_mips ? texture.GetGuestMipsSize() : 0)) *
++        scale_area;
++    CountCopyBytes(CopyByteClass::kTextureLoadRead, bytes);
++    CountCopyBytes(CopyByteClass::kTextureLoadWrite, bytes);
++  }
++  // Only a scaled_resolve texture is loaded from the scaled resolve buffer.
++  if (!key.scaled_resolve || resolve_elide_records_.empty() || resolve_elide_ignore_reads_) {
++    return;
++  }
++  if (load_base) {
++    NoteResolveElideScaledRead(key, key.base_page << 12, texture.GetGuestBaseSize());
++  }
++  if (load_mips && key.mip_page) {
++    NoteResolveElideScaledRead(key, key.mip_page << 12, texture.GetGuestMipsSize());
++  }
++}
++
++void D3D12TextureCache::NoteResolveElideScaledRead(const TextureKey& reader, uint32_t start, uint32_t length) {
++  if (!length) {
++    return;
++  }
++  ResolveElideStats& stats = resolve_elide_stats_;
++  const uint64_t end = uint64_t(start) + length;
++  for (size_t i = resolve_elide_records_.size(); i-- > 0;) {
++    ResolveElideRecord& record = resolve_elide_records_[i];
++    if (record.extent_end <= start || record.extent_start >= end) {
++      continue;
++    }
++    ResolveElideKeyInfo& info = resolve_elide_keys_[record.key_index];
++    if (!record.consumed) {
++      record.consumed = true;
++      ++info.consumed;
++      ++stats.consumed;
++      stats.consumed_bytes += record.host_bytes;
++    }
++    const FormatInfo* reader_format = FormatInfo::Get(reader.format);
++    const std::string reader_text = fmt::format(
++        "a {} {}x{} texture at 0x{:08X} ({})", reader_format ? reader_format->name : "?", reader.GetWidth(),
++        reader.GetHeight(), reader.base_page << 12,
++        reader == record.written_texture_key ? "the one the resolve wrote, outdated since" : "not the one the resolve wrote");
++    if (!info.kept_consumed) {
++      info.kept_consumed = true;
++      ++stats.keys_learned;
++      if (resolve_elide_consumed_lines_ < kMaxResolveElideReadLines) {
++        ++resolve_elide_consumed_lines_;
++        REXGPU_INFO("[resolve-elide] read: {} - by the load of {}, after {} stores of it ({} elided); stored from now on",
++                    DescribeResolveElideKey(info), reader_text, info.seen, info.elided);
++      }
++    }
++    if (record.elided) {
++      ++info.misses;
++      ++stats.misses;
++      if (!info.miss_logged) {
++        info.miss_logged = true;
++        REXGPU_ERROR(
++            "[resolve-elide] MISS: the load of {} read the bytes of an elided store of {} (what the buffer held before: "
++            "this texture is wrong); the destination is stored from now on, to keep it in later runs: "
++            "resolve_elide_keep_rules={}",
++            reader_text, DescribeResolveElideKey(info), DescribeResolveElideKey(info));
++      }
++    } else {
++      if (record.would_elide) {
++        ++info.would_misses;
++        ++stats.would_misses;
++        if (!info.miss_logged) {
++          info.miss_logged = true;
++          REXGPU_WARN("[resolve-elide] would-miss: the load of {} read a store of {} that resolve_elide 2 would have "
++                      "elided (its texture would have been wrong once)",
++                      reader_text, DescribeResolveElideKey(info));
++        }
++      }
++      // The bytes were stored: the read is learnt, nothing more to watch.
++      RemoveResolveElideRecordAt(i);
++    }
++  }
++}
++
++void D3D12TextureCache::PoisonResolveElideRecord(const ResolveElideRecord& record) {
++  ResolveElideStats& stats = resolve_elide_stats_;
++  const uint64_t scale_area = uint64_t(draw_resolution_scale_x()) * draw_resolution_scale_y();
++  const uint64_t start_scaled = uint64_t(record.extent_start) * scale_area;
++  const uint64_t length_scaled = uint64_t(record.extent_end - record.extent_start) * scale_area;
++  // The resolve made its range current: the extent is in it.
++  const size_t buffer_index = GetCurrentScaledResolveBufferIndex();
++  const uint64_t buffer_base = uint64_t(buffer_index) << 30;
++  if (!length_scaled || (length_scaled & 3) || start_scaled < scaled_resolve_current_range_start_scaled_ ||
++      start_scaled + length_scaled >
++          scaled_resolve_current_range_start_scaled_ + scaled_resolve_current_range_length_scaled_ ||
++      start_scaled < buffer_base || ((start_scaled - buffer_base) & 3) || (length_scaled >> 2) > UINT32_MAX) {
++    ++stats.poison_skipped;
++    return;
++  }
++  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
++  ID3D12Device* device = provider.GetDevice();
++  if (!resolve_elide_poison_heap_) {
++    D3D12_DESCRIPTOR_HEAP_DESC heap_desc;
++    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
++    heap_desc.NumDescriptors = kResolveElidePoisonSlots;
++    heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
++    heap_desc.NodeMask = 0;
++    if (FAILED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&resolve_elide_poison_heap_)))) {
++      ++stats.poison_skipped;
++      return;
++    }
++    resolve_elide_poison_slot_submission_.assign(kResolveElidePoisonSlots, 0);
++  }
++  // A CPU descriptor is read when the clear is recorded, which is when the deferred command list is replayed: one used in a
++  // submission that has not completed yet may not have been.
++  const uint32_t slot = resolve_elide_poison_next_;
++  if (resolve_elide_poison_slot_submission_[slot] > command_processor_.GetCompletedSubmission()) {
++    ++stats.poison_skipped;
++    return;
++  }
++  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor;
++  if (!command_processor_.RequestOneUseSingleViewDescriptors(1, &descriptor)) {
++    ++stats.poison_skipped;
++    return;
++  }
++  resolve_elide_poison_slot_submission_[slot] = command_processor_.GetCurrentSubmission();
++  resolve_elide_poison_next_ = (slot + 1) % kResolveElidePoisonSlots;
++  const D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle =
++      provider.OffsetViewDescriptor(resolve_elide_poison_heap_->GetCPUDescriptorHandleForHeapStart(), slot);
++  ScaledResolveVirtualBuffer& buffer = GetCurrentScaledResolveBuffer();
++  ID3D12Resource* resource = buffer.resource();
++  for (D3D12_CPU_DESCRIPTOR_HANDLE handle : {cpu_handle, descriptor.first}) {
++    ui::d3d12::util::CreateBufferTypedUAV(device, handle, resource, DXGI_FORMAT_R32_UINT, uint32_t(length_scaled >> 2),
++                                          (start_scaled - buffer_base) >> 2);
++  }
++  TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++  command_processor_.PushUAVBarrier(resource);
++  command_processor_.SubmitBarriers();
++  const uint32_t value = REXCVAR_GET(resolve_elide_poison_value);
++  const UINT values[4] = {value, value, value, value};
++  command_processor_.GetDeferredCommandList().D3DClearUnorderedAccessViewUint(descriptor.second, cpu_handle, resource,
++                                                                              values, 0, nullptr);
++  MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
++  ++stats.poisoned;
++}
++
++std::string D3D12TextureCache::DescribeResolveElideKey(const ResolveElideKeyInfo& info) const {
++  const ResolveElideKeyFields& f = info.fields;
++  return fmt::format("addr=0x{:08X},len={},pitch={},height={},fmt={},src={}", f[0], f[1], f[2], f[3], f[4], f[5]);
++}
++
++void D3D12TextureCache::LogResolveElideIfDue(bool at_exit) {
++  const uint64_t now = rex::chrono::Clock::QueryHostUptimeMillis();
++  const uint64_t frame = command_processor_.GetCurrentFrame();
++  if (!at_exit) {
++    if (!resolve_elide_last_log_ms_) {
++      resolve_elide_last_log_ms_ = now;
++      resolve_elide_last_log_frame_ = frame;
++      return;
++    }
++    if (now - resolve_elide_last_log_ms_ < 10000) {
++      return;
++    }
++  }
++  const double seconds = resolve_elide_last_log_ms_ ? double(now - resolve_elide_last_log_ms_) / 1000.0 : 0.0;
++  const uint64_t frames = frame > resolve_elide_last_log_frame_ ? frame - resolve_elide_last_log_frame_ : 0;
++  const double per_frame = frames ? 1.0 / double(frames) : 0.0;
++  resolve_elide_last_log_ms_ = now;
++  resolve_elide_last_log_frame_ = frame;
++  const ResolveElideStats& stats = resolve_elide_stats_;
++  uint64_t kept_keys = 0;
++  for (const ResolveElideKeyInfo& info : resolve_elide_keys_) {
++    kept_keys += info.kept_consumed ? 1 : 0;
++  }
++  if (stats.resolves || stats.tracked || !resolve_elide_records_.empty() || at_exit) {
++    std::string reasons;
++    for (size_t i = 0; i < size_t(ResolveElideKeep::kCount); ++i) {
++      if (!stats.keep[i]) {
++        continue;
++      }
++      reasons += reasons.empty() ? "" : ", ";
++      reasons += fmt::format("{} {}", kResolveElideKeepNames[i], stats.keep[i]);
++    }
++    std::string untracked;
++    if (stats.not_dual_written || stats.keys_full || stats.not_covered) {
++      untracked = fmt::format(", not tracked: {} not dual-written, {} not covered, {} with the key table full",
++                              stats.not_dual_written, stats.not_covered, stats.keys_full);
++    }
++    std::string poison;
++    if (stats.poisoned || stats.poison_skipped) {
++      poison = fmt::format(", {} poisoned ({} could not be)", stats.poisoned, stats.poison_skipped);
++    }
++    REXGPU_INFO(
++        "[resolve-elide] {} ({}) over {} frames ({:.1f} s): {} resolves at scale, {} dual-written tracked ({}); elided "
++        "{} a frame{}; overwritten whole before any read: {} stores ({} a frame), {} elided ones ({} a frame); read by a "
++        "load: {} records ({} a frame), {} MISSES, {} would-misses; {} destinations ({} stored after a read, {} new "
++        "this time), {} records live ({} elided){}{}",
++        resolve_elide_mode_, kResolveElideModeNames[std::clamp(resolve_elide_mode_, int32_t(0), int32_t(3))], frames,
++        seconds, stats.resolves, stats.tracked, reasons.empty() ? "none" : reasons,
++        Megabytes(double(stats.elided_bytes) * per_frame),
++        stats.would_elide_bytes
++            ? fmt::format(" (2 would elide {} a frame)", Megabytes(double(stats.would_elide_bytes) * per_frame))
++            : std::string(),
++        stats.superseded_unread, Megabytes(double(stats.superseded_unread_bytes) * per_frame), stats.superseded_elided,
++        Megabytes(double(stats.superseded_elided_bytes) * per_frame), stats.consumed,
++        Megabytes(double(stats.consumed_bytes) * per_frame), stats.misses, stats.would_misses,
++        resolve_elide_keys_.size(), kept_keys, stats.keys_learned, resolve_elide_records_.size(),
++        resolve_elide_elided_records_, untracked, poison);
++  }
++  if (at_exit && !resolve_elide_keys_.empty()) {
++    std::string rules;
++    for (const ResolveElideKeyInfo& info : resolve_elide_keys_) {
++      if (info.kept_consumed) {
++        rules += rules.empty() ? "" : ";";
++        rules += DescribeResolveElideKey(info);
++      }
++    }
++    REXGPU_INFO("[resolve-elide] at exit: {} destinations, {} read at least once; as keep rules: {}",
++                resolve_elide_keys_.size(), kept_keys, rules.empty() ? "(none)" : rules);
++    // The destinations with the most bytes stored, and what became of them: the inventory of the dual-written resolves.
++    const uint64_t run_frames =
++        frame > resolve_elide_first_frame_ ? frame - resolve_elide_first_frame_ : uint64_t(1);
++    std::vector<uint32_t> order(resolve_elide_keys_.size());
++    for (uint32_t i = 0; i < uint32_t(order.size()); ++i) {
++      order[i] = i;
++    }
++    std::sort(order.begin(), order.end(), [this](uint32_t a, uint32_t b) {
++      const ResolveElideKeyInfo& ka = resolve_elide_keys_[a];
++      const ResolveElideKeyInfo& kb = resolve_elide_keys_[b];
++      return ka.seen * ka.store_bytes > kb.seen * kb.store_bytes;
++    });
++    for (size_t i = 0; i < std::min(order.size(), size_t(kMaxResolveElideExitKeyLines)); ++i) {
++      const ResolveElideKeyInfo& info = resolve_elide_keys_[order[i]];
++      REXGPU_INFO(
++          "[resolve-elide] at exit: {}: {} stores ({:.2f} a frame over {} frames) of {} each, {} elided ({}), read {} "
++          "times ({} misses, {} would-misses){}",
++          DescribeResolveElideKey(info), info.seen, double(info.seen) / double(run_frames), run_frames,
++          Megabytes(double(info.store_bytes)), info.elided, Megabytes(double(info.elided_bytes)), info.consumed,
++          info.misses, info.would_misses, info.kept_consumed ? ", stored after a read" : "");
++    }
++  }
++  resolve_elide_stats_ = ResolveElideStats();
++}
++
++void D3D12TextureCache::ShutdownResolveElide() {
++  if (resolve_elide_mode_ || !resolve_elide_keys_.empty()) {
++    LogResolveElideIfDue(true);
++  }
++  resolve_elide_records_.clear();
++  resolve_elide_elided_records_ = 0;
++  resolve_elide_poison_heap_.Reset();
++}
++
++}  // namespace rex::graphics::d3d12
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index c758bfc..0b4310d 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -426,6 +426,8 @@ D3D12TextureCache::~D3D12TextureCache() {
+   // LOCAL PATCH - MCLA (0560): resolve_defer_memory_write: nothing waits for the textures' data
+   // any more, nothing calls the hook any more.
+   ShutdownResolveDefer();
++  // LOCAL PATCH - MCLA (0810): resolve_elide: the line at exit (the destinations read, as rules).
++  ShutdownResolveElide();
+ 
+   // While the texture descriptor cache still exists (referenced by
+   // ~D3D12Texture), destroy all textures.
+@@ -2164,6 +2166,9 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+     return false;
+   }
+   bool texture_resolution_scaled = texture_key.scaled_resolve;
++  // LOCAL PATCH - MCLA (0810): resolve_elide: a load from the scaled resolve buffer reads the stores over its range;
++  // copy_byte_census: the bytes of the load.
++  NoteTextureLoadForResolveElide(d3d12_texture, load_base, load_mips);
+   ID3D12PipelineState* pipeline = texture_resolution_scaled
+                                       ? load_pipelines_scaled_[load_shader].Get()
+                                       : load_pipelines_[load_shader].Get();
+@@ -3242,7 +3247,10 @@ void D3D12TextureCache::RecordResolveDualWriteVerify(D3D12Texture& texture,
+   D3D12Texture scratch_texture(*this, key, verify.scratch.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                false);
+   scratch_texture.SetDirectLoadUAVFormat(texture.direct_load_uav_format());
++  // LOCAL PATCH - MCLA (0810): resolve_elide: this load is the check's own, not a reader of the game's.
++  resolve_elide_ignore_reads_ = true;
+   const bool verify_loaded = LoadTextureDataFromResidentMemoryImpl(scratch_texture, true, false);
++  resolve_elide_ignore_reads_ = false;
+   if (verify_scaled) {
+     RestoreScaledResolveRange(verify_saved_range_start, verify_saved_range_length);
+   }
