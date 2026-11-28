@@ -1151,6 +1151,24 @@ purpose = "D3D12 (zero-copy session 2 B): resolve_elide's keep rules match a dep
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0815-front-buffer-resolve-skip"
+source = "local"
+path = "patches/sdk/0815-front-buffer-resolve-skip.patch"
+sha256 = "b32fdc70d9d0a6e96e8ba6a1c1720388dba6c08104dfe86a76c53ecbe36eb49b"
+purpose = "D3D12 (zero-copy session 3): cvar front_buffer_resolve_skip (bool, default false, hot reload): when the swap shows the front buffer's host render target itself (scaled_copy_levers 2 + 16), the front-buffer resolve right before it (no draw or resolve in between; dual-written, its store elided by resolve_elide; no clear; not a check swap) is cancelled: its recorded dispatch becomes empty (DeferredCommandList::CancelDispatch) and its texture outdated with an unknown reload state (a later reader is a logged MISS, never a stale texture). About 49 MB a frame at 2000p. '[front-buffer-skip]' every 10 s; '[resolve-dual-write] unused ... by destination' learn line. Not built before the next SDK build."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0816-elide-flip-keep-file"
+source = "local"
+path = "patches/sdk/0816-elide-flip-keep-file.patch"
+sha256 = "346e7ceb35521db48c803d1a3fe956d9e1e0752e859f523a09f189716809d769"
+purpose = "D3D12 (zero-copy session 3): the reload skip (resolve_reinterpret_reload 1) stays while any store elided by resolve_elide is live (the MISS at 0x06CEE000 right after both were switched off live); cvar resolve_elide_keep_file (bool, default true, at start; with resolve_elide on at a scale above 1): <cache>/shaders/shareable/<title>.resolve-keep.txt keeps the destinations a load of their own layout read, from the start of later runs, and a new one is appended; a MISS says whether its rule came from the file. Needs 0815. Not built before the next SDK build."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]

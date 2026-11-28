@@ -1,0 +1,362 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mcla-x86 SDK patch layer
+Date: Sat, 28 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0815: front_buffer_resolve_skip: the front-buffer resolve is cancelled when the swap shows the render target itself (Direct3D 12; native stream, zero-copy session 3)
+
+Source: Ours, written for this SDK (native stream; scratch/zerocopy3/TESTPLAN3.md). Written without a build or a run: checked with
+  clang++ 20.1.8 -fsyntax-only (the SDK's Release flags) of d3d12/render_target_cache.cpp, d3d12/texture_cache.cpp,
+  d3d12/deferred_command_list.cpp and units that include the changed headers; 0 errors, no warning on an added line.
+  Applies after 0814 (W/sdk/src of unlock-2x with 0800-0814).
+Licence: GPL-3 (owner's own work, part of mcla-x86); the patched files are ReXGlue SDK code (BSD-3-Clause)
+Purpose: With direct present at scale (scaled_copy_levers 2 + 16) the swap reads the front buffer's host render target; the
+  front-buffer resolve (the 8888 pair at 2000p, one a frame, 24.4 MB read + 24.4 MB written) still reads it and writes a texture
+  only the swap's fallbacks sample. New cvar front_buffer_resolve_skip (bool, default false, hot reload): a resolve that
+  NoteSwapDirectResolve has just recorded as showable, dual-written, its scaled store elided by resolve_elide, not clearing, is
+  armed; any draw or other resolve disarms it (it is then made as recorded); when the swap uses the render target it read
+  (UseSwapDirectSource, same render target and destination base) and swap_direct_present_check is off, its recorded dispatch is
+  turned into an empty one (DeferredCommandList::CancelDispatch, valid until the stream is taken: a generation counter), and the
+  dual-written texture is made outdated with an unknown reload state (D3D12TextureCache::ForgetResolveDualWrite), so a later
+  reader loads it from the scaled buffer and resolve_elide's record logs that load as a MISS (resolve_elide 3 poisons it), never
+  a silently stale texture. A swap from the loaded texture (any fallback) never cancels: the resolve is in the stream already.
+  `[front-buffer-skip] ...` every 10 s. Also a learn line: `[resolve-dual-write] unused (written again before any use) by
+  destination: 0x... fmt WxH xN, ...` with the 10 s dual-write line (which destinations nothing samples).
+Bucket: REDO
+
+0815-front-buffer-resolve-skip.patch (mcla-x86 native stream, zero-copy session 3).
+
+---
+diff --git a/include/rex/graphics/d3d12/deferred_command_list.h b/include/rex/graphics/d3d12/deferred_command_list.h
+index 5851ff6..b862195 100644
+--- a/include/rex/graphics/d3d12/deferred_command_list.h
++++ b/include/rex/graphics/d3d12/deferred_command_list.h
+@@ -217,6 +217,33 @@ class DeferredCommandList {
+     args.thread_group_count_x = thread_group_count_x;
+     args.thread_group_count_y = thread_group_count_y;
+     args.thread_group_count_z = thread_group_count_z;
++    // LOCAL PATCH - MCLA (0815): where it is, for CancelDispatch.
++    last_dispatch_ = DispatchHandle();
++    if (write_stream_ == &command_stream_) {
++      last_dispatch_.offset =
++          size_t(reinterpret_cast<const uintmax_t*>(&args) - command_stream_.data());
++      last_dispatch_.generation = generation_;
++    }
++  }
++
++  // LOCAL PATCH - MCLA (0815): front_buffer_resolve_skip. The dispatch recorded last (in the main stream), which
++  // CancelDispatch turns into a dispatch of no thread groups (a no-op) as long as the stream has not been taken or reset
++  // since (false otherwise, and nothing is changed).
++  struct DispatchHandle {
++    size_t offset = SIZE_MAX;
++    uint64_t generation = 0;
++  };
++  DispatchHandle LastDispatch() const { return last_dispatch_; }
++  bool CancelDispatch(const DispatchHandle& handle) {
++    if (handle.offset == SIZE_MAX || handle.generation != generation_ ||
++        handle.offset * sizeof(uintmax_t) + sizeof(D3DDispatchArguments) > command_stream_.size() * sizeof(uintmax_t)) {
++      return false;
++    }
++    auto& args = *reinterpret_cast<D3DDispatchArguments*>(command_stream_.data() + handle.offset);
++    args.thread_group_count_x = 0;
++    args.thread_group_count_y = 0;
++    args.thread_group_count_z = 0;
++    return true;
+   }
+ 
+   void D3DDrawIndexedInstanced(UINT index_count_per_instance, UINT instance_count,
+@@ -777,6 +804,9 @@ class DeferredCommandList {
+   std::vector<uintmax_t> command_stream_;
+   std::vector<uintmax_t> hoisted_stream_;
+   std::vector<uintmax_t>* write_stream_ = &command_stream_;
++  // LOCAL PATCH - MCLA (0815): front_buffer_resolve_skip: counts the resets (a handle of an earlier stream is stale).
++  uint64_t generation_ = 1;
++  DispatchHandle last_dispatch_;
+   RecordedStats stats_;  // LOCAL PATCH - MCLA (04f0)
+ };
+ 
+diff --git a/include/rex/graphics/d3d12/render_target_cache.h b/include/rex/graphics/d3d12/render_target_cache.h
+index ef9aa84..ba3fcd3 100644
+--- a/include/rex/graphics/d3d12/render_target_cache.h
++++ b/include/rex/graphics/d3d12/render_target_cache.h
+@@ -173,6 +173,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+     // LOCAL PATCH - MCLA (0800): scaled_copy_levers 16: the resolve was at a draw resolution scale above 1 and filled the
+     // half-pixel gap: the picture's first host rows and columns aren't the render target's (the swap's reads clamp).
+     bool fill_half_pixel_offset = false;
++    // LOCAL PATCH - MCLA (0815): the record's destination base (front_buffer_resolve_skip matches the armed resolve).
++    uint32_t dest_base = 0;
+   };
+   // Whether the swap's texture can be shown from the render target (true), or why not (a string literal). Changes
+   // nothing.
+@@ -1010,6 +1012,30 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+     uint64_t sequence = 0;
+   };
+   SwapDirectRecord swap_direct_records_[kSwapDirectRecordCount];
++  // LOCAL PATCH - MCLA (0815): front_buffer_resolve_skip: the last resolve, if it is a front buffer the swap may show from
++  // the render target, with what cancelling it needs (the texture is pinned while armed).
++  struct FrontBufferPending {
++    bool armed = false;
++    // DeferredCommandList::DispatchHandle (offset, generation).
++    size_t dispatch_offset = SIZE_MAX;
++    uint64_t dispatch_generation = 0;
++    D3D12TextureCache* texture_cache = nullptr;
++    void* render_target = nullptr;
++    uint32_t dest_base = 0;
++    uint32_t extent_start = 0, extent_length = 0;
++    decltype(D3D12TextureCache::ResolveDualWriteTarget::texture) texture = nullptr;
++    uint64_t bytes = 0;
++  };
++  FrontBufferPending front_buffer_pending_;
++  struct FrontBufferSkipStats {
++    uint64_t cancelled = 0, cancelled_bytes = 0;
++    uint64_t disarmed_by_work = 0, not_cancelled_swap = 0, not_armed_kept_store = 0;
++    std::chrono::steady_clock::time_point window_start = std::chrono::steady_clock::now();
++  };
++  FrontBufferSkipStats front_buffer_skip_stats_;
++  // Drops the armed resolve (it is made as recorded); counts why.
++  void DisarmFrontBufferPending(bool by_work);
++  void LogFrontBufferSkipIfDue();
+   uint64_t swap_direct_sequence_ = 0;
+   // For each record, what the shared memory's global watch needs (any thread, within the global critical region): the
+   // memory range written, inclusive (start > end: none), and how many times it was invalidated (CPU writes, other
+diff --git a/include/rex/graphics/d3d12/texture_cache.h b/include/rex/graphics/d3d12/texture_cache.h
+index e8d698c..1971106 100644
+--- a/include/rex/graphics/d3d12/texture_cache.h
++++ b/include/rex/graphics/d3d12/texture_cache.h
+@@ -392,6 +392,11 @@ class D3D12TextureCache final : public TextureCache {
+   void NoteResolveElideWritten(const ResolveElideGeometry& geometry, const ResolveElideDecision& decision);
+   // copy_byte_census: after every resolve that copied (any scale).
+   void NoteResolveCopyBytes(const ResolveElideGeometry& geometry, bool dual_written, bool elided);
++  // LOCAL PATCH - MCLA (0815): front_buffer_resolve_skip: the dual write of a resolve whose dispatch was cancelled did not
++  // happen: the range is made resolved again (every texture over it outdated, the dual-written one too) and the texture's
++  // reload state is unknown, so the next load of it reads the scaled resolve buffer (where resolve_elide's record of the
++  // elided store sees it: a MISS, never a silently stale texture).
++  void ForgetResolveDualWrite(Texture* texture, uint32_t start, uint32_t length);
+   // LOCAL PATCH - MCLA (0814): resolve_reinterpret_reload (resolve_elide.cpp). Every resolve at a draw resolution scale
+   // above 1 is logged (a ring: its extent, its pitch and texel size, the texture it dual-wrote), after
+   // FinishResolveDualWrite / MarkRangeAsResolved. A scaled texture that is outdated only by resolves of another pitch or
+@@ -1067,6 +1072,9 @@ class D3D12TextureCache final : public TextureCache {
+   // LOCAL PATCH - MCLA (0530): resolve_dual_write_msaa: the fallbacks already logged
+   // (LogResolveDualWriteFallback): address, size and reason with format and sample count.
+   std::set<std::array<uint32_t, 3>> resolve_dual_write_fallbacks_logged_;
++  // LOCAL PATCH - MCLA (0815): the dual writes written again before anything used them, by the texture they went to
++  // (base address -> count, its key): a destination that only ever shows here is one nobody samples.
++  std::map<uint32_t, std::pair<uint64_t, TextureKey>> resolve_dual_write_unused_by_dest_;
+   // A resolve_dual_write_verify check in flight: the texture and the one loaded the usual way,
+   // copied to a readback buffer in the submission that has to complete before they're compared.
+   struct ResolveDualWriteVerify {
+diff --git a/src/graphics/d3d12/deferred_command_list.cpp b/src/graphics/d3d12/deferred_command_list.cpp
+index 3eac3c8..5c16757 100644
+--- a/src/graphics/d3d12/deferred_command_list.cpp
++++ b/src/graphics/d3d12/deferred_command_list.cpp
+@@ -28,6 +28,8 @@ void DeferredCommandList::Reset() {
+   command_stream_.clear();
+   hoisted_stream_.clear();
+   write_stream_ = &command_stream_;
++  ++generation_;  // LOCAL PATCH - MCLA (0815): front_buffer_resolve_skip
++  last_dispatch_ = DispatchHandle();
+ }
+ 
+ size_t DeferredCommandList::CmdHoistPoint() {
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index 24e15e8..b4be1e1 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -106,6 +106,20 @@ REXCVAR_DECLARE(bool, resolve_dual_write_msaa);  // LOCAL PATCH - MCLA (0530): r
+ // LOCAL PATCH - MCLA (0560): resolve_defer_memory_write (defined in resolve_defer.cpp)
+ REXCVAR_DECLARE(bool, resolve_defer_memory_write);
+ 
++// LOCAL PATCH - MCLA (0815): front_buffer_resolve_skip
++REXCVAR_DEFINE_BOOL(front_buffer_resolve_skip, false, "GPU/D3D12",
++                    "At a draw resolution scale above 1, with swap_direct_present at scale (scaled_copy_levers 2 and 16) "
++                    "and resolve_elide eliding the front buffer's store: when the swap reads the host render target "
++                    "itself, the front-buffer resolve that preceded it with nothing in between (no draw, no other "
++                    "resolve) is cancelled: its recorded dispatch, which reads the render target and writes the "
++                    "texture only the swap's fallbacks sample, becomes empty. Kept: a check swap (swap_direct_present_check), "
++                    "a swap made from the loaded texture, a front buffer whose store a reader keeps. The texture is made "
++                    "outdated with its reload state unknown, so a later reader loads it from the scaled resolve buffer "
++                    "(resolve_elide 3 poisons that) and resolve_elide logs it as a MISS. Logs '[front-buffer-skip] ...' "
++                    "every 10 s")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DECLARE(uint32_t, swap_direct_present_check);
++
+ // LOCAL PATCH - MCLA (0813): transfer_skip_scrambled
+ REXCVAR_DEFINE_INT32(transfer_skip_scrambled, 0, "GPU/D3D12",
+                      "Host render targets: an EDRAM ownership transfer whose source and destination lay their pixels "
+@@ -1699,6 +1713,10 @@ void D3D12RenderTargetCache::BeginSubmission() {
+ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
+                                     reg::RB_DEPTHCONTROL normalized_depth_control,
+                                     uint32_t normalized_color_mask, const Shader& vertex_shader) {
++  // LOCAL PATCH - MCLA (0815): front_buffer_resolve_skip: a draw after the front-buffer resolve may sample its texture.
++  if (front_buffer_pending_.armed) {
++    DisarmFrontBufferPending(true);
++  }
+   if (!RenderTargetCache::Update(is_rasterization_done, normalized_depth_control,
+                                  normalized_color_mask, vertex_shader)) {
+     return false;
+@@ -2145,6 +2163,11 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+   written_address_out = 0;
+   written_length_out = 0;
+ 
++  // LOCAL PATCH - MCLA (0815): front_buffer_resolve_skip: only the resolve right before the swap is cancelled.
++  if (front_buffer_pending_.armed) {
++    DisarmFrontBufferPending(true);
++  }
++
+   bool draw_resolution_scaled = IsDrawResolutionScaled();
+ 
+   draw_util::ResolveInfo resolve_info;
+@@ -2606,7 +2629,33 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+           written_address_out = resolve_info.copy_dest_extent_start;
+           written_length_out = resolve_info.copy_dest_extent_length;
+           copied = true;
++          // LOCAL PATCH - MCLA (0815): front_buffer_resolve_skip: a front buffer the swap may show from the render target
++          // (NoteSwapDirectResolve made a record of it just now), dual-written, its store elided: armed.
++          const uint64_t swap_direct_sequence_before = swap_direct_sequence_;
+           NoteSwapDirectResolve(shared_memory, resolve_info, direct_source, direct_source_constants);
++          if (REXCVAR_GET(front_buffer_resolve_skip) && draw_resolution_scaled &&
++              swap_direct_sequence_ != swap_direct_sequence_before && dual_write && direct_source &&
++              !resolve_info.IsClearingColor() && !resolve_info.IsClearingDepth()) {
++            if (!elide_decision.elide) {
++              ++front_buffer_skip_stats_.not_armed_kept_store;
++            } else {
++              FrontBufferPending& pending = front_buffer_pending_;
++              pending.armed = true;
++              const DeferredCommandList::DispatchHandle dispatch_handle = command_list.LastDispatch();
++              pending.dispatch_offset = dispatch_handle.offset;
++              pending.dispatch_generation = dispatch_handle.generation;
++              pending.texture_cache = &texture_cache;
++              pending.render_target = direct_source;
++              pending.dest_base = resolve_info.copy_dest_base;
++              pending.extent_start = resolve_info.copy_dest_extent_start;
++              pending.extent_length = resolve_info.copy_dest_extent_length;
++              pending.texture = dual_write_target.texture;
++              pending.texture->Pin();
++              pending.bytes = uint64_t(elide_geometry.x1 - elide_geometry.x0) * (elide_geometry.y1 - elide_geometry.y0) *
++                              draw_resolution_scale_x() * draw_resolution_scale_y() *
++                              (elide_geometry.source_bytes_per_pixel + elide_geometry.bytes_per_texel);
++            }
++          }
+         }
+       } else {
+         REXGPU_ERROR(
+@@ -8400,11 +8449,65 @@ bool D3D12RenderTargetCache::FindSwapDirectSource(const SwapDirectTexture& textu
+   source_out.render_target = render_target;
+   source_out.swap_red_blue = record.dest_swap;
+   source_out.fill_half_pixel_offset = record.fill_half_pixel_offset;  // LOCAL PATCH - MCLA (0800)
++  source_out.dest_base = record.dest_base;  // LOCAL PATCH - MCLA (0815)
+   return true;
+ }
+ 
++// LOCAL PATCH - MCLA (0815): front_buffer_resolve_skip
++void D3D12RenderTargetCache::DisarmFrontBufferPending(bool by_work) {
++  FrontBufferPending& pending = front_buffer_pending_;
++  if (!pending.armed) {
++    return;
++  }
++  if (by_work) {
++    ++front_buffer_skip_stats_.disarmed_by_work;
++  }
++  if (pending.texture) {
++    pending.texture->Unpin();
++  }
++  pending = FrontBufferPending();
++}
++
++void D3D12RenderTargetCache::LogFrontBufferSkipIfDue() {
++  FrontBufferSkipStats& stats = front_buffer_skip_stats_;
++  const auto now = std::chrono::steady_clock::now();
++  const double seconds = std::chrono::duration<double>(now - stats.window_start).count();
++  if (seconds < 10.0) {
++    return;
++  }
++  if (stats.cancelled || stats.disarmed_by_work || stats.not_cancelled_swap || stats.not_armed_kept_store) {
++    REXGPU_INFO(
++        "[front-buffer-skip] {:.1f} s: {} front-buffer resolves cancelled at a swap from the render target ({:.1f} MB "
++        "read and written not); made: {} a draw or resolve came before the swap, {} the swap was a check or not from "
++        "that render target, {} the store is kept (a reader of the front buffer)",
++        seconds, stats.cancelled, double(stats.cancelled_bytes) / 1048576.0,
++        stats.disarmed_by_work, stats.not_cancelled_swap, stats.not_armed_kept_store);
++  }
++  stats = FrontBufferSkipStats();
++  stats.window_start = now;
++}
++
+ void D3D12RenderTargetCache::UseSwapDirectSource(const SwapDirectSource& source,
+                                                  D3D12_RESOURCE_STATES state) {
++  // LOCAL PATCH - MCLA (0815): front_buffer_resolve_skip: this swap is shown from the render target the armed resolve
++  // read, at the address it wrote, with nothing recorded in between: the resolve's work is not needed (not for a check
++  // swap, which compares against the texture).
++  FrontBufferPending& pending = front_buffer_pending_;
++  if (pending.armed) {
++    if (REXCVAR_GET(front_buffer_resolve_skip) && !REXCVAR_GET(swap_direct_present_check) &&
++        source.render_target == pending.render_target && source.dest_base == pending.dest_base &&
++        pending.texture_cache &&
++        command_processor_.GetDeferredCommandList().CancelDispatch(
++            DeferredCommandList::DispatchHandle{pending.dispatch_offset, pending.dispatch_generation})) {
++      pending.texture_cache->ForgetResolveDualWrite(pending.texture, pending.extent_start, pending.extent_length);
++      ++front_buffer_skip_stats_.cancelled;
++      front_buffer_skip_stats_.cancelled_bytes += pending.bytes;
++    } else {
++      ++front_buffer_skip_stats_.not_cancelled_swap;
++    }
++    DisarmFrontBufferPending(false);
++  }
++  LogFrontBufferSkipIfDue();
+   auto* render_target = static_cast<D3D12RenderTarget*>(source.render_target);
+   command_processor_.PushTransitionBarrier(
+       render_target->resource(), render_target->SetResourceState(state), state);
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index ca34fb2..92af63b 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -3064,6 +3064,15 @@ void D3D12TextureCache::BeginResolveDualWrite(const ResolveDualWriteTarget& targ
+   texture.MarkAsUsed();
+ }
+ 
++// LOCAL PATCH - MCLA (0815): front_buffer_resolve_skip
++void D3D12TextureCache::ForgetResolveDualWrite(Texture* texture, uint32_t start, uint32_t length) {
++  MarkRangeAsResolved(start, length);
++  if (texture) {
++    static_cast<D3D12Texture*>(texture)->SetReloadResolveSerial(0);
++    static_cast<D3D12Texture*>(texture)->SetDualWriteUnused(false);
++  }
++}
++
+ void D3D12TextureCache::FinishResolveDualWrite(const ResolveDualWriteTarget& target,
+                                                uint32_t written_start, uint32_t written_length) {
+   D3D12Texture& texture = *static_cast<D3D12Texture*>(target.texture);
+@@ -3096,6 +3105,10 @@ void D3D12TextureCache::FinishResolveDualWrite(const ResolveDualWriteTarget& tar
+       // is the same write: the cascades into an atlas, one texture used once).
+       if (!target.partial) {  // LOCAL PATCH - MCLA (0530)
+         ++resolve_dual_write_stats_.unused;
++        // LOCAL PATCH - MCLA (0815): by destination.
++        auto& unused_dest = resolve_dual_write_unused_by_dest_[texture.key().base_page << 12];
++        ++unused_dest.first;
++        unused_dest.second = texture.key();
+       }
+     } else {
+       texture.SetDualWriteUnused(true);
+@@ -3159,6 +3172,24 @@ void D3D12TextureCache::LogResolveDualWriteIfDue() {
+                         "them)")
+                      : std::string());
+   }
++  // LOCAL PATCH - MCLA (0815): the unused dual writes by destination, the largest counts first (at most 8).
++  if (!resolve_dual_write_unused_by_dest_.empty()) {
++    std::vector<std::pair<uint64_t, uint32_t>> order;
++    for (const auto& entry : resolve_dual_write_unused_by_dest_) {
++      order.emplace_back(entry.second.first, entry.first);
++    }
++    std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
++    std::string list;
++    for (size_t i = 0; i < std::min(order.size(), size_t(8)); ++i) {
++      const TextureKey& unused_key = resolve_dual_write_unused_by_dest_[order[i].second].second;
++      const FormatInfo* unused_info = FormatInfo::Get(unused_key.format);
++      list += fmt::format("{}0x{:08X} {} {}x{} x{}", list.empty() ? "" : ", ", order[i].second,
++                          unused_info ? unused_info->name : "?", unused_key.GetWidth(), unused_key.GetHeight(),
++                          order[i].first);
++    }
++    REXGPU_INFO("[resolve-dual-write] unused (written again before any use) by destination: {}", list);
++    resolve_dual_write_unused_by_dest_.clear();
++  }
+   if (stats.verified || stats.verify_skipped) {
+     REXGPU_INFO(
+         "[resolve-dual-write] verify: {} textures checked (msaa {}, partial {}), {} differ ({} bytes), {} not "
