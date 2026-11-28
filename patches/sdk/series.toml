@@ -1169,6 +1169,15 @@ purpose = "D3D12 (zero-copy session 3): the reload skip (resolve_reinterpret_rel
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0817-shared-memory-upload-merge"
+source = "local"
+path = "patches/sdk/0817-shared-memory-upload-merge.patch"
+sha256 = "1ad214e5babcf8c73d290d91792c6989b26276227c4a7df1047ae2a6e9bf5ea9"
+purpose = "D3D12 (uploads session): the shared memory uploads, all new cvars default off (UploadRangesPlain is the old code). d3d12_upload_census (bool): '[upload-census]' every 10 s: per frame copies, pieces, bytes, calls hoisted / in place, transitions, distinct pages, pages uploaded more than once or in each of the last 2 / 8 / 32 frames, gap histogram in address order and the copies left if gaps of 0 / 4 / 16 / 64 KB were bridged. d3d12_upload_merge (bool) + d3d12_upload_bridge_pages (0..64): runs sorted and joined; a copy that continues the one before it (same upload buffer and next bytes, in one call or one hoisted run) is that command, longer; a gap of up to N pages is copied with them if every page is valid, not GPU-written, not hot, and unread by the hoisted run. shared_memory_merge_upload_calls (bool): one UploadRanges call for a request with hot pages. d3d12_upload_skip_same (0 off, 1 hot pages, 2 any page) + d3d12_upload_skip_same_pages: a page at the start or end of a run whose bytes are the last copied ones (kept on this side) is not copied. d3d12_upload_verify: read-back proof of the skipped and bridged pages. Not built before the next SDK build."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]
