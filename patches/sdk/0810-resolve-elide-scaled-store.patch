@@ -574,7 +574,7 @@ new file mode 100644
 index 0000000..a661a0e
 --- /dev/null
 +++ b/src/graphics/d3d12/resolve_elide.cpp
-@@ -0,0 +1,704 @@
+@@ -0,0 +1,713 @@
 +/**
 + * LOCAL PATCH - MCLA (0810): resolve_elide and copy_byte_census (Direct3D 12).
 + *
@@ -645,6 +645,13 @@ index 0000000..a661a0e
 +                      "With resolve_elide 3: the dword the range of an elided store is filled with (0xFFFF00FF: a "
 +                      "saturated magenta, yellow or cyan in an 8-bit colour texture, depending on its component order; "
 +                      "not a number in a 16-bit float one)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(resolve_elide_inventory, false, "GPU/D3D12",
++                    "With resolve_elide (any mode): while true, every 10 s line is followed by the inventory ('[resolve-elide] "
++                    "inventory: ...': the destinations read as keep rules, then the destinations with the most bytes stored). "
++                    "The title hard-exits, so the same lines 'at exit' never print in a scripted run: switch it on for one "
++                    "10 s tick with --schedule")
 +    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 +
 +REXCVAR_DEFINE_BOOL(copy_byte_census, false, "GPU/D3D12",
@@ -1189,6 +1196,8 @@ index 0000000..a661a0e
 +      return;
 +    }
 +  }
++  const bool inventory = at_exit || REXCVAR_GET(resolve_elide_inventory);
++  const char* const when = at_exit ? "at exit" : "inventory";
 +  const double seconds = resolve_elide_last_log_ms_ ? double(now - resolve_elide_last_log_ms_) / 1000.0 : 0.0;
 +  const uint64_t frames = frame > resolve_elide_last_log_frame_ ? frame - resolve_elide_last_log_frame_ : 0;
 +  const double per_frame = frames ? 1.0 / double(frames) : 0.0;
@@ -1234,7 +1243,7 @@ index 0000000..a661a0e
 +        resolve_elide_keys_.size(), kept_keys, stats.keys_learned, resolve_elide_records_.size(),
 +        resolve_elide_elided_records_, untracked, poison);
 +  }
-+  if (at_exit && !resolve_elide_keys_.empty()) {
++  if (inventory && !resolve_elide_keys_.empty()) {
 +    std::string rules;
 +    for (const ResolveElideKeyInfo& info : resolve_elide_keys_) {
 +      if (info.kept_consumed) {
@@ -1242,7 +1251,7 @@ index 0000000..a661a0e
 +        rules += DescribeResolveElideKey(info);
 +      }
 +    }
-+    REXGPU_INFO("[resolve-elide] at exit: {} destinations, {} read at least once; as keep rules: {}",
++    REXGPU_INFO("[resolve-elide] {}: {} destinations, {} read at least once; as keep rules: {}", when,
 +                resolve_elide_keys_.size(), kept_keys, rules.empty() ? "(none)" : rules);
 +    // The destinations with the most bytes stored, and what became of them: the inventory of the dual-written resolves.
 +    const uint64_t run_frames =
@@ -1259,9 +1268,9 @@ index 0000000..a661a0e
 +    for (size_t i = 0; i < std::min(order.size(), size_t(kMaxResolveElideExitKeyLines)); ++i) {
 +      const ResolveElideKeyInfo& info = resolve_elide_keys_[order[i]];
 +      REXGPU_INFO(
-+          "[resolve-elide] at exit: {}: {} stores ({:.2f} a frame over {} frames) of {} each, {} elided ({}), read {} "
++          "[resolve-elide] {}: {}: {} stores ({:.2f} a frame over {} frames) of {} each, {} elided ({}), read {} "
 +          "times ({} misses, {} would-misses){}",
-+          DescribeResolveElideKey(info), info.seen, double(info.seen) / double(run_frames), run_frames,
++          when, DescribeResolveElideKey(info), info.seen, double(info.seen) / double(run_frames), run_frames,
 +          Megabytes(double(info.store_bytes)), info.elided, Megabytes(double(info.elided_bytes)), info.consumed,
 +          info.misses, info.would_misses, info.kept_consumed ? ", stored after a read" : "");
 +    }
