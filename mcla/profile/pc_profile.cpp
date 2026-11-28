@@ -471,6 +471,11 @@ constexpr CvarDefault k2000pDefaults[] = {
      // The seventh, from the pause menu / GPS map flow (menus_probe, s3-p1, one MISS at 99 s in the map): the same kind of
      // 128x128 8888 texture at another address.
      "addr=0x031C3000,len=65536,pitch=128,height=128,fmt=6,src=0"},
+    // SDK 0815 (unlock-2x session 4): the front-buffer resolve right before a swap that is shown from the render target is
+    // cancelled (nothing samples that front buffer: 2 destinations, 0x08850000 / 0x094D0000 k_8_8_8_8 1600x1000, learn line
+    // `[resolve-dual-write] unused`). 1150 of ~1150 frames per 10 s cancelled, 0 MISS and 0 magenta pixels with resolve_elide=3
+    // (poison) over the tour; paired A/B in one saturated run pair at 2685 MHz: -0.26 +- 0.08 ms GPU busy (resolve_dw -0.14).
+    {"front_buffer_resolve_skip", "true"},
     // The rain: its four 128x128 render targets are resolved and then read as vertex data, which at a draw scale above 1 only
     // works when the resolve is also written unscaled into the shared memory (Renan's mcla_rain_unscaled_copy, not in this
     // host). Without the rule the rain is not drawn at 2000p (r1-rain0: stormy weather, no streak; r1-rain1: the same with the
