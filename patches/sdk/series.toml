@@ -1133,6 +1133,24 @@ purpose = "GPU / D3D12 (zero-copy P2): cvar stencil_transfer_cut (bool, default 
 subdir = ""
 bucket = "REDO"
 
+[[patch]]
+name = "0813-transfer-skip-scrambled"
+source = "local"
+path = "patches/sdk/0813-transfer-skip-scrambled.patch"
+sha256 = "64e7cd27ceaeb0babb6039079781a047347ea9004730cd1bf6312c21a350e77e"
+purpose = "D3D12 (zero-copy session 2 A): cvar transfer_skip_scrambled (int bits, default 0 = unchanged, hot reload): an EDRAM ownership transfer whose source and destination lay their pixels out differently (1 sample count, 2 bits a pixel, 4 pitch: each destination pixel would get another pixel's or sample's bits, garbage on the console too) is not made; same-layout transfers (also depth to colour, format changes: the same pixel's bits read another way, which the title uses) and base-only shifts still are. transfer_skip_scrambled_poison clears the left-out area (magenta; depth 0.5, stencil 0xA5). '[transfer-skip-scrambled]' every 10 s. Fixes 0811's census pitch for 64 bpp targets. Not built before the next SDK build."
+subdir = ""
+bucket = "REDO"
+
+[[patch]]
+name = "0814-resolve-reinterpret-reload"
+source = "local"
+path = "patches/sdk/0814-resolve-reinterpret-reload.patch"
+sha256 = "c967721d1fca7cf713ac82554971389c2c7189578bb81a17ace8609880c64bea"
+purpose = "D3D12 (zero-copy session 2 B): resolve_elide's keep rules match a depth resolve's own format (the MISS on a rule-protected depth key: the rules were matched on the RB_COPY_DEST_INFO register, which GetResolveInfo replaces for depth); cvar resolve_reinterpret_reload (int 0..2, default 0 = unchanged, hot reload): a scaled texture outdated only by resolves of another pitch or texel size over its memory, and by dual writes into itself, is not loaded (1; it keeps its data) or loaded with those bytes poisoned (2); such loads are no readers of a store for resolve_elide (no keep, no miss); resolve_elide_after and resolve_elide_min_kb default to 0. '[resolve-reload]' every 10 s. Needs 0813. Not built before the next SDK build."
+subdir = ""
+bucket = "REDO"
+
 # Renan patches left out (platform- or compiler-only). Kept here for the record; prepare_sdk.py ignores them.
 
 [[dropped]]
