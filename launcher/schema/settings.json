@@ -319,8 +319,10 @@
         {"value": "900p16", "label": "1440x900 (16:10)", "help": "16:10 at 900 rows. Vert+ camera, HUD in a 16:9 band."},
         {"value": "900p", "label": "1600x900 (16:9)", "help": "A step below 1080p: a lighter load than 1920x1080, scaled to the screen by the presenter."},
         {"value": "1000p", "label": "1600x1000 (16:10)", "help": "16:10 at 1000 rows. Vert+ camera, HUD in a 16:9 band."},
+        {"value": "992p", "label": "1600x992 (62 whole tiles; experimental)", "help": "1600x992: 16:10 less 8 rows, 992 being a whole number of the console's 16-row tiles. Vert+ camera, HUD in a 16:9 band. Only for the 1984p test; the picture is 1600x992 in a window of that size, otherwise scaled."},
         {"value": "1080p", "label": "1920x1080 (16:9)", "help": "True 1920x1080 render, MSAA off. On a Radeon 880M in Performance mode with the Performance scene-detail preset: 60 fps most of the time, with occasional holds at 30 fps in the heaviest streets."},
         {"value": "1200p", "label": "1920x1200 (16:10)", "help": "16:10 at 1200 rows. Vert+ camera, HUD in a 16:9 band. Fills a 16:10 panel with no black bars; on a Radeon 880M it measured the same as 1920x1080 (60 fps most of the time, occasional holds at 30 fps)."},
+        {"value": "1984p", "label": "3200x1984 on the 3200x2000 panel (experimental)", "help": "The 2000p picture with the game at 1600x992 (every render target drawn at 2x2: 3200x1984), shown pixel for pixel in the middle of the 3200x2000 panel with 8 black rows above and below; 0.8 % fewer rows than 2000p and the host's render targets are exactly the size of the textures (a test of the zero-copy work). Vert+ camera, HUD in a 16:9 band. Use Fullscreen mode \"Desktop size (borderless)\": with \"Switch the display to the game's mode\" the display would go to 1600x992. NVIDIA Frame Generation does not run with it (the picture is not the whole screen); use 2000p for that."},
         {"value": "2000p", "label": "3200x2000 (16:10, native laptop panel)", "help": "The game renders 1600x1000 and every render target is drawn at 2x2, so the picture is a true 3200x2000 (Vert+ camera, HUD in a 16:9 band); 4x the pixels of 1600x1000 (measured: holds 60 fps while driving on a GeForce RTX 4060 Laptop, about 93 fps unlocked; 23-26 fps on a Radeon 880M in a parked scene, before the 2x copy and shadow savings). Use Fullscreen mode \"Desktop size (borderless)\": with \"Switch the display to the game's mode\" the display would go to 1600x1000."}
       ],
       "advanced": false,
@@ -474,7 +476,7 @@
     {
       "id": "mcla_ws_tall_fov",
       "label": "16:10 camera",
-      "help": "Camera on a back buffer taller than 16:9 (the 16:10 sizes: 1280x800, 1440x900, 1600x1000, 1920x1200 and 3200x2000). Has no effect at 16:9 sizes.",
+      "help": "Camera on a back buffer taller than 16:9 (the 16:10 sizes: 1280x800, 1440x900, 1600x1000, 1600x992, 1920x1200, 3200x2000 and 3200x1984). Has no effect at 16:9 sizes.",
       "category": "display",
       "type": "enum",
       "cvar": "mcla_ws_tall_fov",

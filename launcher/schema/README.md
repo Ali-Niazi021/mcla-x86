@@ -17,7 +17,7 @@ Conventions used by this file:
 - `requires` follows how the game works: FSR needs MSAA off, the single-tile scene and Direct3D 12 (`temporal_aa`), its
   version/quality/sharpness need FSR, the 60 fps timing options need `mcla_fps_target` 60 or 120 (`"requires": {"mcla_fps_target": [60, 120]}`: a list is "any of these values"), keyboard bindings need
   `mnk_mode`, the window size needs windowed mode. A hidden setting is never emitted.
-- `mcla_profile` values are the presets of `pc_profile.cpp` (`default`, `800p`, `900p16`, `900p`, `1000p`, `1080p`, `1200p`, `2000p`); the FSR
+- `mcla_profile` values are the presets of `pc_profile.cpp` (`default`, `800p`, `900p16`, `900p`, `1000p`, `992p`, `1080p`, `1200p`, `2000p`, `1984p`); the FSR
   variants (`1080p-fsr`, `1080p-fsr4p`, ...) are the base size plus `temporal_aa*` cvars, so the upscaler is a separate
   choice. The FSR version defaults to `fsr3` (never `auto`) and is always emitted; the FSR 4 preset sets `fsr4`, 2x, sharpness 0.2.
   Presets name `mcla_gfx_preset=default` for "as shipped" (an empty value would be an empty `--name=` argument). `720p-fsr1` is the shipped size plus `present_effect=fsr`.

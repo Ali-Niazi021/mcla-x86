@@ -134,10 +134,12 @@ void TestWarning() {
   SystemStatus s = Laptop();
   CHECK(SystemStatusWarning(s, 30, 2000).empty());
   CHECK(SystemStatusWarning(s, 60, 720).empty());
+  CHECK(SystemStatusWarning(s, 120, 991).empty());  // under the 1600x992 guest of the 992p / 1984p profiles
 
   // The test laptop in Lenovo's auto mode: advice, naming the vendor mode and the watts.
   std::string w = SystemStatusWarning(s, 120, 1000);
   CHECK_HAS(w, "120 fps at 1000p may be held back");
+  CHECK_HAS(SystemStatusWarning(s, 120, 992), "120 fps at 992p may be held back");  // 1984p's guest: 3200x1984 on the host
   CHECK_HAS(w, "55 W of its 100 W maximum");
   CHECK_HAS(w, "Intelligent Cooling is on Intelligent Cooling (auto)");
   CHECK_HAS(w, "Extreme Performance");

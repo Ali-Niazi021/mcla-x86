@@ -81,10 +81,10 @@ inline std::string Watts(uint32_t milliwatts) {
 // <advice>`. Hard reasons: on battery, battery saver, Windows power mode "Best power efficiency", a display refresh that is not
 // a multiple of the target. Advice (a setting that is usually free to change): the Windows power mode is not Best performance
 // on a plan that does not boost freely, and the GPU is held to under 70 % of its maximum power limit (the Lenovo mode is named
-// when the machine has one). Empty when target_fps < 60, guest_height < 1000 or nothing applies. (The plan's boost mode and
+// when the machine has one). Empty when target_fps < 60, guest_height < 992 (the 1600x992 guest of the 992p / 1984p profiles, and the 1000p / 2000p ones above it) or nothing applies. (The plan's boost mode and
 // maximum state are logged but are not reasons.)
 inline std::string SystemStatusWarning(const SystemStatus& status, int target_fps, int guest_height) {
-  if (target_fps < 60 || guest_height < 1000) {
+  if (target_fps < 60 || guest_height < 992) {
     return {};
   }
   std::string hard, advice;

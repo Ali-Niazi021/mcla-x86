@@ -12,6 +12,8 @@
 // same with AMD's FSR 4 machine-learning upscaler, SDK patch 0470) and the 16:10 sizes `800p`, `900p16`, `1200p`, with
 // `1200p-fsr` and `1200p-fsr4p` (the 1200p render with FSR 3.1/4 at 1.5x / FSR 4 at 2x). `1000p` (1600x1000) and `2000p`
 // (the same drawn at 2x2 on the host: 3200x2000, a 16:10 laptop panel's native size) came with the owner's native request.
+// `992p` and `1984p` (1600x992, a multiple of the 16-row EDRAM tile, and the same at 2x2: 3200x1984) came with the zero-copy
+// work: no padding rows, so the host render targets are as tall as the textures resolved into them.
 //
 // Frame-rate target (W4.1): `--mcla_fps_target=60` (cvar below; 0 = the shipped timing, nothing is set) is the whole 60 fps
 // profile in one switch; `--mcla_fps_target=120` (T6) is the same on the 1/120 world grid and a 120 Hz guest vblank. It is a separate axis from the resolution presets: `--mcla_profile=1080p --mcla_fps_target=60`
@@ -46,7 +48,9 @@ REXCVAR_DEFINE_STRING(mcla_profile, "", "MCLA",
                       "1280x800, '900p16' = 1440x900, '1200p' = 1920x1200, '1200p-fsr' = 1200p with the scene at "
                       "1280x800 upscaled by FSR (1.5x), '1200p-fsr4p' = 1200p from 960x600 by FSR 4 (2x), '1000p' = "
                       "1600x1000, '2000p' = 3200x2000 on the host (1000p with every render target drawn at 2x2: "
-                      "about 4x the GPU load, less with its sun-shadow map 320 and VRS level 2 base). "
+                      "about 4x the GPU load, less with its sun-shadow map 320 and VRS level 2 base), '992p' = 1600x992 (62 whole "
+                      "EDRAM tiles), '1984p' = 3200x1984 on the host (2000p with the 1600x992 guest: no render-target padding rows, "
+                      "shown 1:1 on a 3200x2000 panel with 8 black rows above and below). "
                       "NVIDIA DLSS (RTX; SDK patch 0770): '2000p-dlssq' / '-dlssb' / '-dlssp' / '-dlssu' = 2000p with the "
                       "scene at 2133x1333 / 1856x1160 / 1600x1000 / 1067x667 upscaled to 3200x2000, '2000p-dlaa' = DLSS "
                       "anti-aliasing at 3200x2000, '1080p-dlssq' = 1080p from 1280x720, '1080p-dlaa' = DLAA at 1080p, '2000p-fg' / "
@@ -399,6 +403,31 @@ constexpr CvarDefault k1000pDefaults[] = {
     {"mcla_ws_ui_squeeze", "268"},
     {"mcla_ws_ui_probe", "false"},
 };
+// 992p / 1984p (owner decision; unbuilt and unrun when written, docs/native/ROADMAP.md R5 and scratch/zerocopy/R5_DESIGN.md 2.1).
+// The 1000p render target is padded to whole 16-row EDRAM tiles: 1008 rows, so at draw scale 2 the host render targets are
+// 3200x2016 while the textures the game resolves into (the fetch constant's size times the scale) are 3200x2000, and a texture
+// cannot take over a render target's resource (the game samples with normalized coordinates: every row would be off). A guest
+// height that is a multiple of 16 has no padding: 1600x992 is 62 tiles of 16 rows by 20 of 80 columns (a host render target of
+// 3200x1984 at scale 2, equal to its texture). Drawn 2x2 the picture is 3200x1984, shown 1:1 on the 3200x2000 panel with 8 black
+// rows above and below (the presenter's letterbox, read in SDK presenter.cpp GetGuestOutputPaintFlow: output rectangle 3200x1984
+// at (0, 8), every size an integer, no scaling anywhere: a 0.8 % stretch to 2000 rows would blur the whole picture). 992p is the
+// same render at 1x (1600x992 on a 1600x992 window or a scaling presenter). The aspect the game is told is the buffer's own
+// 1600/992 = 1.6129 by the aspect hooks (they work from the resolved W/H, mcla_ws_aspect.cpp), the camera is Vert+ and the Flash UI a
+// 16:9 band of 1600x900 centred in the 992 rows (46 above and below), as in the other 16:10 sizes; the pixels are square on the
+// panel, so circles stay round.
+static_assert(AcceptedAs(1600, 992) && sizing::RenderTargetMaxHeight(992) == 992 && sizing::SingleTileFits(1600, 992, 1, 4096),
+              "1600x992 is accepted as asked and fits the single-tile EDRAM");
+static_assert(sizing::RenderTargetPaddingRows(992) == 0 && sizing::RenderTargetPaddingRows(1000) == 8 &&
+                  sizing::DeviceSurfaceTiles(1600, 992) == 20 * 62 && 2 * 992 == 1984 && (2000 - 2 * 992) % 2 == 0 &&
+                  (2000 - 2 * 992) / 2 == 8,
+              "992 rows are 62 whole tiles: no padding, host render target 3200x1984 at scale 2, bars of 8 rows on a 2000-row panel");
+constexpr CvarDefault k992pDefaults[] = {
+    {"mcla_scene_height", "992"},
+    {"video_mode_height", "992"},
+    {"window_height", "992"},
+    // Exactly the guest height: no padding rows below the picture (1000p: 1008).
+    {"render_target_max_height", "992"},
+};
 // The levers that keep 2x2 drawing from costing 4x everywhere (docs/native/ROADMAP.md R2 and R3), each behind its own cvar, so
 // `--mcla_gfx_shadow_res=640` / `--mcla_gfx_env_res=0` / `--vrs_level=2` on the command line (or in the config file) is the A/B and wins
 // over these defaults. Measured on the RTX 4060 Laptop with quick_drive2 (the bike really driving, runs `k-*`, graphics clock locked
@@ -489,6 +518,19 @@ constexpr CvarDefault k2000pDefaults[] = {
     {"resolve_unscaled_copy_rules", "len=131072,pitch=128,height=128,fmt=37"},
     {"mcla_gfx_shadow_res", "320"},
     {"mcla_gfx_env_res", "256"},
+};
+// 1984p: 2000p with the guest 1600x992 (see the 992p note above): everything 2000p sets stays (draw scale 2, the copy levers, the rain's
+// unscaled copy, shadow 320, env 256, the 3200x2000 window: a borderless fullscreen window of the panel's size), and only the height
+// rules change. The picture is 3200x1984, placed by the presenter with 8 black rows above and below. Use Fullscreen mode "Desktop size
+// (borderless)": the display mode "game" would ask for 1600x992. The DLSS and frame-generation children of 2000p are not offered: DLSS
+// Frame Generation needs the guest picture to be the whole swap chain (d3d12_presenter_dlssg.cpp GetDlssgInputs: 3200x1984 against 3200x2000
+// keeps it off), and the DLSS sizes are not checked at 3200x1984.
+static_assert(2 * 1600 == 3200 && 2 * 992 == 1984 && sizing::RenderTargetPaddingRows(992) == 0,
+              "1984p: the host render target (62 tiles x 16 rows x 2) is the texture's size, 3200x1984");
+constexpr CvarDefault k1984pDefaults[] = {
+    {"mcla_scene_height", "992"},
+    {"video_mode_height", "992"},
+    {"render_target_max_height", "992"},
 };
 
 // DLSS (SDK patch 0770, NVIDIA Streamline; RTX GPUs). The same squeeze as FSR (temporal_aa=fsr, the scene drawn into the
@@ -669,6 +711,13 @@ constexpr Preset kPresets[] = {
      "the game still sees 1600x1000; sun-shadow map 320 (host 640, mcla_gfx_shadow_res) and environment map 256x128 (host "
      "512x256, mcla_gfx_env_res)",
      k2000pDefaults, sizeof(k2000pDefaults) / sizeof(k2000pDefaults[0]), "1000p"},
+    {"992p", "16:10-ish 1600x992 internal render, 1x (noaa), single-tile scene, Vert+ camera, the Flash UI in a 16:9 band; 992 = 62 whole "
+             "EDRAM tiles (no padding rows)",
+     k992pDefaults, sizeof(k992pDefaults) / sizeof(k992pDefaults[0]), "1000p"},
+    {"1984p",
+     "3200x1984 on the host: the 2000p profile with the guest 1600x992 (62 whole EDRAM tiles, host render targets 3200x1984 = the "
+     "textures' size), shown 1:1 on the 3200x2000 panel with 8 black rows above and below",
+     k1984pDefaults, sizeof(k1984pDefaults) / sizeof(k1984pDefaults[0]), "2000p"},
     {"2000p-dlssq", "2000p with the scene drawn at 2133x1333 and upscaled to 3200x2000 by NVIDIA DLSS (Quality, 1.5x)",
      k2000pDlssQDefaults, sizeof(k2000pDlssQDefaults) / sizeof(k2000pDlssQDefaults[0]), "2000p"},
     {"2000p-dlssb", "2000p with the scene at 1856x1160 upscaled by DLSS (Balanced, 1.72x)", k2000pDlssBDefaults,

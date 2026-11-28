@@ -7,6 +7,7 @@
 // Built and run by CTest (mcla/tests/CMakeLists.txt, test mcla_ws_sizing_test). By hand:
 //   clang++ -std=c++23 -O1 -Wall -Wextra -I mcla/hooks mcla/tests/test_ws_sizing.cpp \
 //       -o <scratch>/test_ws_sizing && <scratch>/test_ws_sizing
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -248,6 +249,55 @@ void TestRenderTargetMaxHeight() {
   CHECK_EQ(sz::RenderTargetMaxHeight(900), 912);
   CHECK_EQ(sz::RenderTargetMaxHeight(1080), 1088);  // not a multiple of the 16-row tile: rounded up
   CHECK_EQ(sz::RenderTargetMaxHeight(1200), 1200);  // 16:10 at 1920x1200: already a multiple of 16
+  CHECK_EQ(sz::RenderTargetMaxHeight(1000), 1008);  // 1000p: 8 padding rows, 16 host rows at draw scale 2 (3200x2016)
+  CHECK_EQ(sz::RenderTargetMaxHeight(992), 992);    // 992p / 1984p: 62 whole tiles
+  CHECK_EQ(sz::RenderTargetPaddingRows(1000), 8);
+  CHECK_EQ(sz::RenderTargetPaddingRows(992), 0);
+  CHECK_EQ(sz::RenderTargetPaddingRows(1200), 0);
+  CHECK_EQ(sz::RenderTargetPaddingRows(1080), 8);
+  CHECK_EQ(sz::RenderTargetPaddingRows(720), 0);
+}
+
+// The 992p / 1984p profiles (pc_profile.cpp): a 1600x992 guest, 62 whole EDRAM tiles; drawn 2x2 it is 3200x1984, shown 1:1 on a
+// 3200x2000 panel with 8 black rows above and below. Everything the profile relies on is a number of this header.
+void Test992() {
+  CHECK(On(sz::Resolve({1600, 992}, {1600, 992}), 1600, 992));  // accepted as asked, no rounding note
+  CHECK(On(sz::Resolve({1600, 0}, {1600, 992}), 1600, 992, sz::kNoteHeightFromMode));
+  CHECK_EQ(sz::DeviceSurfaceTiles(1600, 992), 20 * 62);     // 1,240 each
+  CHECK_EQ(sz::DeviceSurfaceTiles(1600, 1000), 20 * 63);    // 1,260: the 1000p surfaces pad to 1008 rows
+  CHECK_EQ(sz::FreeTilesAfterDeviceSurfaces(4096, 1600, 992), 4096 - 2 * 1240);
+  CHECK_EQ(sz::SingleTileSurfaceTiles(1600, 992, 1), 20 * 62);  // 992 is a multiple of 32: no row of the tile surface is spare
+  CHECK_EQ(sz::SingleTileSurfaceTiles(1600, 1000, 1), 20 * 64);
+  CHECK(sz::SingleTileFits(1600, 992, 1, 4096));
+  CHECK(!sz::SingleTileFits(1600, 992, 1, 2048));  // two surfaces of 1,240 do not fit the console's 2,048
+  CHECK(!sz::SingleTileFits(1600, 992, 2, 4096));  // 2x MSAA: one surface of 20 x 124 = 2,480 is past the console's 2,048
+  const sz::SceneTiling t = sz::GameSceneTiling(1600, 992, 1);
+  CHECK_TILING(t, 800, 2, 1000);  // the game's own tiling is 800 + 192 rows; the single-tile hook merges it
+  CHECK(sz::IsTall(1600, 992) && !sz::IsSixteenNine(1600, 992));  // Vert+ camera and the Flash UI in a 16:9 band
+  CHECK(sz::AspectOf(1600, 992) == double(float(1600) / float(992)));  // the aspect the camera and the map get: 1.6129
+  CHECK(sz::AspectOf(1600, 992) > 1.6129 && sz::AspectOf(1600, 992) < 1.6130);
+  CHECK(sz::UiBlockHeight(1600) == 900.0);  // the UI band: 1600x900 centred in 992 rows, 46 above and below
+  CHECK_EQ((992 - 900) / 2, 46);
+  CHECK(sz::FsrSqueezeWidthOk(1600));
+  // Vert+ keeps the 16:9 horizontal view: 60 degrees become a little more at 1.6129 (a little less than at 1.6).
+  const double k = double(std::bit_cast<float>(0x3C0EFA35u));
+  const double wide = sz::VertPlusFov(60.0, sz::AspectOf(1600, 992), k);
+  CHECK(wide > 60.0 && wide < sz::VertPlusFov(60.0, sz::AspectOf(1600, 1000), k));
+  // At the draw scale 2 the picture and the host render target are the same size: 3200x1984 (the size condition of render-target
+  // renaming), where 1000p has 3200x2000 against 3200x2016. The presenter places 3200x1984 in a 3200x2000 swap chain at (0, 8).
+  CHECK_EQ(2 * sz::RenderTargetMaxHeight(992), 2 * 992);
+  CHECK_EQ(2 * sz::RenderTargetMaxHeight(1000) - 2 * 1000, 16);
+  CHECK_EQ((2000 - 2 * 992) % 2, 0);
+  CHECK_EQ((2000 - 2 * 992) / 2, 8);
+  // The same the presenter computes in GetGuestOutputPaintFlow (src/ui/presenter.cpp): the window 3200x2000 is "taller" than the
+  // 1600:992 source, so the output is the full width and the height 3200 x 992 / 1600 (rounded to nearest), centred.
+  const uint64_t surface_w = 3200, surface_h = 2000, aspect_x = 1600, aspect_y = 992;
+  CHECK(!(surface_w * aspect_y > surface_h * aspect_x));                       // the "taller" branch
+  const uint64_t width_by_height = (surface_h * aspect_x + (aspect_y >> 1)) / aspect_y;  // 3,226 > 3,200: letterbox
+  CHECK(width_by_height > surface_w);
+  const uint64_t output_height = (surface_w * 100 * aspect_y + ((aspect_x * 100) >> 1)) / (aspect_x * 100);
+  CHECK_EQ(output_height, 1984);
+  CHECK_EQ((surface_h - output_height) / 2, 8);
 }
 
 void TestAspect() {
@@ -423,6 +473,7 @@ int main() {
   TestPhysicalMemory();
   TestTextureBlock();
   TestRenderTargetMaxHeight();
+  Test992();
   TestAspect();
   TestVertPlusFov();
   TestFsrSqueezeWidth();

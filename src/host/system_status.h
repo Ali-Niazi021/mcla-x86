@@ -13,7 +13,7 @@
 //                             reasons (NVML, loaded at run time), the refresh rate and DPI of the window's monitor, the
 //                             logical processors per efficiency class
 //   LogSystemStatus(...)      the `[mcla-sys]` lines; the last one is a WARNING when `target_fps` >= 60 at a guest
-//                             height >= 1000 is unlikely and says why
+//                             height >= 992 (the 992p profiles, 1000p, 2000p) is unlikely and says why
 //   SystemStatusWarning(...)  the same warning text on its own (empty = nothing to warn about)
 //   SystemStatusOneLine(...)  one compact line for a launcher status line
 //
@@ -114,7 +114,7 @@ SystemStatus QuerySystemStatus(void* native_window = nullptr);
 
 // Logs the `[mcla-sys]` lines. `target_fps` is the frame rate the run aims at (0 = unknown), `guest_height` the guest
 // video mode's height (GuestVideoModeSize in window_fit.h; 0 = unknown). The warning line is only written when
-// target_fps >= 60 and guest_height >= 1000 and a reason applies.
+// target_fps >= 60 and guest_height >= 992 and a reason applies.
 void LogSystemStatus(const SystemStatus& status, int target_fps, int guest_height);
 
 // The pure rules (the warning text, the GPU-capped test, the Lenovo mode names, the refresh multiple) live in
