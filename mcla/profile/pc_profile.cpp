@@ -450,7 +450,7 @@ constexpr CvarDefault k2000pDefaults[] = {
     //   resolve_reinterpret_reload=1  0814: a texture that is a resolve's other-layout copy is not reloaded from memory.
     //   resolve_elide=2            0814: the memory store of a scaled resolve is left out when the scaled copy is the only
     //                              reader (~170-190 MB a frame); a reader the rules do not know of shows as a `MISS` line.
-    //   resolve_elide_keep_rules   the five destinations that are read again as the memory layout (learn run + the three
+    //   resolve_elide_keep_rules   the destinations (the first five, then two from the soak) that are read again as the memory layout (learn run + the three
     //                              `MISS` lines of s2-ep: front-end, dusk and night switches); with them 0 MISS in the
     //                              tour, the drive and the soak runs (R5.txt of session 2).
     // Measured at 2685 MHz on the RTX 4060 Laptop, paired in one run: all on against all off -0.73 +- 0.09 ms GPU busy
@@ -464,7 +464,13 @@ constexpr CvarDefault k2000pDefaults[] = {
      "addr=0x052C1000,len=1048576,pitch=512,height=512,fmt=6,src=0;"
      "addr=0x0732E000,len=778240,pitch=640,height=640,fmt=22,src=4;"
      "addr=0x035BD000,len=262144,pitch=256,height=256,fmt=6,src=0;"
-     "addr=0x05D64000,len=262144,pitch=256,height=256,fmt=23,src=4"},
+     "addr=0x05D64000,len=262144,pitch=256,height=256,fmt=23,src=4;"
+     // The sixth, from the 6-minute soak (unlock-2x session 3, s3-b2, one MISS at 305.7 s of a drive): a 128x128 8888 texture
+     // that reads the resolve's own bytes after 5,354 elided stores.
+     "addr=0x0328F000,len=65536,pitch=128,height=128,fmt=6,src=0;"
+     // The seventh, from the pause menu / GPS map flow (menus_probe, s3-p1, one MISS at 99 s in the map): the same kind of
+     // 128x128 8888 texture at another address.
+     "addr=0x031C3000,len=65536,pitch=128,height=128,fmt=6,src=0"},
     // The rain: its four 128x128 render targets are resolved and then read as vertex data, which at a draw scale above 1 only
     // works when the resolve is also written unscaled into the shared memory (Renan's mcla_rain_unscaled_copy, not in this
     // host). Without the rule the rain is not drawn at 2000p (r1-rain0: stormy weather, no streak; r1-rain1: the same with the
